@@ -1,0 +1,39 @@
+services:
+  nucleus:
+    image: ghcr.io/neutron-build/nucleus:latest
+    # Or build from source:
+    # build:
+    #   context: ../tystack/nucleus
+    #   dockerfile: Dockerfile
+    ports:
+      - "5432:5432"
+    volumes:
+      - nucleus_data:/data
+    command: ["start", "--port", "5432", "--cluster-port", "5433", "--data", "/data"]
+    healthcheck:
+      test: ["CMD", "sh", "-c", "echo 'SELECT 1' | timeout 2 nc localhost 5432"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  observe:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      OBSERVE_ADDR: ":3000"
+      OBSERVE_NUCLEUS_URL: "postgres://nucleus:5432/observe"
+      OBSERVE_SITE_ID: "default"
+      OBSERVE_SESSION_SALT: "change-me-in-production"
+      OBSERVE_BUFFER_SIZE: "100000"
+      OBSERVE_FLUSH_INTERVAL_MS: "2000"
+      OBSERVE_FLUSH_SIZE: "500"
+      OBSERVE_RAW_RETENTION_DAYS: "30"
+      OBSERVE_HOURLY_RETENTION_DAYS: "365"
+    depends_on:
+      nucleus:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  nucleus_data:

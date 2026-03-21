@@ -1,0 +1,20 @@
+{
+  "name": "observe-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "neutron-ts dev",
+    "build": "neutron-ts build",
+    "preview": "neutron-ts preview"
+  },
+  "dependencies": {
+    "neutron": "workspace:*",
+    "neutron-cli": "workspace:*",
+    "preact": "10.25.4",
+    "uplot": "1.6.31"
+  },
+  "devDependencies": {
+    "typescript": "5.7.2"
+  }
+}

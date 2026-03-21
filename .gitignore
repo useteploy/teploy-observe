@@ -1,0 +1,35 @@
+# Go
+/observe
+*.exe
+*.test
+
+# Nucleus data
+nucleus_data/
+
+# Node
+node_modules/
+ui/node_modules/
+
+# Build artifacts
+cmd/observe/ui/dist/
+
+# Geo binary (generated, 2.4MB)
+internal/geo/geo_ranges.bin
+
+# Environment
+.env
+
+# Reference codebases (large, not our code)
+ref/umami/
+ref/posthog/
+ref/signoz/
+ref/sentry/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp

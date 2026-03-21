@@ -1,0 +1,92 @@
+import { useEffect, useState } from "preact/hooks";
+import type { OverviewResponse, RealtimeResult } from "../api.js";
+import { api } from "../api.js";
+import { useFilters } from "../hooks/useFilters.js";
+import { formatNumber, formatDuration, formatPercent, formatChange } from "../utils/format.js";
+
+function StatsCards() {
+  const { state } = useFilters();
+  const { siteId, from, to, compare, filters } = state;
+
+  const [overview, setOverview] = useState<OverviewResponse | null>(null);
+  const [realtime, setRealtime] = useState<RealtimeResult | null>(null);
+
+  useEffect(() => {
+    api.overview(siteId, from, to, compare, filters).then(setOverview).catch(() => {});
+    api.realtime(siteId).then(setRealtime).catch(() => {});
+
+    const interval = setInterval(() => {
+      api.realtime(siteId).then(setRealtime).catch(() => {});
+    }, 15000);
+    return () => clearInterval(interval);
+  }, [siteId, from, to, compare, JSON.stringify(filters)]);
+
+  const cur = overview?.current;
+  const prev = overview?.previous;
+
+  const cards: Array<{
+    label: string;
+    value: string;
+    live?: boolean;
+    change?: { value: string; direction: string; color: string };
+  }> = [
+    {
+      label: "Active now",
+      value: realtime != null ? formatNumber(realtime.active_visitors) : "--",
+      live: true,
+    },
+    {
+      label: "Pageviews",
+      value: cur != null ? formatNumber(cur.pageviews) : "--",
+      change: prev != null && cur != null ? formatChange(cur.pageviews, prev.pageviews) : undefined,
+    },
+    {
+      label: "Visitors",
+      value: cur != null ? formatNumber(cur.visitors) : "--",
+      change: prev != null && cur != null ? formatChange(cur.visitors, prev.visitors) : undefined,
+    },
+    {
+      label: "Sessions",
+      value: cur != null ? formatNumber(cur.sessions) : "--",
+      change: prev != null && cur != null ? formatChange(cur.sessions, prev.sessions) : undefined,
+    },
+    {
+      label: "Bounce Rate",
+      value: cur != null ? formatPercent(cur.bounce_rate) : "--",
+      change: prev != null && cur != null ? formatChange(cur.bounce_rate, prev.bounce_rate, true) : undefined,
+    },
+    {
+      label: "Avg Duration",
+      value: cur != null ? formatDuration(cur.avg_duration) : "--",
+      change: prev != null && cur != null ? formatChange(cur.avg_duration, prev.avg_duration) : undefined,
+    },
+  ];
+
+  return (
+    <div class="obs-grid-stats">
+      {cards.map((c) => (
+        <div key={c.label} class="obs-card">
+          <div class="obs-stat-value" style={c.live ? "color:var(--obs-success)" : undefined}>
+            {c.value}
+          </div>
+          <div class="obs-stat-label">
+            {c.live && <span class="obs-live-dot" />}
+            {c.label}
+          </div>
+          {c.change && (
+            <div class={`obs-stat-change ${c.change.direction === "up" ? "obs-change-up" : c.change.direction === "down" ? "obs-change-down" : "obs-change-flat"}`}>
+              <span class="obs-stat-change-pill">
+                {c.change.direction === "up" && "\u2191 "}
+                {c.change.direction === "down" && "\u2193 "}
+                {c.change.value}
+              </span>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+StatsCards.displayName = "StatsCards";
+export default StatsCards;
