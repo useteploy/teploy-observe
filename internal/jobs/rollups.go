@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
-
-	"github.com/teploy/observe/internal/dbutil"
 )
 
 // RollupService aggregates raw events into hourly and daily summary tables.
@@ -31,15 +29,16 @@ func (r *RollupService) RunHourlyRollup(ctx context.Context) error {
 	windowStart := now.Truncate(time.Hour).Add(-2 * time.Hour)
 	windowEnd := now.Truncate(time.Hour).Add(time.Hour)
 
-	startMs := dbutil.IntParam(windowStart.UnixMilli())
-	endMs := dbutil.IntParam(windowEnd.UnixMilli())
-	version := dbutil.IntParam(now.UnixMilli())
-
-	hourMs := dbutil.IntParam(3600000)
+	// Exec uses extended protocol — pass raw int64, NOT string
+	startMs := windowStart.UnixMilli()
+	endMs := windowEnd.UnixMilli()
+	version := now.UnixMilli()
 
 	sql := r.db.SQL()
 
-	_, err := sql.Exec(ctx, `
+	// Bucket size inlined in SQL (can't use parameter — Exec uses extended protocol
+	// which types string params as TEXT, and Nucleus can't divide BIGINT by TEXT)
+	_, err := sql.Exec(ctx, fmt.Sprintf(`
 		INSERT INTO stats_hourly (
 			tenant_id, site_id, ts_bucket, pathname, event_type,
 			pageviews, visitors, sessions, bounces, total_duration,
@@ -48,7 +47,7 @@ func (r *RollupService) RunHourlyRollup(ctx context.Context) error {
 		SELECT
 			e.tenant_id,
 			e.site_id,
-			(e.timestamp / $3) * $3 AS ts_bucket,
+			(e.timestamp / 3600000) * 3600000 AS ts_bucket,
 			COALESCE(e.pathname, '') AS pathname,
 			e.event_type,
 			COUNT(*) AS pageviews,
@@ -56,12 +55,12 @@ func (r *RollupService) RunHourlyRollup(ctx context.Context) error {
 			COUNT(DISTINCT e.visit_id) AS sessions,
 			SUM(CASE WHEN s.is_bounce = 'true' THEN 1 ELSE 0 END) AS bounces,
 			COALESCE(SUM(s.last_ts - s.first_ts), 0) AS total_duration,
-			$4 AS version
+			$3 AS version
 		FROM events e
 		LEFT JOIN sessions s ON s.session_id = e.session_id AND s.site_id = e.site_id
 		WHERE e.timestamp >= $1 AND e.timestamp < $2
-		GROUP BY e.tenant_id, e.site_id, (e.timestamp / $3) * $3, e.pathname, e.event_type`,
-		startMs, endMs, hourMs, version,
+		GROUP BY e.tenant_id, e.site_id, (e.timestamp / 3600000) * 3600000, e.pathname, e.event_type`),
+		startMs, endMs, version,
 	)
 	if err != nil {
 		return fmt.Errorf("hourly rollup: %w", err)
@@ -78,15 +77,13 @@ func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 	windowStart := now.Truncate(24*time.Hour).Add(-48 * time.Hour)
 	windowEnd := now.Truncate(24 * time.Hour).Add(24 * time.Hour)
 
-	startMs := dbutil.IntParam(windowStart.UnixMilli())
-	endMs := dbutil.IntParam(windowEnd.UnixMilli())
-	version := dbutil.IntParam(now.UnixMilli())
-
-	dayMs := dbutil.IntParam(86400000)
+	startMs := windowStart.UnixMilli()
+	endMs := windowEnd.UnixMilli()
+	version := now.UnixMilli()
 
 	sql := r.db.SQL()
 
-	_, err := sql.Exec(ctx, `
+	_, err := sql.Exec(ctx, fmt.Sprintf(`
 		INSERT INTO stats_daily (
 			tenant_id, site_id, ts_bucket, pathname, event_type,
 			referrer, browser, os, country, device,
@@ -97,7 +94,7 @@ func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 		SELECT
 			e.tenant_id,
 			e.site_id,
-			(e.timestamp / $3) * $3 AS ts_bucket,
+			(e.timestamp / 86400000) * 86400000 AS ts_bucket,
 			COALESCE(e.pathname, '') AS pathname,
 			e.event_type,
 			COALESCE(e.referrer, '') AS referrer,
@@ -113,14 +110,14 @@ func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 			COUNT(DISTINCT e.visit_id) AS sessions,
 			SUM(CASE WHEN s.is_bounce = 'true' THEN 1 ELSE 0 END) AS bounces,
 			COALESCE(SUM(s.last_ts - s.first_ts), 0) AS total_duration,
-			$4 AS version
+			$3 AS version
 		FROM events e
 		LEFT JOIN sessions s ON s.session_id = e.session_id AND s.site_id = e.site_id
 		WHERE e.timestamp >= $1 AND e.timestamp < $2
-		GROUP BY e.tenant_id, e.site_id, (e.timestamp / $3) * $3, e.pathname, e.event_type,
+		GROUP BY e.tenant_id, e.site_id, (e.timestamp / 86400000) * 86400000, e.pathname, e.event_type,
 		         e.referrer, e.browser, e.os, e.country, e.device,
-		         e.utm_source, e.utm_medium, e.utm_campaign`,
-		startMs, endMs, dayMs, version,
+		         e.utm_source, e.utm_medium, e.utm_campaign`),
+		startMs, endMs, version,
 	)
 	if err != nil {
 		return fmt.Errorf("daily rollup: %w", err)
@@ -136,8 +133,8 @@ func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 // version (most recent computation).
 func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 	now := time.Now().UTC()
-	cutoff := dbutil.IntParam(now.Add(-30 * time.Minute).UnixMilli())
-	version := dbutil.IntParam(now.UnixMilli())
+	cutoff := now.Add(-30 * time.Minute).UnixMilli()
+	version := now.UnixMilli()
 
 	sql := r.db.SQL()
 

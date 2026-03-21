@@ -140,9 +140,8 @@ func main() {
 	jwtMW := auth.JWTAuthMiddleware(authSvc)
 	query.RegisterRoutes(r, statsSvc, jwtMW)
 
-	// --- Live event stream (JWT auth) ---
-	liveGroup := r.Group("/api/v1/stats", jwtMW)
-	liveGroup.HandleFunc("GET /live", liveSvc.Handler())
+	// --- Live event stream (JWT auth, registered on root router to avoid group prefix bug) ---
+	r.Handle("GET /api/v1/stats/live", jwtMW(liveSvc.Handler()))
 
 	// --- Share link management API (JWT auth) ---
 	shareGroup := r.Group("/api/v1", jwtMW)

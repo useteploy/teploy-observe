@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
-
-	"github.com/teploy/observe/internal/dbutil"
 )
 
 // RetentionService cleans up old data according to configured retention periods.
@@ -35,7 +33,7 @@ func (r *RetentionService) RunCleanup(ctx context.Context) error {
 	now := time.Now().UTC()
 
 	// Delete raw events older than retention period
-	rawCutoff := dbutil.IntParam(now.Add(-time.Duration(r.rawRetentionDays) * 24 * time.Hour).UnixMilli())
+	rawCutoff := (now.Add(-time.Duration(r.rawRetentionDays) * 24 * time.Hour).UnixMilli())
 	affected, err := sql.Exec(ctx,
 		`DELETE FROM events WHERE timestamp < $1`, rawCutoff)
 	if err != nil {
@@ -44,7 +42,7 @@ func (r *RetentionService) RunCleanup(ctx context.Context) error {
 	r.logger.Info("retention: raw events", "deleted", affected, "cutoff_days", r.rawRetentionDays)
 
 	// Delete recent events older than 7 days
-	recentCutoff := dbutil.IntParam(now.Add(-7 * 24 * time.Hour).UnixMilli())
+	recentCutoff := (now.Add(-7 * 24 * time.Hour).UnixMilli())
 	affected, err = sql.Exec(ctx,
 		`DELETE FROM events_recent WHERE timestamp < $1`, recentCutoff)
 	if err != nil {
@@ -53,7 +51,7 @@ func (r *RetentionService) RunCleanup(ctx context.Context) error {
 	r.logger.Info("retention: recent events", "deleted", affected)
 
 	// Delete hourly rollups older than retention period
-	hourlyCutoff := dbutil.IntParam(now.Add(-time.Duration(r.hourlyRetentionDays) * 24 * time.Hour).UnixMilli())
+	hourlyCutoff := (now.Add(-time.Duration(r.hourlyRetentionDays) * 24 * time.Hour).UnixMilli())
 	affected, err = sql.Exec(ctx,
 		`DELETE FROM stats_hourly WHERE ts_bucket < $1`, hourlyCutoff)
 	if err != nil {
@@ -62,7 +60,7 @@ func (r *RetentionService) RunCleanup(ctx context.Context) error {
 	r.logger.Info("retention: hourly rollups", "deleted", affected, "cutoff_days", r.hourlyRetentionDays)
 
 	// Sessions older than 90 days
-	sessionCutoff := dbutil.IntParam(now.Add(-90 * 24 * time.Hour).UnixMilli())
+	sessionCutoff := (now.Add(-90 * 24 * time.Hour).UnixMilli())
 	affected, err = sql.Exec(ctx,
 		`DELETE FROM sessions WHERE last_ts < $1`, sessionCutoff)
 	if err != nil {

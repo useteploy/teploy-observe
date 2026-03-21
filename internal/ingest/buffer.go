@@ -8,10 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/neutron-dev/neutron-go/nucleus"
-
-	"github.com/teploy/observe/internal/dbutil"
 )
 
 // Event represents a single analytics event ready for storage.
@@ -131,6 +128,7 @@ func (b *Buffer) Flush() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	b.logger.Info("flushing events", "count", len(batch))
 	if err := b.insertBatch(ctx, batch); err != nil {
 		b.logger.Error("flush failed", "count", len(batch), "err", err)
 		// Re-queue events that failed to insert (best effort, may drop under pressure)
@@ -145,7 +143,7 @@ func (b *Buffer) Flush() {
 		b.mu.Unlock()
 		return
 	}
-	b.logger.Debug("flushed events", "count", len(batch))
+	b.logger.Info("flushed events OK", "count", len(batch))
 }
 
 // Len returns the current number of buffered events.
@@ -171,42 +169,36 @@ const insertRecentSQL = `INSERT INTO events_recent (
 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`
 
 func (b *Buffer) insertBatch(ctx context.Context, batch []Event) error {
-	pgxBatch := &pgx.Batch{}
-	for _, e := range batch {
+	sql := b.db.SQL()
+	for i, e := range batch {
 		var propsJSON string
 		if e.Properties != nil {
 			if raw, err := json.Marshal(e.Properties); err == nil {
 				propsJSON = string(raw)
 			}
 		}
-		ts := dbutil.IntParam(e.Timestamp)
-		sw := dbutil.IntParam(int64(e.ScreenWidth))
-		sh := dbutil.IntParam(int64(e.ScreenHeight))
-		// Main events table
-		pgxBatch.Queue(insertSQL,
+		// Use SQLModel.Exec which has SimpleProtocol — Nucleus extended protocol
+		// silently drops INSERT data.
+		_, err := sql.Exec(ctx, insertSQL,
 			e.EventID, e.TenantID, e.SiteID, e.SessionID, e.VisitID, e.EventType,
-			ts, e.URL, e.Referrer, e.Title, e.Hostname, e.Pathname,
+			e.Timestamp, e.URL, e.Referrer, e.Title, e.Hostname, e.Pathname,
 			e.Language, e.Country, e.Region, e.City,
 			e.Browser, e.BrowserVersion, e.OS, e.OSVersion, e.Device,
-			sw, sh,
+			e.ScreenWidth, e.ScreenHeight,
 			e.UTMSource, e.UTMMedium, e.UTMCampaign, e.UTMTerm, e.UTMContent,
 			propsJSON,
 		)
-		// Recent events table (slim copy for real-time queries)
-		pgxBatch.Queue(insertRecentSQL,
+		if err != nil {
+			return fmt.Errorf("insert event %d/%d: %w", i+1, len(batch), err)
+		}
+		// Recent events table
+		_, err = sql.Exec(ctx, insertRecentSQL,
 			e.EventID, e.TenantID, e.SiteID, e.SessionID, e.EventType,
-			ts, e.Pathname, e.Referrer, e.Browser, e.OS, e.Country,
+			e.Timestamp, e.Pathname, e.Referrer, e.Browser, e.OS, e.Country,
 			propsJSON,
 		)
-	}
-	results := b.db.Pool().SendBatch(ctx, pgxBatch)
-	defer results.Close()
-
-	// 2 statements per event (events + events_recent)
-	for i := 0; i < len(batch)*2; i++ {
-		_, err := results.Exec()
 		if err != nil {
-			return fmt.Errorf("insert batch statement %d/%d: %w", i+1, len(batch)*2, err)
+			return fmt.Errorf("insert recent %d/%d: %w", i+1, len(batch), err)
 		}
 	}
 	return nil
