@@ -24,6 +24,7 @@ import (
 	"github.com/teploy/observe/internal/query"
 	"github.com/teploy/observe/internal/share"
 	"github.com/teploy/observe/internal/sites"
+	"github.com/teploy/observe/internal/platform"
 	"github.com/teploy/observe/internal/tracing"
 )
 
@@ -90,6 +91,11 @@ func main() {
 	// Tracing services
 	traceIngest := tracing.NewIngestService(db)
 	traceQuery := tracing.NewQueryService(db)
+
+	// Platform services
+	userSvc := platform.NewUserService(db)
+	alertSvc := platform.NewAlertService(db, logger)
+	webhookSvc := platform.NewWebhookService(db, logger)
 
 	// Background jobs: rollups + retention
 	rollups := jobs.NewRollupService(db, logger)
@@ -229,6 +235,29 @@ func main() {
 		neutron.WithSummary("Get service dependency graph"),
 	)
 
+	// --- Platform API (JWT auth, admin-only for writes) ---
+	platformGroup := r.Group("/api/v1/platform", jwtMW)
+	neutron.Get(platformGroup, "/users", listUsersHandler(userSvc),
+		neutron.WithTags("platform"), neutron.WithSummary("List users"))
+	neutron.Post(platformGroup, "/users", createUserHandler(userSvc),
+		neutron.WithTags("platform"), neutron.WithSummary("Create/invite user"))
+	neutron.Post(platformGroup, "/users/{user_id}/role", updateUserRoleHandler(userSvc),
+		neutron.WithTags("platform"), neutron.WithSummary("Update user role"))
+	neutron.Get(platformGroup, "/alerts/rules", listAlertRulesHandler(alertSvc),
+		neutron.WithTags("platform"), neutron.WithSummary("List alert rules"))
+	neutron.Post(platformGroup, "/alerts/rules", createAlertRuleHandler(alertSvc),
+		neutron.WithTags("platform"), neutron.WithSummary("Create alert rule"))
+	neutron.Delete(platformGroup, "/alerts/rules/{rule_id}", deleteAlertRuleHandler(alertSvc),
+		neutron.WithTags("platform"), neutron.WithSummary("Delete alert rule"))
+	neutron.Get(platformGroup, "/alerts/history", alertHistoryHandler(alertSvc),
+		neutron.WithTags("platform"), neutron.WithSummary("Alert history"))
+	neutron.Get(platformGroup, "/webhooks", listWebhooksHandler(webhookSvc),
+		neutron.WithTags("platform"), neutron.WithSummary("List webhooks"))
+	neutron.Post(platformGroup, "/webhooks", createWebhookHandler(webhookSvc),
+		neutron.WithTags("platform"), neutron.WithSummary("Create webhook"))
+	neutron.Delete(platformGroup, "/webhooks/{webhook_id}", deleteWebhookHandler(webhookSvc),
+		neutron.WithTags("platform"), neutron.WithSummary("Delete webhook"))
+
 	// --- Share link management API (JWT auth) ---
 	shareGroup := r.Group("/api/v1", jwtMW)
 	neutron.Post(shareGroup, "/sites/{site_id}/share", createShareHandler(shareSvc),
@@ -290,6 +319,17 @@ func main() {
 	// Start background services directly (lifecycle hooks may not fire on all platforms)
 	buf.Start()
 	scheduler.Start()
+
+	// Alert check loop (every 60s)
+	go func() {
+		time.Sleep(30 * time.Second)
+		for {
+			if err := alertSvc.CheckRules(context.Background()); err != nil {
+				logger.Error("alert check failed", "err", err)
+			}
+			time.Sleep(60 * time.Second)
+		}
+	}()
 
 	logger.Info("starting observe", "addr", cfg.Addr)
 	if err := app.Run(cfg.Addr); err != nil {
@@ -613,6 +653,177 @@ func issueSessionHandler(issueSvc *obserrors.IssueService, statsSvc *query.Stats
 			return issueSessionResponse{}, err
 		}
 		return issueSessionResponse{SessionID: sessionID, Events: sessEvents}, nil
+	}
+}
+
+// --- Platform handlers ---
+
+type listUsersInput struct{}
+type listUsersResponse struct {
+	Users []platform.User `json:"users"`
+}
+
+func listUsersHandler(svc *platform.UserService) neutron.HandlerFunc[listUsersInput, listUsersResponse] {
+	return func(ctx context.Context, _ listUsersInput) (listUsersResponse, error) {
+		users, err := svc.List(ctx)
+		if err != nil {
+			return listUsersResponse{}, err
+		}
+		if users == nil {
+			users = []platform.User{}
+		}
+		return listUsersResponse{Users: users}, nil
+	}
+}
+
+type createUserInput struct {
+	Username string `json:"username"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	Role     string `json:"role"`
+}
+
+func createUserHandler(svc *platform.UserService) neutron.HandlerFunc[createUserInput, platform.User] {
+	return func(ctx context.Context, input createUserInput) (platform.User, error) {
+		if input.Username == "" || input.Password == "" {
+			return platform.User{}, neutron.ErrBadRequest("username and password required")
+		}
+		user, err := svc.Create(ctx, input.Username, input.Email, input.Password, input.Role, "")
+		if err != nil {
+			return platform.User{}, err
+		}
+		return *user, nil
+	}
+}
+
+type updateRoleInput struct {
+	UserID string `path:"user_id"`
+	Role   string `json:"role"`
+}
+
+func updateUserRoleHandler(svc *platform.UserService) neutron.HandlerFunc[updateRoleInput, neutron.Empty] {
+	return func(ctx context.Context, input updateRoleInput) (neutron.Empty, error) {
+		if input.UserID == "" || input.Role == "" {
+			return neutron.Empty{}, neutron.ErrBadRequest("user_id and role required")
+		}
+		return neutron.Empty{}, svc.UpdateRole(ctx, input.UserID, input.Role)
+	}
+}
+
+type listAlertRulesInput struct {
+	SiteID string `query:"site_id"`
+}
+
+func listAlertRulesHandler(svc *platform.AlertService) neutron.HandlerFunc[listAlertRulesInput, []platform.AlertRule] {
+	return func(ctx context.Context, input listAlertRulesInput) ([]platform.AlertRule, error) {
+		if input.SiteID == "" {
+			return nil, neutron.ErrBadRequest("site_id required")
+		}
+		return svc.ListRules(ctx, input.SiteID)
+	}
+}
+
+type createAlertRuleInput struct {
+	SiteID        string `json:"site_id"`
+	Name          string `json:"name"`
+	Metric        string `json:"metric"`
+	Operator      string `json:"operator"`
+	Threshold     string `json:"threshold"`
+	WindowMinutes string `json:"window_minutes"`
+	Cooldown      string `json:"cooldown"`
+}
+
+func createAlertRuleHandler(svc *platform.AlertService) neutron.HandlerFunc[createAlertRuleInput, platform.AlertRule] {
+	return func(ctx context.Context, input createAlertRuleInput) (platform.AlertRule, error) {
+		if input.SiteID == "" || input.Name == "" || input.Metric == "" {
+			return platform.AlertRule{}, neutron.ErrBadRequest("site_id, name, and metric required")
+		}
+		rule := platform.AlertRule{
+			SiteID: input.SiteID, Name: input.Name, Metric: input.Metric,
+			Operator: input.Operator, Threshold: input.Threshold,
+			WindowMinutes: input.WindowMinutes, Cooldown: input.Cooldown, Enabled: "true",
+		}
+		if rule.Operator == "" {
+			rule.Operator = "gt"
+		}
+		if rule.WindowMinutes == "" {
+			rule.WindowMinutes = "5"
+		}
+		if rule.Cooldown == "" {
+			rule.Cooldown = "300"
+		}
+		r, err := svc.CreateRule(ctx, rule)
+		if err != nil {
+			return platform.AlertRule{}, err
+		}
+		return *r, nil
+	}
+}
+
+type deleteAlertRuleInput struct {
+	RuleID string `path:"rule_id"`
+}
+
+func deleteAlertRuleHandler(svc *platform.AlertService) neutron.HandlerFunc[deleteAlertRuleInput, neutron.Empty] {
+	return func(ctx context.Context, input deleteAlertRuleInput) (neutron.Empty, error) {
+		return neutron.Empty{}, svc.DeleteRule(ctx, input.RuleID)
+	}
+}
+
+type alertHistoryInput struct {
+	SiteID string `query:"site_id"`
+	Limit  int    `query:"limit"`
+}
+
+func alertHistoryHandler(svc *platform.AlertService) neutron.HandlerFunc[alertHistoryInput, []platform.AlertHistoryEntry] {
+	return func(ctx context.Context, input alertHistoryInput) ([]platform.AlertHistoryEntry, error) {
+		if input.SiteID == "" {
+			return nil, neutron.ErrBadRequest("site_id required")
+		}
+		return svc.ListHistory(ctx, input.SiteID, input.Limit)
+	}
+}
+
+type listWebhooksInput struct {
+	SiteID string `query:"site_id"`
+}
+
+func listWebhooksHandler(svc *platform.WebhookService) neutron.HandlerFunc[listWebhooksInput, []platform.Webhook] {
+	return func(ctx context.Context, input listWebhooksInput) ([]platform.Webhook, error) {
+		if input.SiteID == "" {
+			return nil, neutron.ErrBadRequest("site_id required")
+		}
+		return svc.List(ctx, input.SiteID)
+	}
+}
+
+type createWebhookInput struct {
+	SiteID      string `json:"site_id"`
+	Name        string `json:"name"`
+	WebhookType string `json:"webhook_type"`
+	URL         string `json:"url"`
+}
+
+func createWebhookHandler(svc *platform.WebhookService) neutron.HandlerFunc[createWebhookInput, platform.Webhook] {
+	return func(ctx context.Context, input createWebhookInput) (platform.Webhook, error) {
+		if input.SiteID == "" || input.URL == "" {
+			return platform.Webhook{}, neutron.ErrBadRequest("site_id and url required")
+		}
+		w, err := svc.Create(ctx, input.SiteID, input.Name, input.WebhookType, input.URL)
+		if err != nil {
+			return platform.Webhook{}, err
+		}
+		return *w, nil
+	}
+}
+
+type deleteWebhookInput struct {
+	WebhookID string `path:"webhook_id"`
+}
+
+func deleteWebhookHandler(svc *platform.WebhookService) neutron.HandlerFunc[deleteWebhookInput, neutron.Empty] {
+	return func(ctx context.Context, input deleteWebhookInput) (neutron.Empty, error) {
+		return neutron.Empty{}, svc.Delete(ctx, input.WebhookID)
 	}
 }
 
