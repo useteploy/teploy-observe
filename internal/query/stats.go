@@ -552,7 +552,7 @@ func (s *StatsService) Overview(ctx context.Context, siteID string, from, to tim
 		        COUNT(*) AS total_sessions,
 		        SUM(CAST(last_ts AS BIGINT) - CAST(first_ts AS BIGINT)) AS duration_sum
 		 FROM sessions
-		 WHERE site_id = $1 AND CAST(first_ts AS BIGINT) >= $2 AND CAST(first_ts AS BIGINT) < $3%s`, fSQL)
+		 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3%s`, fSQL)
 
 	sessRows, err := nucleus.Query[sessionStats](ctx, s.db.SQL(), sessQ, sessParams...)
 	if err != nil {
@@ -711,7 +711,7 @@ func (s *StatsService) TopEntryPages(ctx context.Context, siteID string, from, t
 	q := fmt.Sprintf(`SELECT entry_url AS pathname,
 	        COUNT(*) AS visitors
 	 FROM sessions
-	 WHERE site_id = $1 AND CAST(first_ts AS BIGINT) >= $2 AND CAST(first_ts AS BIGINT) < $3
+	 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3
 	   AND entry_url != ''%s
 	 GROUP BY entry_url
 	 ORDER BY visitors DESC
@@ -742,7 +742,7 @@ func (s *StatsService) TopExitPages(ctx context.Context, siteID string, from, to
 	q := fmt.Sprintf(`SELECT exit_url AS pathname,
 	        COUNT(*) AS visitors
 	 FROM sessions
-	 WHERE site_id = $1 AND CAST(first_ts AS BIGINT) >= $2 AND CAST(first_ts AS BIGINT) < $3
+	 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3
 	   AND exit_url != ''%s
 	 GROUP BY exit_url
 	 ORDER BY visitors DESC
@@ -816,14 +816,14 @@ func (s *StatsService) Sessions(ctx context.Context, siteID string, from, to tim
 	}
 
 	q := fmt.Sprintf(`SELECT session_id,
-	        CAST(first_ts AS BIGINT) AS first_ts,
-	        CAST(last_ts AS BIGINT) AS last_ts,
-	        CAST(pageviews AS BIGINT) AS pageviews,
+	        first_ts AS first_ts,
+	        last_ts AS last_ts,
+	        pageviews AS pageviews,
 	        entry_url, exit_url,
 	        browser, os, country, device, is_bounce
 	 FROM sessions
-	 WHERE site_id = $1 AND CAST(first_ts AS BIGINT) >= $2 AND CAST(first_ts AS BIGINT) < $3
-	 ORDER BY CAST(first_ts AS BIGINT) DESC
+	 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3
+	 ORDER BY first_ts DESC
 	 LIMIT %d`, limit)
 
 	rows, err := nucleus.Query[SessionSummary](ctx, s.db.SQL(), q, siteID, fromMs, toMs)

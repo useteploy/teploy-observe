@@ -47,7 +47,7 @@ func (r *RollupService) RunHourlyRollup(ctx context.Context) error {
 		SELECT
 			tenant_id,
 			site_id,
-			(CAST(timestamp AS BIGINT) / 3600000) * 3600000 AS ts_bucket,
+			(timestamp / 3600000) * 3600000 AS ts_bucket,
 			COALESCE(pathname, '') AS pathname,
 			event_type,
 			COUNT(*) AS pageviews,
@@ -58,7 +58,7 @@ func (r *RollupService) RunHourlyRollup(ctx context.Context) error {
 			$3 AS version
 		FROM events
 		WHERE timestamp >= $1 AND timestamp < $2
-		GROUP BY tenant_id, site_id, (CAST(timestamp AS BIGINT) / 3600000) * 3600000, pathname, event_type`),
+		GROUP BY tenant_id, site_id, (timestamp / 3600000) * 3600000, pathname, event_type`),
 		startMs, endMs, version,
 	)
 	if err != nil {
@@ -93,7 +93,7 @@ func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 		SELECT
 			tenant_id,
 			site_id,
-			(CAST(timestamp AS BIGINT) / 86400000) * 86400000 AS ts_bucket,
+			(timestamp / 86400000) * 86400000 AS ts_bucket,
 			COALESCE(pathname, '') AS pathname,
 			event_type,
 			COALESCE(referrer, '') AS referrer,
@@ -112,7 +112,7 @@ func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 			$3 AS version
 		FROM events
 		WHERE timestamp >= $1 AND timestamp < $2
-		GROUP BY tenant_id, site_id, (CAST(timestamp AS BIGINT) / 86400000) * 86400000, pathname, event_type,
+		GROUP BY tenant_id, site_id, (timestamp / 86400000) * 86400000, pathname, event_type,
 		         referrer, browser, os, country, device,
 		         utm_source, utm_medium, utm_campaign`),
 		startMs, endMs, version,
@@ -173,7 +173,7 @@ func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 			CASE WHEN COUNT(*) <= 1 THEN 'true' ELSE 'false' END AS is_bounce,
 			$2 AS version
 		FROM events
-		WHERE CAST(timestamp AS BIGINT) >= $1
+		WHERE timestamp >= $1
 		GROUP BY tenant_id, site_id, session_id`,
 		cutoff, version,
 	)
