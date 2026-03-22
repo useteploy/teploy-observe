@@ -136,6 +136,46 @@ func (i EventPropertyValuesInput) TimeRange() (time.Time, time.Time) {
 	return from, to
 }
 
+// FunnelInput is the request body for funnel analysis.
+type FunnelInput struct {
+	SiteID string       `json:"site_id"`
+	From   string       `json:"from"`
+	To     string       `json:"to"`
+	Steps  []FunnelStep `json:"steps"`
+}
+
+func (i FunnelInput) TimeRange() (time.Time, time.Time) {
+	from, _ := time.Parse(time.RFC3339, i.From)
+	to, _ := time.Parse(time.RFC3339, i.To)
+	if from.IsZero() {
+		from = time.Now().UTC().Add(-24 * time.Hour)
+	}
+	if to.IsZero() {
+		to = time.Now().UTC()
+	}
+	return from, to
+}
+
+// RetentionInput is the query params for retention cohort analysis.
+type RetentionInput struct {
+	SiteID     string `query:"site_id"`
+	From       string `query:"from"`
+	To         string `query:"to"`
+	PeriodDays int    `query:"period_days"`
+}
+
+func (i RetentionInput) TimeRange() (time.Time, time.Time) {
+	from, _ := time.Parse(time.RFC3339, i.From)
+	to, _ := time.Parse(time.RFC3339, i.To)
+	if from.IsZero() {
+		from = time.Now().UTC().Add(-30 * 24 * time.Hour)
+	}
+	if to.IsZero() {
+		to = time.Now().UTC()
+	}
+	return from, to
+}
+
 // RegisterRoutes registers all dashboard query API endpoints.
 // Optional middleware is applied to the stats route group (e.g. JWT auth).
 func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middleware) {
@@ -335,5 +375,17 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 			slog.Error("event property values query failed", "err", err, "event", input.Name, "key", input.Key, "site", input.SiteID)
 		}
 		return result, err
+	}, neutron.WithTags("stats"))
+
+	// Funnel analysis
+	neutron.Post(api, "/funnel", func(ctx context.Context, input FunnelInput) ([]FunnelResult, error) {
+		from, to := input.TimeRange()
+		return svc.Funnel(ctx, input.SiteID, from, to, input.Steps)
+	}, neutron.WithTags("stats"))
+
+	// Retention cohort analysis
+	neutron.Get(api, "/retention", func(ctx context.Context, input RetentionInput) ([]RetentionCohort, error) {
+		from, to := input.TimeRange()
+		return svc.Retention(ctx, input.SiteID, from, to, input.PeriodDays)
 	}, neutron.WithTags("stats"))
 }
