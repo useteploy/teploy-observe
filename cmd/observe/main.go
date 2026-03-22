@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/neutron-dev/neutron-go/neutron"
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -119,14 +120,15 @@ func main() {
 		neutron.WithSummary("Login and receive JWT token"),
 	)
 
-	// --- Ingestion API (API key auth, wildcard CORS) ---
+	// --- Ingestion API (API key auth, wildcard CORS, rate limited) ---
+	rateLimiter := ingest.NewRateLimiter(100, time.Second, 200) // 100 req/s per IP, burst 200
 	ingestCORS := neutron.CORS(neutron.CORSOptions{
 		AllowOrigins: []string{"*"},
 		AllowMethods: []string{"POST", "OPTIONS"},
 		AllowHeaders: []string{"Content-Type", "X-API-Key"},
 		MaxAge:       86400,
 	})
-	ingestGroup := r.Group("/api/v1", ingestCORS, auth.APIKeyAuthMiddleware(authSvc, cfg.SiteID))
+	ingestGroup := r.Group("/api/v1", ingestCORS, rateLimiter.Middleware, auth.APIKeyAuthMiddleware(authSvc, cfg.SiteID))
 	neutron.Post(ingestGroup, "/events", ingest.Handler(buf, cfg.SessionSalt),
 		neutron.WithTags("ingest"),
 		neutron.WithSummary("Ingest analytics event"),

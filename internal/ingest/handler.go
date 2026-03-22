@@ -43,6 +43,20 @@ func Handler(buf *Buffer, salt string) neutron.HandlerFunc[IngestInput, IngestRe
 			return IngestResponse{OK: true}, nil
 		}
 
+		// Input validation
+		if len(input.URL) > 2048 {
+			return IngestResponse{}, neutron.ErrBadRequest("url too long (max 2048)")
+		}
+		if len(input.Title) > 512 {
+			input.Title = input.Title[:512]
+		}
+		if len(input.Referrer) > 2048 {
+			input.Referrer = input.Referrer[:2048]
+		}
+		if input.Properties != nil && len(input.Properties) > 50 {
+			return IngestResponse{}, neutron.ErrBadRequest("too many properties (max 50)")
+		}
+
 		// Site ID priority: JSON body > middleware context (header) > empty
 		siteID := input.SiteID
 		if siteID == "" {
@@ -168,6 +182,12 @@ type BatchInput struct {
 func BatchHandler(buf *Buffer, salt string) neutron.HandlerFunc[BatchInput, IngestResponse] {
 	singleHandler := Handler(buf, salt)
 	return func(ctx context.Context, input BatchInput) (IngestResponse, error) {
+		if len(input.Events) > 100 {
+			return IngestResponse{}, neutron.ErrBadRequest("batch too large (max 100 events)")
+		}
+		if len(input.Events) == 0 {
+			return IngestResponse{OK: true}, nil
+		}
 		for _, ev := range input.Events {
 			if _, err := singleHandler(ctx, ev); err != nil {
 				return IngestResponse{}, err

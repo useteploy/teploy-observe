@@ -3,11 +3,12 @@ package auth
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 	"github.com/neutron-dev/neutron-go/neutronauth"
@@ -101,7 +102,6 @@ func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string
 // Login validates credentials and returns a JWT token.
 func (s *AuthService) Login(ctx context.Context, username, password string) (string, error) {
 	sql := s.db.SQL()
-	hash := hashPassword(password)
 
 	user, err := nucleus.QueryOne[adminUserRow](ctx, sql,
 		"SELECT id, username, password_hash, created_at FROM admin_users WHERE username = $1",
@@ -111,7 +111,7 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (str
 		return "", fmt.Errorf("auth: invalid credentials")
 	}
 
-	if user.PasswordHash != hash {
+	if !checkPassword(password, user.PasswordHash) {
 		return "", fmt.Errorf("auth: invalid credentials")
 	}
 
@@ -129,8 +129,16 @@ func (s *AuthService) HasAdminUsers(ctx context.Context) bool {
 }
 
 func hashPassword(password string) string {
-	h := sha256.Sum256([]byte(password))
-	return hex.EncodeToString(h[:])
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		// Fallback should never happen with valid input
+		return ""
+	}
+	return string(hash)
+}
+
+func checkPassword(password, hash string) bool {
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 
 func generateID() string {
