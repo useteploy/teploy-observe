@@ -173,9 +173,10 @@ CREATE TABLE IF NOT EXISTS api_keys (
     site_id        TEXT NOT NULL,
     key_hash       TEXT NOT NULL,
     label          TEXT,
-    created_at     BIGINT NOT NULL,
-    revoked        BOOLEAN DEFAULT false
-);
+    created_at     TEXT NOT NULL,
+    revoked        TEXT NOT NULL DEFAULT 'false'
+) WITH (engine = 'mergetree')
+ORDER BY (tenant_id, key_hash);
 
 -- ============================================================================
 -- Sites registry
@@ -186,9 +187,10 @@ CREATE TABLE IF NOT EXISTS sites (
     tenant_id      TEXT NOT NULL DEFAULT 'default',
     domain         TEXT NOT NULL,
     name           TEXT,
-    created_at     BIGINT NOT NULL,
+    created_at     TEXT NOT NULL,
     session_salt   TEXT NOT NULL
-);
+) WITH (engine = 'mergetree')
+ORDER BY (tenant_id, site_id);
 
 -- ============================================================================
 -- Admin users for dashboard auth
@@ -198,8 +200,9 @@ CREATE TABLE IF NOT EXISTS admin_users (
     id             TEXT NOT NULL,
     username       TEXT NOT NULL,
     password_hash  TEXT NOT NULL,
-    created_at     BIGINT NOT NULL
-);
+    created_at     TEXT NOT NULL
+) WITH (engine = 'mergetree')
+ORDER BY (id);
 
 -- ============================================================================
 -- Share links for public dashboard access
@@ -208,5 +211,6 @@ CREATE TABLE IF NOT EXISTS admin_users (
 CREATE TABLE IF NOT EXISTS share_links (
     token          TEXT NOT NULL,
     site_id        TEXT NOT NULL,
-    created_at     BIGINT NOT NULL
-);
+    created_at     TEXT NOT NULL
+) WITH (engine = 'mergetree')
+ORDER BY (token);

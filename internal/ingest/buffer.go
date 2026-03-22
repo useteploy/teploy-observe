@@ -76,6 +76,11 @@ func (b *Buffer) Start() {
 	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				b.logger.Error("buffer flush goroutine panicked", "err", r)
+			}
+		}()
 		ticker := time.NewTicker(b.flushInterval)
 		defer ticker.Stop()
 		for {

@@ -16,6 +16,8 @@ import (
 
 	"github.com/teploy/observe/internal/auth"
 	"github.com/teploy/observe/internal/config"
+	obserrors "github.com/teploy/observe/internal/errors"
+	"github.com/teploy/observe/internal/export"
 	"github.com/teploy/observe/internal/ingest"
 	"github.com/teploy/observe/internal/jobs"
 	"github.com/teploy/observe/internal/live"
@@ -75,6 +77,14 @@ func main() {
 
 	// Share link service
 	shareSvc := share.NewShareService(db)
+
+	// Export service
+	exportSvc := export.NewExportService(db)
+
+	// Error tracking services
+	issueSvc := obserrors.NewIssueService(db)
+	searchSvc := obserrors.NewSearchService(db)
+	errorHandler := obserrors.NewErrorHandler(db, issueSvc, searchSvc)
 
 	// Background jobs: rollups + retention
 	rollups := jobs.NewRollupService(db, logger)
@@ -138,12 +148,48 @@ func main() {
 		neutron.WithSummary("Ingest batch of analytics events"),
 	)
 
+	// --- Error Ingestion (API key auth, wildcard CORS) ---
+	neutron.Post(ingestGroup, "/errors", errorIngestHandler(errorHandler),
+		neutron.WithTags("errors"),
+		neutron.WithSummary("Ingest error event"),
+	)
+
 	// --- Stats API (JWT auth) ---
 	jwtMW := auth.JWTAuthMiddleware(authSvc)
 	query.RegisterRoutes(r, statsSvc, jwtMW)
 
 	// --- Live event stream (JWT auth, registered on root router to avoid group prefix bug) ---
 	r.Handle("GET /api/v1/stats/live", jwtMW(liveSvc.Handler()))
+
+	// --- Data export (JWT auth) ---
+	r.Handle("GET /api/v1/export", jwtMW(exportSvc.Handler()))
+
+	// --- Issue management API (JWT auth) ---
+	issueGroup := r.Group("/api/v1/issues", jwtMW)
+	neutron.Get(issueGroup, "", listIssuesHandler(issueSvc),
+		neutron.WithTags("issues"),
+		neutron.WithSummary("List issues for a site"),
+	)
+	neutron.Get(issueGroup, "/{issue_id}", getIssueHandler(issueSvc),
+		neutron.WithTags("issues"),
+		neutron.WithSummary("Get issue detail"),
+	)
+	neutron.Post(issueGroup, "/{issue_id}/status", updateIssueStatusHandler(issueSvc),
+		neutron.WithTags("issues"),
+		neutron.WithSummary("Update issue status"),
+	)
+	neutron.Get(issueGroup, "/{issue_id}/events", issueEventsHandler(issueSvc),
+		neutron.WithTags("issues"),
+		neutron.WithSummary("List error events for an issue"),
+	)
+	neutron.Get(issueGroup, "/{issue_id}/session", issueSessionHandler(issueSvc, statsSvc),
+		neutron.WithTags("issues"),
+		neutron.WithSummary("Get analytics session correlated with an error"),
+	)
+	neutron.Get(issueGroup, "/search", searchIssuesHandler(searchSvc),
+		neutron.WithTags("issues"),
+		neutron.WithSummary("Full-text search across error messages"),
+	)
 
 	// --- Share link management API (JWT auth) ---
 	shareGroup := r.Group("/api/v1", jwtMW)
@@ -179,8 +225,9 @@ func main() {
 		neutron.WithSummary("Generate API key for a site"),
 	)
 
-	// Tracker script (served as static JS)
+	// Tracker scripts (served as static JS)
 	r.HandleFunc("GET /t/observe.js", serveTracker)
+	r.HandleFunc("GET /t/observe-errors.js", serveErrorTracker)
 
 	// Dashboard UI (embedded static files)
 	uiSub, err := fs.Sub(uiFS, "ui/dist")
@@ -201,6 +248,10 @@ func main() {
 
 	// --- Public share dashboard ---
 	r.HandleFunc("GET /share/{token}", shareViewHandler(shareSvc, uiSub))
+
+	// Start background services directly (lifecycle hooks may not fire on all platforms)
+	buf.Start()
+	scheduler.Start()
 
 	logger.Info("starting observe", "addr", cfg.Addr)
 	if err := app.Run(cfg.Addr); err != nil {
@@ -321,6 +372,15 @@ func serveTracker(w http.ResponseWriter, r *http.Request) {
 //go:embed tracker/observe.js
 var trackerScript []byte
 
+//go:embed tracker/observe-errors.js
+var errorTrackerScript []byte
+
+func serveErrorTracker(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Write(errorTrackerScript)
+}
+
 // --- Share handlers ---
 
 type createShareInput struct {
@@ -370,6 +430,179 @@ func revokeShareHandler(shareSvc *share.ShareService) neutron.HandlerFunc[revoke
 			return neutron.Empty{}, err
 		}
 		return neutron.Empty{}, nil
+	}
+}
+
+// --- Error ingestion handler ---
+
+func errorIngestHandler(h *obserrors.ErrorHandler) neutron.HandlerFunc[obserrors.ErrorInput, obserrors.ErrorResponse] {
+	return func(ctx context.Context, input obserrors.ErrorInput) (obserrors.ErrorResponse, error) {
+		siteID := input.SiteID
+		if siteID == "" {
+			siteID = ingest.SiteIDFromContext(ctx)
+		}
+		if siteID == "" {
+			return obserrors.ErrorResponse{}, neutron.ErrBadRequest("missing site_id")
+		}
+		input.SiteID = siteID
+		return h.Handle(ctx, input)
+	}
+}
+
+// --- Issue management handlers ---
+
+type listIssuesInput struct {
+	SiteID string `query:"site_id"`
+	Status string `query:"status"`
+	Limit  int    `query:"limit"`
+}
+
+type listIssuesResponse struct {
+	Issues []obserrors.Issue `json:"issues"`
+}
+
+func listIssuesHandler(svc *obserrors.IssueService) neutron.HandlerFunc[listIssuesInput, listIssuesResponse] {
+	return func(ctx context.Context, input listIssuesInput) (listIssuesResponse, error) {
+		if input.SiteID == "" {
+			return listIssuesResponse{}, neutron.ErrBadRequest("site_id required")
+		}
+		issues, err := svc.ListIssues(ctx, input.SiteID, input.Status, input.Limit)
+		if err != nil {
+			return listIssuesResponse{}, err
+		}
+		if issues == nil {
+			issues = []obserrors.Issue{}
+		}
+		return listIssuesResponse{Issues: issues}, nil
+	}
+}
+
+type getIssueInput struct {
+	IssueID string `path:"issue_id"`
+	SiteID  string `query:"site_id"`
+}
+
+func getIssueHandler(svc *obserrors.IssueService) neutron.HandlerFunc[getIssueInput, obserrors.Issue] {
+	return func(ctx context.Context, input getIssueInput) (obserrors.Issue, error) {
+		if input.SiteID == "" || input.IssueID == "" {
+			return obserrors.Issue{}, neutron.ErrBadRequest("site_id and issue_id required")
+		}
+		issue, err := svc.GetIssue(ctx, input.IssueID, input.SiteID)
+		if err != nil {
+			return obserrors.Issue{}, err
+		}
+		if issue == nil {
+			return obserrors.Issue{}, neutron.ErrNotFound("issue not found")
+		}
+		return *issue, nil
+	}
+}
+
+type updateStatusInput struct {
+	IssueID string `path:"issue_id"`
+	SiteID  string `json:"site_id"`
+	Status  string `json:"status"`
+}
+
+func updateIssueStatusHandler(svc *obserrors.IssueService) neutron.HandlerFunc[updateStatusInput, neutron.Empty] {
+	return func(ctx context.Context, input updateStatusInput) (neutron.Empty, error) {
+		if input.IssueID == "" || input.SiteID == "" || input.Status == "" {
+			return neutron.Empty{}, neutron.ErrBadRequest("issue_id, site_id, and status required")
+		}
+		if input.Status != "open" && input.Status != "resolved" && input.Status != "ignored" {
+			return neutron.Empty{}, neutron.ErrBadRequest("status must be open, resolved, or ignored")
+		}
+		if err := svc.UpdateStatus(ctx, input.IssueID, input.SiteID, input.Status); err != nil {
+			return neutron.Empty{}, err
+		}
+		return neutron.Empty{}, nil
+	}
+}
+
+type issueEventsInput struct {
+	IssueID string `path:"issue_id"`
+	SiteID  string `query:"site_id"`
+	Limit   int    `query:"limit"`
+}
+
+type issueEventsResponse struct {
+	Events []obserrors.ErrorEvent `json:"events"`
+}
+
+func issueEventsHandler(svc *obserrors.IssueService) neutron.HandlerFunc[issueEventsInput, issueEventsResponse] {
+	return func(ctx context.Context, input issueEventsInput) (issueEventsResponse, error) {
+		if input.SiteID == "" || input.IssueID == "" {
+			return issueEventsResponse{}, neutron.ErrBadRequest("site_id and issue_id required")
+		}
+		events, err := svc.LatestEvents(ctx, input.IssueID, input.SiteID, input.Limit)
+		if err != nil {
+			return issueEventsResponse{}, err
+		}
+		if events == nil {
+			events = []obserrors.ErrorEvent{}
+		}
+		return issueEventsResponse{Events: events}, nil
+	}
+}
+
+type issueSessionInput struct {
+	IssueID string `path:"issue_id"`
+	SiteID  string `query:"site_id"`
+}
+
+type issueSessionResponse struct {
+	SessionID string              `json:"session_id"`
+	Events    []query.SessionEvent `json:"events"`
+}
+
+func issueSessionHandler(issueSvc *obserrors.IssueService, statsSvc *query.StatsService) neutron.HandlerFunc[issueSessionInput, issueSessionResponse] {
+	return func(ctx context.Context, input issueSessionInput) (issueSessionResponse, error) {
+		if input.SiteID == "" || input.IssueID == "" {
+			return issueSessionResponse{}, neutron.ErrBadRequest("site_id and issue_id required")
+		}
+		// Get the latest error event for this issue to find its session_id
+		events, err := issueSvc.LatestEvents(ctx, input.IssueID, input.SiteID, 1)
+		if err != nil || len(events) == 0 {
+			return issueSessionResponse{}, neutron.ErrNotFound("no error events for this issue")
+		}
+		sessionID := events[0].SessionID
+		if sessionID == "" {
+			return issueSessionResponse{}, neutron.ErrNotFound("error has no associated session")
+		}
+		// Fetch the analytics session timeline
+		sessEvents, err := statsSvc.SessionDetail(ctx, sessionID, input.SiteID)
+		if err != nil {
+			return issueSessionResponse{}, err
+		}
+		return issueSessionResponse{SessionID: sessionID, Events: sessEvents}, nil
+	}
+}
+
+// --- Error search handler ---
+
+type searchIssuesInput struct {
+	SiteID string `query:"site_id"`
+	Query  string `query:"q"`
+	Limit  int    `query:"limit"`
+}
+
+type searchIssuesResponse struct {
+	Issues []obserrors.Issue `json:"issues"`
+}
+
+func searchIssuesHandler(svc *obserrors.SearchService) neutron.HandlerFunc[searchIssuesInput, searchIssuesResponse] {
+	return func(ctx context.Context, input searchIssuesInput) (searchIssuesResponse, error) {
+		if input.SiteID == "" || input.Query == "" {
+			return searchIssuesResponse{}, neutron.ErrBadRequest("site_id and q required")
+		}
+		issues, err := svc.SearchIssues(ctx, input.SiteID, input.Query, input.Limit)
+		if err != nil {
+			return searchIssuesResponse{}, err
+		}
+		if issues == nil {
+			issues = []obserrors.Issue{}
+		}
+		return searchIssuesResponse{Issues: issues}, nil
 	}
 }
 

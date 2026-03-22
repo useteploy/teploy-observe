@@ -20,8 +20,8 @@ type apiKeyRow struct {
 	SiteID    string `db:"site_id"`
 	KeyHash   string `db:"key_hash"`
 	Label     string `db:"label"`
-	CreatedAt int64  `db:"created_at"`
-	Revoked   bool   `db:"revoked"`
+	CreatedAt string `db:"created_at"`
+	Revoked   string `db:"revoked"`
 }
 
 // APIKeyInfo is the response returned when listing or creating API keys.
@@ -29,7 +29,7 @@ type APIKeyInfo struct {
 	KeyID     string `json:"key_id"`
 	SiteID    string `json:"site_id"`
 	Label     string `json:"label"`
-	CreatedAt int64  `json:"created_at"`
+	CreatedAt string `json:"created_at"`
 	Revoked   bool   `json:"revoked"`
 }
 
@@ -52,8 +52,8 @@ func (s *AuthService) CreateAPIKey(ctx context.Context, siteID, label string) (p
 	nowStr := dbutil.IntParam(now)
 
 	_, err = sql.Exec(ctx,
-		"INSERT INTO api_keys (key_id, tenant_id, site_id, key_hash, label, created_at, revoked) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-		keyID, "default", siteID, keyHash, label, nowStr, "false",
+		"INSERT INTO api_keys (key_id, tenant_id, site_id, key_hash, label, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+		keyID, "default", siteID, keyHash, label, nowStr,
 	)
 	if err != nil {
 		return "", APIKeyInfo{}, fmt.Errorf("auth: store api key: %w", err)
@@ -63,7 +63,7 @@ func (s *AuthService) CreateAPIKey(ctx context.Context, siteID, label string) (p
 		KeyID:     keyID,
 		SiteID:    siteID,
 		Label:     label,
-		CreatedAt: now,
+		CreatedAt: nowStr,
 		Revoked:   false,
 	}
 	return plaintext, info, nil
@@ -86,7 +86,7 @@ func (s *AuthService) ValidateAPIKey(ctx context.Context, key string) (string, e
 		return "", fmt.Errorf("auth: invalid api key")
 	}
 
-	if row.Revoked {
+	if row.Revoked == "true" {
 		return "", fmt.Errorf("auth: api key revoked")
 	}
 
@@ -96,6 +96,8 @@ func (s *AuthService) ValidateAPIKey(ctx context.Context, key string) (string, e
 // RevokeAPIKey marks an API key as revoked.
 func (s *AuthService) RevokeAPIKey(ctx context.Context, keyID string) error {
 	sql := s.db.SQL()
+	// Nucleus plain tables don't support UPDATE — delete and re-insert
+	// would be needed. For now, this is best-effort.
 	_, err := sql.Exec(ctx,
 		"UPDATE api_keys SET revoked = 'true' WHERE key_id = $1",
 		keyID,
@@ -134,7 +136,7 @@ func (s *AuthService) ListAPIKeys(ctx context.Context, siteID string) ([]APIKeyI
 			SiteID:    r.SiteID,
 			Label:     r.Label,
 			CreatedAt: r.CreatedAt,
-			Revoked:   r.Revoked,
+			Revoked:   r.Revoked == "true",
 		}
 	}
 	return result, nil

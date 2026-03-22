@@ -29,7 +29,7 @@ type adminUserRow struct {
 	ID           string `db:"id"`
 	Username     string `db:"username"`
 	PasswordHash string `db:"password_hash"`
-	CreatedAt    int64  `db:"created_at"`
+	CreatedAt    string `db:"created_at"`
 }
 
 // countRow is used for COUNT queries.
@@ -70,10 +70,6 @@ func (s *AuthService) ValidateToken(tokenStr string) (neutronauth.Claims, error)
 // EnsureAdmin creates a default admin user if the admin_users table is empty.
 func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string) error {
 	sql := s.db.SQL()
-
-	// Ensure table exists (migration may have been applied before this table was added)
-	_, _ = sql.Exec(ctx, `CREATE TABLE IF NOT EXISTS admin_users (
-		id TEXT NOT NULL, username TEXT NOT NULL, password_hash TEXT NOT NULL, created_at BIGINT NOT NULL)`)
 
 	rows, err := nucleus.Query[countRow](ctx, sql, "SELECT COUNT(*) AS count FROM admin_users")
 	if err != nil {
