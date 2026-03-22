@@ -113,14 +113,14 @@ func (s *StatsService) PageviewTimeSeries(ctx context.Context, siteID string, fr
 		case "month":
 			bucketMs = 86400000 * 30
 		}
-		q = fmt.Sprintf(`SELECT (timestamp / %d) * %d AS bucket,
+		q = fmt.Sprintf(`SELECT (CAST(timestamp AS BIGINT) / %d) * %d AS bucket,
 		        COUNT(*) AS pageviews,
 		        COUNT(DISTINCT session_id) AS visitors
 		 FROM events
 		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		   AND event_type = 'pageview'%s
-		 GROUP BY (timestamp / %d) * %d
-		 ORDER BY (timestamp / %d) * %d`, bucketMs, bucketMs, fSQL, bucketMs, bucketMs, bucketMs, bucketMs)
+		 GROUP BY (CAST(timestamp AS BIGINT) / %d) * %d
+		 ORDER BY (CAST(timestamp AS BIGINT) / %d) * %d`, bucketMs, bucketMs, fSQL, bucketMs, bucketMs, bucketMs, bucketMs)
 	} else {
 		q = fmt.Sprintf(`SELECT %s AS bucket,
 		        SUM(pageviews) AS pageviews,
@@ -550,9 +550,9 @@ func (s *StatsService) Overview(ctx context.Context, siteID string, from, to tim
 	sessQ := fmt.Sprintf(`SELECT
 		        SUM(CASE WHEN is_bounce = 'true' THEN 1 ELSE 0 END) AS bounces,
 		        COUNT(*) AS total_sessions,
-		        SUM(last_ts - first_ts) AS duration_sum
+		        SUM(CAST(last_ts AS BIGINT) - CAST(first_ts AS BIGINT)) AS duration_sum
 		 FROM sessions
-		 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3%s`, fSQL)
+		 WHERE site_id = $1 AND CAST(first_ts AS BIGINT) >= $2 AND CAST(first_ts AS BIGINT) < $3%s`, fSQL)
 
 	sessRows, err := nucleus.Query[sessionStats](ctx, s.db.SQL(), sessQ, sessParams...)
 	if err != nil {
@@ -638,12 +638,12 @@ func (s *StatsService) TopScreens(ctx context.Context, siteID string, from, to t
 	fSQL, _ := filterSQL(filters)
 	allParams := baseParams(siteID, fromMs, toMs, filters)
 
-	q := fmt.Sprintf(`SELECT screen_width || 'x' || screen_height AS screen,
+	q := fmt.Sprintf(`SELECT CAST(screen_width AS TEXT) || 'x' || CAST(screen_height AS TEXT) AS screen,
 	        COUNT(DISTINCT session_id) AS visitors
 	 FROM events
 	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-	   AND screen_width > 0%s
-	 GROUP BY screen_width || 'x' || screen_height
+	   AND CAST(screen_width AS INTEGER) > 0%s
+	 GROUP BY CAST(screen_width AS TEXT) || 'x' || CAST(screen_height AS TEXT)
 	 ORDER BY visitors DESC
 	 LIMIT %d`, fSQL, limit)
 
@@ -711,7 +711,7 @@ func (s *StatsService) TopEntryPages(ctx context.Context, siteID string, from, t
 	q := fmt.Sprintf(`SELECT entry_url AS pathname,
 	        COUNT(*) AS visitors
 	 FROM sessions
-	 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3
+	 WHERE site_id = $1 AND CAST(first_ts AS BIGINT) >= $2 AND CAST(first_ts AS BIGINT) < $3
 	   AND entry_url != ''%s
 	 GROUP BY entry_url
 	 ORDER BY visitors DESC
@@ -742,7 +742,7 @@ func (s *StatsService) TopExitPages(ctx context.Context, siteID string, from, to
 	q := fmt.Sprintf(`SELECT exit_url AS pathname,
 	        COUNT(*) AS visitors
 	 FROM sessions
-	 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3
+	 WHERE site_id = $1 AND CAST(first_ts AS BIGINT) >= $2 AND CAST(first_ts AS BIGINT) < $3
 	   AND exit_url != ''%s
 	 GROUP BY exit_url
 	 ORDER BY visitors DESC
@@ -815,11 +815,15 @@ func (s *StatsService) Sessions(ctx context.Context, siteID string, from, to tim
 		limit = 20
 	}
 
-	q := fmt.Sprintf(`SELECT session_id, first_ts, last_ts, pageviews, entry_url, exit_url,
+	q := fmt.Sprintf(`SELECT session_id,
+	        CAST(first_ts AS BIGINT) AS first_ts,
+	        CAST(last_ts AS BIGINT) AS last_ts,
+	        CAST(pageviews AS BIGINT) AS pageviews,
+	        entry_url, exit_url,
 	        browser, os, country, device, is_bounce
 	 FROM sessions
-	 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3
-	 ORDER BY first_ts DESC
+	 WHERE site_id = $1 AND CAST(first_ts AS BIGINT) >= $2 AND CAST(first_ts AS BIGINT) < $3
+	 ORDER BY CAST(first_ts AS BIGINT) DESC
 	 LIMIT %d`, limit)
 
 	rows, err := nucleus.Query[SessionSummary](ctx, s.db.SQL(), q, siteID, fromMs, toMs)

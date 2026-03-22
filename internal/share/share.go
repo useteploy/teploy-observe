@@ -19,6 +19,10 @@ type ShareService struct {
 
 // NewShareService creates a new ShareService.
 func NewShareService(db *nucleus.Client) *ShareService {
+	// Ensure table exists (migration may have been applied before this table was added)
+	ctx := context.Background()
+	db.SQL().Exec(ctx, `CREATE TABLE IF NOT EXISTS share_links (
+		token TEXT NOT NULL, site_id TEXT NOT NULL, created_at BIGINT NOT NULL)`)
 	return &ShareService{db: db}
 }
 

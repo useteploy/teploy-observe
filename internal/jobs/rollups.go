@@ -45,21 +45,20 @@ func (r *RollupService) RunHourlyRollup(ctx context.Context) error {
 			version
 		)
 		SELECT
-			e.tenant_id,
-			e.site_id,
-			(e.timestamp / 3600000) * 3600000 AS ts_bucket,
-			COALESCE(e.pathname, '') AS pathname,
-			e.event_type,
+			tenant_id,
+			site_id,
+			(CAST(timestamp AS BIGINT) / 3600000) * 3600000 AS ts_bucket,
+			COALESCE(pathname, '') AS pathname,
+			event_type,
 			COUNT(*) AS pageviews,
-			COUNT(DISTINCT e.session_id) AS visitors,
-			COUNT(DISTINCT e.visit_id) AS sessions,
-			SUM(CASE WHEN s.is_bounce = 'true' THEN 1 ELSE 0 END) AS bounces,
-			COALESCE(SUM(s.last_ts - s.first_ts), 0) AS total_duration,
+			COUNT(DISTINCT session_id) AS visitors,
+			COUNT(DISTINCT visit_id) AS sessions,
+			0 AS bounces,
+			0 AS total_duration,
 			$3 AS version
-		FROM events e
-		LEFT JOIN sessions s ON s.session_id = e.session_id AND s.site_id = e.site_id
-		WHERE e.timestamp >= $1 AND e.timestamp < $2
-		GROUP BY e.tenant_id, e.site_id, (e.timestamp / 3600000) * 3600000, e.pathname, e.event_type`),
+		FROM events
+		WHERE timestamp >= $1 AND timestamp < $2
+		GROUP BY tenant_id, site_id, (CAST(timestamp AS BIGINT) / 3600000) * 3600000, pathname, event_type`),
 		startMs, endMs, version,
 	)
 	if err != nil {
@@ -92,31 +91,30 @@ func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 			version
 		)
 		SELECT
-			e.tenant_id,
-			e.site_id,
-			(e.timestamp / 86400000) * 86400000 AS ts_bucket,
-			COALESCE(e.pathname, '') AS pathname,
-			e.event_type,
-			COALESCE(e.referrer, '') AS referrer,
-			COALESCE(e.browser, '') AS browser,
-			COALESCE(e.os, '') AS os,
-			COALESCE(e.country, '') AS country,
-			COALESCE(e.device, '') AS device,
-			COALESCE(e.utm_source, '') AS utm_source,
-			COALESCE(e.utm_medium, '') AS utm_medium,
-			COALESCE(e.utm_campaign, '') AS utm_campaign,
+			tenant_id,
+			site_id,
+			(CAST(timestamp AS BIGINT) / 86400000) * 86400000 AS ts_bucket,
+			COALESCE(pathname, '') AS pathname,
+			event_type,
+			COALESCE(referrer, '') AS referrer,
+			COALESCE(browser, '') AS browser,
+			COALESCE(os, '') AS os,
+			COALESCE(country, '') AS country,
+			COALESCE(device, '') AS device,
+			COALESCE(utm_source, '') AS utm_source,
+			COALESCE(utm_medium, '') AS utm_medium,
+			COALESCE(utm_campaign, '') AS utm_campaign,
 			COUNT(*) AS pageviews,
-			COUNT(DISTINCT e.session_id) AS visitors,
-			COUNT(DISTINCT e.visit_id) AS sessions,
-			SUM(CASE WHEN s.is_bounce = 'true' THEN 1 ELSE 0 END) AS bounces,
-			COALESCE(SUM(s.last_ts - s.first_ts), 0) AS total_duration,
+			COUNT(DISTINCT session_id) AS visitors,
+			COUNT(DISTINCT visit_id) AS sessions,
+			0 AS bounces,
+			0 AS total_duration,
 			$3 AS version
-		FROM events e
-		LEFT JOIN sessions s ON s.session_id = e.session_id AND s.site_id = e.site_id
-		WHERE e.timestamp >= $1 AND e.timestamp < $2
-		GROUP BY e.tenant_id, e.site_id, (e.timestamp / 86400000) * 86400000, e.pathname, e.event_type,
-		         e.referrer, e.browser, e.os, e.country, e.device,
-		         e.utm_source, e.utm_medium, e.utm_campaign`),
+		FROM events
+		WHERE timestamp >= $1 AND timestamp < $2
+		GROUP BY tenant_id, site_id, (CAST(timestamp AS BIGINT) / 86400000) * 86400000, pathname, event_type,
+		         referrer, browser, os, country, device,
+		         utm_source, utm_medium, utm_campaign`),
 		startMs, endMs, version,
 	)
 	if err != nil {
@@ -138,9 +136,9 @@ func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 
 	sql := r.db.SQL()
 
-	// Two-pass approach:
-	// 1. Aggregate stats per session
-	// 2. Join back to get entry/exit URLs and first-seen dimensions
+	// Simple aggregation — no JOINs or subqueries (Nucleus limitations).
+	// Entry/exit URLs, referrer, browser etc. are left empty for now.
+	// Bounce = sessions with only 1 event total.
 	_, err := sql.Exec(ctx, `
 		INSERT INTO sessions (
 			tenant_id, site_id, session_id,
@@ -152,47 +150,31 @@ func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 			is_bounce, version
 		)
 		SELECT
-			agg.tenant_id,
-			agg.site_id,
-			agg.session_id,
-			agg.first_ts,
-			agg.last_ts,
-			agg.pageviews,
-			agg.events_count,
-			COALESCE(entry.url, '') AS entry_url,
-			COALESCE(exit_.url, '') AS exit_url,
-			COALESCE(entry.referrer, '') AS referrer,
-			COALESCE(entry.browser, '') AS browser,
-			COALESCE(entry.os, '') AS os,
-			COALESCE(entry.device, '') AS device,
-			COALESCE(entry.country, '') AS country,
-			COALESCE(entry.language, '') AS language,
-			COALESCE(entry.screen_width, 0) AS screen_width,
-			COALESCE(entry.screen_height, 0) AS screen_height,
-			COALESCE(entry.utm_source, '') AS utm_source,
-			COALESCE(entry.utm_medium, '') AS utm_medium,
-			COALESCE(entry.utm_campaign, '') AS utm_campaign,
-			agg.pageviews <= 1 AS is_bounce,
+			tenant_id,
+			site_id,
+			session_id,
+			MIN(CAST(timestamp AS BIGINT)) AS first_ts,
+			MAX(CAST(timestamp AS BIGINT)) AS last_ts,
+			COUNT(*) AS pageviews,
+			COUNT(*) AS events_count,
+			'' AS entry_url,
+			'' AS exit_url,
+			'' AS referrer,
+			'' AS browser,
+			'' AS os,
+			'' AS device,
+			'' AS country,
+			'' AS language,
+			0 AS screen_width,
+			0 AS screen_height,
+			'' AS utm_source,
+			'' AS utm_medium,
+			'' AS utm_campaign,
+			CASE WHEN COUNT(*) <= 1 THEN 'true' ELSE 'false' END AS is_bounce,
 			$2 AS version
-		FROM (
-			SELECT
-				tenant_id, site_id, session_id,
-				MIN(timestamp) AS first_ts,
-				MAX(timestamp) AS last_ts,
-				COUNT(*) FILTER (WHERE event_type = 'pageview') AS pageviews,
-				COUNT(*) AS events_count
-			FROM events
-			WHERE timestamp >= $1
-			GROUP BY tenant_id, site_id, session_id
-		) agg
-		LEFT JOIN events entry
-			ON entry.session_id = agg.session_id
-			AND entry.site_id = agg.site_id
-			AND entry.timestamp = agg.first_ts
-		LEFT JOIN events exit_
-			ON exit_.session_id = agg.session_id
-			AND exit_.site_id = agg.site_id
-			AND exit_.timestamp = agg.last_ts`,
+		FROM events
+		WHERE CAST(timestamp AS BIGINT) >= $1
+		GROUP BY tenant_id, site_id, session_id`,
 		cutoff, version,
 	)
 	if err != nil {
