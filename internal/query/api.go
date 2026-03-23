@@ -377,6 +377,12 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 		return result, err
 	}, neutron.WithTags("stats"))
 
+	// User journeys
+	neutron.Get(api, "/journeys", func(ctx context.Context, input StatsInput) (*JourneyResult, error) {
+		from, to := input.TimeRange()
+		return svc.Journeys(ctx, input.SiteID, from, to, input.Limit)
+	}, neutron.WithTags("stats"))
+
 	// Funnel analysis
 	neutron.Post(api, "/funnel", func(ctx context.Context, input FunnelInput) ([]FunnelResult, error) {
 		from, to := input.TimeRange()

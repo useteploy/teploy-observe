@@ -24,7 +24,13 @@ import (
 	"github.com/teploy/observe/internal/query"
 	"github.com/teploy/observe/internal/share"
 	"github.com/teploy/observe/internal/sites"
+	"github.com/teploy/observe/internal/dashboards"
+	"github.com/teploy/observe/internal/logs"
+	"github.com/teploy/observe/internal/monitoring"
 	"github.com/teploy/observe/internal/platform"
+	"github.com/teploy/observe/internal/replays"
+	"github.com/teploy/observe/internal/sourcemaps"
+	"github.com/teploy/observe/internal/tracking"
 	"github.com/teploy/observe/internal/tracing"
 )
 
@@ -96,6 +102,15 @@ func main() {
 	userSvc := platform.NewUserService(db)
 	alertSvc := platform.NewAlertService(db, logger)
 	webhookSvc := platform.NewWebhookService(db, logger)
+
+	// Feature expansion services
+	logSvc := logs.NewLogService(db)
+	uptimeSvc := monitoring.NewUptimeService(db, logger)
+	cronSvc := monitoring.NewCronService(db, logger)
+	linkSvc := tracking.NewLinkService(db)
+	srcmapSvc := sourcemaps.NewSourceMapService(db)
+	dashSvc := dashboards.NewDashboardService(db)
+	replaySvc := replays.NewReplayService(db)
 
 	// Background jobs: rollups + retention
 	rollups := jobs.NewRollupService(db, logger)
@@ -292,9 +307,81 @@ func main() {
 		neutron.WithSummary("Generate API key for a site"),
 	)
 
+	// --- Log ingestion (API key auth) ---
+	neutron.Post(ingestGroup, "/logs", logIngestHandler(logSvc),
+		neutron.WithTags("logs"), neutron.WithSummary("Ingest log entry"))
+
+	// --- Replay ingestion (API key auth) ---
+	neutron.Post(ingestGroup, "/replays", replayIngestHandler(replaySvc),
+		neutron.WithTags("replays"), neutron.WithSummary("Ingest session replay events"))
+
+	// --- Source maps (JWT auth) ---
+	r.Handle("POST /api/v1/sourcemaps/upload", jwtMW(srcmapUploadHandler(srcmapSvc)))
+
+	// --- Log query API (JWT auth) ---
+	logGroup := r.Group("/api/v1/logs", jwtMW)
+	neutron.Get(logGroup, "/search", logSearchHandler(logSvc),
+		neutron.WithTags("logs"), neutron.WithSummary("Search logs"))
+
+	// --- Goals API (JWT auth) ---
+	goalGroup := r.Group("/api/v1/goals", jwtMW)
+	neutron.Get(goalGroup, "", listGoalsHandler(statsSvc),
+		neutron.WithTags("goals"), neutron.WithSummary("List goals with conversions"))
+	neutron.Post(goalGroup, "", createGoalHandler(statsSvc),
+		neutron.WithTags("goals"), neutron.WithSummary("Create goal"))
+
+	// --- Uptime monitors (JWT auth) ---
+	uptimeGroup := r.Group("/api/v1/monitors", jwtMW)
+	neutron.Get(uptimeGroup, "", listMonitorsHandler(uptimeSvc),
+		neutron.WithTags("monitors"), neutron.WithSummary("List uptime monitors"))
+	neutron.Post(uptimeGroup, "", createMonitorHandler(uptimeSvc),
+		neutron.WithTags("monitors"), neutron.WithSummary("Create uptime monitor"))
+	neutron.Get(uptimeGroup, "/{monitor_id}/results", monitorResultsHandler(uptimeSvc),
+		neutron.WithTags("monitors"), neutron.WithSummary("Get monitor results"))
+
+	// --- Cron monitors (JWT auth + public checkin) ---
+	cronGroup := r.Group("/api/v1/crons", jwtMW)
+	neutron.Get(cronGroup, "", listCronsHandler(cronSvc),
+		neutron.WithTags("crons"), neutron.WithSummary("List cron monitors"))
+	neutron.Post(cronGroup, "", createCronHandler(cronSvc),
+		neutron.WithTags("crons"), neutron.WithSummary("Create cron monitor"))
+	// Public checkin endpoint (no auth)
+	r.HandleFunc("POST /api/v1/checkin/{slug}", cronCheckinHandler(cronSvc))
+	r.HandleFunc("GET /api/v1/checkin/{slug}", cronCheckinHandler(cronSvc))
+
+	// --- Dashboards (JWT auth) ---
+	dashGroup := r.Group("/api/v1/dashboards", jwtMW)
+	neutron.Get(dashGroup, "", listDashboardsHandler(dashSvc),
+		neutron.WithTags("dashboards"), neutron.WithSummary("List dashboards"))
+	neutron.Post(dashGroup, "", createDashboardHandler(dashSvc),
+		neutron.WithTags("dashboards"), neutron.WithSummary("Create dashboard"))
+	neutron.Get(dashGroup, "/{dashboard_id}", getDashboardHandler(dashSvc),
+		neutron.WithTags("dashboards"), neutron.WithSummary("Get dashboard with panels"))
+	neutron.Post(dashGroup, "/{dashboard_id}/panels", addPanelHandler(dashSvc),
+		neutron.WithTags("dashboards"), neutron.WithSummary("Add panel to dashboard"))
+
+	// --- Replays (JWT auth) ---
+	replayGroup := r.Group("/api/v1/replays", jwtMW)
+	neutron.Get(replayGroup, "", listReplaysHandler(replaySvc),
+		neutron.WithTags("replays"), neutron.WithSummary("List session replays"))
+	neutron.Get(replayGroup, "/{replay_id}", getReplayHandler(replaySvc),
+		neutron.WithTags("replays"), neutron.WithSummary("Get replay events"))
+
+	// --- Tracked links ---
+	linkGroup := r.Group("/api/v1/links", jwtMW)
+	neutron.Get(linkGroup, "", listLinksHandler(linkSvc),
+		neutron.WithTags("links"), neutron.WithSummary("List tracked links"))
+	neutron.Post(linkGroup, "", createLinkHandler(linkSvc),
+		neutron.WithTags("links"), neutron.WithSummary("Create tracked link"))
+	// Public redirect (no auth)
+	r.HandleFunc("GET /l/{slug}", linkSvc.ClickHandler())
+	// Tracking pixel (no auth)
+	r.HandleFunc("GET /t/pixel.gif", linkSvc.PixelHandler())
+
 	// Tracker scripts (served as static JS)
 	r.HandleFunc("GET /t/observe.js", serveTracker)
 	r.HandleFunc("GET /t/observe-errors.js", serveErrorTracker)
+	r.HandleFunc("GET /t/observe-replay.js", serveReplayTracker)
 
 	// Dashboard UI (embedded static files)
 	uiSub, err := fs.Sub(uiFS, "ui/dist")
@@ -328,6 +415,15 @@ func main() {
 				logger.Error("alert check failed", "err", err)
 			}
 			time.Sleep(60 * time.Second)
+		}
+	}()
+
+	// Uptime monitor check loop (every 30s)
+	go func() {
+		time.Sleep(15 * time.Second)
+		for {
+			uptimeSvc.RunChecks(context.Background())
+			time.Sleep(30 * time.Second)
 		}
 	}()
 
@@ -453,10 +549,19 @@ var trackerScript []byte
 //go:embed tracker/observe-errors.js
 var errorTrackerScript []byte
 
+//go:embed tracker/observe-replay.js
+var replayTrackerScript []byte
+
 func serveErrorTracker(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.Write(errorTrackerScript)
+}
+
+func serveReplayTracker(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Write(replayTrackerScript)
 }
 
 // --- Share handlers ---
@@ -653,6 +758,362 @@ func issueSessionHandler(issueSvc *obserrors.IssueService, statsSvc *query.Stats
 			return issueSessionResponse{}, err
 		}
 		return issueSessionResponse{SessionID: sessionID, Events: sessEvents}, nil
+	}
+}
+
+// --- Log handlers ---
+
+type logIngestResponse struct {
+	OK    bool   `json:"ok"`
+	LogID string `json:"log_id"`
+}
+
+func logIngestHandler(svc *logs.LogService) neutron.HandlerFunc[logs.LogInput, logIngestResponse] {
+	return func(ctx context.Context, input logs.LogInput) (logIngestResponse, error) {
+		if input.SiteID == "" {
+			input.SiteID = ingest.SiteIDFromContext(ctx)
+		}
+		id, err := svc.IngestLog(ctx, input)
+		if err != nil {
+			return logIngestResponse{}, err
+		}
+		return logIngestResponse{OK: true, LogID: id}, nil
+	}
+}
+
+type logSearchInput struct {
+	SiteID  string `query:"site_id"`
+	From    string `query:"from"`
+	To      string `query:"to"`
+	Level   string `query:"level"`
+	Service string `query:"service"`
+	Query   string `query:"q"`
+	Limit   int    `query:"limit"`
+}
+
+func logSearchHandler(svc *logs.LogService) neutron.HandlerFunc[logSearchInput, []logs.Log] {
+	return func(ctx context.Context, input logSearchInput) ([]logs.Log, error) {
+		from, to := parseTimeRange(input.From, input.To)
+		return svc.SearchLogs(ctx, input.SiteID, from, to, input.Level, input.Service, input.Query, input.Limit)
+	}
+}
+
+// --- Goal handlers ---
+
+type listGoalsInput struct {
+	SiteID string `query:"site_id"`
+	From   string `query:"from"`
+	To     string `query:"to"`
+}
+
+func listGoalsHandler(svc *query.StatsService) neutron.HandlerFunc[listGoalsInput, []query.GoalConversion] {
+	return func(ctx context.Context, input listGoalsInput) ([]query.GoalConversion, error) {
+		from, to := parseTimeRange(input.From, input.To)
+		return svc.GoalConversions(ctx, input.SiteID, from, to)
+	}
+}
+
+type createGoalInput struct {
+	SiteID    string `json:"site_id"`
+	Name      string `json:"name"`
+	GoalType  string `json:"goal_type"`
+	GoalValue string `json:"goal_value"`
+}
+
+func createGoalHandler(svc *query.StatsService) neutron.HandlerFunc[createGoalInput, query.Goal] {
+	return func(ctx context.Context, input createGoalInput) (query.Goal, error) {
+		if input.SiteID == "" || input.Name == "" || input.GoalValue == "" {
+			return query.Goal{}, neutron.ErrBadRequest("site_id, name, and goal_value required")
+		}
+		g, err := svc.CreateGoal(ctx, input.SiteID, input.Name, input.GoalType, input.GoalValue)
+		if err != nil {
+			return query.Goal{}, err
+		}
+		return *g, nil
+	}
+}
+
+// --- Uptime monitor handlers ---
+
+type listMonitorsInput struct {
+	SiteID string `query:"site_id"`
+}
+
+func listMonitorsHandler(svc *monitoring.UptimeService) neutron.HandlerFunc[listMonitorsInput, []monitoring.Monitor] {
+	return func(ctx context.Context, input listMonitorsInput) ([]monitoring.Monitor, error) {
+		return svc.ListMonitors(ctx, input.SiteID)
+	}
+}
+
+type createMonitorInput struct {
+	SiteID         string `json:"site_id"`
+	Name           string `json:"name"`
+	URL            string `json:"url"`
+	IntervalSecs   string `json:"interval_secs"`
+	ExpectedStatus string `json:"expected_status"`
+}
+
+func createMonitorHandler(svc *monitoring.UptimeService) neutron.HandlerFunc[createMonitorInput, monitoring.Monitor] {
+	return func(ctx context.Context, input createMonitorInput) (monitoring.Monitor, error) {
+		if input.SiteID == "" || input.URL == "" {
+			return monitoring.Monitor{}, neutron.ErrBadRequest("site_id and url required")
+		}
+		m := monitoring.Monitor{
+			SiteID: input.SiteID, Name: input.Name, URL: input.URL,
+			IntervalSecs: input.IntervalSecs, ExpectedStatus: input.ExpectedStatus,
+		}
+		created, err := svc.CreateMonitor(ctx, m)
+		if err != nil {
+			return monitoring.Monitor{}, err
+		}
+		return *created, nil
+	}
+}
+
+type monitorResultsInput struct {
+	MonitorID string `path:"monitor_id"`
+	SiteID    string `query:"site_id"`
+	Limit     int    `query:"limit"`
+}
+
+func monitorResultsHandler(svc *monitoring.UptimeService) neutron.HandlerFunc[monitorResultsInput, []monitoring.MonitorResult] {
+	return func(ctx context.Context, input monitorResultsInput) ([]monitoring.MonitorResult, error) {
+		return svc.ListResults(ctx, input.MonitorID, input.Limit)
+	}
+}
+
+// --- Cron monitor handlers ---
+
+type listCronsInput struct {
+	SiteID string `query:"site_id"`
+}
+
+func listCronsHandler(svc *monitoring.CronService) neutron.HandlerFunc[listCronsInput, []monitoring.CronMonitor] {
+	return func(ctx context.Context, input listCronsInput) ([]monitoring.CronMonitor, error) {
+		return svc.ListCrons(ctx, input.SiteID)
+	}
+}
+
+type createCronInput struct {
+	SiteID      string `json:"site_id"`
+	Name        string `json:"name"`
+	Schedule    string `json:"schedule"`
+	GracePeriod string `json:"grace_period"`
+}
+
+func createCronHandler(svc *monitoring.CronService) neutron.HandlerFunc[createCronInput, monitoring.CronMonitor] {
+	return func(ctx context.Context, input createCronInput) (monitoring.CronMonitor, error) {
+		if input.SiteID == "" || input.Name == "" {
+			return monitoring.CronMonitor{}, neutron.ErrBadRequest("site_id and name required")
+		}
+		cm := monitoring.CronMonitor{
+			SiteID: input.SiteID, Name: input.Name,
+			Schedule: input.Schedule, GracePeriod: input.GracePeriod,
+		}
+		c, err := svc.CreateCron(ctx, cm)
+		if err != nil {
+			return monitoring.CronMonitor{}, err
+		}
+		return *c, nil
+	}
+}
+
+func cronCheckinHandler(svc *monitoring.CronService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		slug := r.PathValue("slug")
+		if slug == "" {
+			http.Error(w, "missing slug", http.StatusBadRequest)
+			return
+		}
+		if err := svc.RecordCheckin(r.Context(), slug, "", "ok", "0"); err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	}
+}
+
+// --- Dashboard handlers ---
+
+type listDashboardsInput struct {
+	SiteID string `query:"site_id"`
+}
+
+func listDashboardsHandler(svc *dashboards.DashboardService) neutron.HandlerFunc[listDashboardsInput, []dashboards.Dashboard] {
+	return func(ctx context.Context, input listDashboardsInput) ([]dashboards.Dashboard, error) {
+		return svc.List(ctx, input.SiteID)
+	}
+}
+
+type createDashboardInput struct {
+	SiteID      string `json:"site_id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+func createDashboardHandler(svc *dashboards.DashboardService) neutron.HandlerFunc[createDashboardInput, dashboards.Dashboard] {
+	return func(ctx context.Context, input createDashboardInput) (dashboards.Dashboard, error) {
+		if input.SiteID == "" || input.Name == "" {
+			return dashboards.Dashboard{}, neutron.ErrBadRequest("site_id and name required")
+		}
+		d, err := svc.Create(ctx, input.SiteID, input.Name, input.Description, "")
+		if err != nil {
+			return dashboards.Dashboard{}, err
+		}
+		return *d, nil
+	}
+}
+
+type getDashboardInput struct {
+	DashboardID string `path:"dashboard_id"`
+}
+
+type dashboardDetail struct {
+	dashboards.Dashboard
+	Panels []dashboards.Panel `json:"panels"`
+}
+
+func getDashboardHandler(svc *dashboards.DashboardService) neutron.HandlerFunc[getDashboardInput, dashboardDetail] {
+	return func(ctx context.Context, input getDashboardInput) (dashboardDetail, error) {
+		d, err := svc.Get(ctx, input.DashboardID)
+		if err != nil || d == nil {
+			return dashboardDetail{}, neutron.ErrNotFound("dashboard not found")
+		}
+		panels, _ := svc.ListPanels(ctx, input.DashboardID)
+		if panels == nil {
+			panels = []dashboards.Panel{}
+		}
+		return dashboardDetail{Dashboard: *d, Panels: panels}, nil
+	}
+}
+
+type addPanelInput struct {
+	DashboardID string `path:"dashboard_id"`
+	PanelType   string `json:"panel_type"`
+	Title       string `json:"title"`
+	QueryType   string `json:"query_type"`
+	QueryConfig string `json:"query_config"`
+	PositionX   string `json:"position_x"`
+	PositionY   string `json:"position_y"`
+	Width       string `json:"width"`
+	Height      string `json:"height"`
+}
+
+func addPanelHandler(svc *dashboards.DashboardService) neutron.HandlerFunc[addPanelInput, dashboards.Panel] {
+	return func(ctx context.Context, input addPanelInput) (dashboards.Panel, error) {
+		panel := dashboards.Panel{
+			PanelType: input.PanelType, Title: input.Title,
+			QueryType: input.QueryType, QueryConfig: input.QueryConfig,
+			PositionX: input.PositionX, PositionY: input.PositionY,
+			Width: input.Width, Height: input.Height,
+		}
+		p, err := svc.AddPanel(ctx, input.DashboardID, panel)
+		if err != nil {
+			return dashboards.Panel{}, err
+		}
+		return *p, nil
+	}
+}
+
+// --- Replay handlers ---
+
+func replayIngestHandler(svc *replays.ReplayService) neutron.HandlerFunc[replays.IngestInput, map[string]string] {
+	return func(ctx context.Context, input replays.IngestInput) (map[string]string, error) {
+		if input.SiteID == "" {
+			input.SiteID = ingest.SiteIDFromContext(ctx)
+		}
+		id, err := svc.Ingest(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]string{"ok": "true", "replay_id": id}, nil
+	}
+}
+
+type listReplaysInput struct {
+	SiteID string `query:"site_id"`
+	From   string `query:"from"`
+	To     string `query:"to"`
+	Limit  int    `query:"limit"`
+}
+
+func listReplaysHandler(svc *replays.ReplayService) neutron.HandlerFunc[listReplaysInput, []replays.ReplaySession] {
+	return func(ctx context.Context, input listReplaysInput) ([]replays.ReplaySession, error) {
+		from, to := parseTimeRange(input.From, input.To)
+		return svc.ListReplays(ctx, input.SiteID, from, to, input.Limit)
+	}
+}
+
+type getReplayInput struct {
+	ReplayID string `path:"replay_id"`
+}
+
+func getReplayHandler(svc *replays.ReplayService) neutron.HandlerFunc[getReplayInput, []replays.ReplayEvent] {
+	return func(ctx context.Context, input getReplayInput) ([]replays.ReplayEvent, error) {
+		return svc.GetReplayEvents(ctx, input.ReplayID)
+	}
+}
+
+// --- Link handlers ---
+
+type listLinksInput struct {
+	SiteID string `query:"site_id"`
+}
+
+func listLinksHandler(svc *tracking.LinkService) neutron.HandlerFunc[listLinksInput, []tracking.TrackedLink] {
+	return func(ctx context.Context, input listLinksInput) ([]tracking.TrackedLink, error) {
+		return svc.ListLinks(ctx, "default", input.SiteID)
+	}
+}
+
+type createLinkInput struct {
+	SiteID      string `json:"site_id"`
+	Name        string `json:"name"`
+	Destination string `json:"destination"`
+}
+
+func createLinkHandler(svc *tracking.LinkService) neutron.HandlerFunc[createLinkInput, tracking.TrackedLink] {
+	return func(ctx context.Context, input createLinkInput) (tracking.TrackedLink, error) {
+		if input.SiteID == "" || input.Destination == "" {
+			return tracking.TrackedLink{}, neutron.ErrBadRequest("site_id and destination required")
+		}
+		link, err := svc.CreateLink(ctx, "default", input.SiteID, input.Name, input.Destination)
+		if err != nil {
+			return tracking.TrackedLink{}, err
+		}
+		return link, nil
+	}
+}
+
+// --- Source map upload handler ---
+
+func srcmapUploadHandler(svc *sourcemaps.SourceMapService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		siteID := r.FormValue("site_id")
+		release := r.FormValue("release")
+		filename := r.FormValue("filename")
+		if siteID == "" || release == "" || filename == "" {
+			http.Error(w, "site_id, release, and filename required", http.StatusBadRequest)
+			return
+		}
+		file, _, err := r.FormFile("sourcemap")
+		if err != nil {
+			http.Error(w, "sourcemap file required", http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+		data := make([]byte, 10*1024*1024) // max 10MB
+		n, _ := file.Read(data)
+		data = data[:n]
+
+		if err := svc.Upload(r.Context(), siteID, release, filename, data); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		svc.TrackRelease(r.Context(), siteID, release)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
 	}
 }
 
