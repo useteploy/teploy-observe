@@ -30,6 +30,8 @@ import (
 	"github.com/teploy/observe/internal/explorer"
 	"github.com/teploy/observe/internal/flags"
 	"github.com/teploy/observe/internal/feedback"
+	"github.com/teploy/observe/internal/infra"
+	"github.com/teploy/observe/internal/llm"
 	"github.com/teploy/observe/internal/groups"
 	"github.com/teploy/observe/internal/integrations"
 	"github.com/teploy/observe/internal/logs"
@@ -120,6 +122,10 @@ func main() {
 	feedbackSvc := feedback.NewFeedbackService(db)
 	viewSvc := views.NewViewService(db)
 	explorerSvc := explorer.NewExplorerService(db)
+	llmSvc := llm.NewLLMService(db)
+	infraSvc := infra.NewInfraService(db)
+	pipelineSvc := logs.NewPipelineService(db)
+	_ = pipelineSvc // Used in log ingest pipeline
 	groupSvc := groups.NewGroupService(db)
 	ssoSvc := sso.NewSSOService(db)
 	flagSvc := flags.NewFlagService(db)
@@ -378,6 +384,33 @@ func main() {
 		neutron.WithTags("sso"), neutron.WithSummary("List SSO configs"))
 	neutron.Post(r.Group("/api/v1/sso", jwtMW), "/configs", createSSOHandler(ssoSvc),
 		neutron.WithTags("sso"), neutron.WithSummary("Create SSO config"))
+
+	// --- LLM observability (API key auth for ingest, JWT for queries) ---
+	neutron.Post(ingestGroup, "/llm/traces", llmIngestHandler(llmSvc),
+		neutron.WithTags("llm"), neutron.WithSummary("Ingest LLM trace"))
+	llmGroup := r.Group("/api/v1/llm", jwtMW)
+	neutron.Get(llmGroup, "/stats", llmStatsHandler(llmSvc),
+		neutron.WithTags("llm"), neutron.WithSummary("LLM usage stats"))
+	neutron.Get(llmGroup, "/models", llmModelsHandler(llmSvc),
+		neutron.WithTags("llm"), neutron.WithSummary("LLM model breakdown"))
+	neutron.Get(llmGroup, "/traces", llmTracesHandler(llmSvc),
+		neutron.WithTags("llm"), neutron.WithSummary("Recent LLM traces"))
+
+	// --- Infrastructure monitoring (API key auth for agent reports, JWT for queries) ---
+	neutron.Post(ingestGroup, "/infra/metrics", infraReportHandler(infraSvc),
+		neutron.WithTags("infra"), neutron.WithSummary("Report host metrics"))
+	infraGroup := r.Group("/api/v1/infra", jwtMW)
+	neutron.Get(infraGroup, "/hosts", infraHostsHandler(infraSvc),
+		neutron.WithTags("infra"), neutron.WithSummary("List monitored hosts"))
+	neutron.Get(infraGroup, "/hosts/{hostname}/history", infraHistoryHandler(infraSvc),
+		neutron.WithTags("infra"), neutron.WithSummary("Host metric history"))
+
+	// --- Log pipelines (JWT auth) ---
+	pipeGroup := r.Group("/api/v1/log-pipelines", jwtMW)
+	neutron.Get(pipeGroup, "", listPipelinesHandler(pipelineSvc),
+		neutron.WithTags("logs"), neutron.WithSummary("List log pipelines"))
+	neutron.Post(pipeGroup, "", createPipelineHandler(pipelineSvc),
+		neutron.WithTags("logs"), neutron.WithSummary("Create log pipeline"))
 
 	// --- OTLP standard endpoint (compatible with all OTLP HTTP exporters) ---
 	otlpHandler := tracing.NewOTLPHandler(traceIngest)
@@ -904,6 +937,102 @@ func issueSessionHandler(issueSvc *obserrors.IssueService, statsSvc *query.Stats
 			return issueSessionResponse{}, err
 		}
 		return issueSessionResponse{SessionID: sessionID, Events: sessEvents}, nil
+	}
+}
+
+// --- LLM handlers ---
+
+func llmIngestHandler(svc *llm.LLMService) neutron.HandlerFunc[llm.LLMInput, llm.LLMResponse] {
+	return func(ctx context.Context, input llm.LLMInput) (llm.LLMResponse, error) {
+		if input.SiteID == "" { input.SiteID = ingest.SiteIDFromContext(ctx) }
+		return svc.Ingest(ctx, input)
+	}
+}
+
+type llmStatsInput struct { SiteID string `query:"site_id"`; From string `query:"from"`; To string `query:"to"` }
+
+func llmStatsHandler(svc *llm.LLMService) neutron.HandlerFunc[llmStatsInput, llm.LLMStats] {
+	return func(ctx context.Context, input llmStatsInput) (llm.LLMStats, error) {
+		from, to := parseTimeRange(input.From, input.To)
+		s, err := svc.Stats(ctx, input.SiteID, from, to)
+		if err != nil { return llm.LLMStats{}, err }
+		return *s, nil
+	}
+}
+
+func llmModelsHandler(svc *llm.LLMService) neutron.HandlerFunc[llmStatsInput, []llm.ModelStats] {
+	return func(ctx context.Context, input llmStatsInput) ([]llm.ModelStats, error) {
+		from, to := parseTimeRange(input.From, input.To)
+		return svc.ModelBreakdown(ctx, input.SiteID, from, to)
+	}
+}
+
+type llmTracesInput struct { SiteID string `query:"site_id"`; Limit int `query:"limit"` }
+
+func llmTracesHandler(svc *llm.LLMService) neutron.HandlerFunc[llmTracesInput, []llm.LLMTrace] {
+	return func(ctx context.Context, input llmTracesInput) ([]llm.LLMTrace, error) {
+		return svc.RecentTraces(ctx, input.SiteID, input.Limit)
+	}
+}
+
+// --- Infra handlers ---
+
+func infraReportHandler(svc *infra.InfraService) neutron.HandlerFunc[infra.MetricInput, map[string]string] {
+	return func(ctx context.Context, input infra.MetricInput) (map[string]string, error) {
+		if input.SiteID == "" { input.SiteID = ingest.SiteIDFromContext(ctx) }
+		err := svc.Report(ctx, input)
+		if err != nil { return nil, err }
+		return map[string]string{"ok": "true"}, nil
+	}
+}
+
+type infraHostsInput struct { SiteID string `query:"site_id"` }
+
+func infraHostsHandler(svc *infra.InfraService) neutron.HandlerFunc[infraHostsInput, []infra.HostSummary] {
+	return func(ctx context.Context, input infraHostsInput) ([]infra.HostSummary, error) {
+		return svc.ListHosts(ctx, input.SiteID)
+	}
+}
+
+type infraHistoryInput struct {
+	SiteID   string `query:"site_id"`
+	Hostname string `path:"hostname"`
+	From     string `query:"from"`
+	To       string `query:"to"`
+}
+
+func infraHistoryHandler(svc *infra.InfraService) neutron.HandlerFunc[infraHistoryInput, []infra.HostMetric] {
+	return func(ctx context.Context, input infraHistoryInput) ([]infra.HostMetric, error) {
+		from, to := parseTimeRange(input.From, input.To)
+		return svc.HostHistory(ctx, input.SiteID, input.Hostname, from, to, 100)
+	}
+}
+
+// --- Pipeline handlers ---
+
+type listPipelinesInput struct { SiteID string `query:"site_id"` }
+
+func listPipelinesHandler(svc *logs.PipelineService) neutron.HandlerFunc[listPipelinesInput, []logs.Pipeline] {
+	return func(ctx context.Context, input listPipelinesInput) ([]logs.Pipeline, error) {
+		return svc.List(ctx, input.SiteID)
+	}
+}
+
+type createPipelineInput struct {
+	SiteID   string `json:"site_id"`
+	Name     string `json:"name"`
+	Rules    string `json:"rules"`
+	Priority int    `json:"priority"`
+}
+
+func createPipelineHandler(svc *logs.PipelineService) neutron.HandlerFunc[createPipelineInput, logs.Pipeline] {
+	return func(ctx context.Context, input createPipelineInput) (logs.Pipeline, error) {
+		if input.SiteID == "" || input.Name == "" {
+			return logs.Pipeline{}, neutron.ErrBadRequest("site_id and name required")
+		}
+		p, err := svc.Create(ctx, input.SiteID, input.Name, input.Rules, input.Priority)
+		if err != nil { return logs.Pipeline{}, err }
+		return *p, nil
 	}
 }
 
