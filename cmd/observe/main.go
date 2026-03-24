@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"strings"
 	"time"
 
@@ -57,13 +59,28 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfg := config.Load()
 
-	// Connect to Nucleus
+	// Connect to Nucleus with retry
 	ctx := context.Background()
-	db, err := nucleus.Connect(ctx, cfg.NucleusURL)
-	if err != nil {
-		logger.Error("failed to connect to nucleus", "err", err)
-		os.Exit(1)
+	var db *nucleus.Client
+	maxRetries := 15
+	for i := 0; i < maxRetries; i++ {
+		var err error
+		db, err = nucleus.Connect(ctx, cfg.NucleusURL)
+		if err == nil {
+			break
+		}
+		if i == maxRetries-1 {
+			logger.Error("failed to connect to nucleus after retries", "err", err, "attempts", maxRetries)
+			os.Exit(1)
+		}
+		wait := time.Duration(i+1) * 2 * time.Second
+		if wait > 10*time.Second {
+			wait = 10 * time.Second
+		}
+		logger.Info("waiting for nucleus...", "attempt", i+1, "retry_in", wait)
+		time.Sleep(wait)
 	}
+	logger.Info("connected to nucleus")
 
 	// Run migrations
 	migrations, err := nucleus.LoadMigrations(migrationsFS)
@@ -619,6 +636,26 @@ func main() {
 			reportSvc.RunScheduled(context.Background(), smtpHost, smtpPort, smtpUser, smtpPass, fromEmail)
 			time.Sleep(1 * time.Hour)
 		}
+	}()
+
+	// Graceful shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigCh
+		logger.Info("shutting down gracefully...")
+
+		// Flush buffers
+		buf.Stop()
+		errorBuf.Stop()
+		scheduler.Stop()
+
+		// Close database
+		db.Close()
+
+		logger.Info("shutdown complete")
+		os.Exit(0)
 	}()
 
 	logger.Info("starting observe", "addr", cfg.Addr)
