@@ -26,6 +26,8 @@ import (
 	"github.com/teploy/observe/internal/share"
 	"github.com/teploy/observe/internal/sites"
 	"github.com/teploy/observe/internal/dashboards"
+	"github.com/teploy/observe/internal/experiments"
+	"github.com/teploy/observe/internal/flags"
 	"github.com/teploy/observe/internal/feedback"
 	"github.com/teploy/observe/internal/integrations"
 	"github.com/teploy/observe/internal/logs"
@@ -34,6 +36,7 @@ import (
 	"github.com/teploy/observe/internal/reports"
 	"github.com/teploy/observe/internal/replays"
 	"github.com/teploy/observe/internal/sourcemaps"
+	"github.com/teploy/observe/internal/surveys"
 	"github.com/teploy/observe/internal/tracking"
 	"github.com/teploy/observe/internal/tracing"
 	"github.com/teploy/observe/internal/views"
@@ -113,6 +116,9 @@ func main() {
 	integrationSvc := integrations.NewIntegrationService(db, logger)
 	feedbackSvc := feedback.NewFeedbackService(db)
 	viewSvc := views.NewViewService(db)
+	flagSvc := flags.NewFlagService(db)
+	experimentSvc := experiments.NewExperimentService(db)
+	surveySvc := surveys.NewSurveyService(db)
 	logSvc := logs.NewLogService(db)
 	uptimeSvc := monitoring.NewUptimeService(db, logger)
 	cronSvc := monitoring.NewCronService(db, logger)
@@ -349,6 +355,44 @@ func main() {
 		neutron.WithTags("reports"), neutron.WithSummary("Create report schedule"))
 	neutron.Delete(reportGroup, "/{schedule_id}", deleteReportHandler(reportSvc),
 		neutron.WithTags("reports"), neutron.WithSummary("Delete report schedule"))
+
+	// --- Feature flags (JWT auth + public evaluate) ---
+	flagGroup := r.Group("/api/v1/flags", jwtMW)
+	neutron.Get(flagGroup, "", listFlagsHandler(flagSvc),
+		neutron.WithTags("flags"), neutron.WithSummary("List feature flags"))
+	neutron.Post(flagGroup, "", createFlagHandler(flagSvc),
+		neutron.WithTags("flags"), neutron.WithSummary("Create feature flag"))
+	neutron.Post(flagGroup, "/{flag_id}/toggle", toggleFlagHandler(flagSvc),
+		neutron.WithTags("flags"), neutron.WithSummary("Toggle feature flag"))
+	// Public evaluate endpoint (no JWT, uses API key or site_id)
+	r.HandleFunc("POST /api/v1/flags/evaluate", flagEvaluateHandler(flagSvc))
+
+	// --- Experiments (JWT auth) ---
+	expGroup := r.Group("/api/v1/experiments", jwtMW)
+	neutron.Get(expGroup, "", listExperimentsHandler(experimentSvc),
+		neutron.WithTags("experiments"), neutron.WithSummary("List experiments"))
+	neutron.Post(expGroup, "", createExperimentHandler(experimentSvc),
+		neutron.WithTags("experiments"), neutron.WithSummary("Create experiment"))
+	neutron.Post(expGroup, "/{experiment_id}/start", startExperimentHandler(experimentSvc),
+		neutron.WithTags("experiments"), neutron.WithSummary("Start experiment"))
+	neutron.Post(expGroup, "/{experiment_id}/stop", stopExperimentHandler(experimentSvc),
+		neutron.WithTags("experiments"), neutron.WithSummary("Stop experiment"))
+	neutron.Get(expGroup, "/{experiment_id}/results", experimentResultsHandler(experimentSvc),
+		neutron.WithTags("experiments"), neutron.WithSummary("Get experiment results"))
+
+	// --- Surveys (JWT auth + public endpoints) ---
+	surveyGroup := r.Group("/api/v1/surveys", jwtMW)
+	neutron.Get(surveyGroup, "", listSurveysHandler(surveySvc),
+		neutron.WithTags("surveys"), neutron.WithSummary("List surveys"))
+	neutron.Post(surveyGroup, "", createSurveyHandler(surveySvc),
+		neutron.WithTags("surveys"), neutron.WithSummary("Create survey"))
+	neutron.Post(surveyGroup, "/{survey_id}/activate", activateSurveyHandler(surveySvc),
+		neutron.WithTags("surveys"), neutron.WithSummary("Activate survey"))
+	neutron.Get(surveyGroup, "/{survey_id}/responses", surveyResponsesHandler(surveySvc),
+		neutron.WithTags("surveys"), neutron.WithSummary("List survey responses"))
+	// Public: get active surveys + submit response
+	r.HandleFunc("GET /api/v1/surveys/active", activeSurveysPublicHandler(surveySvc))
+	r.HandleFunc("POST /api/v1/surveys/respond", surveyRespondHandler(surveySvc))
 
 	// --- Release health (JWT auth) ---
 	neutron.Get(r.Group("/api/v1/releases", jwtMW), "", releaseHealthHandler(issueSvc),
@@ -829,6 +873,201 @@ func issueSessionHandler(issueSvc *obserrors.IssueService, statsSvc *query.Stats
 			return issueSessionResponse{}, err
 		}
 		return issueSessionResponse{SessionID: sessionID, Events: sessEvents}, nil
+	}
+}
+
+// --- Flag handlers ---
+
+type listFlagsInput struct{ SiteID string `query:"site_id"` }
+
+func listFlagsHandler(svc *flags.FlagService) neutron.HandlerFunc[listFlagsInput, []flags.FeatureFlag] {
+	return func(ctx context.Context, input listFlagsInput) ([]flags.FeatureFlag, error) {
+		return svc.List(ctx, input.SiteID)
+	}
+}
+
+type createFlagInput struct {
+	SiteID      string `json:"site_id"`
+	FlagKey     string `json:"flag_key"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	FlagType    string `json:"flag_type"`
+	RolloutPct  int    `json:"rollout_pct"`
+	Variants    string `json:"variants"`
+	Targeting   string `json:"targeting"`
+}
+
+func createFlagHandler(svc *flags.FlagService) neutron.HandlerFunc[createFlagInput, flags.FeatureFlag] {
+	return func(ctx context.Context, input createFlagInput) (flags.FeatureFlag, error) {
+		if input.SiteID == "" || input.FlagKey == "" {
+			return flags.FeatureFlag{}, neutron.ErrBadRequest("site_id and flag_key required")
+		}
+		f, err := svc.Create(ctx, input.SiteID, input.FlagKey, input.Name, input.Description, input.FlagType, input.Variants, input.Targeting, input.RolloutPct)
+		if err != nil { return flags.FeatureFlag{}, err }
+		return *f, nil
+	}
+}
+
+type toggleFlagInput struct {
+	FlagID  string `path:"flag_id"`
+	Enabled string `json:"enabled"`
+}
+
+func toggleFlagHandler(svc *flags.FlagService) neutron.HandlerFunc[toggleFlagInput, neutron.Empty] {
+	return func(ctx context.Context, input toggleFlagInput) (neutron.Empty, error) {
+		return neutron.Empty{}, svc.Toggle(ctx, input.FlagID, input.Enabled)
+	}
+}
+
+func flagEvaluateHandler(svc *flags.FlagService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var input struct {
+			SiteID  string `json:"site_id"`
+			FlagKey string `json:"flag_key"`
+			UserID  string `json:"user_id"`
+		}
+		json.NewDecoder(r.Body).Decode(&input)
+		result, _ := svc.Evaluate(r.Context(), input.SiteID, input.FlagKey, input.UserID)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		json.NewEncoder(w).Encode(result)
+	}
+}
+
+// --- Experiment handlers ---
+
+type listExperimentsInput struct{ SiteID string `query:"site_id"` }
+
+func listExperimentsHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[listExperimentsInput, []experiments.Experiment] {
+	return func(ctx context.Context, input listExperimentsInput) ([]experiments.Experiment, error) {
+		return svc.List(ctx, input.SiteID)
+	}
+}
+
+type createExperimentInput struct {
+	SiteID     string `json:"site_id"`
+	Name       string `json:"name"`
+	FlagKey    string `json:"flag_key"`
+	GoalMetric string `json:"goal_metric"`
+	GoalValue  string `json:"goal_value"`
+	MinSample  string `json:"min_sample"`
+}
+
+func createExperimentHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[createExperimentInput, experiments.Experiment] {
+	return func(ctx context.Context, input createExperimentInput) (experiments.Experiment, error) {
+		if input.SiteID == "" || input.FlagKey == "" {
+			return experiments.Experiment{}, neutron.ErrBadRequest("site_id and flag_key required")
+		}
+		e, err := svc.Create(ctx, input.SiteID, input.Name, input.FlagKey, input.GoalMetric, input.GoalValue, input.MinSample)
+		if err != nil { return experiments.Experiment{}, err }
+		return *e, nil
+	}
+}
+
+type experimentIDInput struct{ ExperimentID string `path:"experiment_id"` }
+
+func startExperimentHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[experimentIDInput, neutron.Empty] {
+	return func(ctx context.Context, input experimentIDInput) (neutron.Empty, error) {
+		return neutron.Empty{}, svc.Start(ctx, input.ExperimentID)
+	}
+}
+
+func stopExperimentHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[experimentIDInput, neutron.Empty] {
+	return func(ctx context.Context, input experimentIDInput) (neutron.Empty, error) {
+		return neutron.Empty{}, svc.Stop(ctx, input.ExperimentID)
+	}
+}
+
+type experimentResultsInput struct {
+	ExperimentID string `path:"experiment_id"`
+	SiteID       string `query:"site_id"`
+}
+
+func experimentResultsHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[experimentResultsInput, experiments.ExperimentResults] {
+	return func(ctx context.Context, input experimentResultsInput) (experiments.ExperimentResults, error) {
+		r, err := svc.Results(ctx, input.ExperimentID, input.SiteID)
+		if err != nil { return experiments.ExperimentResults{}, err }
+		return *r, nil
+	}
+}
+
+// --- Survey handlers ---
+
+type listSurveysInput struct{ SiteID string `query:"site_id"` }
+
+func listSurveysHandler(svc *surveys.SurveyService) neutron.HandlerFunc[listSurveysInput, []surveys.Survey] {
+	return func(ctx context.Context, input listSurveysInput) ([]surveys.Survey, error) {
+		return svc.List(ctx, input.SiteID)
+	}
+}
+
+type createSurveyInput struct {
+	SiteID     string `json:"site_id"`
+	Name       string `json:"name"`
+	Questions  string `json:"questions"`
+	Appearance string `json:"appearance"`
+	Targeting  string `json:"targeting"`
+}
+
+func createSurveyHandler(svc *surveys.SurveyService) neutron.HandlerFunc[createSurveyInput, surveys.Survey] {
+	return func(ctx context.Context, input createSurveyInput) (surveys.Survey, error) {
+		if input.SiteID == "" || input.Name == "" {
+			return surveys.Survey{}, neutron.ErrBadRequest("site_id and name required")
+		}
+		s, err := svc.Create(ctx, input.SiteID, input.Name, input.Questions, input.Appearance, input.Targeting)
+		if err != nil { return surveys.Survey{}, err }
+		return *s, nil
+	}
+}
+
+type surveyIDInput struct{ SurveyID string `path:"survey_id"` }
+
+func activateSurveyHandler(svc *surveys.SurveyService) neutron.HandlerFunc[surveyIDInput, neutron.Empty] {
+	return func(ctx context.Context, input surveyIDInput) (neutron.Empty, error) {
+		return neutron.Empty{}, svc.Activate(ctx, input.SurveyID)
+	}
+}
+
+type surveyResponsesInput struct {
+	SurveyID string `path:"survey_id"`
+	SiteID   string `query:"site_id"`
+	Limit    int    `query:"limit"`
+}
+
+func surveyResponsesHandler(svc *surveys.SurveyService) neutron.HandlerFunc[surveyResponsesInput, []surveys.SurveyResponse] {
+	return func(ctx context.Context, input surveyResponsesInput) ([]surveys.SurveyResponse, error) {
+		return svc.ListResponses(ctx, input.SurveyID, input.SiteID, input.Limit)
+	}
+}
+
+func activeSurveysPublicHandler(svc *surveys.SurveyService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		siteID := r.URL.Query().Get("site_id")
+		active, _ := svc.GetActive(r.Context(), siteID)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if active == nil { active = []surveys.Survey{} }
+		json.NewEncoder(w).Encode(active)
+	}
+}
+
+func surveyRespondHandler(svc *surveys.SurveyService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var input struct {
+			SurveyID string         `json:"survey_id"`
+			SiteID   string         `json:"site_id"`
+			UserID   string         `json:"user_id"`
+			Answers  map[string]any `json:"answers"`
+		}
+		json.NewDecoder(r.Body).Decode(&input)
+		id, err := svc.SubmitResponse(r.Context(), input.SurveyID, input.SiteID, input.UserID, input.Answers)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if err != nil {
+			fmt.Fprintf(w, `{"ok":false,"error":"%s"}`, err.Error())
+			return
+		}
+		fmt.Fprintf(w, `{"ok":true,"response_id":"%s"}`, id)
 	}
 }
 
