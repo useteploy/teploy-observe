@@ -9,7 +9,11 @@ services:
       - "5432:5432"
     volumes:
       - nucleus_data:/data
-    command: ["start", "--port", "5432", "--cluster-port", "5433", "--data", "/data"]
+    command: ["start", "--port", "5432", "--cluster-port", "5433", "--data", "/data", "--max-memory", "512"]
+    environment:
+      NUCLEUS_ALLOW_INSECURE_CLUSTER: "1"
+      NUCLEUS_ALLOW_INSECURE_REPLICATION: "1"
+      NUCLEUS_ALLOW_NO_AUTH: "1"
     healthcheck:
       test: ["CMD", "sh", "-c", "echo 'SELECT 1' | timeout 2 nc localhost 5432"]
       interval: 5s
@@ -30,6 +34,9 @@ services:
       OBSERVE_FLUSH_SIZE: "500"
       OBSERVE_RAW_RETENTION_DAYS: "30"
       OBSERVE_HOURLY_RETENTION_DAYS: "365"
+      OBSERVE_JWT_SECRET: "change-me-in-production"
+      OBSERVE_ADMIN_USER: "admin"
+      OBSERVE_ADMIN_PASSWORD: "observe"
     depends_on:
       nucleus:
         condition: service_healthy
