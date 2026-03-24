@@ -386,8 +386,16 @@ func main() {
 		neutron.WithTags("sso"), neutron.WithSummary("Create SSO config"))
 
 	// --- LLM observability (API key auth for ingest, JWT for queries) ---
-	neutron.Post(ingestGroup, "/llm/traces", llmIngestHandler(llmSvc),
-		neutron.WithTags("llm"), neutron.WithSummary("Ingest LLM trace"))
+	r.HandleFunc("POST /api/v1/llm/ingest", func(w http.ResponseWriter, req *http.Request) {
+		var input llm.LLMInput
+		json.NewDecoder(req.Body).Decode(&input)
+		if input.SiteID == "" { input.SiteID = "default" }
+		result, err := llmSvc.Ingest(req.Context(), input)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if err != nil { fmt.Fprintf(w, `{"ok":false,"error":"%s"}`, err.Error()); return }
+		json.NewEncoder(w).Encode(result)
+	})
 	llmGroup := r.Group("/api/v1/llm", jwtMW)
 	neutron.Get(llmGroup, "/stats", llmStatsHandler(llmSvc),
 		neutron.WithTags("llm"), neutron.WithSummary("LLM usage stats"))
@@ -396,9 +404,17 @@ func main() {
 	neutron.Get(llmGroup, "/traces", llmTracesHandler(llmSvc),
 		neutron.WithTags("llm"), neutron.WithSummary("Recent LLM traces"))
 
-	// --- Infrastructure monitoring (API key auth for agent reports, JWT for queries) ---
-	neutron.Post(ingestGroup, "/infra/metrics", infraReportHandler(infraSvc),
-		neutron.WithTags("infra"), neutron.WithSummary("Report host metrics"))
+	// --- Infrastructure monitoring (public agent reports, JWT for queries) ---
+	r.HandleFunc("POST /api/v1/infra/report", func(w http.ResponseWriter, req *http.Request) {
+		var input infra.MetricInput
+		json.NewDecoder(req.Body).Decode(&input)
+		if input.SiteID == "" { input.SiteID = "default" }
+		err := infraSvc.Report(req.Context(), input)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if err != nil { fmt.Fprintf(w, `{"ok":false}`); return }
+		fmt.Fprintf(w, `{"ok":true}`)
+	})
 	infraGroup := r.Group("/api/v1/infra", jwtMW)
 	neutron.Get(infraGroup, "/hosts", infraHostsHandler(infraSvc),
 		neutron.WithTags("infra"), neutron.WithSummary("List monitored hosts"))
