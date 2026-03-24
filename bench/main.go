@@ -60,18 +60,26 @@ var (
 )
 
 func main() {
+	// Check for stress subcommand
+	if len(os.Args) > 1 && os.Args[1] == "stress" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		stressMain()
+		return
+	}
+
 	cfg := Config{}
 	flag.StringVar(&cfg.Target, "target", "http://localhost:3000", "Target URL")
 	flag.StringVar(&cfg.APIKey, "key", "", "API key for ingestion")
 	flag.StringVar(&cfg.SiteID, "site", "", "Site ID")
 	flag.DurationVar(&cfg.Duration, "duration", 30*time.Second, "Test duration")
 	flag.IntVar(&cfg.Concurrency, "c", 10, "Concurrent workers")
-	flag.StringVar(&cfg.Mode, "mode", "all", "Benchmark mode: analytics, errors, traces, queries, all")
+	flag.StringVar(&cfg.Mode, "mode", "all", "Benchmark mode: analytics, errors, traces, queries, all, stress")
 	flag.StringVar(&cfg.QueryToken, "token", "", "JWT token for query benchmarks")
 	flag.Parse()
 
 	if cfg.APIKey == "" || cfg.SiteID == "" {
 		fmt.Fprintln(os.Stderr, "Usage: bench -key <api_key> -site <site_id> [-target url] [-duration 30s] [-c 10] [-mode all]")
+		fmt.Fprintln(os.Stderr, "       bench stress -key <api_key> -site <site_id> -token <jwt> [-duration 60s] [-c 20]")
 		os.Exit(1)
 	}
 
