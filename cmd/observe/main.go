@@ -27,6 +27,7 @@ import (
 	"github.com/teploy/observe/internal/sites"
 	"github.com/teploy/observe/internal/dashboards"
 	"github.com/teploy/observe/internal/experiments"
+	"github.com/teploy/observe/internal/explorer"
 	"github.com/teploy/observe/internal/flags"
 	"github.com/teploy/observe/internal/feedback"
 	"github.com/teploy/observe/internal/integrations"
@@ -116,6 +117,7 @@ func main() {
 	integrationSvc := integrations.NewIntegrationService(db, logger)
 	feedbackSvc := feedback.NewFeedbackService(db)
 	viewSvc := views.NewViewService(db)
+	explorerSvc := explorer.NewExplorerService(db)
 	flagSvc := flags.NewFlagService(db)
 	experimentSvc := experiments.NewExperimentService(db)
 	surveySvc := surveys.NewSurveyService(db)
@@ -355,6 +357,10 @@ func main() {
 		neutron.WithTags("reports"), neutron.WithSummary("Create report schedule"))
 	neutron.Delete(reportGroup, "/{schedule_id}", deleteReportHandler(reportSvc),
 		neutron.WithTags("reports"), neutron.WithSummary("Delete report schedule"))
+
+	// --- SQL Explorer (JWT auth) ---
+	r.Handle("POST /api/v1/query", jwtMW(explorerQueryHandler(explorerSvc)))
+	r.Handle("GET /api/v1/query/tables", jwtMW(explorerTablesHandler(explorerSvc)))
 
 	// --- Feature flags (JWT auth + public evaluate) ---
 	flagGroup := r.Group("/api/v1/flags", jwtMW)
@@ -873,6 +879,32 @@ func issueSessionHandler(issueSvc *obserrors.IssueService, statsSvc *query.Stats
 			return issueSessionResponse{}, err
 		}
 		return issueSessionResponse{SessionID: sessionID, Events: sessEvents}, nil
+	}
+}
+
+// --- Explorer handlers ---
+
+func explorerQueryHandler(svc *explorer.ExplorerService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var input struct {
+			SQL string `json:"sql"`
+		}
+		json.NewDecoder(r.Body).Decode(&input)
+		if input.SQL == "" {
+			http.Error(w, "sql required", http.StatusBadRequest)
+			return
+		}
+		result, _ := svc.Execute(r.Context(), input.SQL)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	}
+}
+
+func explorerTablesHandler(svc *explorer.ExplorerService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tables, _ := svc.ListTables(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(tables)
 	}
 }
 

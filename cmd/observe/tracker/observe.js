@@ -155,11 +155,62 @@
     }
   }
 
+  // Web vitals tracking
+  function trackWebVitals() {
+    if (typeof PerformanceObserver === 'undefined') return;
+
+    // LCP
+    try {
+      new PerformanceObserver(function(list) {
+        var entries = list.getEntries();
+        if (entries.length) {
+          send('web_vital', { metric: 'lcp', value: Math.round(entries[entries.length - 1].startTime) });
+        }
+      }).observe({ type: 'largest-contentful-paint', buffered: true });
+    } catch(e) {}
+
+    // FID
+    try {
+      new PerformanceObserver(function(list) {
+        var entries = list.getEntries();
+        if (entries.length) {
+          send('web_vital', { metric: 'fid', value: Math.round(entries[0].processingStart - entries[0].startTime) });
+        }
+      }).observe({ type: 'first-input', buffered: true });
+    } catch(e) {}
+
+    // CLS
+    try {
+      var clsValue = 0;
+      new PerformanceObserver(function(list) {
+        for (var i = 0; i < list.getEntries().length; i++) {
+          if (!list.getEntries()[i].hadRecentInput) clsValue += list.getEntries()[i].value;
+        }
+        send('web_vital', { metric: 'cls', value: Math.round(clsValue * 1000) });
+      }).observe({ type: 'layout-shift', buffered: true });
+    } catch(e) {}
+
+    // TTFB
+    if (performance.getEntriesByType) {
+      var nav = performance.getEntriesByType('navigation');
+      if (nav.length) {
+        send('web_vital', { metric: 'ttfb', value: Math.round(nav[0].responseStart) });
+      }
+    }
+  }
+
   window.observe = {
     track: function(name, props) {
       send(name || 'custom', props);
     },
-    pageview: trackPageview
+    pageview: trackPageview,
+    revenue: function(amount, currency, props) {
+      var p = props || {};
+      p.amount = amount;
+      p.currency = currency || 'USD';
+      send('revenue', p);
+    },
+    trackVitals: trackWebVitals
   };
 
   init();
