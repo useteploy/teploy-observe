@@ -377,6 +377,17 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 		return result, err
 	}, neutron.WithTags("stats"))
 
+	// Correlation analysis
+	neutron.Get(api, "/correlations", func(ctx context.Context, input struct {
+		StatsInput
+		Target string `query:"target"`
+	}) ([]Correlation, error) {
+		from, to := input.TimeRange()
+		target := input.Target
+		if target == "" { target = "signup" }
+		return svc.CorrelationAnalysis(ctx, input.SiteID, target, from, to)
+	}, neutron.WithTags("stats"))
+
 	// User journeys
 	neutron.Get(api, "/journeys", func(ctx context.Context, input StatsInput) (*JourneyResult, error) {
 		from, to := input.TimeRange()

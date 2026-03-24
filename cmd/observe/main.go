@@ -30,6 +30,7 @@ import (
 	"github.com/teploy/observe/internal/explorer"
 	"github.com/teploy/observe/internal/flags"
 	"github.com/teploy/observe/internal/feedback"
+	"github.com/teploy/observe/internal/groups"
 	"github.com/teploy/observe/internal/integrations"
 	"github.com/teploy/observe/internal/logs"
 	"github.com/teploy/observe/internal/monitoring"
@@ -37,6 +38,7 @@ import (
 	"github.com/teploy/observe/internal/reports"
 	"github.com/teploy/observe/internal/replays"
 	"github.com/teploy/observe/internal/sourcemaps"
+	"github.com/teploy/observe/internal/sso"
 	"github.com/teploy/observe/internal/surveys"
 	"github.com/teploy/observe/internal/tracking"
 	"github.com/teploy/observe/internal/tracing"
@@ -118,6 +120,8 @@ func main() {
 	feedbackSvc := feedback.NewFeedbackService(db)
 	viewSvc := views.NewViewService(db)
 	explorerSvc := explorer.NewExplorerService(db)
+	groupSvc := groups.NewGroupService(db)
+	ssoSvc := sso.NewSSOService(db)
 	flagSvc := flags.NewFlagService(db)
 	experimentSvc := experiments.NewExperimentService(db)
 	surveySvc := surveys.NewSurveyService(db)
@@ -357,6 +361,31 @@ func main() {
 		neutron.WithTags("reports"), neutron.WithSummary("Create report schedule"))
 	neutron.Delete(reportGroup, "/{schedule_id}", deleteReportHandler(reportSvc),
 		neutron.WithTags("reports"), neutron.WithSummary("Delete report schedule"))
+
+	// --- Groups (JWT auth) ---
+	grpGroup := r.Group("/api/v1/groups", jwtMW)
+	neutron.Get(grpGroup, "", listGroupsHandler(groupSvc),
+		neutron.WithTags("groups"), neutron.WithSummary("List groups"))
+	neutron.Post(grpGroup, "", createGroupHandler(groupSvc),
+		neutron.WithTags("groups"), neutron.WithSummary("Create group"))
+	neutron.Post(grpGroup, "/{group_id}/members", addGroupMemberHandler(groupSvc),
+		neutron.WithTags("groups"), neutron.WithSummary("Add member to group"))
+
+	// --- Correlation analysis (JWT auth) ---
+	neutron.Get(r.Group("/api/v1/stats", jwtMW), "/correlations", correlationHandler(statsSvc),
+		neutron.WithTags("stats"), neutron.WithSummary("Find property correlations"))
+
+	// --- SSO (public endpoints) ---
+	r.HandleFunc("GET /api/v1/sso/metadata", ssoMetadataHandler(ssoSvc, cfg.Addr))
+	r.HandleFunc("POST /api/v1/sso/callback", ssoSvc.SAMLCallbackHandler())
+	neutron.Get(r.Group("/api/v1/sso", jwtMW), "/configs", listSSOHandler(ssoSvc),
+		neutron.WithTags("sso"), neutron.WithSummary("List SSO configs"))
+	neutron.Post(r.Group("/api/v1/sso", jwtMW), "/configs", createSSOHandler(ssoSvc),
+		neutron.WithTags("sso"), neutron.WithSummary("Create SSO config"))
+
+	// --- OTLP standard endpoint (compatible with all OTLP HTTP exporters) ---
+	otlpHandler := tracing.NewOTLPHandler(traceIngest)
+	r.Handle("POST /v1/traces", otlpHandler)
 
 	// --- SQL Explorer (JWT auth) ---
 	r.Handle("POST /api/v1/query", jwtMW(explorerQueryHandler(explorerSvc)))
@@ -879,6 +908,102 @@ func issueSessionHandler(issueSvc *obserrors.IssueService, statsSvc *query.Stats
 			return issueSessionResponse{}, err
 		}
 		return issueSessionResponse{SessionID: sessionID, Events: sessEvents}, nil
+	}
+}
+
+// --- Group handlers ---
+
+type listGroupsInput struct{ SiteID string `query:"site_id"` }
+
+func listGroupsHandler(svc *groups.GroupService) neutron.HandlerFunc[listGroupsInput, []groups.Group] {
+	return func(ctx context.Context, input listGroupsInput) ([]groups.Group, error) {
+		return svc.List(ctx, input.SiteID)
+	}
+}
+
+type createGroupInput struct {
+	SiteID     string         `json:"site_id"`
+	GroupType  string         `json:"group_type"`
+	Name       string         `json:"name"`
+	Properties map[string]any `json:"properties"`
+}
+
+func createGroupHandler(svc *groups.GroupService) neutron.HandlerFunc[createGroupInput, groups.Group] {
+	return func(ctx context.Context, input createGroupInput) (groups.Group, error) {
+		if input.SiteID == "" || input.Name == "" {
+			return groups.Group{}, neutron.ErrBadRequest("site_id and name required")
+		}
+		g, err := svc.Create(ctx, input.SiteID, input.GroupType, input.Name, input.Properties)
+		if err != nil { return groups.Group{}, err }
+		return *g, nil
+	}
+}
+
+type addMemberInput struct {
+	GroupID   string `path:"group_id"`
+	SiteID    string `json:"site_id"`
+	SessionID string `json:"session_id"`
+	UserID    string `json:"user_id"`
+}
+
+func addGroupMemberHandler(svc *groups.GroupService) neutron.HandlerFunc[addMemberInput, neutron.Empty] {
+	return func(ctx context.Context, input addMemberInput) (neutron.Empty, error) {
+		return neutron.Empty{}, svc.AddMember(ctx, input.SiteID, input.GroupID, input.SessionID, input.UserID)
+	}
+}
+
+// --- Correlation handler ---
+
+type correlationInput struct {
+	SiteID string `query:"site_id"`
+	Target string `query:"target"`
+	From   string `query:"from"`
+	To     string `query:"to"`
+}
+
+func correlationHandler(svc *query.StatsService) neutron.HandlerFunc[correlationInput, []query.Correlation] {
+	return func(ctx context.Context, input correlationInput) ([]query.Correlation, error) {
+		from, to := parseTimeRange(input.From, input.To)
+		target := input.Target
+		if target == "" { target = "signup" }
+		return svc.CorrelationAnalysis(ctx, input.SiteID, target, from, to)
+	}
+}
+
+// --- SSO handlers ---
+
+func ssoMetadataHandler(svc *sso.SSOService, addr string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		baseURL := "http://" + r.Host
+		w.Header().Set("Content-Type", "application/xml")
+		w.Write([]byte(svc.GetSAMLMetadata(baseURL)))
+	}
+}
+
+type listSSOInput struct{}
+
+func listSSOHandler(svc *sso.SSOService) neutron.HandlerFunc[listSSOInput, []sso.SSOConfig] {
+	return func(ctx context.Context, _ listSSOInput) ([]sso.SSOConfig, error) {
+		return svc.List(ctx)
+	}
+}
+
+type createSSOInput struct {
+	Provider    string `json:"provider"`
+	EntityID    string `json:"entity_id"`
+	SSOURL      string `json:"sso_url"`
+	Certificate string `json:"certificate"`
+	AttributeMap string `json:"attribute_map"`
+}
+
+func createSSOHandler(svc *sso.SSOService) neutron.HandlerFunc[createSSOInput, sso.SSOConfig] {
+	return func(ctx context.Context, input createSSOInput) (sso.SSOConfig, error) {
+		if input.EntityID == "" || input.SSOURL == "" {
+			return sso.SSOConfig{}, neutron.ErrBadRequest("entity_id and sso_url required")
+		}
+		c, err := svc.Create(ctx, input.Provider, input.EntityID, input.SSOURL, input.Certificate, input.AttributeMap)
+		if err != nil { return sso.SSOConfig{}, err }
+		return *c, nil
 	}
 }
 
