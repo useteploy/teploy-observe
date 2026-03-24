@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -25,6 +26,8 @@ import (
 	"github.com/teploy/observe/internal/share"
 	"github.com/teploy/observe/internal/sites"
 	"github.com/teploy/observe/internal/dashboards"
+	"github.com/teploy/observe/internal/feedback"
+	"github.com/teploy/observe/internal/integrations"
 	"github.com/teploy/observe/internal/logs"
 	"github.com/teploy/observe/internal/monitoring"
 	"github.com/teploy/observe/internal/platform"
@@ -32,6 +35,7 @@ import (
 	"github.com/teploy/observe/internal/sourcemaps"
 	"github.com/teploy/observe/internal/tracking"
 	"github.com/teploy/observe/internal/tracing"
+	"github.com/teploy/observe/internal/views"
 )
 
 //go:embed migrations/*.sql
@@ -104,6 +108,9 @@ func main() {
 	webhookSvc := platform.NewWebhookService(db, logger)
 
 	// Feature expansion services
+	integrationSvc := integrations.NewIntegrationService(db, logger)
+	feedbackSvc := feedback.NewFeedbackService(db)
+	viewSvc := views.NewViewService(db)
 	logSvc := logs.NewLogService(db)
 	uptimeSvc := monitoring.NewUptimeService(db, logger)
 	cronSvc := monitoring.NewCronService(db, logger)
@@ -307,6 +314,35 @@ func main() {
 		neutron.WithSummary("Generate API key for a site"),
 	)
 
+	// --- Feedback (public, no auth for user submissions) ---
+	r.HandleFunc("POST /api/v1/feedback", feedbackSubmitHandler(feedbackSvc))
+
+	// --- Integrations (JWT auth) ---
+	intGroup := r.Group("/api/v1/integrations", jwtMW)
+	neutron.Get(intGroup, "", listIntegrationsHandler(integrationSvc),
+		neutron.WithTags("integrations"), neutron.WithSummary("List integrations"))
+	neutron.Post(intGroup, "", createIntegrationHandler(integrationSvc),
+		neutron.WithTags("integrations"), neutron.WithSummary("Create integration"))
+	neutron.Delete(intGroup, "/{integration_id}", deleteIntegrationHandler(integrationSvc),
+		neutron.WithTags("integrations"), neutron.WithSummary("Delete integration"))
+
+	// --- Saved views (JWT auth) ---
+	viewGroup := r.Group("/api/v1/views", jwtMW)
+	neutron.Get(viewGroup, "", listViewsHandler(viewSvc),
+		neutron.WithTags("views"), neutron.WithSummary("List saved views"))
+	neutron.Post(viewGroup, "", createViewHandler(viewSvc),
+		neutron.WithTags("views"), neutron.WithSummary("Create saved view"))
+	neutron.Delete(viewGroup, "/{view_id}", deleteViewHandler(viewSvc),
+		neutron.WithTags("views"), neutron.WithSummary("Delete saved view"))
+
+	// --- Feedback list (JWT auth) ---
+	neutron.Get(r.Group("/api/v1/feedback", jwtMW), "/list", listFeedbackHandler(feedbackSvc),
+		neutron.WithTags("feedback"), neutron.WithSummary("List user feedback"))
+
+	// --- Release health (JWT auth) ---
+	neutron.Get(r.Group("/api/v1/releases", jwtMW), "", releaseHealthHandler(issueSvc),
+		neutron.WithTags("releases"), neutron.WithSummary("Release health metrics"))
+
 	// --- Log ingestion (API key auth) ---
 	neutron.Post(ingestGroup, "/logs", logIngestHandler(logSvc),
 		neutron.WithTags("logs"), neutron.WithSummary("Ingest log entry"))
@@ -382,6 +418,7 @@ func main() {
 	r.HandleFunc("GET /t/observe.js", serveTracker)
 	r.HandleFunc("GET /t/observe-errors.js", serveErrorTracker)
 	r.HandleFunc("GET /t/observe-replay.js", serveReplayTracker)
+	r.HandleFunc("GET /t/observe-feedback.js", serveFeedbackWidget)
 
 	// Dashboard UI (embedded static files)
 	uiSub, err := fs.Sub(uiFS, "ui/dist")
@@ -562,6 +599,15 @@ func serveReplayTracker(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.Write(replayTrackerScript)
+}
+
+//go:embed tracker/observe-feedback.js
+var feedbackWidgetScript []byte
+
+func serveFeedbackWidget(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Write(feedbackWidgetScript)
 }
 
 // --- Share handlers ---
@@ -758,6 +804,138 @@ func issueSessionHandler(issueSvc *obserrors.IssueService, statsSvc *query.Stats
 			return issueSessionResponse{}, err
 		}
 		return issueSessionResponse{SessionID: sessionID, Events: sessEvents}, nil
+	}
+}
+
+// --- Integration handlers ---
+
+type listIntegrationsInput struct {
+	SiteID string `query:"site_id"`
+}
+
+func listIntegrationsHandler(svc *integrations.IntegrationService) neutron.HandlerFunc[listIntegrationsInput, []integrations.Integration] {
+	return func(ctx context.Context, input listIntegrationsInput) ([]integrations.Integration, error) {
+		return svc.List(ctx, input.SiteID)
+	}
+}
+
+type createIntegrationInput struct {
+	SiteID string `json:"site_id"`
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+	Config string `json:"config"`
+}
+
+func createIntegrationHandler(svc *integrations.IntegrationService) neutron.HandlerFunc[createIntegrationInput, integrations.Integration] {
+	return func(ctx context.Context, input createIntegrationInput) (integrations.Integration, error) {
+		if input.SiteID == "" || input.Type == "" {
+			return integrations.Integration{}, neutron.ErrBadRequest("site_id and type required")
+		}
+		i, err := svc.Create(ctx, input.SiteID, input.Name, input.Type, input.Config)
+		if err != nil {
+			return integrations.Integration{}, err
+		}
+		return *i, nil
+	}
+}
+
+type deleteIntegrationInput struct {
+	IntegrationID string `path:"integration_id"`
+}
+
+func deleteIntegrationHandler(svc *integrations.IntegrationService) neutron.HandlerFunc[deleteIntegrationInput, neutron.Empty] {
+	return func(ctx context.Context, input deleteIntegrationInput) (neutron.Empty, error) {
+		return neutron.Empty{}, svc.Delete(ctx, input.IntegrationID)
+	}
+}
+
+// --- Feedback handlers ---
+
+func feedbackSubmitHandler(svc *feedback.FeedbackService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var input feedback.FeedbackInput
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		id, err := svc.Submit(r.Context(), input)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		fmt.Fprintf(w, `{"ok":true,"feedback_id":"%s"}`, id)
+	}
+}
+
+type listFeedbackInput struct {
+	SiteID string `query:"site_id"`
+	From   string `query:"from"`
+	To     string `query:"to"`
+	Limit  int    `query:"limit"`
+}
+
+func listFeedbackHandler(svc *feedback.FeedbackService) neutron.HandlerFunc[listFeedbackInput, []feedback.FeedbackEntry] {
+	return func(ctx context.Context, input listFeedbackInput) ([]feedback.FeedbackEntry, error) {
+		from, to := parseTimeRange(input.From, input.To)
+		return svc.List(ctx, input.SiteID, from, to, input.Limit)
+	}
+}
+
+// --- Saved views handlers ---
+
+type listViewsInput struct {
+	SiteID string `query:"site_id"`
+}
+
+func listViewsHandler(svc *views.ViewService) neutron.HandlerFunc[listViewsInput, []views.SavedView] {
+	return func(ctx context.Context, input listViewsInput) ([]views.SavedView, error) {
+		return svc.List(ctx, input.SiteID)
+	}
+}
+
+type createViewInput struct {
+	SiteID     string `json:"site_id"`
+	Name       string `json:"name"`
+	ViewConfig string `json:"view_config"`
+}
+
+func createViewHandler(svc *views.ViewService) neutron.HandlerFunc[createViewInput, views.SavedView] {
+	return func(ctx context.Context, input createViewInput) (views.SavedView, error) {
+		if input.SiteID == "" || input.Name == "" {
+			return views.SavedView{}, neutron.ErrBadRequest("site_id and name required")
+		}
+		v, err := svc.Create(ctx, input.SiteID, input.Name, input.ViewConfig, "")
+		if err != nil {
+			return views.SavedView{}, err
+		}
+		return *v, nil
+	}
+}
+
+type deleteViewInput struct {
+	ViewID string `path:"view_id"`
+}
+
+func deleteViewHandler(svc *views.ViewService) neutron.HandlerFunc[deleteViewInput, neutron.Empty] {
+	return func(ctx context.Context, input deleteViewInput) (neutron.Empty, error) {
+		return neutron.Empty{}, svc.Delete(ctx, input.ViewID)
+	}
+}
+
+// --- Release health handler ---
+
+type releaseHealthInput struct {
+	SiteID string `query:"site_id"`
+	From   string `query:"from"`
+	To     string `query:"to"`
+}
+
+func releaseHealthHandler(svc *obserrors.IssueService) neutron.HandlerFunc[releaseHealthInput, []obserrors.ReleaseHealth] {
+	return func(ctx context.Context, input releaseHealthInput) ([]obserrors.ReleaseHealth, error) {
+		from, to := parseTimeRange(input.From, input.To)
+		return svc.ReleaseHealthList(ctx, input.SiteID, from, to)
 	}
 }
 

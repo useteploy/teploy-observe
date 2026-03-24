@@ -8,6 +8,7 @@
   var endpoint = script.getAttribute('data-endpoint') || origin + '/api/v1/events/batch';
   var siteId = script.getAttribute('data-site-id') || '';
   var autoTrack = script.getAttribute('data-auto-track') !== 'false';
+  var autoCapture = script.getAttribute('data-autocapture') !== 'false';
   var respectDNT = script.getAttribute('data-respect-dnt') !== 'false';
 
   if (respectDNT && navigator.doNotTrack === '1') return;
@@ -91,6 +92,67 @@
     document.addEventListener('visibilitychange', function() {
       if (document.visibilityState === 'hidden') flush();
     });
+
+    // Autocapture: clicks, form submissions, rage clicks
+    if (autoCapture) {
+      var lastClickTime = 0;
+      var lastClickTarget = null;
+      var clickCount = 0;
+
+      document.addEventListener('click', function(e) {
+        var target = e.target;
+        if (!target || !target.tagName) return;
+        var tag = target.tagName.toLowerCase();
+        if (tag === 'html' || tag === 'body') return;
+
+        var selector = tag;
+        if (target.id) selector += '#' + target.id;
+        else if (target.className && typeof target.className === 'string') selector += '.' + target.className.split(' ')[0];
+
+        var text = (target.textContent || '').trim().substring(0, 32);
+        var href = target.getAttribute('href') || '';
+
+        // Rage click detection: 3+ clicks on same element within 1 second
+        var now = Date.now();
+        if (target === lastClickTarget && now - lastClickTime < 1000) {
+          clickCount++;
+          if (clickCount === 3) {
+            send('rage_click', { selector: selector, text: text });
+          }
+        } else {
+          clickCount = 1;
+          lastClickTarget = target;
+        }
+        lastClickTime = now;
+
+        // Track meaningful clicks (links, buttons, inputs)
+        if (tag === 'a' || tag === 'button' || tag === 'input' || target.getAttribute('role') === 'button') {
+          send('click', { selector: selector, text: text, href: href });
+        }
+      }, true);
+
+      // Form submissions
+      document.addEventListener('submit', function(e) {
+        var form = e.target;
+        if (!form || !form.tagName) return;
+        var id = form.id ? '#' + form.id : '';
+        var action = form.getAttribute('action') || '';
+        send('form_submit', { selector: 'form' + id, action: action });
+      }, true);
+
+      // Track outbound link clicks
+      document.addEventListener('click', function(e) {
+        var link = e.target;
+        while (link && link.tagName !== 'A') link = link.parentElement;
+        if (!link || !link.href) return;
+        try {
+          var url = new URL(link.href);
+          if (url.hostname !== location.hostname) {
+            send('outbound_click', { href: link.href, text: (link.textContent || '').trim().substring(0, 32) });
+          }
+        } catch(err) {}
+      }, true);
+    }
   }
 
   window.observe = {
