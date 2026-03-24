@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -175,36 +176,75 @@ const insertRecentSQL = `INSERT INTO events_recent (
 
 func (b *Buffer) insertBatch(ctx context.Context, batch []Event) error {
 	sql := b.db.SQL()
-	for i, e := range batch {
-		var propsJSON string
-		if e.Properties != nil {
-			if raw, err := json.Marshal(e.Properties); err == nil {
-				propsJSON = string(raw)
+
+	// Build multi-row INSERT for events table
+	// Nucleus supports multi-row VALUES via SimpleProtocol
+	const batchSize = 50 // rows per INSERT statement
+	for start := 0; start < len(batch); start += batchSize {
+		end := start + batchSize
+		if end > len(batch) {
+			end = len(batch)
+		}
+		chunk := batch[start:end]
+
+		// Build events INSERT
+		eventsQuery := `INSERT INTO events (
+			event_id, tenant_id, site_id, session_id, visit_id, event_type,
+			timestamp, url, referrer, title, hostname, pathname,
+			language, country, region, city,
+			browser, browser_version, os, os_version, device,
+			screen_width, screen_height,
+			utm_source, utm_medium, utm_campaign, utm_term, utm_content,
+			properties) VALUES `
+
+		recentQuery := `INSERT INTO events_recent (
+			event_id, tenant_id, site_id, session_id, event_type,
+			timestamp, pathname, referrer, browser, os, country, properties) VALUES `
+
+		var eventsValues, recentValues []string
+		for _, e := range chunk {
+			propsJSON := "''"
+			if e.Properties != nil {
+				if raw, err := json.Marshal(e.Properties); err == nil {
+					propsJSON = "'" + escapeSQL(string(raw)) + "'"
+				}
 			}
+			eventsValues = append(eventsValues, fmt.Sprintf(
+				"('%s','%s','%s','%s','%s','%s',%d,'%s','%s','%s','%s','%s','%s','%s','%s','%s','%s','%s','%s','%s','%s',%d,%d,'%s','%s','%s','%s','%s',%s)",
+				escapeSQL(e.EventID), escapeSQL(e.TenantID), escapeSQL(e.SiteID),
+				escapeSQL(e.SessionID), escapeSQL(e.VisitID), escapeSQL(e.EventType),
+				e.Timestamp, escapeSQL(e.URL), escapeSQL(e.Referrer), escapeSQL(e.Title),
+				escapeSQL(e.Hostname), escapeSQL(e.Pathname),
+				escapeSQL(e.Language), escapeSQL(e.Country), escapeSQL(e.Region), escapeSQL(e.City),
+				escapeSQL(e.Browser), escapeSQL(e.BrowserVersion), escapeSQL(e.OS),
+				escapeSQL(e.OSVersion), escapeSQL(e.Device),
+				e.ScreenWidth, e.ScreenHeight,
+				escapeSQL(e.UTMSource), escapeSQL(e.UTMMedium), escapeSQL(e.UTMCampaign),
+				escapeSQL(e.UTMTerm), escapeSQL(e.UTMContent), propsJSON,
+			))
+			recentValues = append(recentValues, fmt.Sprintf(
+				"('%s','%s','%s','%s','%s',%d,'%s','%s','%s','%s','%s',%s)",
+				escapeSQL(e.EventID), escapeSQL(e.TenantID), escapeSQL(e.SiteID),
+				escapeSQL(e.SessionID), escapeSQL(e.EventType),
+				e.Timestamp, escapeSQL(e.Pathname), escapeSQL(e.Referrer),
+				escapeSQL(e.Browser), escapeSQL(e.OS), escapeSQL(e.Country), propsJSON,
+			))
 		}
-		// Use SQLModel.Exec which has SimpleProtocol — Nucleus extended protocol
-		// silently drops INSERT data.
-		_, err := sql.Exec(ctx, insertSQL,
-			e.EventID, e.TenantID, e.SiteID, e.SessionID, e.VisitID, e.EventType,
-			e.Timestamp, e.URL, e.Referrer, e.Title, e.Hostname, e.Pathname,
-			e.Language, e.Country, e.Region, e.City,
-			e.Browser, e.BrowserVersion, e.OS, e.OSVersion, e.Device,
-			e.ScreenWidth, e.ScreenHeight,
-			e.UTMSource, e.UTMMedium, e.UTMCampaign, e.UTMTerm, e.UTMContent,
-			propsJSON,
-		)
-		if err != nil {
-			return fmt.Errorf("insert event %d/%d: %w", i+1, len(batch), err)
+
+		fullEventsQuery := eventsQuery + strings.Join(eventsValues, ",")
+		fullRecentQuery := recentQuery + strings.Join(recentValues, ",")
+
+		if _, err := sql.Exec(ctx, fullEventsQuery); err != nil {
+			return fmt.Errorf("batch insert events %d-%d: %w", start+1, end, err)
 		}
-		// Recent events table
-		_, err = sql.Exec(ctx, insertRecentSQL,
-			e.EventID, e.TenantID, e.SiteID, e.SessionID, e.EventType,
-			e.Timestamp, e.Pathname, e.Referrer, e.Browser, e.OS, e.Country,
-			propsJSON,
-		)
-		if err != nil {
-			return fmt.Errorf("insert recent %d/%d: %w", i+1, len(batch), err)
+		if _, err := sql.Exec(ctx, fullRecentQuery); err != nil {
+			return fmt.Errorf("batch insert recent %d-%d: %w", start+1, end, err)
 		}
 	}
 	return nil
+}
+
+// escapeSQL escapes single quotes for SQL string literals.
+func escapeSQL(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
 }
