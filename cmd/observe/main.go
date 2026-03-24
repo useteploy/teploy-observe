@@ -371,10 +371,6 @@ func main() {
 	neutron.Post(grpGroup, "/{group_id}/members", addGroupMemberHandler(groupSvc),
 		neutron.WithTags("groups"), neutron.WithSummary("Add member to group"))
 
-	// --- Correlation analysis (JWT auth) ---
-	neutron.Get(r.Group("/api/v1/stats", jwtMW), "/correlations", correlationHandler(statsSvc),
-		neutron.WithTags("stats"), neutron.WithSummary("Find property correlations"))
-
 	// --- SSO (public endpoints) ---
 	r.HandleFunc("GET /api/v1/sso/metadata", ssoMetadataHandler(ssoSvc, cfg.Addr))
 	r.HandleFunc("POST /api/v1/sso/callback", ssoSvc.SAMLCallbackHandler())
