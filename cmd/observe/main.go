@@ -31,6 +31,7 @@ import (
 	"github.com/teploy/observe/internal/logs"
 	"github.com/teploy/observe/internal/monitoring"
 	"github.com/teploy/observe/internal/platform"
+	"github.com/teploy/observe/internal/reports"
 	"github.com/teploy/observe/internal/replays"
 	"github.com/teploy/observe/internal/sourcemaps"
 	"github.com/teploy/observe/internal/tracking"
@@ -108,6 +109,7 @@ func main() {
 	webhookSvc := platform.NewWebhookService(db, logger)
 
 	// Feature expansion services
+	reportSvc := reports.NewReportService(db, logger)
 	integrationSvc := integrations.NewIntegrationService(db, logger)
 	feedbackSvc := feedback.NewFeedbackService(db)
 	viewSvc := views.NewViewService(db)
@@ -339,6 +341,15 @@ func main() {
 	neutron.Get(r.Group("/api/v1/feedback", jwtMW), "/list", listFeedbackHandler(feedbackSvc),
 		neutron.WithTags("feedback"), neutron.WithSummary("List user feedback"))
 
+	// --- Reports (JWT auth) ---
+	reportGroup := r.Group("/api/v1/reports", jwtMW)
+	neutron.Get(reportGroup, "", listReportsHandler(reportSvc),
+		neutron.WithTags("reports"), neutron.WithSummary("List report schedules"))
+	neutron.Post(reportGroup, "", createReportHandler(reportSvc),
+		neutron.WithTags("reports"), neutron.WithSummary("Create report schedule"))
+	neutron.Delete(reportGroup, "/{schedule_id}", deleteReportHandler(reportSvc),
+		neutron.WithTags("reports"), neutron.WithSummary("Delete report schedule"))
+
 	// --- Release health (JWT auth) ---
 	neutron.Get(r.Group("/api/v1/releases", jwtMW), "", releaseHealthHandler(issueSvc),
 		neutron.WithTags("releases"), neutron.WithSummary("Release health metrics"))
@@ -461,6 +472,20 @@ func main() {
 		for {
 			uptimeSvc.RunChecks(context.Background())
 			time.Sleep(30 * time.Second)
+		}
+	}()
+
+	// Report scheduler (every hour)
+	go func() {
+		time.Sleep(45 * time.Second)
+		smtpHost := os.Getenv("OBSERVE_SMTP_HOST")
+		smtpPort := os.Getenv("OBSERVE_SMTP_PORT")
+		smtpUser := os.Getenv("OBSERVE_SMTP_USER")
+		smtpPass := os.Getenv("OBSERVE_SMTP_PASS")
+		fromEmail := os.Getenv("OBSERVE_SMTP_FROM")
+		for {
+			reportSvc.RunScheduled(context.Background(), smtpHost, smtpPort, smtpUser, smtpPass, fromEmail)
+			time.Sleep(1 * time.Hour)
 		}
 	}()
 
@@ -804,6 +829,48 @@ func issueSessionHandler(issueSvc *obserrors.IssueService, statsSvc *query.Stats
 			return issueSessionResponse{}, err
 		}
 		return issueSessionResponse{SessionID: sessionID, Events: sessEvents}, nil
+	}
+}
+
+// --- Report handlers ---
+
+type listReportsInput struct {
+	SiteID string `query:"site_id"`
+}
+
+func listReportsHandler(svc *reports.ReportService) neutron.HandlerFunc[listReportsInput, []reports.ReportSchedule] {
+	return func(ctx context.Context, input listReportsInput) ([]reports.ReportSchedule, error) {
+		return svc.List(ctx, input.SiteID)
+	}
+}
+
+type createReportInput struct {
+	SiteID     string `json:"site_id"`
+	Name       string `json:"name"`
+	Frequency  string `json:"frequency"`
+	Recipients string `json:"recipients"`
+}
+
+func createReportHandler(svc *reports.ReportService) neutron.HandlerFunc[createReportInput, reports.ReportSchedule] {
+	return func(ctx context.Context, input createReportInput) (reports.ReportSchedule, error) {
+		if input.SiteID == "" || input.Recipients == "" {
+			return reports.ReportSchedule{}, neutron.ErrBadRequest("site_id and recipients required")
+		}
+		r, err := svc.Create(ctx, input.SiteID, input.Name, input.Frequency, input.Recipients)
+		if err != nil {
+			return reports.ReportSchedule{}, err
+		}
+		return *r, nil
+	}
+}
+
+type deleteReportInput struct {
+	ScheduleID string `path:"schedule_id"`
+}
+
+func deleteReportHandler(svc *reports.ReportService) neutron.HandlerFunc[deleteReportInput, neutron.Empty] {
+	return func(ctx context.Context, input deleteReportInput) (neutron.Empty, error) {
+		return neutron.Empty{}, svc.Delete(ctx, input.ScheduleID)
 	}
 }
 
