@@ -139,6 +139,9 @@ func main() {
 	dashSvc := dashboards.NewDashboardService(db)
 	replaySvc := replays.NewReplayService(db)
 
+	// Error buffer (async processing for throughput)
+	errorBuf := obserrors.NewErrorBuffer(errorHandler, 50000, 100, 2*time.Second, logger)
+
 	// Background jobs: rollups + retention
 	rollups := jobs.NewRollupService(db, logger)
 	retention := jobs.NewRetentionService(db, logger, cfg.RawRetentionDays, cfg.HourlyRetentionDays)
@@ -184,7 +187,11 @@ func main() {
 	)
 
 	// --- Ingestion API (API key auth, wildcard CORS, rate limited) ---
-	rateLimiter := ingest.NewRateLimiter(100, time.Second, 200) // 100 req/s per IP, burst 200
+	rateLimit := cfg.RateLimit
+	if rateLimit <= 0 {
+		rateLimit = 1000
+	}
+	rateLimiter := ingest.NewRateLimiter(rateLimit, time.Second, rateLimit*2)
 	ingestCORS := neutron.CORS(neutron.CORSOptions{
 		AllowOrigins: []string{"*"},
 		AllowMethods: []string{"POST", "OPTIONS"},
@@ -202,7 +209,7 @@ func main() {
 	)
 
 	// --- Error Ingestion (API key auth, wildcard CORS) ---
-	neutron.Post(ingestGroup, "/errors", errorIngestHandler(errorHandler),
+	neutron.Post(ingestGroup, "/errors", errorIngestHandler(errorBuf),
 		neutron.WithTags("errors"),
 		neutron.WithSummary("Ingest error event"),
 	)
@@ -577,6 +584,7 @@ func main() {
 
 	// Start background services directly (lifecycle hooks may not fire on all platforms)
 	buf.Start()
+	errorBuf.Start()
 	scheduler.Start()
 
 	// Alert check loop (every 60s)
@@ -813,7 +821,7 @@ func revokeShareHandler(shareSvc *share.ShareService) neutron.HandlerFunc[revoke
 
 // --- Error ingestion handler ---
 
-func errorIngestHandler(h *obserrors.ErrorHandler) neutron.HandlerFunc[obserrors.ErrorInput, obserrors.ErrorResponse] {
+func errorIngestHandler(buf *obserrors.ErrorBuffer) neutron.HandlerFunc[obserrors.ErrorInput, obserrors.ErrorResponse] {
 	return func(ctx context.Context, input obserrors.ErrorInput) (obserrors.ErrorResponse, error) {
 		siteID := input.SiteID
 		if siteID == "" {
@@ -822,8 +830,10 @@ func errorIngestHandler(h *obserrors.ErrorHandler) neutron.HandlerFunc[obserrors
 		if siteID == "" {
 			return obserrors.ErrorResponse{}, neutron.ErrBadRequest("missing site_id")
 		}
-		input.SiteID = siteID
-		return h.Handle(ctx, input)
+		if !buf.Push(siteID, input) {
+			return obserrors.ErrorResponse{}, neutron.ErrRateLimited("error buffer full")
+		}
+		return obserrors.ErrorResponse{OK: true}, nil
 	}
 }
 

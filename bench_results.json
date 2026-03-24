@@ -1,19 +1,19 @@
 [
   {
-    "mode": "errors",
+    "mode": "traces",
     "target": "http://192.168.1.80:3000",
     "duration": "30s",
-    "concurrency": 3,
-    "total_requests": 86,
-    "success_requests": 85,
-    "failed_requests": 1,
-    "throughput_rps": 2.8333333333333335,
-    "latency_p50_ms": 83.3235,
-    "latency_p95_ms": 6500.668334,
-    "latency_p99_ms": 10002.510958,
-    "latency_avg_ms": 1090.7089190581396,
-    "latency_min_ms": 17.624582999999998,
-    "latency_max_ms": 10002.510958,
-    "bytes_sent": 40148
+    "concurrency": 10,
+    "total_requests": 30,
+    "success_requests": 0,
+    "failed_requests": 30,
+    "throughput_rps": 0,
+    "latency_p50_ms": 10000.868917,
+    "latency_p95_ms": 10002.0335,
+    "latency_p99_ms": 10002.071167,
+    "latency_avg_ms": 10000.906619433334,
+    "latency_min_ms": 10000.042833,
+    "latency_max_ms": 10002.071167,
+    "bytes_sent": 19994
   }
 ]

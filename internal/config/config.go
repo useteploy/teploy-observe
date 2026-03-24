@@ -21,6 +21,9 @@ type Config struct {
 	RawRetentionDays    int
 	HourlyRetentionDays int
 
+	// Rate limiting
+	RateLimit int
+
 	// Auth
 	JWTSecret     string
 	AdminUser     string
@@ -38,6 +41,7 @@ func Load() Config {
 		FlushSize:           envInt("OBSERVE_FLUSH_SIZE", 500),
 		RawRetentionDays:    envInt("OBSERVE_RAW_RETENTION_DAYS", 30),
 		HourlyRetentionDays: envInt("OBSERVE_HOURLY_RETENTION_DAYS", 365),
+		RateLimit:           envInt("OBSERVE_RATE_LIMIT", 1000),
 		JWTSecret:           envOr("OBSERVE_JWT_SECRET", ""),
 		AdminUser:           envOr("OBSERVE_ADMIN_USER", "admin"),
 		AdminPassword:       envOr("OBSERVE_ADMIN_PASSWORD", "observe"),
