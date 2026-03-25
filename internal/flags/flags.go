@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -91,9 +92,81 @@ func (s *FlagService) Toggle(ctx context.Context, flagID, enabled string) error 
 	return err
 }
 
+// TargetingRule defines a condition for flag targeting.
+// Rules are AND'd together: all must match for the flag to be enabled.
+type TargetingRule struct {
+	Attribute string `json:"attribute"` // e.g. "country", "plan", "user_id"
+	Operator  string `json:"operator"`  // "eq", "neq", "in", "not_in", "contains"
+	Value     any    `json:"value"`     // string or []string
+}
+
+// matchesTargeting checks if the provided context matches all targeting rules.
+func matchesTargeting(rules []TargetingRule, userCtx map[string]string) bool {
+	for _, r := range rules {
+		actual, ok := userCtx[r.Attribute]
+		if !ok {
+			return false // attribute not provided, rule fails
+		}
+		switch r.Operator {
+		case "eq":
+			if actual != fmt.Sprintf("%v", r.Value) {
+				return false
+			}
+		case "neq":
+			if actual == fmt.Sprintf("%v", r.Value) {
+				return false
+			}
+		case "in":
+			vals := toStringSlice(r.Value)
+			found := false
+			for _, v := range vals {
+				if actual == v {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		case "not_in":
+			vals := toStringSlice(r.Value)
+			for _, v := range vals {
+				if actual == v {
+					return false
+				}
+			}
+		case "contains":
+			if !containsSubstring(actual, fmt.Sprintf("%v", r.Value)) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func containsSubstring(s, substr string) bool {
+	return strings.Contains(s, substr)
+}
+
+func toStringSlice(v any) []string {
+	switch val := v.(type) {
+	case []any:
+		out := make([]string, len(val))
+		for i, item := range val {
+			out[i] = fmt.Sprintf("%v", item)
+		}
+		return out
+	case []string:
+		return val
+	default:
+		return []string{fmt.Sprintf("%v", v)}
+	}
+}
+
 // Evaluate checks a flag for a given user. Returns the result.
 // Uses deterministic hashing for consistent assignment.
-func (s *FlagService) Evaluate(ctx context.Context, siteID, flagKey, userID string) (*EvaluationResult, error) {
+// userCtx provides arbitrary attributes for targeting rule evaluation.
+func (s *FlagService) Evaluate(ctx context.Context, siteID, flagKey, userID string, userCtx map[string]string) (*EvaluationResult, error) {
 	flags, err := nucleus.Query[FeatureFlag](ctx, s.db.SQL(),
 		`SELECT flag_id, tenant_id, site_id, flag_key, name, description, flag_type, enabled, rollout_pct,
 			COALESCE(variants, '') AS variants, COALESCE(targeting, '') AS targeting, created_at, version
@@ -113,6 +186,16 @@ func (s *FlagService) Evaluate(ctx context.Context, siteID, flagKey, userID stri
 		hash := hashUser(flagKey, userID)
 		if hash > rollout {
 			return &EvaluationResult{Key: flagKey, Enabled: false}, nil
+		}
+	}
+
+	// Check targeting rules (if any)
+	if flag.Targeting != "" && flag.Targeting != "[]" && flag.Targeting != "null" {
+		var rules []TargetingRule
+		if err := json.Unmarshal([]byte(flag.Targeting), &rules); err == nil && len(rules) > 0 {
+			if !matchesTargeting(rules, userCtx) {
+				return &EvaluationResult{Key: flagKey, Enabled: false}, nil
+			}
 		}
 	}
 

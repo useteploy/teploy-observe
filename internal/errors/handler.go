@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/teploy/observe/internal/sourcemaps"
 )
 
 // ErrorInput is the JSON body for POST /api/v1/errors (SDK envelope format).
@@ -55,10 +57,11 @@ type ErrorHandler struct {
 	db        *nucleus.Client
 	issueSvc  *IssueService
 	searchSvc *SearchService
+	srcmapSvc *sourcemaps.SourceMapService
 }
 
-func NewErrorHandler(db *nucleus.Client, issueSvc *IssueService, searchSvc *SearchService) *ErrorHandler {
-	return &ErrorHandler{db: db, issueSvc: issueSvc, searchSvc: searchSvc}
+func NewErrorHandler(db *nucleus.Client, issueSvc *IssueService, searchSvc *SearchService, srcmapSvc *sourcemaps.SourceMapService) *ErrorHandler {
+	return &ErrorHandler{db: db, issueSvc: issueSvc, searchSvc: searchSvc, srcmapSvc: srcmapSvc}
 }
 
 // Handle processes a single error event: compute grouphash, resolve issue, store event.
@@ -92,6 +95,14 @@ func (h *ErrorHandler) Handle(ctx context.Context, input ErrorInput) (ErrorRespo
 
 	// Serialize JSONB fields
 	stackJSON := jsonOrEmpty(input.StackTrace)
+
+	// Resolve minified stack trace via source maps (if available)
+	if input.ReleaseTag != "" && h.srcmapSvc != nil {
+		if resolved, err := h.srcmapSvc.ResolveStackTrace(ctx, input.SiteID, input.ReleaseTag, stackJSON); err == nil {
+			stackJSON = resolved
+		}
+	}
+
 	breadcrumbsJSON := jsonOrEmpty(input.Breadcrumbs)
 	contextsJSON := jsonOrEmpty(input.Contexts)
 	extraJSON := jsonOrEmpty(input.Extra)

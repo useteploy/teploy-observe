@@ -13,12 +13,13 @@ import (
 )
 
 type AlertService struct {
-	db     *nucleus.Client
-	logger *slog.Logger
+	db         *nucleus.Client
+	logger     *slog.Logger
+	webhookSvc *WebhookService
 }
 
-func NewAlertService(db *nucleus.Client, logger *slog.Logger) *AlertService {
-	return &AlertService{db: db, logger: logger}
+func NewAlertService(db *nucleus.Client, logger *slog.Logger, webhookSvc *WebhookService) *AlertService {
+	return &AlertService{db: db, logger: logger, webhookSvc: webhookSvc}
 }
 
 type AlertRule struct {
@@ -172,6 +173,17 @@ func (s *AlertService) CheckRules(ctx context.Context) error {
 				s.logger.Error("alert history insert failed", "rule", rule.RuleID, "err", err)
 			} else {
 				s.logger.Info("alert triggered", "rule", rule.Name, "metric", rule.Metric, "value", value, "threshold", threshold)
+				if s.webhookSvc != nil {
+					s.webhookSvc.Fire(ctx, rule.SiteID, AlertPayload{
+						AlertID:   alertID,
+						RuleName:  rule.Name,
+						Metric:    rule.Metric,
+						Value:     value,
+						Threshold: rule.Threshold,
+						SiteID:    rule.SiteID,
+						Timestamp: time.Now().UTC().Format(time.RFC3339),
+					})
+				}
 			}
 		}
 	}

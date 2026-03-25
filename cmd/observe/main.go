@@ -120,9 +120,10 @@ func main() {
 	exportSvc := export.NewExportService(db)
 
 	// Error tracking services
+	srcmapSvc := sourcemaps.NewSourceMapService(db)
 	issueSvc := obserrors.NewIssueService(db)
 	searchSvc := obserrors.NewSearchService(db)
-	errorHandler := obserrors.NewErrorHandler(db, issueSvc, searchSvc)
+	errorHandler := obserrors.NewErrorHandler(db, issueSvc, searchSvc, srcmapSvc)
 
 	// Tracing services
 	traceIngest := tracing.NewIngestService(db)
@@ -130,8 +131,8 @@ func main() {
 
 	// Platform services
 	userSvc := platform.NewUserService(db)
-	alertSvc := platform.NewAlertService(db, logger)
 	webhookSvc := platform.NewWebhookService(db, logger)
+	alertSvc := platform.NewAlertService(db, logger, webhookSvc)
 
 	// Feature expansion services
 	reportSvc := reports.NewReportService(db, logger)
@@ -152,7 +153,6 @@ func main() {
 	uptimeSvc := monitoring.NewUptimeService(db, logger)
 	cronSvc := monitoring.NewCronService(db, logger)
 	linkSvc := tracking.NewLinkService(db)
-	srcmapSvc := sourcemaps.NewSourceMapService(db)
 	dashSvc := dashboards.NewDashboardService(db)
 	replaySvc := replays.NewReplayService(db)
 
@@ -1267,12 +1267,13 @@ func toggleFlagHandler(svc *flags.FlagService) neutron.HandlerFunc[toggleFlagInp
 func flagEvaluateHandler(svc *flags.FlagService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var input struct {
-			SiteID  string `json:"site_id"`
-			FlagKey string `json:"flag_key"`
-			UserID  string `json:"user_id"`
+			SiteID  string            `json:"site_id"`
+			FlagKey string            `json:"flag_key"`
+			UserID  string            `json:"user_id"`
+			Context map[string]string `json:"context"`
 		}
 		json.NewDecoder(r.Body).Decode(&input)
-		result, _ := svc.Evaluate(r.Context(), input.SiteID, input.FlagKey, input.UserID)
+		result, _ := svc.Evaluate(r.Context(), input.SiteID, input.FlagKey, input.UserID, input.Context)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		json.NewEncoder(w).Encode(result)
