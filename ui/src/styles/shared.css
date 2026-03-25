@@ -1,0 +1,134 @@
+/* ─── Data Table ─── */
+.obs-table-wrap { overflow-x: auto; }
+.obs-table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+}
+.obs-table th {
+  text-align: left; padding: 8px 12px; font-weight: 600; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--obs-text-muted); border-bottom: 1px solid var(--obs-border-subtle);
+}
+.obs-table td {
+  padding: 10px 12px; border-bottom: 1px solid var(--obs-border-subtle);
+  color: var(--obs-text-secondary);
+}
+.obs-table tbody tr:hover { background: var(--obs-elevated); }
+.obs-table-row--clickable { cursor: pointer; }
+.obs-table-skeleton { display: flex; flex-direction: column; gap: 8px; padding: 16px 0; }
+.obs-skeleton-row {
+  height: 40px; background: var(--obs-surface); border-radius: var(--obs-radius);
+  animation: obs-shimmer 1.5s ease-in-out infinite;
+}
+
+/* ─── Empty State ─── */
+.obs-empty-state {
+  text-align: center; padding: 48px 24px; color: var(--obs-text-muted);
+  font-size: 14px;
+}
+
+/* ─── Search Input ─── */
+.obs-search-input-wrap {
+  position: relative; display: inline-flex; align-items: center; width: 100%; max-width: 320px;
+}
+.obs-search-icon {
+  position: absolute; left: 12px; color: var(--obs-text-muted); pointer-events: none;
+}
+.obs-search-input {
+  width: 100%; padding: 8px 12px 8px 34px;
+  background: var(--obs-surface); border: 1px solid var(--obs-border);
+  border-radius: var(--obs-radius); color: var(--obs-text);
+  font-size: 13px; font-family: var(--obs-font); outline: none;
+  transition: border-color var(--obs-transition);
+}
+.obs-search-input:focus { border-color: var(--obs-accent); }
+.obs-search-input::placeholder { color: var(--obs-text-muted); }
+
+/* ─── Modal ─── */
+.obs-modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 200; backdrop-filter: blur(2px);
+}
+.obs-modal {
+  background: var(--obs-surface); border: 1px solid var(--obs-border);
+  border-radius: var(--obs-radius-lg); width: 100%; max-width: 480px;
+  max-height: 85vh; overflow-y: auto;
+  animation: obs-dropdown-in 150ms ease;
+}
+.obs-modal-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 20px; border-bottom: 1px solid var(--obs-border-subtle);
+}
+.obs-modal-title { font-size: 15px; font-weight: 600; margin: 0; color: var(--obs-text); }
+.obs-modal-close {
+  background: none; border: none; color: var(--obs-text-muted); cursor: pointer;
+  padding: 4px; border-radius: var(--obs-radius-sm); display: flex;
+  transition: color var(--obs-transition);
+}
+.obs-modal-close:hover { color: var(--obs-text); }
+.obs-modal-body { padding: 20px; }
+
+/* ─── Code Block ─── */
+.obs-code-block {
+  background: var(--obs-bg); border: 1px solid var(--obs-border-subtle);
+  border-radius: var(--obs-radius); padding: 12px 16px;
+  overflow: auto; font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 12px; line-height: 1.6; color: var(--obs-text-secondary);
+  margin: 0; white-space: pre-wrap; word-break: break-word;
+}
+
+/* ─── Tabs ─── */
+.obs-tabs-bar {
+  display: flex; gap: 2px; border-bottom: 1px solid var(--obs-border-subtle);
+  margin-bottom: 16px;
+}
+.obs-tab {
+  padding: 8px 16px; background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--obs-text-muted); font-size: 13px; font-weight: 500;
+  font-family: var(--obs-font); cursor: pointer;
+  transition: color var(--obs-transition), border-color var(--obs-transition);
+}
+.obs-tab:hover { color: var(--obs-text); }
+.obs-tab--active { color: var(--obs-accent); border-bottom-color: var(--obs-accent); }
+.obs-tab-content { min-height: 200px; }
+
+/* ─── Page Header ─── */
+.obs-page-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 24px;
+}
+.obs-page-title {
+  font-size: 20px; font-weight: 700; margin: 0; color: var(--obs-text);
+}
+.obs-page-actions { display: flex; gap: 8px; }
+
+/* ─── Buttons ─── */
+.obs-btn {
+  padding: 8px 16px; border-radius: var(--obs-radius); font-size: 13px;
+  font-weight: 500; font-family: var(--obs-font); cursor: pointer;
+  border: 1px solid var(--obs-border); background: var(--obs-surface);
+  color: var(--obs-text); transition: all var(--obs-transition);
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.obs-btn:hover { background: var(--obs-elevated); border-color: var(--obs-text-muted); }
+.obs-btn--primary {
+  background: var(--obs-accent); border-color: var(--obs-accent); color: white;
+}
+.obs-btn--primary:hover { background: var(--obs-accent-hover); }
+.obs-btn--danger { color: var(--obs-danger); }
+.obs-btn--danger:hover { background: var(--obs-danger-bg); border-color: var(--obs-danger); }
+.obs-btn--sm { padding: 4px 10px; font-size: 12px; }
+
+/* ─── Form inputs ─── */
+.obs-input, .obs-select {
+  padding: 8px 12px; background: var(--obs-bg); border: 1px solid var(--obs-border);
+  border-radius: var(--obs-radius); color: var(--obs-text);
+  font-size: 13px; font-family: var(--obs-font); outline: none; width: 100%;
+  transition: border-color var(--obs-transition);
+}
+.obs-input:focus, .obs-select:focus { border-color: var(--obs-accent); }
+.obs-label {
+  display: block; font-size: 12px; font-weight: 500;
+  color: var(--obs-text-secondary); margin-bottom: 6px;
+}
+.obs-form-group { margin-bottom: 16px; }
