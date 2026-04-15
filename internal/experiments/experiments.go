@@ -20,65 +20,124 @@ func NewExperimentService(db *nucleus.Client) *ExperimentService {
 	return &ExperimentService{db: db}
 }
 
+// Experiment is the domain type with typed fields.
 type Experiment struct {
-	ExperimentID string `json:"experiment_id" db:"experiment_id"`
-	TenantID     string `json:"-" db:"tenant_id"`
-	SiteID       string `json:"site_id" db:"site_id"`
-	Name         string `json:"name" db:"name"`
-	FlagKey      string `json:"flag_key" db:"flag_key"`
-	GoalMetric   string `json:"goal_metric" db:"goal_metric"`
-	GoalValue    string `json:"goal_value" db:"goal_value"`
-	Status       string `json:"status" db:"status"` // draft, running, completed
-	MinSample    string `json:"min_sample" db:"min_sample"`
-	StartedAt    string `json:"started_at" db:"started_at"`
-	EndedAt      string `json:"ended_at" db:"ended_at"`
-	CreatedAt    string `json:"created_at" db:"created_at"`
-	Version      string `json:"-" db:"version"`
+	ExperimentID string    `json:"experiment_id"`
+	SiteID       string    `json:"site_id"`
+	Name         string    `json:"name"`
+	FlagKey      string    `json:"flag_key"`
+	GoalMetric   string    `json:"goal_metric"`
+	GoalValue    string    `json:"goal_value"`
+	Status       string    `json:"status"`
+	MinSample    int       `json:"min_sample"`
+	Variants     string    `json:"variants"`
+	StartedAt    time.Time `json:"started_at"`
+	EndedAt      time.Time `json:"ended_at"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+type experimentRow struct {
+	ExperimentID string `db:"experiment_id"`
+	TenantID     string `db:"tenant_id"`
+	SiteID       string `db:"site_id"`
+	Name         string `db:"name"`
+	FlagKey      string `db:"flag_key"`
+	GoalMetric   string `db:"goal_metric"`
+	GoalValue    string `db:"goal_value"`
+	Status       string `db:"status"`
+	MinSample    string `db:"min_sample"`
+	Variants     string `db:"variants"`
+	StartedAt    string `db:"started_at"`
+	EndedAt      string `db:"ended_at"`
+	CreatedAt    string `db:"created_at"`
+	Version      string `db:"version"`
+}
+
+func parseEpochMillis(s string) time.Time {
+	if s == "" || s == "0" {
+		return time.Time{}
+	}
+	if ms, err := strconv.ParseInt(s, 10, 64); err == nil {
+		if ms == 0 {
+			return time.Time{}
+		}
+		return time.UnixMilli(ms).UTC()
+	}
+	return time.Time{}
+}
+
+func (r experimentRow) toDomain() Experiment {
+	ms, _ := strconv.Atoi(r.MinSample)
+	return Experiment{
+		ExperimentID: r.ExperimentID, SiteID: r.SiteID,
+		Name: r.Name, FlagKey: r.FlagKey,
+		GoalMetric: r.GoalMetric, GoalValue: r.GoalValue,
+		Status: r.Status, MinSample: ms,
+		Variants:  r.Variants,
+		StartedAt: parseEpochMillis(r.StartedAt),
+		EndedAt:   parseEpochMillis(r.EndedAt),
+		CreatedAt: parseEpochMillis(r.CreatedAt),
+	}
 }
 
 type ExperimentResults struct {
-	Experiment Experiment      `json:"experiment"`
-	Variants   []VariantResult `json:"variants"`
-	Significant bool           `json:"significant"`
-	Winner      string         `json:"winner"`
+	Experiment  Experiment      `json:"experiment"`
+	Variants    []VariantResult `json:"variants"`
+	Significant bool            `json:"significant"`
+	Winner      string          `json:"winner"`
 }
 
 type VariantResult struct {
-	Variant     string  `json:"variant"`
-	Exposures   int64   `json:"exposures"`
-	Conversions int64   `json:"conversions"`
-	Rate        float64 `json:"rate"`
+	Variant        string  `json:"variant"`
+	Exposures      int64   `json:"exposures"`
+	Conversions    int64   `json:"conversions"`
+	ConversionRate float64 `json:"conversion_rate"`
 }
 
-func (s *ExperimentService) Create(ctx context.Context, siteID, name, flagKey, goalMetric, goalValue, minSample string) (*Experiment, error) {
+func (s *ExperimentService) Create(ctx context.Context, siteID, name, flagKey, goalMetric, goalValue, variants string, minSample int) (*Experiment, error) {
 	id := genID()
-	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
-	if minSample == "" {
-		minSample = "100"
+	now := time.Now().UTC()
+	nowMs := strconv.FormatInt(now.UnixMilli(), 10)
+	if minSample <= 0 {
+		minSample = 100
 	}
 
 	_, err := s.db.SQL().Exec(ctx,
-		`INSERT INTO experiments (experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample, started_at, ended_at, created_at, version)
-		 VALUES ($1, 'default', $2, $3, $4, $5, $6, 'draft', $7, '0', '0', $8, $9)`,
-		id, siteID, name, flagKey, goalMetric, goalValue, minSample, now, now,
+		`INSERT INTO experiments (experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample, variants, started_at, ended_at, created_at, version)
+		 VALUES ($1, 'default', $2, $3, $4, $5, $6, 'draft', $7, $8, '0', '0', $9, $10)`,
+		id, siteID, name, flagKey, goalMetric, goalValue, strconv.Itoa(minSample), variants, nowMs, nowMs,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create experiment: %w", err)
 	}
-	return &Experiment{ExperimentID: id, SiteID: siteID, Name: name, FlagKey: flagKey, GoalMetric: goalMetric, GoalValue: goalValue, Status: "draft", MinSample: minSample, CreatedAt: now}, nil
+	return &Experiment{
+		ExperimentID: id, SiteID: siteID, Name: name, FlagKey: flagKey,
+		GoalMetric: goalMetric, GoalValue: goalValue, Status: "draft",
+		MinSample: minSample, Variants: variants, CreatedAt: now,
+	}, nil
 }
 
 func (s *ExperimentService) List(ctx context.Context, siteID string) ([]Experiment, error) {
-	return nucleus.Query[Experiment](ctx, s.db.SQL(),
-		`SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample, started_at, ended_at, created_at, version
+	rows, err := nucleus.Query[experimentRow](ctx, s.db.SQL(),
+		`SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample,
+			COALESCE(variants, '') AS variants,
+			started_at, ended_at, created_at, version
 		 FROM experiments WHERE site_id = $1 ORDER BY created_at DESC`, siteID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Experiment, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.toDomain())
+	}
+	return out, nil
 }
 
 func (s *ExperimentService) Start(ctx context.Context, experimentID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
-		`INSERT INTO experiments (experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample, started_at, ended_at, created_at, version)
-		 SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, 'running', min_sample, $2, '0', created_at, $3
+		`INSERT INTO experiments (experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample, variants, started_at, ended_at, created_at, version)
+		 SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, 'running', min_sample, variants, $2, '0', created_at, $3
 		 FROM experiments WHERE experiment_id = $1`,
 		experimentID, now, now)
 	return err
@@ -87,8 +146,8 @@ func (s *ExperimentService) Start(ctx context.Context, experimentID string) erro
 func (s *ExperimentService) Stop(ctx context.Context, experimentID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
-		`INSERT INTO experiments (experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample, started_at, ended_at, created_at, version)
-		 SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, 'completed', min_sample, started_at, $2, created_at, $3
+		`INSERT INTO experiments (experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample, variants, started_at, ended_at, created_at, version)
+		 SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, 'completed', min_sample, variants, started_at, $2, created_at, $3
 		 FROM experiments WHERE experiment_id = $1`,
 		experimentID, now, now)
 	return err
@@ -117,8 +176,10 @@ func (s *ExperimentService) RecordConversion(ctx context.Context, experimentID, 
 
 // Results computes experiment results with statistical significance.
 func (s *ExperimentService) Results(ctx context.Context, experimentID, siteID string) (*ExperimentResults, error) {
-	exps, err := nucleus.Query[Experiment](ctx, s.db.SQL(),
-		`SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample, started_at, ended_at, created_at, version
+	exps, err := nucleus.Query[experimentRow](ctx, s.db.SQL(),
+		`SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample,
+			COALESCE(variants, '') AS variants,
+			started_at, ended_at, created_at, version
 		 FROM experiments WHERE experiment_id = $1 AND site_id = $2`, experimentID, siteID)
 	if err != nil || len(exps) == 0 {
 		return nil, fmt.Errorf("experiment not found")
@@ -148,19 +209,18 @@ func (s *ExperimentService) Results(ctx context.Context, experimentID, siteID st
 		conv, _ := strconv.ParseInt(r.Converted, 10, 64)
 		rate := 0.0
 		if total > 0 {
-			rate = float64(conv) / float64(total) * 100
+			rate = float64(conv) / float64(total)
 		}
-		variants = append(variants, VariantResult{Variant: r.Variant, Exposures: total, Conversions: conv, Rate: rate})
+		variants = append(variants, VariantResult{Variant: r.Variant, Exposures: total, Conversions: conv, ConversionRate: rate})
 	}
 
-	// Simple significance check (chi-squared approximation)
 	significant := false
 	winner := ""
 	if len(variants) >= 2 {
 		significant = chiSquaredSignificant(variants)
 		best := variants[0]
 		for _, v := range variants[1:] {
-			if v.Rate > best.Rate {
+			if v.ConversionRate > best.ConversionRate {
 				best = v
 			}
 		}
@@ -170,7 +230,7 @@ func (s *ExperimentService) Results(ctx context.Context, experimentID, siteID st
 	}
 
 	return &ExperimentResults{
-		Experiment:  exps[0],
+		Experiment:  exps[0].toDomain(),
 		Variants:    variants,
 		Significant: significant,
 		Winner:      winner,
@@ -208,7 +268,6 @@ func chiSquaredSignificant(variants []VariantResult) bool {
 		}
 	}
 
-	// df = k-1, p<0.05 critical values: df1=3.84, df2=5.99, df3=7.81
 	df := len(variants) - 1
 	criticals := []float64{0, 3.84, 5.99, 7.81, 9.49, 11.07}
 	if df < len(criticals) {

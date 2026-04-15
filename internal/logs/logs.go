@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -22,18 +23,53 @@ func NewLogService(db *nucleus.Client) *LogService {
 	return &LogService{db: db}
 }
 
-// Log represents a stored log entry. All fields are strings for Nucleus compatibility.
+// Log represents a stored log entry. Timestamps serialize as RFC3339 strings.
 type Log struct {
-	LogID       string `json:"log_id" db:"log_id"`
-	TenantID    string `json:"tenant_id" db:"tenant_id"`
-	SiteID      string `json:"site_id" db:"site_id"`
-	Timestamp   int64  `json:"timestamp" db:"timestamp"`
-	Level       string `json:"level" db:"level"`
-	Message     string `json:"message" db:"message"`
-	ServiceName string `json:"service_name" db:"service_name"`
-	TraceID     string `json:"trace_id" db:"trace_id"`
-	SpanID      string `json:"span_id" db:"span_id"`
-	Attributes  string `json:"attributes" db:"attributes"`
+	LogID       string    `json:"log_id"`
+	SiteID      string    `json:"site_id"`
+	Timestamp   time.Time `json:"timestamp"`
+	Level       string    `json:"level"`
+	Message     string    `json:"message"`
+	ServiceName string    `json:"service_name"`
+	TraceID     string    `json:"trace_id"`
+	SpanID      string    `json:"span_id"`
+	Attributes  string    `json:"attributes"`
+}
+
+type logRow struct {
+	LogID       string `db:"log_id"`
+	TenantID    string `db:"tenant_id"`
+	SiteID      string `db:"site_id"`
+	Timestamp   string `db:"timestamp"`
+	Level       string `db:"level"`
+	Message     string `db:"message"`
+	ServiceName string `db:"service_name"`
+	TraceID     string `db:"trace_id"`
+	SpanID      string `db:"span_id"`
+	Attributes  string `db:"attributes"`
+}
+
+func parseEpochMillis(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	if ms, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return time.UnixMilli(ms).UTC()
+	}
+	return time.Time{}
+}
+
+func (r logRow) toDomain() Log {
+	return Log{
+		LogID: r.LogID, SiteID: r.SiteID,
+		Timestamp:   parseEpochMillis(r.Timestamp),
+		Level:       r.Level,
+		Message:     r.Message,
+		ServiceName: r.ServiceName,
+		TraceID:     r.TraceID,
+		SpanID:      r.SpanID,
+		Attributes:  r.Attributes,
+	}
 }
 
 // LogInput is the payload accepted for log ingestion.
@@ -120,13 +156,26 @@ func (s *LogService) SearchLogs(ctx context.Context, siteID string, from, to tim
 		 ORDER BY timestamp DESC
 		 LIMIT %d`, where, limit)
 
-	return nucleus.Query[Log](ctx, s.db.SQL(), query, params...)
+	rows, err := nucleus.Query[logRow](ctx, s.db.SQL(), query, params...)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Log, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.toDomain())
+	}
+	return out, nil
 }
 
 // LevelCount holds the count of logs for a single level.
 type LevelCount struct {
-	Level string `json:"level" db:"level"`
-	Count string `json:"count" db:"count"`
+	Level string `json:"level"`
+	Count int64  `json:"count"`
+}
+
+type levelCountRow struct {
+	Level string `db:"level"`
+	Count string `db:"count"`
 }
 
 // LogStats returns the count of logs per level for a time range.
@@ -134,14 +183,23 @@ func (s *LogService) LogStats(ctx context.Context, siteID string, from, to time.
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
-	return nucleus.Query[LevelCount](ctx, s.db.SQL(),
-		`SELECT level, COUNT(*) AS count
+	rows, err := nucleus.Query[levelCountRow](ctx, s.db.SQL(),
+		`SELECT level, CAST(COUNT(*) AS TEXT) AS count
 		 FROM logs
 		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		 GROUP BY level
 		 ORDER BY count DESC`,
 		siteID, fromMs, toMs,
 	)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]LevelCount, 0, len(rows))
+	for _, r := range rows {
+		n, _ := strconv.ParseInt(r.Count, 10, 64)
+		out = append(out, LevelCount{Level: r.Level, Count: n})
+	}
+	return out, nil
 }
 
 func generateID() (string, error) {

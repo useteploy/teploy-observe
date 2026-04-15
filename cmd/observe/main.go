@@ -517,6 +517,8 @@ func main() {
 	logGroup := r.Group("/api/v1/logs", jwtMW)
 	neutron.Get(logGroup, "/search", logSearchHandler(logSvc),
 		neutron.WithTags("logs"), neutron.WithSummary("Search logs"))
+	neutron.Get(logGroup, "/stats", logStatsHandler(logSvc),
+		neutron.WithTags("logs"), neutron.WithSummary("Log counts per level"))
 
 	// --- Goals API (JWT auth) ---
 	goalGroup := r.Group("/api/v1/goals", jwtMW)
@@ -882,23 +884,19 @@ type listIssuesInput struct {
 	Limit  int    `query:"limit"`
 }
 
-type listIssuesResponse struct {
-	Issues []obserrors.Issue `json:"issues"`
-}
-
-func listIssuesHandler(svc *obserrors.IssueService) neutron.HandlerFunc[listIssuesInput, listIssuesResponse] {
-	return func(ctx context.Context, input listIssuesInput) (listIssuesResponse, error) {
+func listIssuesHandler(svc *obserrors.IssueService) neutron.HandlerFunc[listIssuesInput, []obserrors.Issue] {
+	return func(ctx context.Context, input listIssuesInput) ([]obserrors.Issue, error) {
 		if input.SiteID == "" {
-			return listIssuesResponse{}, neutron.ErrBadRequest("site_id required")
+			return nil, neutron.ErrBadRequest("site_id required")
 		}
 		issues, err := svc.ListIssues(ctx, input.SiteID, input.Status, input.Limit)
 		if err != nil {
-			return listIssuesResponse{}, err
+			return nil, err
 		}
 		if issues == nil {
 			issues = []obserrors.Issue{}
 		}
-		return listIssuesResponse{Issues: issues}, nil
+		return issues, nil
 	}
 }
 
@@ -950,23 +948,19 @@ type issueEventsInput struct {
 	Limit   int    `query:"limit"`
 }
 
-type issueEventsResponse struct {
-	Events []obserrors.ErrorEvent `json:"events"`
-}
-
-func issueEventsHandler(svc *obserrors.IssueService) neutron.HandlerFunc[issueEventsInput, issueEventsResponse] {
-	return func(ctx context.Context, input issueEventsInput) (issueEventsResponse, error) {
+func issueEventsHandler(svc *obserrors.IssueService) neutron.HandlerFunc[issueEventsInput, []obserrors.ErrorEvent] {
+	return func(ctx context.Context, input issueEventsInput) ([]obserrors.ErrorEvent, error) {
 		if input.SiteID == "" || input.IssueID == "" {
-			return issueEventsResponse{}, neutron.ErrBadRequest("site_id and issue_id required")
+			return nil, neutron.ErrBadRequest("site_id and issue_id required")
 		}
 		events, err := svc.LatestEvents(ctx, input.IssueID, input.SiteID, input.Limit)
 		if err != nil {
-			return issueEventsResponse{}, err
+			return nil, err
 		}
 		if events == nil {
 			events = []obserrors.ErrorEvent{}
 		}
-		return issueEventsResponse{Events: events}, nil
+		return events, nil
 	}
 }
 
@@ -1255,7 +1249,7 @@ func createFlagHandler(svc *flags.FlagService) neutron.HandlerFunc[createFlagInp
 
 type toggleFlagInput struct {
 	FlagID  string `path:"flag_id"`
-	Enabled string `json:"enabled"`
+	Enabled bool   `json:"enabled"`
 }
 
 func toggleFlagHandler(svc *flags.FlagService) neutron.HandlerFunc[toggleFlagInput, neutron.Empty] {
@@ -1296,7 +1290,8 @@ type createExperimentInput struct {
 	FlagKey    string `json:"flag_key"`
 	GoalMetric string `json:"goal_metric"`
 	GoalValue  string `json:"goal_value"`
-	MinSample  string `json:"min_sample"`
+	Variants   string `json:"variants"`
+	MinSample  int    `json:"min_sample"`
 }
 
 func createExperimentHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[createExperimentInput, experiments.Experiment] {
@@ -1304,7 +1299,7 @@ func createExperimentHandler(svc *experiments.ExperimentService) neutron.Handler
 		if input.SiteID == "" || input.FlagKey == "" {
 			return experiments.Experiment{}, neutron.ErrBadRequest("site_id and flag_key required")
 		}
-		e, err := svc.Create(ctx, input.SiteID, input.Name, input.FlagKey, input.GoalMetric, input.GoalValue, input.MinSample)
+		e, err := svc.Create(ctx, input.SiteID, input.Name, input.FlagKey, input.GoalMetric, input.GoalValue, input.Variants, input.MinSample)
 		if err != nil { return experiments.Experiment{}, err }
 		return *e, nil
 	}
@@ -1625,6 +1620,22 @@ func logSearchHandler(svc *logs.LogService) neutron.HandlerFunc[logSearchInput, 
 	return func(ctx context.Context, input logSearchInput) ([]logs.Log, error) {
 		from, to := parseTimeRange(input.From, input.To)
 		return svc.SearchLogs(ctx, input.SiteID, from, to, input.Level, input.Service, input.Query, input.Limit)
+	}
+}
+
+type logStatsInput struct {
+	SiteID string `query:"site_id"`
+	From   string `query:"from"`
+	To     string `query:"to"`
+}
+
+func logStatsHandler(svc *logs.LogService) neutron.HandlerFunc[logStatsInput, []logs.LevelCount] {
+	return func(ctx context.Context, input logStatsInput) ([]logs.LevelCount, error) {
+		if input.SiteID == "" {
+			return nil, neutron.ErrBadRequest("site_id required")
+		}
+		from, to := parseTimeRange(input.From, input.To)
+		return svc.LogStats(ctx, input.SiteID, from, to)
 	}
 }
 
@@ -2015,13 +2026,21 @@ func listAlertRulesHandler(svc *platform.AlertService) neutron.HandlerFunc[listA
 }
 
 type createAlertRuleInput struct {
-	SiteID        string `json:"site_id"`
-	Name          string `json:"name"`
-	Metric        string `json:"metric"`
-	Operator      string `json:"operator"`
-	Threshold     string `json:"threshold"`
-	WindowMinutes string `json:"window_minutes"`
-	Cooldown      string `json:"cooldown"`
+	SiteID        string  `json:"site_id"`
+	Name          string  `json:"name"`
+	Metric        string  `json:"metric"`
+	Operator      string  `json:"operator"`
+	Threshold     float64 `json:"threshold"`
+	WindowMinutes int     `json:"window_minutes"`
+	Cooldown      int     `json:"cooldown"`
+}
+
+var validAlertMetrics = map[string]struct{}{
+	"error_count": {}, "error_rate": {}, "pageviews": {}, "visitors": {},
+}
+
+var validAlertOperators = map[string]struct{}{
+	"gt": {}, "gte": {}, "lt": {}, "lte": {}, "eq": {},
 }
 
 func createAlertRuleHandler(svc *platform.AlertService) neutron.HandlerFunc[createAlertRuleInput, platform.AlertRule] {
@@ -2029,19 +2048,20 @@ func createAlertRuleHandler(svc *platform.AlertService) neutron.HandlerFunc[crea
 		if input.SiteID == "" || input.Name == "" || input.Metric == "" {
 			return platform.AlertRule{}, neutron.ErrBadRequest("site_id, name, and metric required")
 		}
+		if _, ok := validAlertMetrics[input.Metric]; !ok {
+			return platform.AlertRule{}, neutron.ErrBadRequest("unsupported metric: " + input.Metric)
+		}
+		if input.Operator != "" {
+			if _, ok := validAlertOperators[input.Operator]; !ok {
+				return platform.AlertRule{}, neutron.ErrBadRequest("unsupported operator: " + input.Operator)
+			}
+		}
 		rule := platform.AlertRule{
 			SiteID: input.SiteID, Name: input.Name, Metric: input.Metric,
-			Operator: input.Operator, Threshold: input.Threshold,
-			WindowMinutes: input.WindowMinutes, Cooldown: input.Cooldown, Enabled: "true",
-		}
-		if rule.Operator == "" {
-			rule.Operator = "gt"
-		}
-		if rule.WindowMinutes == "" {
-			rule.WindowMinutes = "5"
-		}
-		if rule.Cooldown == "" {
-			rule.Cooldown = "300"
+			Operator:      input.Operator,
+			Threshold:     input.Threshold,
+			WindowMinutes: input.WindowMinutes,
+			Cooldown:      input.Cooldown,
 		}
 		r, err := svc.CreateRule(ctx, rule)
 		if err != nil {
@@ -2206,23 +2226,19 @@ type traceErrorsInput struct {
 	SiteID  string `query:"site_id"`
 }
 
-type traceErrorsResponse struct {
-	Errors []tracing.TraceErrorHit `json:"errors"`
-}
-
-func traceErrorsHandler(svc *tracing.QueryService) neutron.HandlerFunc[traceErrorsInput, traceErrorsResponse] {
-	return func(ctx context.Context, input traceErrorsInput) (traceErrorsResponse, error) {
+func traceErrorsHandler(svc *tracing.QueryService) neutron.HandlerFunc[traceErrorsInput, []tracing.TraceErrorHit] {
+	return func(ctx context.Context, input traceErrorsInput) ([]tracing.TraceErrorHit, error) {
 		if input.SiteID == "" || input.TraceID == "" {
-			return traceErrorsResponse{}, neutron.ErrBadRequest("site_id and trace_id required")
+			return nil, neutron.ErrBadRequest("site_id and trace_id required")
 		}
 		hits, err := svc.TraceErrors(ctx, input.TraceID, input.SiteID)
 		if err != nil {
-			return traceErrorsResponse{}, err
+			return nil, err
 		}
 		if hits == nil {
 			hits = []tracing.TraceErrorHit{}
 		}
-		return traceErrorsResponse{Errors: hits}, nil
+		return hits, nil
 	}
 }
 
@@ -2262,23 +2278,19 @@ type searchIssuesInput struct {
 	Limit  int    `query:"limit"`
 }
 
-type searchIssuesResponse struct {
-	Issues []obserrors.Issue `json:"issues"`
-}
-
-func searchIssuesHandler(svc *obserrors.SearchService) neutron.HandlerFunc[searchIssuesInput, searchIssuesResponse] {
-	return func(ctx context.Context, input searchIssuesInput) (searchIssuesResponse, error) {
+func searchIssuesHandler(svc *obserrors.SearchService) neutron.HandlerFunc[searchIssuesInput, []obserrors.Issue] {
+	return func(ctx context.Context, input searchIssuesInput) ([]obserrors.Issue, error) {
 		if input.SiteID == "" || input.Query == "" {
-			return searchIssuesResponse{}, neutron.ErrBadRequest("site_id and q required")
+			return nil, neutron.ErrBadRequest("site_id and q required")
 		}
 		issues, err := svc.SearchIssues(ctx, input.SiteID, input.Query, input.Limit)
 		if err != nil {
-			return searchIssuesResponse{}, err
+			return nil, err
 		}
 		if issues == nil {
 			issues = []obserrors.Issue{}
 		}
-		return searchIssuesResponse{Issues: issues}, nil
+		return issues, nil
 	}
 }
 
