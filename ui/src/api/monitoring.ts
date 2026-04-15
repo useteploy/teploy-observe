@@ -26,19 +26,23 @@ export interface InfraHost {
   cpu_pct: number; memory_pct: number; disk_pct: number;
 }
 
+export interface InfraMetric {
+  timestamp: string; cpu_pct: number; memory_pct: number; disk_pct: number;
+}
+
 export const monitoringApi = {
   uptimeList: (siteId: string) =>
-    get<UptimeMonitor[]>(`${BASE}/monitoring/uptime?site_id=${siteId}`),
+    get<UptimeMonitor[]>(`${BASE}/monitors?site_id=${siteId}`),
   uptimeCreate: (data: { site_id: string; name: string; url: string; method?: string; expected_status?: number; interval_seconds?: number }) =>
-    post<UptimeMonitor>(`${BASE}/monitoring/uptime`, data),
-  uptimeResults: (monitorId: string) =>
-    get<UptimeResult[]>(`${BASE}/monitoring/uptime/${monitorId}/results`),
+    post<UptimeMonitor>(`${BASE}/monitors`, data),
+  uptimeResults: (monitorId: string, limit?: number) =>
+    get<UptimeResult[]>(`${BASE}/monitors/${monitorId}/results${limit ? `?limit=${limit}` : ""}`),
   cronList: (siteId: string) =>
-    get<CronMonitor[]>(`${BASE}/monitoring/cron?site_id=${siteId}`),
+    get<CronMonitor[]>(`${BASE}/crons?site_id=${siteId}`),
   cronCreate: (data: { site_id: string; slug: string; name: string; schedule: string; grace_seconds?: number }) =>
-    post<CronMonitor>(`${BASE}/monitoring/cron`, data),
+    post<CronMonitor>(`${BASE}/crons`, data),
   infraHosts: (siteId: string) =>
     get<InfraHost[]>(`${BASE}/infra/hosts?site_id=${siteId}`),
-  infraHistory: (hostId: string, from: string, to: string) =>
-    get<any[]>(`${BASE}/infra/hosts/${hostId}/history?from=${from}&to=${to}`),
+  infraHistory: (hostname: string, from: string, to: string) =>
+    get<InfraMetric[]>(`${BASE}/infra/hosts/${encodeURIComponent(hostname)}/history?from=${from}&to=${to}`),
 };

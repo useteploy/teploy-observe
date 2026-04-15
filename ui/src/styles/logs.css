@@ -1,0 +1,320 @@
+/* ─── Log Explorer ─── */
+
+.logs-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.logs-toolbar .obs-search-input-wrap {
+  flex: 1;
+  min-width: 200px;
+}
+
+.logs-service-input {
+  width: 160px;
+  padding: 8px 12px;
+  background: var(--obs-surface);
+  border: 1px solid var(--obs-border);
+  border-radius: var(--obs-radius);
+  color: var(--obs-text);
+  font-size: 13px;
+  font-family: var(--obs-font);
+  outline: none;
+  transition: border-color var(--obs-transition);
+}
+
+.logs-service-input:focus {
+  border-color: var(--obs-accent);
+}
+
+.logs-service-input::placeholder {
+  color: var(--obs-text-muted);
+}
+
+/* ─── Level Filter Badges ─── */
+.logs-level-filters {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.logs-level-btn {
+  padding: 4px 10px;
+  border-radius: var(--obs-radius-full);
+  font-size: 11px;
+  font-weight: 600;
+  font-family: var(--obs-font);
+  cursor: pointer;
+  border: 1px solid var(--obs-border);
+  background: transparent;
+  color: var(--obs-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  transition: all var(--obs-transition);
+  line-height: 1.4;
+}
+
+.logs-level-btn:hover {
+  border-color: var(--obs-text-muted);
+  color: var(--obs-text-secondary);
+}
+
+.logs-level-btn--active {
+  color: #fff;
+}
+
+.logs-level-btn--all.logs-level-btn--active {
+  background: var(--obs-accent);
+  border-color: var(--obs-accent);
+}
+
+.logs-level-btn--debug.logs-level-btn--active {
+  background: #52525b;
+  border-color: #52525b;
+}
+
+.logs-level-btn--info.logs-level-btn--active {
+  background: #6366f1;
+  border-color: #6366f1;
+}
+
+.logs-level-btn--warn.logs-level-btn--active {
+  background: #d97706;
+  border-color: #d97706;
+}
+
+.logs-level-btn--error.logs-level-btn--active {
+  background: #dc2626;
+  border-color: #dc2626;
+}
+
+.logs-level-btn--fatal.logs-level-btn--active {
+  background: #991b1b;
+  border-color: #991b1b;
+}
+
+/* ─── Stats Summary ─── */
+.logs-stats-bar {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  padding: 10px 16px;
+  background: var(--obs-card);
+  border: 1px solid var(--obs-border);
+  border-radius: var(--obs-radius-md);
+  margin-bottom: 16px;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+.logs-stat-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--obs-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.logs-stat-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.logs-stat-count {
+  font-weight: 600;
+  color: var(--obs-text);
+}
+
+/* ─── Log Entry List ─── */
+.logs-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--obs-border);
+  border-radius: var(--obs-radius-md);
+  overflow: hidden;
+}
+
+.logs-entry {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--obs-border-subtle);
+  cursor: pointer;
+  transition: background var(--obs-transition);
+}
+
+.logs-entry:last-child {
+  border-bottom: none;
+}
+
+.logs-entry:hover {
+  background: var(--obs-card-hover);
+}
+
+.logs-entry--expanded {
+  background: var(--obs-card);
+}
+
+.logs-entry--expanded:hover {
+  background: var(--obs-card);
+}
+
+.logs-entry-ts {
+  font-size: 11px;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  color: var(--obs-text-muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+  line-height: 1.7;
+  min-width: 80px;
+}
+
+.logs-entry-service {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--obs-text-secondary);
+  white-space: nowrap;
+  flex-shrink: 0;
+  line-height: 1.7;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.logs-entry-message {
+  font-size: 13px;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  color: var(--obs-text);
+  line-height: 1.5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.logs-entry-badge {
+  flex-shrink: 0;
+  line-height: 1.7;
+}
+
+/* ─── Expanded Log Detail ─── */
+.logs-detail {
+  padding: 0 14px 14px 14px;
+  border-bottom: 1px solid var(--obs-border-subtle);
+  background: var(--obs-card);
+}
+
+.logs-detail-section {
+  margin-bottom: 12px;
+}
+
+.logs-detail-section:last-child {
+  margin-bottom: 0;
+}
+
+.logs-detail-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--obs-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+}
+
+.logs-detail-message {
+  font-size: 13px;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  color: var(--obs-text);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--obs-bg);
+  border: 1px solid var(--obs-border-subtle);
+  border-radius: var(--obs-radius);
+  padding: 12px 16px;
+}
+
+.logs-detail-meta {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--obs-text-secondary);
+}
+
+.logs-detail-meta-item {
+  display: flex;
+  gap: 6px;
+}
+
+.logs-detail-meta-key {
+  color: var(--obs-text-muted);
+}
+
+.logs-trace-link {
+  color: var(--obs-accent);
+  text-decoration: none;
+  cursor: pointer;
+  transition: color var(--obs-transition);
+}
+
+.logs-trace-link:hover {
+  color: var(--obs-accent-hover);
+}
+
+/* ─── Loading / Empty ─── */
+.logs-loading {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid var(--obs-border);
+  border-radius: var(--obs-radius-md);
+  overflow: hidden;
+}
+
+.logs-skeleton-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--obs-border-subtle);
+}
+
+.logs-skeleton-row:last-child {
+  border-bottom: none;
+}
+
+.logs-skeleton-bar {
+  height: 12px;
+  border-radius: var(--obs-radius-sm);
+  background: linear-gradient(90deg, var(--obs-border-subtle) 25%, var(--obs-border) 50%, var(--obs-border-subtle) 75%);
+  background-size: 200% 100%;
+  animation: obs-shimmer 1.5s ease-in-out infinite;
+}
+
+/* ─── Responsive ─── */
+@media (max-width: 768px) {
+  .logs-entry-ts {
+    display: none;
+  }
+
+  .logs-entry-service {
+    display: none;
+  }
+
+  .logs-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .logs-service-input {
+    width: 100%;
+  }
+}

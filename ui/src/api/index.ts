@@ -2,7 +2,7 @@
 // Feature-specific imports: import { errorsApi } from "../api/errors.js"
 // Legacy imports: import { api } from "../api.js" (backward compatible)
 
-export { get, post, qs } from "./helpers.js";
+export { get, post, del, qs } from "./helpers.js";
 export { analyticsApi } from "./analytics.js";
 export type * from "./analytics.js";
 export { errorsApi } from "./errors.js";
@@ -15,4 +15,8 @@ export { flagsApi, experimentsApi } from "./flags.js";
 export type * from "./flags.js";
 export { monitoringApi } from "./monitoring.js";
 export type * from "./monitoring.js";
+export { alertsApi } from "./alerts.js";
+export type * from "./alerts.js";
+export { settingsApi } from "./settings.js";
+export type * from "./settings.js";
 export { authApi } from "./auth.js";

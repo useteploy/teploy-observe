@@ -1,4 +1,387 @@
+import { useState, useEffect } from "preact/hooks";
+import { settingsApi } from "../api/settings.js";
+import type { Site, Webhook, User, ShareLink } from "../api/settings.js";
+import StatusBadge from "../components/shared/StatusBadge.js";
+import Modal from "../components/shared/Modal.js";
+import "../styles/settings.css";
+
 export const config = { mode: "app" };
+
+function formatDate(iso: string): string {
+  if (!iso) return "--";
+  try {
+    return new Date(iso).toLocaleDateString("en-US", {
+      month: "short", day: "numeric", year: "numeric",
+    });
+  } catch { return iso; }
+}
+
+function SettingsSkeleton() {
+  return (
+    <div class="settings-loading">
+      {Array.from({ length: 3 }).map((_, i) => (
+        <div class="settings-skeleton-row" key={i}>
+          <div class="settings-skeleton-bar" style={{ width: "120px" }} />
+          <div class="settings-skeleton-bar" style={{ flex: 1 }} />
+          <div class="settings-skeleton-bar" style={{ width: "80px" }} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── Sites ───
+
+function SitesSection() {
+  const [sites, setSites] = useState<Site[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showCreate, setShowCreate] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [newKey, setNewKey] = useState<{ key: string; siteId: string } | null>(null);
+  const [formName, setFormName] = useState("");
+  const [formDomain, setFormDomain] = useState("");
+
+  // Share links
+  const [shareLinks, setShareLinks] = useState<ShareLink[]>([]);
+  const [selectedSiteId, setSelectedSiteId] = useState<string | null>(null);
+
+  const refresh = async () => {
+    const data = await settingsApi.sites();
+    setSites(data || []);
+  };
+
+  useEffect(() => {
+    setLoading(true);
+    refresh().finally(() => setLoading(false));
+  }, []);
+
+  const handleCreate = async () => {
+    if (!formName.trim()) return;
+    setCreating(true);
+    try {
+      await settingsApi.createSite({ name: formName.trim(), domain: formDomain.trim() || undefined });
+      setShowCreate(false);
+      setFormName(""); setFormDomain("");
+      await refresh();
+    } catch (err) { console.error("Failed to create site:", err); }
+    finally { setCreating(false); }
+  };
+
+  const handleDelete = async (siteId: string) => {
+    try {
+      await settingsApi.deleteSite(siteId);
+      setSites(prev => prev.filter(s => s.site_id !== siteId));
+    } catch (err) { console.error("Failed to delete site:", err); }
+  };
+
+  const handleGenerateKey = async (siteId: string) => {
+    try {
+      const result = await settingsApi.createAPIKey(siteId);
+      setNewKey({ key: result.api_key, siteId });
+    } catch (err) { console.error("Failed to generate API key:", err); }
+  };
+
+  const handleShowShareLinks = async (siteId: string) => {
+    if (selectedSiteId === siteId) { setSelectedSiteId(null); return; }
+    setSelectedSiteId(siteId);
+    try {
+      const data = await settingsApi.shareLinks(siteId);
+      setShareLinks(data || []);
+    } catch { setShareLinks([]); }
+  };
+
+  const handleCreateShareLink = async (siteId: string) => {
+    try {
+      await settingsApi.createShareLink(siteId);
+      const data = await settingsApi.shareLinks(siteId);
+      setShareLinks(data || []);
+    } catch (err) { console.error("Failed to create share link:", err); }
+  };
+
+  const handleRevokeShareLink = async (token: string) => {
+    try {
+      await settingsApi.revokeShareLink(token);
+      setShareLinks(prev => prev.filter(l => l.token !== token));
+    } catch (err) { console.error("Failed to revoke share link:", err); }
+  };
+
+  return (
+    <div class="settings-section">
+      <div class="settings-section-header">
+        <h2 class="settings-section-title">Sites</h2>
+        <button class="obs-btn obs-btn--primary obs-btn--sm" onClick={() => setShowCreate(true)}>Add Site</button>
+      </div>
+
+      {loading ? <SettingsSkeleton /> : sites.length === 0 ? (
+        <div class="obs-empty-state">No sites configured</div>
+      ) : (
+        <div class="settings-list">
+          {sites.map(s => (
+            <div key={s.site_id}>
+              <div class="settings-row">
+                <span class="settings-row-name">{s.name}</span>
+                <span class="settings-row-value">{s.domain || s.site_id}</span>
+                <button class="obs-btn obs-btn--sm" onClick={() => handleGenerateKey(s.site_id)}>API Key</button>
+                <button class="obs-btn obs-btn--sm" onClick={() => handleShowShareLinks(s.site_id)}>Share</button>
+                <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => handleDelete(s.site_id)}>Delete</button>
+                <span class="settings-row-date">{formatDate(s.created_at)}</span>
+              </div>
+              {selectedSiteId === s.site_id && (
+                <div style={{ padding: "8px 16px 16px", borderBottom: "1px solid var(--obs-border-subtle)" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
+                    <span style={{ fontSize: "12px", fontWeight: 600, color: "var(--obs-text-secondary)" }}>
+                      Share Links ({shareLinks.length})
+                    </span>
+                    <button class="obs-btn obs-btn--sm" onClick={() => handleCreateShareLink(s.site_id)}>Create Link</button>
+                  </div>
+                  {shareLinks.length === 0 ? (
+                    <div style={{ fontSize: "12px", color: "var(--obs-text-muted)" }}>No share links</div>
+                  ) : (
+                    shareLinks.map(l => (
+                      <div key={l.token} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "4px 0", fontSize: "12px" }}>
+                        <code style={{ flex: 1, color: "var(--obs-text)", fontSize: "11px" }}>/share/{l.token}</code>
+                        <span class="settings-row-date">{formatDate(l.created_at)}</span>
+                        <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => handleRevokeShareLink(l.token)}>Revoke</button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {newKey && (
+        <>
+          <div class="settings-key-display">
+            <span class="settings-key-value">{newKey.key}</span>
+            <button class="obs-btn obs-btn--sm" onClick={() => navigator.clipboard.writeText(newKey.key)}>Copy</button>
+          </div>
+          <div class="settings-key-note">Save this key now. It will not be shown again.</div>
+        </>
+      )}
+
+      <Modal open={showCreate} onClose={() => setShowCreate(false)} title="Add Site">
+        <div class="obs-form-group">
+          <label class="obs-label">Name</label>
+          <input class="obs-input" placeholder="My App" value={formName}
+            onInput={(e) => setFormName((e.target as HTMLInputElement).value)} />
+        </div>
+        <div class="obs-form-group">
+          <label class="obs-label">Domain (optional)</label>
+          <input class="obs-input" placeholder="example.com" value={formDomain}
+            onInput={(e) => setFormDomain((e.target as HTMLInputElement).value)} />
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "8px" }}>
+          <button class="obs-btn" onClick={() => setShowCreate(false)}>Cancel</button>
+          <button class="obs-btn obs-btn--primary" onClick={handleCreate} disabled={creating || !formName.trim()}>
+            {creating ? "Creating..." : "Create"}
+          </button>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+// ─── Webhooks ───
+
+function WebhooksSection() {
+  const siteId = typeof window !== "undefined"
+    ? new URLSearchParams(window.location.search).get("site_id") || "default"
+    : "default";
+
+  const [webhooks, setWebhooks] = useState<Webhook[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showCreate, setShowCreate] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [formName, setFormName] = useState("");
+  const [formType, setFormType] = useState("http");
+  const [formUrl, setFormUrl] = useState("");
+
+  const refresh = async () => {
+    const data = await settingsApi.webhooks(siteId);
+    setWebhooks(data || []);
+  };
+
+  useEffect(() => {
+    setLoading(true);
+    refresh().finally(() => setLoading(false));
+  }, [siteId]);
+
+  const handleCreate = async () => {
+    if (!formName.trim() || !formUrl.trim()) return;
+    setCreating(true);
+    try {
+      await settingsApi.createWebhook({ site_id: siteId, name: formName.trim(), webhook_type: formType, url: formUrl.trim() });
+      setShowCreate(false);
+      setFormName(""); setFormUrl(""); setFormType("http");
+      await refresh();
+    } catch (err) { console.error("Failed to create webhook:", err); }
+    finally { setCreating(false); }
+  };
+
+  const handleDelete = async (webhookId: string) => {
+    try {
+      await settingsApi.deleteWebhook(webhookId);
+      setWebhooks(prev => prev.filter(w => w.webhook_id !== webhookId));
+    } catch (err) { console.error("Failed to delete webhook:", err); }
+  };
+
+  return (
+    <div class="settings-section">
+      <div class="settings-section-header">
+        <h2 class="settings-section-title">Webhooks</h2>
+        <button class="obs-btn obs-btn--primary obs-btn--sm" onClick={() => setShowCreate(true)}>Add Webhook</button>
+      </div>
+
+      {loading ? <SettingsSkeleton /> : webhooks.length === 0 ? (
+        <div class="obs-empty-state">No webhooks configured</div>
+      ) : (
+        <div class="settings-list">
+          {webhooks.map(w => (
+            <div key={w.webhook_id} class="settings-row">
+              <StatusBadge status={w.enabled === "true" || w.enabled === "1" ? "enabled" : "disabled"} size="sm" />
+              <span class="settings-row-name">{w.name}</span>
+              <span class="settings-row-value">{w.url}</span>
+              <span style={{ fontSize: "11px", color: "var(--obs-text-muted)" }}>{w.webhook_type}</span>
+              <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => handleDelete(w.webhook_id)}>Delete</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <Modal open={showCreate} onClose={() => setShowCreate(false)} title="Add Webhook">
+        <div class="obs-form-group">
+          <label class="obs-label">Name</label>
+          <input class="obs-input" placeholder="Slack Alerts" value={formName}
+            onInput={(e) => setFormName((e.target as HTMLInputElement).value)} />
+        </div>
+        <div class="obs-form-group">
+          <label class="obs-label">Type</label>
+          <select class="obs-select" value={formType}
+            onChange={(e) => setFormType((e.target as HTMLSelectElement).value)}>
+            <option value="http">HTTP</option>
+            <option value="slack">Slack</option>
+          </select>
+        </div>
+        <div class="obs-form-group">
+          <label class="obs-label">URL</label>
+          <input class="obs-input" placeholder="https://hooks.slack.com/..." value={formUrl}
+            onInput={(e) => setFormUrl((e.target as HTMLInputElement).value)} />
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "8px" }}>
+          <button class="obs-btn" onClick={() => setShowCreate(false)}>Cancel</button>
+          <button class="obs-btn obs-btn--primary" onClick={handleCreate}
+            disabled={creating || !formName.trim() || !formUrl.trim()}>
+            {creating ? "Creating..." : "Create"}
+          </button>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+// ─── Users ───
+
+function UsersSection() {
+  const [users, setUsers] = useState<User[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showCreate, setShowCreate] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [formUsername, setFormUsername] = useState("");
+  const [formPassword, setFormPassword] = useState("");
+  const [formRole, setFormRole] = useState("viewer");
+
+  const refresh = async () => {
+    const data = await settingsApi.users();
+    setUsers(data || []);
+  };
+
+  useEffect(() => {
+    setLoading(true);
+    refresh().finally(() => setLoading(false));
+  }, []);
+
+  const handleCreate = async () => {
+    if (!formUsername.trim() || !formPassword.trim()) return;
+    setCreating(true);
+    try {
+      await settingsApi.createUser({ username: formUsername.trim(), password: formPassword.trim(), role: formRole });
+      setShowCreate(false);
+      setFormUsername(""); setFormPassword(""); setFormRole("viewer");
+      await refresh();
+    } catch (err) { console.error("Failed to create user:", err); }
+    finally { setCreating(false); }
+  };
+
+  const handleRoleChange = async (userId: string, newRole: string) => {
+    try {
+      await settingsApi.updateRole(userId, newRole);
+      setUsers(prev => prev.map(u => u.user_id === userId ? { ...u, role: newRole } : u));
+    } catch (err) { console.error("Failed to update role:", err); }
+  };
+
+  return (
+    <div class="settings-section">
+      <div class="settings-section-header">
+        <h2 class="settings-section-title">Users</h2>
+        <button class="obs-btn obs-btn--primary obs-btn--sm" onClick={() => setShowCreate(true)}>Add User</button>
+      </div>
+
+      {loading ? <SettingsSkeleton /> : users.length === 0 ? (
+        <div class="obs-empty-state">No users found</div>
+      ) : (
+        <div class="settings-list">
+          {users.map(u => (
+            <div key={u.user_id} class="settings-row">
+              <span class="settings-row-name">{u.username}</span>
+              {u.email && <span class="settings-row-value">{u.email}</span>}
+              <select class="obs-select" value={u.role} style={{ width: "100px", padding: "4px 8px", fontSize: "12px" }}
+                onChange={(e) => handleRoleChange(u.user_id, (e.target as HTMLSelectElement).value)}>
+                <option value="viewer">Viewer</option>
+                <option value="editor">Editor</option>
+                <option value="admin">Admin</option>
+              </select>
+              <span class="settings-row-date">{formatDate(u.created_at)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <Modal open={showCreate} onClose={() => setShowCreate(false)} title="Add User">
+        <div class="obs-form-group">
+          <label class="obs-label">Username</label>
+          <input class="obs-input" placeholder="jane" value={formUsername}
+            onInput={(e) => setFormUsername((e.target as HTMLInputElement).value)} />
+        </div>
+        <div class="obs-form-group">
+          <label class="obs-label">Password</label>
+          <input class="obs-input" type="password" placeholder="Password" value={formPassword}
+            onInput={(e) => setFormPassword((e.target as HTMLInputElement).value)} />
+        </div>
+        <div class="obs-form-group">
+          <label class="obs-label">Role</label>
+          <select class="obs-select" value={formRole}
+            onChange={(e) => setFormRole((e.target as HTMLSelectElement).value)}>
+            <option value="viewer">Viewer</option>
+            <option value="editor">Editor</option>
+            <option value="admin">Admin</option>
+          </select>
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "8px" }}>
+          <button class="obs-btn" onClick={() => setShowCreate(false)}>Cancel</button>
+          <button class="obs-btn obs-btn--primary" onClick={handleCreate}
+            disabled={creating || !formUsername.trim() || !formPassword.trim()}>
+            {creating ? "Creating..." : "Create"}
+          </button>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+// ─── Main ───
 
 export default function SettingsPage() {
   return (
@@ -6,7 +389,9 @@ export default function SettingsPage() {
       <div class="obs-page-header">
         <h1 class="obs-page-title">Settings</h1>
       </div>
-      <div class="obs-empty-state">Coming soon</div>
+      <SitesSection />
+      <WebhooksSection />
+      <UsersSection />
     </div>
   );
 }
