@@ -1,5 +1,44 @@
 # Teploy Observe — Master Plan
 
+## Status as of 2026-04-15
+
+The original phase order (Phase 1 analytics → Phase 5 alerting) no longer reflects reality.
+Backend for most later phases has shipped; the checklists below are historical context, not
+a work plan. Current shipped state:
+
+**Shipped (backend + UI wiring):**
+- Analytics v0.1 (pageviews, sessions, visitors, breakdowns, real-time, live stream)
+- Error tracking (issues, events, status mgmt, FTS search, release health)
+- APM / tracing (OTLP ingest, services + RED metrics, operations, waterfall, service deps, trace→error correlation)
+- Logs (ingestion, search, stats by level)
+- Feature flags (CRUD, toggle, targeting rules, multivariate variants, evaluate)
+- Experiments (CRUD, start/stop, results with chi-squared significance)
+- Monitoring (uptime monitors, cron monitors, infra host metrics)
+- Platform: alerts (rules, history, webhook fire), webhooks, users + roles, share links, sites, API keys
+- SSO (SAML), SQL explorer, saved views, reports, groups, surveys, feedback, LLM observability, session replay
+
+**Known gaps (carried forward from Phase 1-5):**
+- Bounce rate + visit duration in hourly/daily rollups (still hardcoded 0)
+- HyperLogLog for rollup visitor counts (still using distinct count)
+- bcrypt password hashing (still SHA-256)
+- Rate limiting + input validation on ingest endpoints
+- Session browser + activity timeline UI
+- Funnels, retention cohorts
+- Custom event property drill-down UI
+- Data export (CSV/JSON)
+- Source map support for error stack traces
+- Alert metrics beyond count/rate (p95/p99 latency — needs APM query layer)
+- OTLP gRPC ingestion
+- Metrics ingestion (OTLP metrics)
+
+**Architecture debt:**
+- `alerts.go`, `tracing/query.go`, `errors/issues.go`, `logs/logs.go`, `flags/flags.go`,
+  `experiments/experiments.go` now separate DB scan rows from typed domain structs.
+- `platform/webhooks.go` and `platform/users.go` still use the old stringly-typed pattern —
+  fix when touching that code next.
+
+---
+
 **Goal:** Build the best self-hostable observability tool — beating PostHog, Umami, Sentry,
 and SignOz on simplicity, data quality, performance, and cross-signal correlation.
 
