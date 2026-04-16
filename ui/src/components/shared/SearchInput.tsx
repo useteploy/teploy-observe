@@ -1,3 +1,5 @@
+import { useRef, useCallback } from "preact/hooks";
+
 interface Props {
   value: string;
   onInput: (value: string) => void;
@@ -6,6 +8,20 @@ interface Props {
 }
 
 export default function SearchInput({ value, onInput, placeholder = "Search...", onSubmit }: Props) {
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleInput = useCallback((e: Event) => {
+    const val = (e.target as HTMLInputElement).value;
+    onInput(val);
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => onSubmit?.(), 300);
+  }, [onInput, onSubmit]);
+
+  const handleClear = () => {
+    onInput("");
+    onSubmit?.();
+  };
+
   return (
     <div class="obs-search-input-wrap">
       <svg class="obs-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
@@ -16,9 +32,16 @@ export default function SearchInput({ value, onInput, placeholder = "Search...",
         class="obs-search-input"
         value={value}
         placeholder={placeholder}
-        onInput={(e) => onInput((e.target as HTMLInputElement).value)}
+        onInput={handleInput}
         onKeyDown={(e) => e.key === "Enter" && onSubmit?.()}
       />
+      {value && (
+        <button class="obs-search-clear" onClick={handleClear} aria-label="Clear search" type="button">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+          </svg>
+        </button>
+      )}
     </div>
   );
 }

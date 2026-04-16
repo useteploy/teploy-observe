@@ -142,6 +142,34 @@
   font-size: 12px; color: var(--obs-text-secondary); font-variant-numeric: tabular-nums;
 }
 
+/* Code block copy */
+.obs-code-block-wrap { position: relative; }
+.obs-code-copy {
+  position: absolute; top: 8px; right: 8px; z-index: 1;
+  padding: 3px 8px; font-size: 10px; font-weight: 600;
+  background: var(--obs-surface-hover); color: var(--obs-text-secondary);
+  border: 1px solid var(--obs-border); border-radius: var(--obs-radius-sm);
+  cursor: pointer; text-transform: uppercase; letter-spacing: 0.3px;
+  transition: all var(--obs-transition);
+}
+.obs-code-copy:hover { background: var(--obs-border); color: var(--obs-text); }
+
+/* Search clear button */
+.obs-search-clear {
+  position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+  background: none; border: none; color: var(--obs-text-muted); cursor: pointer;
+  padding: 4px; border-radius: var(--obs-radius-sm); display: flex; align-items: center;
+}
+.obs-search-clear:hover { color: var(--obs-text); background: var(--obs-surface-hover); }
+
+/* Focus styles */
+.obs-btn:focus-visible, .obs-tab:focus-visible, .obs-select:focus-visible,
+.obs-input:focus-visible, .obs-sidebar-link:focus-visible {
+  outline: 2px solid var(--obs-accent);
+  outline-offset: 2px;
+}
+button:focus-visible { outline: 2px solid var(--obs-accent); outline-offset: 2px; }
+
 /* Toast notifications */
 .obs-toast-container {
   position: fixed; bottom: 20px; right: 20px; z-index: 9999;

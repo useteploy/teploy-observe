@@ -40,7 +40,7 @@ export function ToastProvider({ children }: { children: ComponentChildren }) {
       {toasts.length > 0 && (
         <div class="obs-toast-container">
           {toasts.map(t => (
-            <div key={t.id} class={`obs-toast obs-toast--${t.type}`}
+            <div key={t.id} class={`obs-toast obs-toast--${t.type}`} role="alert"
               onClick={() => setToasts(prev => prev.filter(x => x.id !== t.id))}>
               {t.message}
             </div>
