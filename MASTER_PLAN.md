@@ -33,18 +33,22 @@ a work plan. Current shipped state:
 - SQL Explorer page (/explorer) with table sidebar, results grid, Ctrl+Enter
 - Custom Dashboards page (/dashboards) with CRUD, panel builder, 12-col grid
 - Service dependency graph SVG in traces page
+- Custom event property drill-down (click event to see key/value breakdown)
+- API key management in settings (list + revoke with confirmation)
+- Onboarding guide (empty dashboard shows tracker/SDK snippets)
+- Light theme toggle with localStorage persistence
+- Responsive design (mobile sidebar collapse, grid stacking, modal sizing)
 
 **Known gaps:**
 - HyperLogLog for rollup visitor counts (still using distinct count)
-- Custom event property drill-down UI
 - Source map support for error stack traces (backend stores, no resolution UI)
 - Alert metrics: p95/p99 latency (needs APM query layer integration)
 - OTLP gRPC ingestion (HTTP/JSON works)
 - Metrics ingestion (OTLP metrics — re-evaluate TimeSeries model)
 - Full DOM session replay player (event timeline exists, playback needs rrweb)
-- UI routes for: custom dashboards, reports, surveys, integrations, link tracking, SSO config
-- Light theme toggle (dark-only currently)
+- UI routes for: reports, surveys, integrations, link tracking, SSO config
 - Audit logs for admin actions
+- Webhook request signing (HMAC-SHA256)
 
 **Architecture debt:**
 - `alerts.go`, `tracing/query.go`, `errors/issues.go`, `logs/logs.go`, `flags/flags.go`,
