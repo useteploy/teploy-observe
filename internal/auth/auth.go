@@ -124,6 +124,29 @@ func (s *AuthService) HasAdminUsers(ctx context.Context) bool {
 	return len(rows) > 0 && rows[0].Count > 0
 }
 
+// ChangePassword updates the password for the given user ID.
+func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPassword, newPassword string) error {
+	user, err := nucleus.QueryOne[adminUserRow](ctx, s.db.SQL(),
+		"SELECT id, username, password_hash, created_at FROM admin_users WHERE id = $1", userID,
+	)
+	if err != nil {
+		return fmt.Errorf("user not found")
+	}
+	if !checkPassword(currentPassword, user.PasswordHash) {
+		return fmt.Errorf("current password is incorrect")
+	}
+	if len(newPassword) < 8 {
+		return fmt.Errorf("new password must be at least 8 characters")
+	}
+	newHash := hashPassword(newPassword)
+	now := dbutil.IntParam(time.Now().UnixMilli())
+	_, err = s.db.SQL().Exec(ctx,
+		"INSERT INTO admin_users (id, username, password_hash, created_at) VALUES ($1, $2, $3, $4)",
+		user.ID, user.Username, newHash, now,
+	)
+	return err
+}
+
 func hashPassword(password string) string {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
