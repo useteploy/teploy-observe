@@ -412,6 +412,80 @@ function UsersSection() {
   );
 }
 
+// ─── Password ───
+
+function PasswordSection() {
+  const [currentPw, setCurrentPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [confirmPw, setConfirmPw] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<{ type: "ok" | "error"; text: string } | null>(null);
+
+  const handleChange = async () => {
+    if (!currentPw || !newPw) return;
+    if (newPw !== confirmPw) {
+      setMessage({ type: "error", text: "New passwords do not match" });
+      return;
+    }
+    if (newPw.length < 8) {
+      setMessage({ type: "error", text: "New password must be at least 8 characters" });
+      return;
+    }
+    setSaving(true);
+    setMessage(null);
+    try {
+      const token = localStorage.getItem("obs_token");
+      const res = await fetch("/api/v1/auth/password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ current_password: currentPw, new_password: newPw }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.error || `Error ${res.status}`);
+      }
+      setCurrentPw(""); setNewPw(""); setConfirmPw("");
+      setMessage({ type: "ok", text: "Password changed successfully" });
+    } catch (err: any) {
+      setMessage({ type: "error", text: err.message || "Failed to change password" });
+    } finally { setSaving(false); }
+  };
+
+  return (
+    <div class="settings-section">
+      <div class="settings-section-header">
+        <h2 class="settings-section-title">Change Password</h2>
+      </div>
+      <div style={{ maxWidth: "400px" }}>
+        <div class="obs-form-group">
+          <label class="obs-label">Current Password</label>
+          <input class="obs-input" type="password" value={currentPw}
+            onInput={(e) => setCurrentPw((e.target as HTMLInputElement).value)} />
+        </div>
+        <div class="obs-form-group">
+          <label class="obs-label">New Password</label>
+          <input class="obs-input" type="password" value={newPw}
+            onInput={(e) => setNewPw((e.target as HTMLInputElement).value)} />
+        </div>
+        <div class="obs-form-group">
+          <label class="obs-label">Confirm New Password</label>
+          <input class="obs-input" type="password" value={confirmPw}
+            onInput={(e) => setConfirmPw((e.target as HTMLInputElement).value)} />
+        </div>
+        {message && (
+          <div style={{ fontSize: "12px", marginBottom: "12px", color: message.type === "ok" ? "var(--obs-success)" : "var(--obs-danger)" }}>
+            {message.text}
+          </div>
+        )}
+        <button class="obs-btn obs-btn--primary" onClick={handleChange}
+          disabled={saving || !currentPw || !newPw || !confirmPw}>
+          {saving ? "Saving..." : "Change Password"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main ───
 
 export default function SettingsPage() {
@@ -423,6 +497,7 @@ export default function SettingsPage() {
       <SitesSection />
       <WebhooksSection />
       <UsersSection />
+      <PasswordSection />
     </div>
   );
 }
