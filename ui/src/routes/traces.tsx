@@ -131,6 +131,18 @@ function TraceWaterfall({ spans, traceId, siteId }: { spans: Span[]; traceId: st
   const maxEnd = Math.max(...flat.map(s => new Date(s.end_time).getTime()));
   const totalDuration = maxEnd - minStart || 1;
 
+  // Calculate duration percentiles for color coding
+  const sortedDurations = [...flat.map(s => s.duration_ms)].sort((a, b) => a - b);
+  const p50 = sortedDurations[Math.floor(sortedDurations.length * 0.5)] || 0;
+  const p95 = sortedDurations[Math.floor(sortedDurations.length * 0.95)] || 0;
+
+  const spanBarClass = (durationMs: number, isError: boolean): string => {
+    if (isError) return "traces-span-bar--error";
+    if (durationMs > p95) return "traces-span-bar--slow";
+    if (durationMs > p50) return "traces-span-bar--mid";
+    return "traces-span-bar--ok";
+  };
+
   const selected = selectedSpanId ? flat.find(s => s.span_id === selectedSpanId) : null;
   const selectedAttrs = selected ? tryParseJson(selected.attributes) : null;
   const selectedResource = selected ? tryParseJson(selected.resource) : null;
@@ -175,7 +187,7 @@ function TraceWaterfall({ spans, traceId, siteId }: { spans: Span[]; traceId: st
               <div class="traces-span-operation">{span.operation_name}</div>
               <div class="traces-span-timeline">
                 <div
-                  class={`traces-span-bar ${isError ? "traces-span-bar--error" : "traces-span-bar--ok"}`}
+                  class={`traces-span-bar ${spanBarClass(span.duration_ms, isError)}`}
                   style={{ left: `${left}%`, width: `${width}%` }}
                 />
                 <span class="traces-span-duration">{formatDuration(span.duration_ms)}</span>

@@ -17,6 +17,8 @@ export default function ExplorerPage() {
   const [result, setResult] = useState<QueryResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  const [sortCol, setSortCol] = useState<string | null>(null);
+  const [sortAsc, setSortAsc] = useState(true);
 
   useEffect(() => {
     get<string[]>("/api/v1/query/tables")
@@ -110,12 +112,24 @@ export default function ExplorerPage() {
                 <thead>
                   <tr>
                     {result.columns.map(col => (
-                      <th key={col}>{col}</th>
+                      <th key={col} style={{ cursor: "pointer", userSelect: "none" }}
+                        onClick={() => {
+                          if (sortCol === col) { setSortAsc(!sortAsc); }
+                          else { setSortCol(col); setSortAsc(true); }
+                        }}>
+                        {col} {sortCol === col ? (sortAsc ? " ^" : " v") : ""}
+                      </th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {result.rows.map((row, i) => (
+                  {[...result.rows].sort((a, b) => {
+                    if (!sortCol) return 0;
+                    const av = formatValue(a[sortCol]);
+                    const bv = formatValue(b[sortCol]);
+                    const cmp = av.localeCompare(bv, undefined, { numeric: true });
+                    return sortAsc ? cmp : -cmp;
+                  }).map((row, i) => (
                     <tr key={i}>
                       {result.columns.map(col => (
                         <td key={col} title={formatValue(row[col])}>

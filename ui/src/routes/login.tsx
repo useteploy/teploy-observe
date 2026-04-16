@@ -25,6 +25,14 @@ export default function LoginPage() {
   return (
     <div class="obs-login-page">
       <form class="obs-login-form" onSubmit={handleSubmit}>
+        <div style={{ display: "flex", justifyContent: "center", marginBottom: "16px" }}>
+          <div style={{
+            width: "48px", height: "48px", borderRadius: "12px",
+            background: "linear-gradient(135deg, var(--obs-accent), #a78bfa)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: "22px", fontWeight: 800, color: "#fff",
+          }}>O</div>
+        </div>
         <h1 class="obs-login-title">Observe</h1>
         <p class="obs-login-subtitle">Sign in to your dashboard</p>
 
@@ -54,14 +62,24 @@ export default function LoginPage() {
         </label>
 
         <button type="submit" class="obs-login-button" disabled={loading}>
-          {loading ? "Signing in..." : "Sign in"}
+          {loading ? (
+            <span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style={{ animation: "spin 1s linear infinite" }}>
+                <path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z" />
+              </svg>
+              Signing in...
+            </span>
+          ) : "Sign in"}
         </button>
       </form>
 
       <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
         .obs-login-page {
           display: flex; align-items: center; justify-content: center;
-          min-height: 100vh; background: var(--obs-bg);
+          min-height: 100vh;
+          background: var(--obs-bg);
+          background-image: radial-gradient(ellipse at 50% 0%, rgba(99, 102, 241, 0.08) 0%, transparent 60%);
         }
         .obs-login-form {
           width: 100%; max-width: 360px; padding: 32px;

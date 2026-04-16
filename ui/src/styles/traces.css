@@ -205,6 +205,12 @@
 .traces-span-bar--ok {
   background: var(--obs-accent);
 }
+.traces-span-bar--mid {
+  background: var(--obs-warning);
+}
+.traces-span-bar--slow {
+  background: #f97316;
+}
 
 .traces-span-bar--error {
   background: var(--obs-danger);
