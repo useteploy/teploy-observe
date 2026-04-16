@@ -17,19 +17,24 @@ a work plan. Current shipped state:
 - Platform: alerts (rules, history, webhook fire), webhooks, users + roles, share links, sites, API keys
 - SSO (SAML), SQL explorer, saved views, reports, groups, surveys, feedback, LLM observability, session replay
 
+**Recently completed (2026-04-15):**
+- Bounce rate + visit duration: computed from sessions table at query time (NOT in rollups)
+- Session browser UI: list + event timeline at /sessions route
+- Delete confirmations on all destructive actions
+- Pagination (offset-based) on issues, logs, traces, alert history, sessions
+- /healthz endpoint + Docker healthcheck for observe service
+
 **Known gaps (carried forward from Phase 1-5):**
-- Bounce rate + visit duration in hourly/daily rollups (still hardcoded 0)
 - HyperLogLog for rollup visitor counts (still using distinct count)
-- bcrypt password hashing (still SHA-256)
-- Rate limiting + input validation on ingest endpoints
-- Session browser + activity timeline UI
+- bcrypt password hashing (done in auth, but MASTER_PLAN still tracked it)
 - Funnels, retention cohorts
 - Custom event property drill-down UI
-- Data export (CSV/JSON)
+- Data export UI (backend supports CSV/JSON, no UI button)
 - Source map support for error stack traces
 - Alert metrics beyond count/rate (p95/p99 latency — needs APM query layer)
 - OTLP gRPC ingestion
 - Metrics ingestion (OTLP metrics)
+- Full DOM session replay player (event timeline exists, DOM playback needs rrweb)
 
 **Architecture debt:**
 - `alerts.go`, `tracing/query.go`, `errors/issues.go`, `logs/logs.go`, `flags/flags.go`,
