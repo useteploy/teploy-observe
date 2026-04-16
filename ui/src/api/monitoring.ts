@@ -5,29 +5,52 @@ import { get, post } from "./helpers.js";
 const BASE = "/api/v1";
 
 export interface UptimeMonitor {
-  monitor_id: string; site_id: string; name: string;
-  url: string; method: string; expected_status: string;
-  interval_seconds: string; enabled: string; created_at: string;
+  monitor_id: string;
+  site_id: string;
+  name: string;
+  url: string;
+  method: string;
+  expected_status: number;
+  interval_seconds: number;
+  enabled: boolean;
+  created_at: string;
 }
 
 export interface UptimeResult {
-  result_id: string; monitor_id: string; timestamp: string;
-  status_code: string; response_ms: string; is_up: string; error_message: string;
+  result_id: string;
+  monitor_id: string;
+  timestamp: string;
+  status_code: number;
+  response_ms: number;
+  is_up: boolean;
+  error_message: string;
 }
 
 export interface CronMonitor {
-  monitor_id: string; site_id: string; slug: string;
-  name: string; schedule: string; grace_seconds: string;
-  enabled: string; created_at: string;
+  monitor_id: string;
+  site_id: string;
+  slug: string;
+  name: string;
+  schedule: string;
+  grace_seconds: number;
+  enabled: boolean;
+  created_at: string;
 }
 
 export interface InfraHost {
-  host_id: string; hostname: string; last_report: string;
-  cpu_pct: number; memory_pct: number; disk_pct: number;
+  host_id: string;
+  hostname: string;
+  last_report: string;
+  cpu_pct: number;
+  memory_pct: number;
+  disk_pct: number;
 }
 
 export interface InfraMetric {
-  timestamp: string; cpu_pct: number; memory_pct: number; disk_pct: number;
+  timestamp: string;
+  cpu_pct: number;
+  memory_pct: number;
+  disk_pct: number;
 }
 
 export const monitoringApi = {

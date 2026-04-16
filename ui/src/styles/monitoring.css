@@ -270,6 +270,29 @@
   animation: obs-shimmer 1.5s ease-in-out infinite;
 }
 
+/* ─── Status Bar (Statuspage-style) ─── */
+.monitoring-status-bar {
+  display: flex; gap: 2px; margin-bottom: 12px; align-items: center;
+}
+.monitoring-status-bar-item {
+  flex: 1; height: 24px; border-radius: 2px; min-width: 4px;
+  transition: opacity var(--obs-transition); cursor: default;
+}
+.monitoring-status-bar-item--up { background: var(--obs-success); }
+.monitoring-status-bar-item--down { background: var(--obs-danger); }
+.monitoring-status-bar-item:hover { opacity: 0.7; }
+
+/* ─── Response Time Chart ─── */
+.monitoring-response-chart {
+  display: flex; gap: 2px; align-items: flex-end;
+  height: 44px; margin-bottom: 12px;
+  padding: 2px 0; border-bottom: 1px solid var(--obs-border-subtle);
+}
+.monitoring-response-bar {
+  flex: 1; min-width: 3px; border-radius: 1px 1px 0 0;
+  transition: height 0.2s ease;
+}
+
 /* ─── Responsive ─── */
 @media (max-width: 768px) {
   .monitoring-row-meta {

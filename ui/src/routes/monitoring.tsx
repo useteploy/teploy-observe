@@ -86,7 +86,7 @@ function UptimeTab() {
         try {
           const results = await monitoringApi.uptimeResults(m.monitor_id, 50);
           const lastResult = results?.[0];
-          const upCount = (results || []).filter(r => r.is_up === "true" || r.is_up === "1").length;
+          const upCount = (results || []).filter(r => r.is_up).length;
           const uptimePct = results?.length ? (upCount / results.length) * 100 : undefined;
           const responseTimes = (results || []).map(r => Number(r.response_ms)).filter(n => !isNaN(n) && n > 0);
           const avgResponseMs = responseTimes.length ? responseTimes.reduce((a, b) => a + b, 0) / responseTimes.length : undefined;
@@ -135,7 +135,7 @@ function UptimeTab() {
 
   const getStatusClass = (m: MonitorWithStatus) => {
     if (!m.lastResult) return "monitoring-status-dot--unknown";
-    const isUp = m.lastResult.is_up === "true" || m.lastResult.is_up === "1";
+    const isUp = m.lastResult.is_up;
     return isUp ? "monitoring-status-dot--up" : "monitoring-status-dot--down";
   };
 
@@ -184,8 +184,39 @@ function UptimeTab() {
                     <div class="obs-empty-state">No check results yet</div>
                   ) : (
                     <div class="monitoring-results">
-                      {results.slice(0, 30).map(r => {
-                        const isUp = r.is_up === "true" || r.is_up === "1";
+                      {/* Status bar */}
+                      <div class="monitoring-status-bar">
+                        {[...results].reverse().slice(-30).map((r, i) => {
+                          const isUp = r.is_up;
+                          return (
+                            <div key={i}
+                              class={`monitoring-status-bar-item ${isUp ? "monitoring-status-bar-item--up" : "monitoring-status-bar-item--down"}`}
+                              title={`${formatDate(r.timestamp)} - ${isUp ? "UP" : "DOWN"} (${r.response_ms}ms)`}
+                            />
+                          );
+                        })}
+                      </div>
+                      {/* Response time chart */}
+                      <div class="monitoring-response-chart">
+                        {(() => {
+                          const recent = [...results].reverse().slice(-30);
+                          const maxMs = Math.max(...recent.map(r => Number(r.response_ms) || 0), 1);
+                          return recent.map((r, i) => {
+                            const ms = Number(r.response_ms) || 0;
+                            const height = Math.max((ms / maxMs) * 40, 2);
+                            const isUp = r.is_up;
+                            return (
+                              <div key={i} class="monitoring-response-bar"
+                                style={{ height: `${height}px`, background: isUp ? "var(--obs-accent)" : "var(--obs-danger)" }}
+                                title={`${ms}ms`}
+                              />
+                            );
+                          });
+                        })()}
+                      </div>
+                      {/* Result list */}
+                      {results.slice(0, 20).map(r => {
+                        const isUp = r.is_up;
                         return (
                           <div key={r.result_id} class="monitoring-result-row">
                             <span class="monitoring-result-ts">{formatDate(r.timestamp)}</span>
@@ -306,7 +337,7 @@ function CronTab() {
         <div class="monitoring-list">
           {monitors.map(m => (
             <div key={m.monitor_id} class="monitoring-row">
-              <StatusBadge status={m.enabled === "true" || m.enabled === "1" ? "enabled" : "disabled"} size="sm" />
+              <StatusBadge status={m.enabled ? "enabled" : "disabled"} size="sm" />
               <div class="monitoring-row-info">
                 <div class="monitoring-row-name">{m.name}</div>
                 <div class="monitoring-row-url">{m.slug}</div>

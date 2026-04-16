@@ -109,12 +109,30 @@
   white-space: nowrap;
 }
 
+.errors-issue-activity {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+  flex-shrink: 0;
+}
+.errors-activity-dot {
+  width: 6px;
+  height: 18px;
+  border-radius: 2px;
+  background: var(--obs-border-subtle);
+  transition: background var(--obs-transition);
+}
+.errors-activity-dot--active {
+  background: var(--obs-accent);
+}
+
 .errors-issue-meta {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
   gap: 4px;
   flex-shrink: 0;
+  min-width: 70px;
   font-size: 12px;
   color: var(--obs-text-secondary);
   font-variant-numeric: tabular-nums;

@@ -561,16 +561,37 @@ function PasswordSection() {
 // ─── Main ───
 
 export default function SettingsPage() {
+  const [tab, setTab] = useState("sites");
+
+  const tabs = [
+    { key: "sites", label: "Sites" },
+    { key: "webhooks", label: "Webhooks" },
+    { key: "users", label: "Users" },
+    { key: "keys", label: "API Keys" },
+    { key: "password", label: "Password" },
+  ];
+
   return (
     <div>
       <div class="obs-page-header">
         <h1 class="obs-page-title">Settings</h1>
       </div>
-      <SitesSection />
-      <WebhooksSection />
-      <UsersSection />
-      <APIKeysSection />
-      <PasswordSection />
+
+      <div class="obs-tabs-bar" style={{ marginBottom: "20px" }}>
+        {tabs.map(t => (
+          <button key={t.key}
+            class={`obs-tab ${tab === t.key ? "obs-tab--active" : ""}`}
+            onClick={() => setTab(t.key)}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "sites" && <SitesSection />}
+      {tab === "webhooks" && <WebhooksSection />}
+      {tab === "users" && <UsersSection />}
+      {tab === "keys" && <APIKeysSection />}
+      {tab === "password" && <PasswordSection />}
     </div>
   );
 }

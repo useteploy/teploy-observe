@@ -408,19 +408,33 @@ export default function ErrorsPage() {
       ) : (
         <>
           <div class="errors-issue-list">
-            {issues.map(issue => (
-              <div key={issue.issue_id} class="errors-issue-row" onClick={() => setSelectedIssue(issue)}>
-                <StatusBadge status={issue.status} size="sm" />
-                <div class="errors-issue-info">
-                  <div class="errors-issue-title">{issue.title}</div>
-                  <div class="errors-issue-culprit">{issue.culprit}</div>
+            {issues.map(issue => {
+              const firstMs = new Date(issue.first_seen).getTime();
+              const lastMs = new Date(issue.last_seen).getTime();
+              const nowMs = Date.now();
+              const dayMs = 86400000;
+              return (
+                <div key={issue.issue_id} class="errors-issue-row" onClick={() => setSelectedIssue(issue)}>
+                  <StatusBadge status={issue.status} size="sm" />
+                  <div class="errors-issue-info">
+                    <div class="errors-issue-title">{issue.title}</div>
+                    <div class="errors-issue-culprit">{issue.culprit}</div>
+                  </div>
+                  <div class="errors-issue-activity">
+                    {Array.from({ length: 14 }).map((_, i) => {
+                      const dayStart = nowMs - (13 - i) * dayMs;
+                      const dayEnd = dayStart + dayMs;
+                      const active = lastMs >= dayStart && firstMs <= dayEnd;
+                      return <div key={i} class={`errors-activity-dot ${active ? "errors-activity-dot--active" : ""}`} />;
+                    })}
+                  </div>
+                  <div class="errors-issue-meta">
+                    <span class="errors-issue-count">{Number(issue.event_count).toLocaleString()}</span>
+                    <span class="errors-issue-time">{timeAgo(issue.last_seen)}</span>
+                  </div>
                 </div>
-                <div class="errors-issue-meta">
-                  <span class="errors-issue-count">{Number(issue.event_count).toLocaleString()} events</span>
-                  <span class="errors-issue-time">{timeAgo(issue.last_seen)}</span>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
           <Pagination page={page} pageSize={PAGE_SIZE} resultCount={issues.length} onPageChange={(p) => { setPage(p); window.scrollTo(0, 0); }} />
         </>
