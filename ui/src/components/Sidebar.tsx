@@ -3,6 +3,8 @@ import { useState, useEffect } from "preact/hooks";
 const NAV_ITEMS = [
   { key: "analytics", label: "Dashboard", icon: "M3 13h4v8H3v-8zm7-4h4v12h-4V9zm7-6h4v18h-4V3z", href: "/" },
   { key: "dashboards", label: "Dashboards", icon: "M4 6h18V4H4c-1.1 0-2 .9-2 2v11H0v3h14v-3H4V6zm19 2h-6c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h6c.55 0 1-.45 1-1V9c0-.55-.45-1-1-1zm-1 9h-4v-7h4v7z", href: "/dashboards" },
+  { key: "events", label: "Events", icon: "M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z", href: "/events" },
+  { key: "campaigns", label: "Campaigns", icon: "M17.5 2h-11C5.67 2 5 2.67 5 3.5V22l7-3 7 3V3.5c0-.83-.67-1.5-1.5-1.5zM17 19l-5-2.18L7 19V4h10v15z", href: "/campaigns" },
   { key: "insights", label: "Insights", icon: "M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 14H5v-2h7v2zm5-4H5v-2h12v2zm0-4H5V7h12v2z", href: "/insights" },
   { key: "errors", label: "Errors", icon: "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z", href: "/errors" },
   { key: "traces", label: "Traces", icon: "M3 4h18v2H3V4zm0 7h18v2H3v-2zm0 7h18v2H3v-2z", href: "/traces" },

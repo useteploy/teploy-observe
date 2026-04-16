@@ -1,10 +1,20 @@
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { replaysApi } from "../api/replays.js";
 import type { ReplaySession, ReplayEvent } from "../api/replays.js";
+import { get } from "../api/helpers.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
 import Pagination from "../components/shared/Pagination.js";
 import "../styles/sessions.css";
+
+interface SessionEvent {
+  event_id: string;
+  event_type: string;
+  url: string;
+  pathname: string;
+  title: string;
+  timestamp: number;
+}
 
 export const config = { mode: "app" };
 
@@ -53,16 +63,20 @@ function SessionsSkeleton() {
 
 function SessionDetail({ session, onBack }: { session: ReplaySession; onBack: () => void }) {
   const [events, setEvents] = useState<ReplayEvent[]>([]);
+  const [pageviews, setPageviews] = useState<SessionEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   useEffect(() => {
     setLoading(true);
-    replaysApi.events(session.replay_id)
-      .then(e => setEvents(e || []))
-      .catch(() => setEvents([]))
-      .finally(() => setLoading(false));
-  }, [session.replay_id]);
+    Promise.all([
+      replaysApi.events(session.replay_id).catch(() => []),
+      get<SessionEvent[]>(`/api/v1/stats/sessions/${session.session_id}?site_id=${session.site_id}`).catch(() => []),
+    ]).then(([replayEvents, sessionEvents]) => {
+      setEvents(replayEvents || []);
+      setPageviews(sessionEvents || []);
+    }).finally(() => setLoading(false));
+  }, [session.replay_id, session.session_id, session.site_id]);
 
   const tryParseData = (raw: string): string | null => {
     if (!raw || raw === "{}" || raw === "null") return null;
@@ -111,35 +125,71 @@ function SessionDetail({ session, onBack }: { session: ReplaySession; onBack: ()
 
       {loading ? (
         <SessionsSkeleton />
-      ) : events.length === 0 ? (
+      ) : events.length === 0 && pageviews.length === 0 ? (
         <div class="obs-empty-state">No events recorded for this session</div>
       ) : (
-        <div>
-          <div style={{ fontSize: "13px", color: "var(--obs-text-secondary)", marginBottom: "12px" }}>
-            {events.length} events
-          </div>
-          <div class="sessions-timeline">
-            {events.map(ev => {
-              const parsed = tryParseData(ev.data);
-              const isExpanded = expandedId === ev.event_id;
-              return (
-                <div key={ev.event_id} class={`sessions-event ${eventClass(ev.event_type)}`}>
-                  <div class="sessions-event-header"
-                    style={{ cursor: parsed ? "pointer" : "default" }}
-                    onClick={() => parsed && setExpandedId(isExpanded ? null : ev.event_id)}>
-                    <span class="sessions-event-time">{formatTime(ev.timestamp)}</span>
-                    <span class="sessions-event-type">{ev.event_type}</span>
-                  </div>
-                  {isExpanded && parsed && (
-                    <div class="sessions-event-data">
-                      <CodeBlock code={parsed} maxHeight="200px" />
+        <>
+          {/* Pageview journey — human-readable navigation flow */}
+          {pageviews.length > 0 && (
+            <div style={{ marginBottom: "20px" }}>
+              <h2 style={{ fontSize: "13px", fontWeight: 600, color: "var(--obs-text)", marginBottom: "12px" }}>
+                Journey ({pageviews.length} event{pageviews.length !== 1 ? "s" : ""})
+              </h2>
+              <div class="sessions-timeline">
+                {pageviews.map((pv, i) => {
+                  const prev = i > 0 ? pageviews[i - 1].timestamp : pv.timestamp;
+                  const delta = pv.timestamp - prev;
+                  const deltaStr = i === 0 ? "start" : delta < 1000 ? `+${delta}ms` : delta < 60000 ? `+${Math.round(delta / 1000)}s` : `+${Math.round(delta / 60000)}m`;
+                  return (
+                    <div key={pv.event_id} class={`sessions-event sessions-event--${pv.event_type}`}>
+                      <div class="sessions-event-header">
+                        <span class="sessions-event-time">{formatTime(new Date(pv.timestamp).toISOString())}</span>
+                        <span class="sessions-event-type">{pv.event_type}</span>
+                        <span style={{ fontSize: "10px", color: "var(--obs-text-muted)" }}>{deltaStr}</span>
+                      </div>
+                      <div style={{ marginTop: "4px", fontSize: "13px", color: "var(--obs-text)" }}>
+                        {pv.title && <div style={{ fontWeight: 500 }}>{pv.title}</div>}
+                        <div style={{ fontSize: "11px", color: "var(--obs-text-muted)", fontFamily: "var(--obs-font-mono, monospace)" }}>
+                          {pv.pathname || pv.url}
+                        </div>
+                      </div>
                     </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Replay events (clicks, scrolls, mutations) */}
+          {events.length > 0 && (
+            <div>
+              <h2 style={{ fontSize: "13px", fontWeight: 600, color: "var(--obs-text)", marginBottom: "12px" }}>
+                Replay Events ({events.length})
+              </h2>
+              <div class="sessions-timeline">
+                {events.map(ev => {
+                  const parsed = tryParseData(ev.data);
+                  const isExpanded = expandedId === ev.event_id;
+                  return (
+                    <div key={ev.event_id} class={`sessions-event ${eventClass(ev.event_type)}`}>
+                      <div class="sessions-event-header"
+                        style={{ cursor: parsed ? "pointer" : "default" }}
+                        onClick={() => parsed && setExpandedId(isExpanded ? null : ev.event_id)}>
+                        <span class="sessions-event-time">{formatTime(ev.timestamp)}</span>
+                        <span class="sessions-event-type">{ev.event_type}</span>
+                      </div>
+                      {isExpanded && parsed && (
+                        <div class="sessions-event-data">
+                          <CodeBlock code={parsed} maxHeight="200px" />
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </>
       )}
     </div>
   );

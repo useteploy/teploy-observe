@@ -7,6 +7,7 @@ import FilterBar from "./FilterBar.js";
 import TabbedBreakdownPanel from "./TabbedBreakdownPanel.js";
 import CustomEventsPanel from "./CustomEventsPanel.js";
 import OnboardingGuide from "./OnboardingGuide.js";
+import WorldMapPanel from "./WorldMapPanel.js";
 import "../styles/dashboard.css";
 
 function ExportButton() {
@@ -95,6 +96,8 @@ function DashboardInner() {
           ]}
         />
       </div>
+
+      <WorldMapPanel />
 
       <CustomEventsPanel />
     </div>
