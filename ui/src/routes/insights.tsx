@@ -87,23 +87,43 @@ function FunnelsPanel({ siteId, from, to }: { siteId: string; from: string; to: 
       {loading ? <InsightsSkeleton /> : analyzed && results.length === 0 ? (
         <div class="obs-empty-state">No data for this funnel</div>
       ) : results.length > 0 ? (
-        <div class="funnel-steps">
-          {results.map((r, i) => (
-            <div class="funnel-step" key={i}>
-              <div class="funnel-step-number">{i + 1}</div>
-              <div class="funnel-step-info">
-                <div class="funnel-step-name">{r.step.value}</div>
-                <div class="funnel-step-meta">
-                  {r.visitors.toLocaleString()} visitors
-                  {r.drop_off > 0 && <span class="funnel-step-drop">-{r.drop_off.toFixed(1)}% drop</span>}
-                </div>
-              </div>
-              <div class="funnel-step-bar-bg">
-                <div class="funnel-step-bar" style={{ width: `${maxVisitors > 0 ? (r.visitors / maxVisitors) * 100 : 0}%` }} />
-              </div>
-              <div class="funnel-step-pct">{r.conversion.toFixed(1)}%</div>
-            </div>
-          ))}
+        <div>
+          {/* SVG funnel shape */}
+          <svg width="100%" height={results.length * 80 + 20} viewBox={`0 0 600 ${results.length * 80 + 20}`} style={{ display: "block", marginBottom: "16px" }}>
+            {results.map((r, i) => {
+              const pct = maxVisitors > 0 ? r.visitors / maxVisitors : 0;
+              const nextPct = i < results.length - 1 && maxVisitors > 0
+                ? results[i + 1].visitors / maxVisitors : pct * 0.8;
+              const topW = Math.max(pct * 500, 40);
+              const botW = Math.max(nextPct * 500, 30);
+              const cx = 300;
+              const y = i * 80 + 10;
+              const h = 60;
+              const opacity = 1 - (i * 0.12);
+
+              return (
+                <g key={i}>
+                  <polygon
+                    points={`${cx - topW / 2},${y} ${cx + topW / 2},${y} ${cx + botW / 2},${y + h} ${cx - botW / 2},${y + h}`}
+                    fill="var(--obs-accent)"
+                    opacity={opacity}
+                    rx="4"
+                  />
+                  <text x={cx} y={y + 24} textAnchor="middle" fill="#fff" fontSize="14" fontWeight="700">
+                    {r.conversion.toFixed(1)}%
+                  </text>
+                  <text x={cx} y={y + 42} textAnchor="middle" fill="rgba(255,255,255,0.7)" fontSize="11">
+                    {r.visitors.toLocaleString()} - {r.step.value}
+                  </text>
+                  {r.drop_off > 0 && (
+                    <text x={cx + topW / 2 + 12} y={y + 35} fill="var(--obs-danger)" fontSize="11" fontWeight="600">
+                      -{r.drop_off.toFixed(1)}%
+                    </text>
+                  )}
+                </g>
+              );
+            })}
+          </svg>
         </div>
       ) : null}
     </div>
@@ -130,11 +150,10 @@ function RetentionPanel({ siteId, from, to }: { siteId: string; from: string; to
   const maxPeriods = Math.max(...cohorts.map(c => c.periods.length));
 
   const cellColor = (pct: number): string => {
-    if (pct >= 80) return "rgba(34, 197, 94, 0.3)";
-    if (pct >= 60) return "rgba(34, 197, 94, 0.2)";
-    if (pct >= 40) return "rgba(34, 197, 94, 0.12)";
-    if (pct >= 20) return "rgba(34, 197, 94, 0.06)";
-    return "transparent";
+    if (pct <= 0) return "transparent";
+    // Smooth 10-step gradient
+    const alpha = Math.min(0.4, (pct / 100) * 0.45 + 0.02);
+    return `rgba(34, 197, 94, ${alpha.toFixed(3)})`;
   };
 
   return (
@@ -217,12 +236,18 @@ function JourneysPanel({ siteId, from, to }: { siteId: string; from: string; to:
           </h3>
           {data.top_paths.slice(0, 15).map((p, i) => (
             <div class="journey-path" key={i}>
-              {p.path.map((step, j) => (
-                <span key={j}>
-                  {j > 0 && <span class="journey-path-sep"> &gt; </span>}
-                  <span class="journey-path-step">{step}</span>
-                </span>
-              ))}
+              <div class="journey-path-chain">
+                {p.path.map((step, j) => (
+                  <span key={j} class="journey-path-node-wrap">
+                    {j > 0 && (
+                      <svg width="16" height="12" viewBox="0 0 16 12" class="journey-path-arrow">
+                        <path d="M0 6h12M9 2l4 4-4 4" stroke="var(--obs-text-muted)" strokeWidth="1.5" fill="none" />
+                      </svg>
+                    )}
+                    <span class="journey-path-node">{step}</span>
+                  </span>
+                ))}
+              </div>
               <span class="journey-path-count">{p.count.toLocaleString()}</span>
             </div>
           ))}

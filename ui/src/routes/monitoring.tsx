@@ -167,10 +167,12 @@ function UptimeTab() {
                     <span class="monitoring-row-response">{Math.round(m.avgResponseMs)}ms avg</span>
                   )}
                   {m.uptimePct !== undefined && (
-                    <span class="monitoring-row-response" style={{
-                      color: m.uptimePct >= 99.9 ? "var(--obs-success)" : m.uptimePct >= 99 ? "var(--obs-warning)" : "var(--obs-danger)"
+                    <span style={{
+                      padding: "2px 8px", borderRadius: "var(--obs-radius-full)", fontSize: "11px", fontWeight: 700,
+                      background: m.uptimePct >= 99.9 ? "rgba(34,197,94,0.1)" : m.uptimePct >= 99 ? "rgba(245,158,11,0.1)" : "rgba(239,68,68,0.1)",
+                      color: m.uptimePct >= 99.9 ? "var(--obs-success)" : m.uptimePct >= 99 ? "var(--obs-warning)" : "var(--obs-danger)",
                     }}>
-                      {m.uptimePct.toFixed(1)}%
+                      {m.uptimePct.toFixed(2)}% SLA
                     </span>
                   )}
                   <span class="monitoring-row-interval">every {formatInterval(m.interval_seconds)}</span>

@@ -69,12 +69,13 @@
 /* ─── Issue Row ─── */
 .errors-issue-row {
   display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  padding: 14px 16px;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
   border-bottom: 1px solid var(--obs-border-subtle);
   cursor: pointer;
   transition: background var(--obs-transition);
+  min-height: 44px;
 }
 
 .errors-issue-row:hover {

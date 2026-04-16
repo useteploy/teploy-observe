@@ -69,9 +69,17 @@
   display: flex; align-items: center; gap: 6px; padding: 8px 0; font-size: 12px;
   border-bottom: 1px solid var(--obs-border-subtle);
 }
-.journey-path-step { color: var(--obs-text); }
-.journey-path-sep { color: var(--obs-text-muted); }
-.journey-path-count { margin-left: auto; color: var(--obs-text-secondary); font-variant-numeric: tabular-nums; }
+.journey-path-chain {
+  display: flex; align-items: center; gap: 0; flex-wrap: wrap; flex: 1;
+}
+.journey-path-node-wrap { display: flex; align-items: center; gap: 0; }
+.journey-path-node {
+  display: inline-block; padding: 3px 10px; font-size: 12px;
+  background: var(--obs-surface); border: 1px solid var(--obs-border-subtle);
+  border-radius: var(--obs-radius); color: var(--obs-text); white-space: nowrap;
+}
+.journey-path-arrow { flex-shrink: 0; margin: 0 2px; }
+.journey-path-count { margin-left: auto; color: var(--obs-text-secondary); font-variant-numeric: tabular-nums; flex-shrink: 0; }
 
 /* Goals */
 .goals-list { display: flex; flex-direction: column; gap: 8px; }
