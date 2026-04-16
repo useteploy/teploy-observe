@@ -1,0 +1,114 @@
+/* Insights page styles — funnels, retention, journeys, goals */
+
+.insights-toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+
+/* Funnel */
+.funnel-steps { display: flex; flex-direction: column; gap: 1px; margin-bottom: 16px; }
+.funnel-step {
+  display: flex; align-items: center; gap: 16px; padding: 14px 16px;
+  background: var(--obs-surface); position: relative;
+}
+.funnel-step:first-child { border-radius: var(--obs-radius-md) var(--obs-radius-md) 0 0; }
+.funnel-step:last-child { border-radius: 0 0 var(--obs-radius-md) var(--obs-radius-md); }
+.funnel-step-number {
+  width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700; background: var(--obs-accent); color: #fff; flex-shrink: 0;
+}
+.funnel-step-info { flex: 1; }
+.funnel-step-name { font-size: 13px; font-weight: 500; color: var(--obs-text); }
+.funnel-step-meta { font-size: 12px; color: var(--obs-text-secondary); margin-top: 2px; }
+.funnel-step-bar-bg {
+  flex: 2; height: 24px; background: var(--obs-surface-hover); border-radius: var(--obs-radius); overflow: hidden;
+}
+.funnel-step-bar {
+  height: 100%; background: var(--obs-accent); border-radius: var(--obs-radius);
+  transition: width 0.4s ease;
+}
+.funnel-step-pct {
+  width: 80px; text-align: right; font-size: 14px; font-weight: 600; color: var(--obs-text);
+  font-variant-numeric: tabular-nums;
+}
+.funnel-step-drop {
+  font-size: 11px; color: var(--obs-danger); margin-left: 4px;
+}
+.funnel-builder { margin-bottom: 20px; }
+.funnel-builder-row {
+  display: flex; gap: 8px; align-items: center; margin-bottom: 8px;
+}
+
+/* Retention grid */
+.retention-grid { overflow-x: auto; }
+.retention-table {
+  width: 100%; border-collapse: collapse; font-size: 12px;
+}
+.retention-table th, .retention-table td {
+  padding: 8px 10px; text-align: center; border: 1px solid var(--obs-border-subtle);
+  white-space: nowrap;
+}
+.retention-table th {
+  background: var(--obs-surface); color: var(--obs-text-secondary); font-weight: 600; font-size: 11px;
+}
+.retention-table td { font-variant-numeric: tabular-nums; }
+.retention-cell { border-radius: 2px; }
+
+/* Journeys */
+.journey-transitions {
+  display: flex; flex-direction: column; gap: 1px; border-radius: var(--obs-radius-md); overflow: hidden;
+}
+.journey-edge {
+  display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: var(--obs-surface);
+  font-size: 13px;
+}
+.journey-edge-from { color: var(--obs-text-secondary); flex: 1; }
+.journey-edge-arrow { color: var(--obs-text-muted); font-size: 14px; }
+.journey-edge-to { color: var(--obs-text); font-weight: 500; flex: 1; }
+.journey-edge-count { color: var(--obs-text-secondary); font-variant-numeric: tabular-nums; min-width: 60px; text-align: right; }
+
+.journey-paths { margin-top: 16px; }
+.journey-path {
+  display: flex; align-items: center; gap: 6px; padding: 8px 0; font-size: 12px;
+  border-bottom: 1px solid var(--obs-border-subtle);
+}
+.journey-path-step { color: var(--obs-text); }
+.journey-path-sep { color: var(--obs-text-muted); }
+.journey-path-count { margin-left: auto; color: var(--obs-text-secondary); font-variant-numeric: tabular-nums; }
+
+/* Goals */
+.goals-list { display: flex; flex-direction: column; gap: 8px; }
+.goal-card {
+  display: flex; align-items: center; gap: 16px; padding: 14px 16px;
+  background: var(--obs-surface); border-radius: var(--obs-radius-md);
+}
+.goal-card-info { flex: 1; }
+.goal-card-name { font-size: 13px; font-weight: 500; color: var(--obs-text); }
+.goal-card-desc { font-size: 12px; color: var(--obs-text-secondary); margin-top: 2px; }
+.goal-card-rate {
+  font-size: 18px; font-weight: 700; color: var(--obs-accent); font-variant-numeric: tabular-nums;
+}
+.goal-card-stats { font-size: 12px; color: var(--obs-text-muted); text-align: right; }
+
+/* Correlations */
+.correlation-row {
+  display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+  background: var(--obs-surface); font-size: 13px;
+}
+.correlation-prop { flex: 1; color: var(--obs-text); }
+.correlation-value { flex: 1; color: var(--obs-text-secondary); }
+.correlation-uplift { width: 80px; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+.correlation-uplift--positive { color: var(--obs-success); }
+.correlation-uplift--negative { color: var(--obs-danger); }
+.correlation-sig {
+  font-size: 10px; padding: 2px 6px; border-radius: var(--obs-radius-full);
+  background: rgba(34, 197, 94, 0.1); color: var(--obs-success); font-weight: 600;
+}
+
+/* Skeleton */
+.insights-loading { display: flex; flex-direction: column; gap: 8px; }
+.insights-skeleton-row {
+  display: flex; align-items: center; gap: 12px; padding: 14px 16px;
+  background: var(--obs-surface); border-radius: var(--obs-radius);
+}
+.insights-skeleton-bar {
+  height: 14px; background: var(--obs-surface-hover); border-radius: 4px;
+  animation: shimmer 1.5s ease-in-out infinite alternate;
+}

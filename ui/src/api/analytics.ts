@@ -1,6 +1,6 @@
 // Analytics stats API — pageviews, visitors, breakdowns, etc.
 
-import { get, qs } from "./helpers.js";
+import { get, post, qs } from "./helpers.js";
 
 const BASE = "/api/v1/stats";
 
@@ -24,6 +24,31 @@ export interface EntryPageStat { pathname: string; visitors: number; }
 export interface ExitPageStat { pathname: string; visitors: number; }
 export interface CustomEventStat { event_type: string; count: number; visitors: number; }
 export interface RealtimeResult { active_visitors: number; }
+
+// Advanced analytics types
+export interface FunnelStep { type: string; value: string; }
+export interface FunnelResult {
+  step: FunnelStep; visitors: number; conversion: number; drop_off: number;
+}
+export interface RetentionCohort {
+  cohort_date: string; cohort_size: number; periods: number[];
+}
+export interface JourneyStep { from: string; to: string; count: number; }
+export interface JourneyPath { path: string[]; count: number; }
+export interface JourneyResult {
+  transitions: JourneyStep[]; top_paths: JourneyPath[]; total_paths: number;
+}
+export interface Goal {
+  goal_id: string; site_id: string; name: string; goal_type: string; goal_value: string;
+}
+export interface GoalConversion {
+  goal: Goal; conversions: number; visitors: number; rate: number;
+}
+export interface Correlation {
+  property: string; value: string; uplift: number;
+  occurrences: number; conversions: number; rate: number;
+  baseline_rate: number; significant: boolean;
+}
 
 export const analyticsApi = {
   realtime: (siteId: string, minutes = 5) =>
@@ -58,4 +83,16 @@ export const analyticsApi = {
     get<ExitPageStat[]>(`${BASE}/exit-pages?${qs(siteId, from, to, { limit, filters })}`),
   customEvents: (siteId: string, from: string, to: string, limit = 20, filters?: Record<string, string>) =>
     get<CustomEventStat[]>(`${BASE}/events?${qs(siteId, from, to, { limit, filters })}`),
+  funnel: (siteId: string, from: string, to: string, steps: FunnelStep[]) =>
+    post<FunnelResult[]>(`${BASE}/funnel`, { site_id: siteId, from, to, steps }),
+  retention: (siteId: string, from: string, to: string, periodDays?: number) =>
+    get<RetentionCohort[]>(`${BASE}/retention?${qs(siteId, from, to)}${periodDays ? `&period_days=${periodDays}` : ""}`),
+  journeys: (siteId: string, from: string, to: string) =>
+    get<JourneyResult>(`${BASE}/journeys?${qs(siteId, from, to)}`),
+  goals: (siteId: string) =>
+    get<GoalConversion[]>(`/api/v1/goals?site_id=${siteId}`),
+  createGoal: (data: { site_id: string; name: string; goal_type: string; goal_value: string }) =>
+    post<Goal>(`/api/v1/goals`, data),
+  correlations: (siteId: string, from: string, to: string, target?: string) =>
+    get<Correlation[]>(`${BASE}/correlations?${qs(siteId, from, to)}${target ? `&target=${encodeURIComponent(target)}` : ""}`),
 };

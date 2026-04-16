@@ -8,6 +8,23 @@ import TabbedBreakdownPanel from "./TabbedBreakdownPanel.js";
 import CustomEventsPanel from "./CustomEventsPanel.js";
 import "../styles/dashboard.css";
 
+function ExportButton() {
+  const { state } = useFilters();
+  const handleExport = (format: string) => {
+    const token = localStorage.getItem("obs_token");
+    const url = `/api/v1/export?site_id=${state.siteId}&from=${state.from}&to=${state.to}&format=${format}${token ? `&token=${token}` : ""}`;
+    window.open(url, "_blank");
+  };
+  return (
+    <div style={{ position: "relative", display: "inline-block" }}>
+      <button class="obs-btn obs-btn--sm" onClick={() => handleExport("csv")}
+        title="Export data as CSV">
+        Export
+      </button>
+    </div>
+  );
+}
+
 function DashboardInner() {
   return (
     <div class="obs-dashboard">
@@ -16,7 +33,10 @@ function DashboardInner() {
           <div class="obs-header-logo">O</div>
           <h1>Observe</h1>
         </div>
-        <DatePicker />
+        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          <ExportButton />
+          <DatePicker />
+        </div>
       </header>
 
       <FilterBar />
