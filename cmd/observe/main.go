@@ -587,6 +587,18 @@ func main() {
 		logger.Error("failed to load ui assets", "err", err)
 		os.Exit(1)
 	}
+	// --- Health check ---
+	r.HandleFunc("GET /healthz", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, err := db.SQL().Exec(req.Context(), "SELECT 1")
+		if err != nil {
+			w.WriteHeader(503)
+			fmt.Fprintf(w, `{"status":"error","error":%q}`, err.Error())
+			return
+		}
+		fmt.Fprintf(w, `{"status":"ok"}`)
+	})
+
 	r.Handle("GET /assets/", http.FileServer(http.FS(uiSub)))
 	r.HandleFunc("GET /{$}", func(w http.ResponseWriter, req *http.Request) {
 		data, err := fs.ReadFile(uiSub, "index.html")
@@ -882,6 +894,7 @@ type listIssuesInput struct {
 	SiteID string `query:"site_id"`
 	Status string `query:"status"`
 	Limit  int    `query:"limit"`
+	Offset int    `query:"offset"`
 }
 
 func listIssuesHandler(svc *obserrors.IssueService) neutron.HandlerFunc[listIssuesInput, []obserrors.Issue] {
@@ -889,7 +902,7 @@ func listIssuesHandler(svc *obserrors.IssueService) neutron.HandlerFunc[listIssu
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		issues, err := svc.ListIssues(ctx, input.SiteID, input.Status, input.Limit)
+		issues, err := svc.ListIssues(ctx, input.SiteID, input.Status, input.Limit, input.Offset)
 		if err != nil {
 			return nil, err
 		}
@@ -1614,12 +1627,13 @@ type logSearchInput struct {
 	Service string `query:"service"`
 	Query   string `query:"q"`
 	Limit   int    `query:"limit"`
+	Offset  int    `query:"offset"`
 }
 
 func logSearchHandler(svc *logs.LogService) neutron.HandlerFunc[logSearchInput, []logs.Log] {
 	return func(ctx context.Context, input logSearchInput) ([]logs.Log, error) {
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.SearchLogs(ctx, input.SiteID, from, to, input.Level, input.Service, input.Query, input.Limit)
+		return svc.SearchLogs(ctx, input.SiteID, from, to, input.Level, input.Service, input.Query, input.Limit, input.Offset)
 	}
 }
 
@@ -1877,12 +1891,13 @@ type listReplaysInput struct {
 	From   string `query:"from"`
 	To     string `query:"to"`
 	Limit  int    `query:"limit"`
+	Offset int    `query:"offset"`
 }
 
 func listReplaysHandler(svc *replays.ReplayService) neutron.HandlerFunc[listReplaysInput, []replays.ReplaySession] {
 	return func(ctx context.Context, input listReplaysInput) ([]replays.ReplaySession, error) {
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.ListReplays(ctx, input.SiteID, from, to, input.Limit)
+		return svc.ListReplays(ctx, input.SiteID, from, to, input.Limit, input.Offset)
 	}
 }
 
@@ -2084,6 +2099,7 @@ func deleteAlertRuleHandler(svc *platform.AlertService) neutron.HandlerFunc[dele
 type alertHistoryInput struct {
 	SiteID string `query:"site_id"`
 	Limit  int    `query:"limit"`
+	Offset int    `query:"offset"`
 }
 
 func alertHistoryHandler(svc *platform.AlertService) neutron.HandlerFunc[alertHistoryInput, []platform.AlertHistoryEntry] {
@@ -2091,7 +2107,7 @@ func alertHistoryHandler(svc *platform.AlertService) neutron.HandlerFunc[alertHi
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		return svc.ListHistory(ctx, input.SiteID, input.Limit)
+		return svc.ListHistory(ctx, input.SiteID, input.Limit, input.Offset)
 	}
 }
 
@@ -2191,6 +2207,7 @@ type searchTracesInput struct {
 	To          string `query:"to"`
 	Service     string `query:"service"`
 	Operation   string `query:"operation"`
+	Offset      int    `query:"offset"`
 	Status      string `query:"status"`
 	MinDuration int64  `query:"min_duration"`
 	MaxDuration int64  `query:"max_duration"`
@@ -2203,7 +2220,7 @@ func searchTracesHandler(svc *tracing.QueryService) neutron.HandlerFunc[searchTr
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.SearchTraces(ctx, input.SiteID, from, to, input.Service, input.Operation, input.Status, input.MinDuration, input.MaxDuration, input.Limit)
+		return svc.SearchTraces(ctx, input.SiteID, from, to, input.Service, input.Operation, input.Status, input.MinDuration, input.MaxDuration, input.Limit, input.Offset)
 	}
 }
 
