@@ -191,9 +191,12 @@ func (s *IssueService) UpdateStatus(ctx context.Context, issueID, siteID, status
 }
 
 // ListIssues returns issues for a site, ordered by last_seen descending.
-func (s *IssueService) ListIssues(ctx context.Context, siteID, status string, limit int) ([]Issue, error) {
+func (s *IssueService) ListIssues(ctx context.Context, siteID, status string, limit, offset int) ([]Issue, error) {
 	if limit <= 0 {
 		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
 	}
 	var q string
 	var params []any
@@ -203,7 +206,7 @@ func (s *IssueService) ListIssues(ctx context.Context, siteID, status string, li
 		 FROM issues
 		 WHERE site_id = $1 AND status = $2
 		 ORDER BY last_seen DESC
-		 LIMIT %d`, limit)
+		 LIMIT %d OFFSET %d`, limit, offset)
 		params = []any{siteID, status}
 	} else {
 		q = fmt.Sprintf(`SELECT issue_id, tenant_id, site_id, group_hash, title, culprit, level, status,
@@ -211,7 +214,7 @@ func (s *IssueService) ListIssues(ctx context.Context, siteID, status string, li
 		 FROM issues
 		 WHERE site_id = $1
 		 ORDER BY last_seen DESC
-		 LIMIT %d`, limit)
+		 LIMIT %d OFFSET %d`, limit, offset)
 		params = []any{siteID}
 	}
 	rows, err := nucleus.Query[issueRow](ctx, s.db.SQL(), q, params...)

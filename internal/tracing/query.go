@@ -228,11 +228,14 @@ func parseEpochMillis(s string) time.Time {
 }
 
 // SearchTraces finds traces matching filters.
-func (q *QueryService) SearchTraces(ctx context.Context, siteID string, from, to time.Time, service, operation, status string, minDuration, maxDuration int64, limit int) ([]TraceSummary, error) {
+func (q *QueryService) SearchTraces(ctx context.Context, siteID string, from, to time.Time, service, operation, status string, minDuration, maxDuration int64, limit, offset int) ([]TraceSummary, error) {
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 	if limit <= 0 {
 		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
 	}
 
 	where := "site_id = $1 AND start_time >= $2 AND start_time < $3"
@@ -271,7 +274,7 @@ func (q *QueryService) SearchTraces(ctx context.Context, siteID string, from, to
 		 FROM spans
 		 WHERE %s AND parent_span_id = ''
 		 ORDER BY start_time DESC
-		 LIMIT %d`, where, limit)
+		 LIMIT %d OFFSET %d`, where, limit, offset)
 
 	rows, err := nucleus.Query[traceSummaryRow](ctx, q.db.SQL(), q2, params...)
 	if err != nil {

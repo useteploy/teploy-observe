@@ -195,16 +195,19 @@ func (s *AlertService) DeleteRule(ctx context.Context, ruleID string) error {
 	return err
 }
 
-func (s *AlertService) ListHistory(ctx context.Context, siteID string, limit int) ([]AlertHistoryEntry, error) {
+func (s *AlertService) ListHistory(ctx context.Context, siteID string, limit, offset int) ([]AlertHistoryEntry, error) {
 	if limit <= 0 {
 		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
 	}
 	rows, err := nucleus.Query[alertHistoryRow](ctx, s.db.SQL(),
 		fmt.Sprintf(`SELECT alert_id, rule_id, site_id,
 			CAST(triggered_at AS TEXT) AS triggered_at,
 			metric_value, threshold, status
 		 FROM alert_history WHERE site_id = $1
-		 ORDER BY triggered_at DESC LIMIT %d`, limit),
+		 ORDER BY triggered_at DESC LIMIT %d OFFSET %d`, limit, offset),
 		siteID,
 	)
 	if err != nil {

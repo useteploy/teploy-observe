@@ -117,11 +117,14 @@ func (s *LogService) IngestLog(ctx context.Context, input LogInput) (string, err
 }
 
 // SearchLogs queries logs with optional filters.
-func (s *LogService) SearchLogs(ctx context.Context, siteID string, from, to time.Time, level, service, search string, limit int) ([]Log, error) {
+func (s *LogService) SearchLogs(ctx context.Context, siteID string, from, to time.Time, level, service, search string, limit, offset int) ([]Log, error) {
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 	if limit <= 0 {
 		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
 	}
 
 	where := "site_id = $1 AND timestamp >= $2 AND timestamp < $3"
@@ -154,7 +157,7 @@ func (s *LogService) SearchLogs(ctx context.Context, siteID string, from, to tim
 		 FROM logs
 		 WHERE %s
 		 ORDER BY timestamp DESC
-		 LIMIT %d`, where, limit)
+		 LIMIT %d OFFSET %d`, where, limit, offset)
 
 	rows, err := nucleus.Query[logRow](ctx, s.db.SQL(), query, params...)
 	if err != nil {
