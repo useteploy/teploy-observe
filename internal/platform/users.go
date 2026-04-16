@@ -22,14 +22,14 @@ func NewUserService(db *nucleus.Client) *UserService {
 }
 
 type User struct {
-	UserID       string `json:"user_id" db:"user_id"`
-	TenantID     string `json:"-" db:"tenant_id"`
-	Username     string `json:"username" db:"username"`
-	Email        string `json:"email" db:"email"`
-	PasswordHash string `json:"-" db:"password_hash"`
-	Role         string `json:"role" db:"role"`
-	CreatedAt    string `json:"created_at" db:"created_at"`
-	InvitedBy    string `json:"invited_by" db:"invited_by"`
+	UserID       string    `json:"user_id" db:"user_id"`
+	TenantID     string    `json:"-" db:"tenant_id"`
+	Username     string    `json:"username"`
+	Email        string    `json:"email"`
+	PasswordHash string    `json:"-" db:"password_hash"`
+	Role         string    `json:"role"`
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
+	InvitedBy    string    `json:"invited_by" db:"invited_by"`
 }
 
 func (s *UserService) Create(ctx context.Context, username, email, password, role, invitedBy string) (*User, error) {
@@ -52,12 +52,13 @@ func (s *UserService) Create(ctx context.Context, username, email, password, rol
 		return nil, fmt.Errorf("create user: %w", err)
 	}
 
+	nowMs, _ := strconv.ParseInt(now, 10, 64)
 	return &User{
 		UserID:    userID,
 		Username:  username,
 		Email:     email,
 		Role:      role,
-		CreatedAt: now,
+		CreatedAt: time.UnixMilli(nowMs).UTC(),
 		InvitedBy: invitedBy,
 	}, nil
 }

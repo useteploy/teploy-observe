@@ -231,7 +231,7 @@ function TraceWaterfall({ spans, traceId, siteId }: { spans: Span[]; traceId: st
           <div class="traces-loading" style={{ gap: 0 }}>
             {traceErrors.map((e) => (
               <div key={e.error_id} class="traces-span-row traces-span-row--error"
-                onClick={() => { window.location.href = `/errors?issue_id=${e.issue_id}`; }}
+                onClick={() => { window.location.href = `/errors?site_id=${siteId}&issue_id=${e.issue_id}`; }}
                 style={{ cursor: "pointer" }}>
                 <div style={{ flex: 1, fontSize: "12px" }}>
                   <strong>{e.error_type}</strong>: {e.error_value}

@@ -28,16 +28,16 @@ func NewWebhookService(db *nucleus.Client, logger *slog.Logger) *WebhookService 
 }
 
 type Webhook struct {
-	WebhookID   string `json:"webhook_id" db:"webhook_id"`
-	TenantID    string `json:"-" db:"tenant_id"`
-	SiteID      string `json:"site_id" db:"site_id"`
-	Name        string `json:"name" db:"name"`
-	WebhookType string `json:"webhook_type" db:"webhook_type"`
-	URL         string `json:"url" db:"url"`
-	Secret      string `json:"-" db:"secret"`
-	Enabled     string `json:"enabled" db:"enabled"`
-	CreatedAt   string `json:"created_at" db:"created_at"`
-	Version     string `json:"-" db:"version"`
+	WebhookID   string    `json:"webhook_id" db:"webhook_id"`
+	TenantID    string    `json:"-" db:"tenant_id"`
+	SiteID      string    `json:"site_id" db:"site_id"`
+	Name        string    `json:"name"`
+	WebhookType string    `json:"webhook_type" db:"webhook_type"`
+	URL         string    `json:"url"`
+	Secret      string    `json:"-" db:"secret"`
+	Enabled     bool      `json:"enabled"`
+	CreatedAt   time.Time `json:"created_at" db:"created_at"`
+	Version     string    `json:"-" db:"version"`
 }
 
 func (s *WebhookService) Create(ctx context.Context, siteID, name, webhookType, url string) (*Webhook, error) {
@@ -55,9 +55,12 @@ func (s *WebhookService) Create(ctx context.Context, siteID, name, webhookType, 
 	if err != nil {
 		return nil, fmt.Errorf("create webhook: %w", err)
 	}
+
+	nowMs, _ := strconv.ParseInt(now, 10, 64)
 	return &Webhook{
 		WebhookID: id, SiteID: siteID, Name: name,
-		WebhookType: webhookType, URL: url, Enabled: "true", CreatedAt: now,
+		WebhookType: webhookType, URL: url, Enabled: true,
+		CreatedAt: time.UnixMilli(nowMs).UTC(),
 	}, nil
 }
 

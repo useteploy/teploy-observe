@@ -22,29 +22,29 @@ func NewInfraService(db *nucleus.Client) *InfraService {
 
 // HostMetric represents a single host metric snapshot.
 type HostMetric struct {
-	MetricID      string `json:"metric_id" db:"metric_id"`
-	TenantID      string `json:"-" db:"tenant_id"`
-	SiteID        string `json:"site_id" db:"site_id"`
-	Hostname      string `json:"hostname" db:"hostname"`
-	Timestamp     int64  `json:"timestamp" db:"timestamp"`
-	CPUPercent    string `json:"cpu_percent" db:"cpu_percent"`
-	MemoryPercent string `json:"memory_percent" db:"memory_percent"`
-	MemoryUsedMB  string `json:"memory_used_mb" db:"memory_used_mb"`
-	MemoryTotalMB string `json:"memory_total_mb" db:"memory_total_mb"`
-	DiskPercent   string `json:"disk_percent" db:"disk_percent"`
-	DiskUsedGB    string `json:"disk_used_gb" db:"disk_used_gb"`
-	DiskTotalGB   string `json:"disk_total_gb" db:"disk_total_gb"`
-	NetRXBytes    string `json:"net_rx_bytes" db:"net_rx_bytes"`
-	NetTXBytes    string `json:"net_tx_bytes" db:"net_tx_bytes"`
-	Load1m        string `json:"load_1m" db:"load_1m"`
-	Load5m        string `json:"load_5m" db:"load_5m"`
-	Load15m       string `json:"load_15m" db:"load_15m"`
+	MetricID      string  `json:"metric_id" db:"metric_id"`
+	TenantID      string  `json:"-" db:"tenant_id"`
+	SiteID        string  `json:"site_id" db:"site_id"`
+	Hostname      string  `json:"hostname"`
+	Timestamp     int64   `json:"timestamp"`
+	CPUPercent    float64 `json:"cpu_percent" db:"cpu_percent"`
+	MemoryPercent float64 `json:"memory_percent" db:"memory_percent"`
+	MemoryUsedMB  int64   `json:"memory_used_mb" db:"memory_used_mb"`
+	MemoryTotalMB int64   `json:"memory_total_mb" db:"memory_total_mb"`
+	DiskPercent   float64 `json:"disk_percent" db:"disk_percent"`
+	DiskUsedGB    int64   `json:"disk_used_gb" db:"disk_used_gb"`
+	DiskTotalGB   int64   `json:"disk_total_gb" db:"disk_total_gb"`
+	NetRXBytes    int64   `json:"net_rx_bytes" db:"net_rx_bytes"`
+	NetTXBytes    int64   `json:"net_tx_bytes" db:"net_tx_bytes"`
+	Load1m        float64 `json:"load_1m" db:"load_1m"`
+	Load5m        float64 `json:"load_5m" db:"load_5m"`
+	Load15m       float64 `json:"load_15m" db:"load_15m"`
 }
 
 // MetricInput is the agent's report payload.
 type MetricInput struct {
-	SiteID        string `json:"site_id"`
-	Hostname      string `json:"hostname"`
+	SiteID        string  `json:"site_id"`
+	Hostname      string  `json:"hostname"`
 	CPUPercent    float64 `json:"cpu_percent"`
 	MemoryPercent float64 `json:"memory_percent"`
 	MemoryUsedMB  int     `json:"memory_used_mb"`
@@ -80,12 +80,12 @@ func (s *InfraService) Report(ctx context.Context, input MetricInput) error {
 
 // HostSummary is a host with its latest metrics.
 type HostSummary struct {
-	Hostname      string `json:"hostname" db:"hostname"`
-	CPUPercent    string `json:"cpu_percent" db:"cpu_percent"`
-	MemoryPercent string `json:"memory_percent" db:"memory_percent"`
-	DiskPercent   string `json:"disk_percent" db:"disk_percent"`
-	Load1m        string `json:"load_1m" db:"load_1m"`
-	LastSeen      string `json:"last_seen" db:"last_seen"`
+	Hostname      string  `json:"hostname"`
+	CPUPercent    float64 `json:"cpu_percent" db:"cpu_percent"`
+	MemoryPercent float64 `json:"memory_percent" db:"memory_percent"`
+	DiskPercent   float64 `json:"disk_percent" db:"disk_percent"`
+	Load1m        float64 `json:"load_1m" db:"load_1m"`
+	LastSeen      string  `json:"last_seen" db:"last_seen"`
 }
 
 func (s *InfraService) ListHosts(ctx context.Context, siteID string) ([]HostSummary, error) {

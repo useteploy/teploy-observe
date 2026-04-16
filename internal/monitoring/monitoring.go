@@ -37,15 +37,15 @@ func NewUptimeService(db *nucleus.Client, logger *slog.Logger) *UptimeService {
 
 // Monitor represents an uptime monitor configuration.
 type Monitor struct {
-	MonitorID      string `json:"monitor_id" db:"monitor_id"`
+	MonitorID      string `json:"monitor_id"`
 	TenantID       string `json:"-" db:"tenant_id"`
 	SiteID         string `json:"site_id" db:"site_id"`
-	Name           string `json:"name" db:"name"`
-	URL            string `json:"url" db:"url"`
-	Method         string `json:"method" db:"method"`
-	IntervalSecs   string `json:"interval_secs" db:"interval_secs"`
-	ExpectedStatus string `json:"expected_status" db:"expected_status"`
-	Enabled        string `json:"enabled" db:"enabled"`
+	Name           string `json:"name"`
+	URL            string `json:"url"`
+	Method         string `json:"method"`
+	IntervalSecs   int    `json:"interval_secs" db:"interval_secs"`
+	ExpectedStatus int    `json:"expected_status" db:"expected_status"`
+	Enabled        bool   `json:"enabled"`
 	CreatedAt      string `json:"created_at" db:"created_at"`
 	Version        string `json:"-" db:"version"`
 }
@@ -56,10 +56,10 @@ type MonitorResult struct {
 	TenantID     string `json:"-" db:"tenant_id"`
 	MonitorID    string `json:"monitor_id" db:"monitor_id"`
 	SiteID       string `json:"site_id" db:"site_id"`
-	Timestamp    int64  `json:"timestamp" db:"timestamp"`
-	StatusCode   string `json:"status_code" db:"status_code"`
-	ResponseMs   string `json:"response_ms" db:"response_ms"`
-	IsUp         string `json:"is_up" db:"is_up"`
+	Timestamp    int64  `json:"timestamp"`
+	StatusCode   int    `json:"status_code" db:"status_code"`
+	ResponseMs   int64  `json:"response_ms" db:"response_ms"`
+	IsUp         bool   `json:"is_up" db:"is_up"`
 	ErrorMessage string `json:"error_message" db:"error_message"`
 }
 
@@ -75,14 +75,14 @@ func (s *UptimeService) CreateMonitor(ctx context.Context, m Monitor) (*Monitor,
 	if m.Method == "" {
 		m.Method = "GET"
 	}
-	if m.Enabled == "" {
-		m.Enabled = "true"
+	if !m.Enabled {
+		m.Enabled = true
 	}
-	if m.ExpectedStatus == "" {
-		m.ExpectedStatus = "200"
+	if m.ExpectedStatus == 0 {
+		m.ExpectedStatus = 200
 	}
-	if m.IntervalSecs == "" {
-		m.IntervalSecs = "60"
+	if m.IntervalSecs == 0 {
+		m.IntervalSecs = 60
 	}
 
 	_, err := s.db.SQL().Exec(ctx,
@@ -90,7 +90,7 @@ func (s *UptimeService) CreateMonitor(ctx context.Context, m Monitor) (*Monitor,
 			interval_secs, expected_status, enabled, created_at, version)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		m.MonitorID, m.TenantID, m.SiteID, m.Name, m.URL, m.Method,
-		m.IntervalSecs, m.ExpectedStatus, m.Enabled, now, now,
+		strconv.Itoa(m.IntervalSecs), strconv.Itoa(m.ExpectedStatus), strconv.FormatBool(m.Enabled), now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("monitoring: create monitor: %w", err)
@@ -137,7 +137,7 @@ func (s *UptimeService) CheckMonitor(ctx context.Context, m Monitor) {
 
 	req, err := http.NewRequestWithContext(ctx, m.Method, m.URL, nil)
 	if err != nil {
-		s.recordResult(ctx, m, 0, 0, "false", err.Error())
+		s.recordResult(ctx, m, 0, 0, false, err.Error())
 		return
 	}
 	req.Header.Set("User-Agent", "Teploy-Observe-Uptime/1.0")
@@ -145,21 +145,17 @@ func (s *UptimeService) CheckMonitor(ctx context.Context, m Monitor) {
 	resp, err := s.client.Do(req)
 	elapsed := time.Since(start).Milliseconds()
 	if err != nil {
-		s.recordResult(ctx, m, 0, elapsed, "false", err.Error())
+		s.recordResult(ctx, m, 0, elapsed, false, err.Error())
 		return
 	}
 	resp.Body.Close()
 
-	expectedCode, _ := strconv.Atoi(m.ExpectedStatus)
-	isUp := "false"
-	if resp.StatusCode == expectedCode {
-		isUp = "true"
-	}
+	isUp := resp.StatusCode == m.ExpectedStatus
 
 	s.recordResult(ctx, m, resp.StatusCode, elapsed, isUp, "")
 }
 
-func (s *UptimeService) recordResult(ctx context.Context, m Monitor, statusCode int, responseMs int64, isUp, errMsg string) {
+func (s *UptimeService) recordResult(ctx context.Context, m Monitor, statusCode int, responseMs int64, isUp bool, errMsg string) {
 	resultID := genID()
 	now := time.Now().UTC().UnixMilli()
 	nowStr := dbutil.IntParam(now)
@@ -169,7 +165,7 @@ func (s *UptimeService) recordResult(ctx context.Context, m Monitor, statusCode 
 			timestamp, status_code, response_ms, is_up, error_message)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		resultID, m.TenantID, m.MonitorID, m.SiteID,
-		nowStr, strconv.Itoa(statusCode), dbutil.IntParam(responseMs), isUp, errMsg,
+		nowStr, strconv.Itoa(statusCode), dbutil.IntParam(responseMs), strconv.FormatBool(isUp), errMsg,
 	)
 	if err != nil {
 		s.logger.Error("monitoring: record result failed", "monitor", m.MonitorID, "err", err)
@@ -233,11 +229,11 @@ type CronMonitor struct {
 	CronID      string `json:"cron_id" db:"cron_id"`
 	TenantID    string `json:"-" db:"tenant_id"`
 	SiteID      string `json:"site_id" db:"site_id"`
-	Name        string `json:"name" db:"name"`
-	Slug        string `json:"slug" db:"slug"`
-	Schedule    string `json:"schedule" db:"schedule"`
-	GracePeriod string `json:"grace_period" db:"grace_period"`
-	Enabled     string `json:"enabled" db:"enabled"`
+	Name        string `json:"name"`
+	Slug        string `json:"slug"`
+	Schedule    string `json:"schedule"`
+	GracePeriod int    `json:"grace_period" db:"grace_period"`
+	Enabled     bool   `json:"enabled"`
 	CreatedAt   string `json:"created_at" db:"created_at"`
 	Version     string `json:"-" db:"version"`
 }
@@ -248,9 +244,9 @@ type CronCheckin struct {
 	TenantID   string `json:"-" db:"tenant_id"`
 	CronID     string `json:"cron_id" db:"cron_id"`
 	SiteID     string `json:"site_id" db:"site_id"`
-	Timestamp  int64  `json:"timestamp" db:"timestamp"`
-	Status     string `json:"status" db:"status"`
-	DurationMs string `json:"duration_ms" db:"duration_ms"`
+	Timestamp  int64  `json:"timestamp"`
+	Status     string `json:"status"`
+	DurationMs int64  `json:"duration_ms" db:"duration_ms"`
 }
 
 // CreateCron registers a new cron monitor.
@@ -262,11 +258,11 @@ func (s *CronService) CreateCron(ctx context.Context, c CronMonitor) (*CronMonit
 	if c.TenantID == "" {
 		c.TenantID = "default"
 	}
-	if c.Enabled == "" {
-		c.Enabled = "true"
+	if !c.Enabled {
+		c.Enabled = true
 	}
-	if c.GracePeriod == "" {
-		c.GracePeriod = "300"
+	if c.GracePeriod == 0 {
+		c.GracePeriod = 300
 	}
 
 	_, err := s.db.SQL().Exec(ctx,
@@ -274,7 +270,7 @@ func (s *CronService) CreateCron(ctx context.Context, c CronMonitor) (*CronMonit
 			grace_period, enabled, created_at, version)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 		c.CronID, c.TenantID, c.SiteID, c.Name, c.Slug, c.Schedule,
-		c.GracePeriod, c.Enabled, now, now,
+		strconv.Itoa(c.GracePeriod), strconv.FormatBool(c.Enabled), now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("monitoring: create cron: %w", err)
@@ -316,7 +312,7 @@ func (s *CronService) DeleteCron(ctx context.Context, cronID string) error {
 }
 
 // RecordCheckin records a heartbeat checkin for a cron job identified by slug.
-func (s *CronService) RecordCheckin(ctx context.Context, siteID, slug, status, durationMs string) error {
+func (s *CronService) RecordCheckin(ctx context.Context, siteID, slug, status string, durationMs int64) error {
 	// Look up the cron monitor by slug
 	crons, err := nucleus.Query[CronMonitor](ctx, s.db.SQL(),
 		`SELECT cron_id, tenant_id, site_id, name, slug, schedule,
@@ -335,16 +331,13 @@ func (s *CronService) RecordCheckin(ctx context.Context, siteID, slug, status, d
 	if status == "" {
 		status = "ok"
 	}
-	if durationMs == "" {
-		durationMs = "0"
-	}
 
 	_, err = s.db.SQL().Exec(ctx,
 		`INSERT INTO cron_checkins (checkin_id, tenant_id, cron_id, site_id,
 			timestamp, status, duration_ms)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		checkinID, cron.TenantID, cron.CronID, cron.SiteID,
-		nowStr, status, durationMs,
+		nowStr, status, dbutil.IntParam(durationMs),
 	)
 	if err != nil {
 		return fmt.Errorf("monitoring: record checkin: %w", err)
@@ -367,7 +360,7 @@ func (s *CronService) CheckMissed(ctx context.Context) ([]CronMonitor, error) {
 	var missed []CronMonitor
 
 	for _, c := range crons {
-		graceSecs, _ := strconv.ParseInt(c.GracePeriod, 10, 64)
+		graceSecs := int64(c.GracePeriod)
 		if graceSecs <= 0 {
 			graceSecs = 300
 		}

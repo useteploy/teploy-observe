@@ -570,6 +570,10 @@ func main() {
 		neutron.WithTags("dashboards"), neutron.WithSummary("Get dashboard with panels"))
 	neutron.Post(dashGroup, "/{dashboard_id}/panels", addPanelHandler(dashSvc),
 		neutron.WithTags("dashboards"), neutron.WithSummary("Add panel to dashboard"))
+	neutron.Delete(dashGroup, "/{dashboard_id}", deleteDashboardHandler(dashSvc),
+		neutron.WithTags("dashboards"), neutron.WithSummary("Delete dashboard"))
+	neutron.Post(dashGroup, "/{dashboard_id}/panels/{panel_id}/execute", executePanelHandler(dashSvc),
+		neutron.WithTags("dashboards"), neutron.WithSummary("Execute panel query"))
 
 	// --- Replays (JWT auth) ---
 	replayGroup := r.Group("/api/v1/replays", jwtMW)
@@ -1776,8 +1780,8 @@ type createMonitorInput struct {
 	SiteID         string `json:"site_id"`
 	Name           string `json:"name"`
 	URL            string `json:"url"`
-	IntervalSecs   string `json:"interval_secs"`
-	ExpectedStatus string `json:"expected_status"`
+	IntervalSecs   int    `json:"interval_secs"`
+	ExpectedStatus int    `json:"expected_status"`
 }
 
 func createMonitorHandler(svc *monitoring.UptimeService) neutron.HandlerFunc[createMonitorInput, monitoring.Monitor] {
@@ -1825,7 +1829,7 @@ type createCronInput struct {
 	SiteID      string `json:"site_id"`
 	Name        string `json:"name"`
 	Schedule    string `json:"schedule"`
-	GracePeriod string `json:"grace_period"`
+	GracePeriod int    `json:"grace_period"`
 }
 
 func createCronHandler(svc *monitoring.CronService) neutron.HandlerFunc[createCronInput, monitoring.CronMonitor] {
@@ -1852,7 +1856,7 @@ func cronCheckinHandler(svc *monitoring.CronService) http.HandlerFunc {
 			http.Error(w, "missing slug", http.StatusBadRequest)
 			return
 		}
-		if err := svc.RecordCheckin(r.Context(), slug, "", "ok", "0"); err != nil {
+		if err := svc.RecordCheckin(r.Context(), slug, "", "ok", 0); err != nil {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
@@ -1940,6 +1944,39 @@ func addPanelHandler(svc *dashboards.DashboardService) neutron.HandlerFunc[addPa
 			return dashboards.Panel{}, err
 		}
 		return *p, nil
+	}
+}
+
+type deleteDashboardInput struct {
+	DashboardID string `path:"dashboard_id"`
+}
+
+func deleteDashboardHandler(svc *dashboards.DashboardService) neutron.HandlerFunc[deleteDashboardInput, neutron.Empty] {
+	return func(ctx context.Context, input deleteDashboardInput) (neutron.Empty, error) {
+		return neutron.Empty{}, svc.Delete(ctx, input.DashboardID)
+	}
+}
+
+type executePanelInput struct {
+	DashboardID string `path:"dashboard_id"`
+	PanelID     string `path:"panel_id"`
+	SiteID      string `json:"site_id"`
+	From        string `json:"from"`
+	To          string `json:"to"`
+}
+
+func executePanelHandler(svc *dashboards.DashboardService) neutron.HandlerFunc[executePanelInput, any] {
+	return func(ctx context.Context, input executePanelInput) (any, error) {
+		panels, err := svc.ListPanels(ctx, input.DashboardID)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range panels {
+			if p.PanelID == input.PanelID {
+				return svc.ExecutePanel(ctx, input.SiteID, p, input.From, input.To)
+			}
+		}
+		return nil, neutron.ErrNotFound("panel not found")
 	}
 }
 

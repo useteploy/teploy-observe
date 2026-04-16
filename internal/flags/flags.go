@@ -217,8 +217,9 @@ func (s *FlagService) Evaluate(ctx context.Context, siteID, flagKey, userID stri
 		}
 	}
 
+	// Fire-and-forget: evaluation tracking is best-effort, must not block response.
 	evalID := genID()
-	s.db.SQL().Exec(ctx,
+	_, _ = s.db.SQL().Exec(ctx,
 		`INSERT INTO flag_evaluations (eval_id, tenant_id, site_id, flag_key, user_id, variant, timestamp)
 		 VALUES ($1, 'default', $2, $3, $4, $5, $6)`,
 		evalID, siteID, flagKey, userID, result.Variant, time.Now().UTC().UnixMilli())

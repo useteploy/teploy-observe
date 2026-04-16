@@ -123,13 +123,15 @@ func (s *ReportService) RunScheduled(ctx context.Context, smtpHost, smtpPort, sm
 			}
 		}
 
-		// Update last_sent
+		// Update last_sent (best-effort — failure means report may re-send next cycle)
 		nowStr := strconv.FormatInt(now.UnixMilli(), 10)
-		s.db.SQL().Exec(ctx,
+		if _, err := s.db.SQL().Exec(ctx,
 			`INSERT INTO report_schedules (schedule_id, tenant_id, site_id, name, frequency, recipients, enabled, last_sent, created_at, version)
 			 SELECT schedule_id, tenant_id, site_id, name, frequency, recipients, enabled, $2, created_at, $3
 			 FROM report_schedules WHERE schedule_id = $1`,
-			sched.ScheduleID, nowStr, nowStr)
+			sched.ScheduleID, nowStr, nowStr); err != nil {
+			s.logger.Error("report last_sent update failed", "schedule", sched.Name, "err", err)
+		}
 
 		s.logger.Info("report sent", "schedule", sched.Name, "recipients", sched.Recipients)
 	}
