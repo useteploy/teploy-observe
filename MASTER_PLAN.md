@@ -17,24 +17,29 @@ a work plan. Current shipped state:
 - Platform: alerts (rules, history, webhook fire), webhooks, users + roles, share links, sites, API keys
 - SSO (SAML), SQL explorer, saved views, reports, groups, surveys, feedback, LLM observability, session replay
 
-**Recently completed (2026-04-15):**
+**Recently completed (2026-04-15 / 2026-04-16):**
 - Bounce rate + visit duration: computed from sessions table at query time (NOT in rollups)
 - Session browser UI: list + event timeline at /sessions route
 - Delete confirmations on all destructive actions
 - Pagination (offset-based) on issues, logs, traces, alert history, sessions
 - /healthz endpoint + Docker healthcheck for observe service
+- SPA catch-all routing: hard refresh on /errors, /sessions, etc. now works
+- Password change endpoint: POST /api/v1/auth/password
+- Insights page (/insights): funnels, retention cohorts, user journeys, goals, correlations
+- Dashboard CSV export button
+- Typed-domain refactor applied to replays.go
 
-**Known gaps (carried forward from Phase 1-5):**
+**Known gaps:**
 - HyperLogLog for rollup visitor counts (still using distinct count)
-- bcrypt password hashing (done in auth, but MASTER_PLAN still tracked it)
-- Funnels, retention cohorts
 - Custom event property drill-down UI
-- Data export UI (backend supports CSV/JSON, no UI button)
-- Source map support for error stack traces
-- Alert metrics beyond count/rate (p95/p99 latency — needs APM query layer)
-- OTLP gRPC ingestion
-- Metrics ingestion (OTLP metrics)
-- Full DOM session replay player (event timeline exists, DOM playback needs rrweb)
+- Source map support for error stack traces (backend stores, no resolution UI)
+- Alert metrics: p95/p99 latency (needs APM query layer integration)
+- OTLP gRPC ingestion (HTTP/JSON works)
+- Metrics ingestion (OTLP metrics — re-evaluate TimeSeries model)
+- Full DOM session replay player (event timeline exists, playback needs rrweb)
+- UI routes for: custom dashboards, reports, surveys, integrations, link tracking, SSO config
+- Light theme toggle (dark-only currently)
+- Audit logs for admin actions
 
 **Architecture debt:**
 - `alerts.go`, `tracing/query.go`, `errors/issues.go`, `logs/logs.go`, `flags/flags.go`,
