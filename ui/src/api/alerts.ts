@@ -38,6 +38,10 @@ export const alertsApi = {
   }) => post<AlertRule>(`${BASE}/alerts/rules`, data),
   deleteRule: (ruleId: string) =>
     del(`${BASE}/alerts/rules/${ruleId}`),
-  history: (siteId: string) =>
-    get<AlertHistoryEntry[]>(`${BASE}/alerts/history?site_id=${siteId}`),
+  history: (siteId: string, limit?: number, offset?: number) => {
+    let q = `site_id=${siteId}`;
+    if (limit) q += `&limit=${limit}`;
+    if (offset) q += `&offset=${offset}`;
+    return get<AlertHistoryEntry[]>(`${BASE}/alerts/history?${q}`);
+  },
 };

@@ -5,6 +5,7 @@ import SearchInput from "../components/shared/SearchInput.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
 import Tabs from "../components/shared/Tabs.js";
+import Pagination from "../components/shared/Pagination.js";
 import "../styles/errors.css";
 
 export const config = { mode: "app" };
@@ -324,12 +325,14 @@ export default function ErrorsPage() {
     ? new URLSearchParams(window.location.search).get("site_id") || "default"
     : "default";
 
+  const PAGE_SIZE = 20;
   const [issues, setIssues] = useState<Issue[]>([]);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState("");
   const [activeStatus, setActiveStatus] = useState<string>("ALL");
   const [activeLevel, setActiveLevel] = useState<string>("ALL");
   const [selectedIssue, setSelectedIssue] = useState<Issue | null>(null);
+  const [page, setPage] = useState(1);
 
   const fetchIssues = useCallback(async () => {
     setLoading(true);
@@ -339,9 +342,8 @@ export default function ErrorsPage() {
         data = await errorsApi.search(siteId, query.trim());
       } else {
         const statusFilter = activeStatus === "ALL" ? undefined : activeStatus.toLowerCase();
-        data = await errorsApi.issues(siteId, statusFilter);
+        data = await errorsApi.issues(siteId, statusFilter, PAGE_SIZE, (page - 1) * PAGE_SIZE);
       }
-      // Client-side level filter
       if (activeLevel !== "ALL") {
         data = data.filter(i => i.level?.toLowerCase() === activeLevel.toLowerCase());
       }
@@ -352,7 +354,7 @@ export default function ErrorsPage() {
     } finally {
       setLoading(false);
     }
-  }, [siteId, query, activeStatus, activeLevel]);
+  }, [siteId, query, activeStatus, activeLevel, page]);
 
   useEffect(() => { fetchIssues(); }, [fetchIssues]);
 
@@ -404,21 +406,24 @@ export default function ErrorsPage() {
           {query || activeStatus !== "ALL" || activeLevel !== "ALL" ? "No issues match the current filters" : "No errors captured yet"}
         </div>
       ) : (
-        <div class="errors-issue-list">
-          {issues.map(issue => (
-            <div key={issue.issue_id} class="errors-issue-row" onClick={() => setSelectedIssue(issue)}>
-              <StatusBadge status={issue.status} size="sm" />
-              <div class="errors-issue-info">
-                <div class="errors-issue-title">{issue.title}</div>
-                <div class="errors-issue-culprit">{issue.culprit}</div>
+        <>
+          <div class="errors-issue-list">
+            {issues.map(issue => (
+              <div key={issue.issue_id} class="errors-issue-row" onClick={() => setSelectedIssue(issue)}>
+                <StatusBadge status={issue.status} size="sm" />
+                <div class="errors-issue-info">
+                  <div class="errors-issue-title">{issue.title}</div>
+                  <div class="errors-issue-culprit">{issue.culprit}</div>
+                </div>
+                <div class="errors-issue-meta">
+                  <span class="errors-issue-count">{Number(issue.event_count).toLocaleString()} events</span>
+                  <span class="errors-issue-time">{timeAgo(issue.last_seen)}</span>
+                </div>
               </div>
-              <div class="errors-issue-meta">
-                <span class="errors-issue-count">{Number(issue.event_count).toLocaleString()} events</span>
-                <span class="errors-issue-time">{timeAgo(issue.last_seen)}</span>
-              </div>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+          <Pagination page={page} pageSize={PAGE_SIZE} resultCount={issues.length} onPageChange={(p) => { setPage(p); window.scrollTo(0, 0); }} />
+        </>
       )}
     </div>
   );

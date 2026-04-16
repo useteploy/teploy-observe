@@ -19,4 +19,6 @@ export { alertsApi } from "./alerts.js";
 export type * from "./alerts.js";
 export { settingsApi } from "./settings.js";
 export type * from "./settings.js";
+export { replaysApi } from "./replays.js";
+export type * from "./replays.js";
 export { authApi } from "./auth.js";

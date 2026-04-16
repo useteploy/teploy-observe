@@ -52,8 +52,13 @@ export interface ReleaseHealth {
 }
 
 export const errorsApi = {
-  issues: (siteId: string, status?: string) =>
-    get<Issue[]>(`${BASE}/issues?site_id=${siteId}${status ? `&status=${status}` : ""}`),
+  issues: (siteId: string, status?: string, limit?: number, offset?: number) => {
+    let q = `site_id=${siteId}`;
+    if (status) q += `&status=${status}`;
+    if (limit) q += `&limit=${limit}`;
+    if (offset) q += `&offset=${offset}`;
+    return get<Issue[]>(`${BASE}/issues?${q}`);
+  },
   issue: (issueId: string, siteId: string) =>
     get<Issue>(`${BASE}/issues/${issueId}?site_id=${siteId}`),
   issueEvents: (issueId: string, siteId: string) =>

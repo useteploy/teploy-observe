@@ -4,6 +4,7 @@ import type { LogEntry, LogStats } from "../api/logs.js";
 import SearchInput from "../components/shared/SearchInput.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
+import Pagination from "../components/shared/Pagination.js";
 import "../styles/logs.css";
 
 export const config = { mode: "app" };
@@ -157,6 +158,7 @@ export default function LogsPage() {
       ? new URLSearchParams(window.location.search).get("site_id") || "default"
       : "default";
 
+  const PAGE_SIZE = 50;
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [stats, setStats] = useState<LogStats[]>([]);
   const [loading, setLoading] = useState(true);
@@ -164,6 +166,7 @@ export default function LogsPage() {
   const [activeLevel, setActiveLevel] = useState<string>("ALL");
   const [service, setService] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [page, setPage] = useState(1);
 
   const fetchLogs = useCallback(async () => {
     setLoading(true);
@@ -173,8 +176,9 @@ export default function LogsPage() {
     const toStr = now.toISOString();
 
     try {
-      const opts: { query?: string; level?: string; service?: string; limit?: number } = {
-        limit: 200,
+      const opts: { query?: string; level?: string; service?: string; limit?: number; offset?: number } = {
+        limit: PAGE_SIZE,
+        offset: (page - 1) * PAGE_SIZE,
       };
       if (query.trim()) opts.query = query.trim();
       if (activeLevel !== "ALL") opts.level = activeLevel;
@@ -194,7 +198,7 @@ export default function LogsPage() {
     } finally {
       setLoading(false);
     }
-  }, [siteId, query, activeLevel, service]);
+  }, [siteId, query, activeLevel, service, page]);
 
   useEffect(() => {
     fetchLogs();
@@ -282,16 +286,19 @@ export default function LogsPage() {
             : "No logs in the last 24 hours"}
         </div>
       ) : (
-        <div class="logs-list">
-          {logs.map((entry) => (
-            <LogRow
-              key={entry.log_id}
-              entry={entry}
-              expanded={expandedId === entry.log_id}
-              onToggle={() => toggleExpand(entry.log_id)}
-            />
-          ))}
-        </div>
+        <>
+          <div class="logs-list">
+            {logs.map((entry) => (
+              <LogRow
+                key={entry.log_id}
+                entry={entry}
+                expanded={expandedId === entry.log_id}
+                onToggle={() => toggleExpand(entry.log_id)}
+              />
+            ))}
+          </div>
+          <Pagination page={page} pageSize={PAGE_SIZE} resultCount={logs.length} onPageChange={(p) => { setPage(p); window.scrollTo(0, 0); }} />
+        </>
       )}
     </div>
   );

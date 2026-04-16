@@ -15,12 +15,13 @@ export interface LogStats {
 }
 
 export const logsApi = {
-  search: (siteId: string, from: string, to: string, opts?: { query?: string; level?: string; service?: string; limit?: number }) => {
+  search: (siteId: string, from: string, to: string, opts?: { query?: string; level?: string; service?: string; limit?: number; offset?: number }) => {
     let q = `site_id=${siteId}&from=${from}&to=${to}`;
     if (opts?.query) q += `&q=${encodeURIComponent(opts.query)}`;
     if (opts?.level) q += `&level=${opts.level}`;
     if (opts?.service) q += `&service=${encodeURIComponent(opts.service)}`;
     if (opts?.limit) q += `&limit=${opts.limit}`;
+    if (opts?.offset) q += `&offset=${opts.offset}`;
     return get<LogEntry[]>(`${BASE}/logs/search?${q}`);
   },
   stats: (siteId: string, from: string, to: string) =>
