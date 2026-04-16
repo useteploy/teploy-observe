@@ -28,6 +28,11 @@ a work plan. Current shipped state:
 - Insights page (/insights): funnels, retention cohorts, user journeys, goals, correlations
 - Dashboard CSV export button
 - Typed-domain refactor applied to replays.go
+- Row struct boilerplate deleted (-684 lines) after neutron-go scanner fix
+- Password change form in settings UI
+- SQL Explorer page (/explorer) with table sidebar, results grid, Ctrl+Enter
+- Custom Dashboards page (/dashboards) with CRUD, panel builder, 12-col grid
+- Service dependency graph SVG in traces page
 
 **Known gaps:**
 - HyperLogLog for rollup visitor counts (still using distinct count)
