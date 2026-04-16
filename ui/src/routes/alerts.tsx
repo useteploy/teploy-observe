@@ -3,6 +3,8 @@ import { alertsApi } from "../api/alerts.js";
 import type { AlertRule, AlertHistoryEntry } from "../api/alerts.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
+import ConfirmDialog from "../components/shared/ConfirmDialog.js";
+import Pagination from "../components/shared/Pagination.js";
 import "../styles/settings.css";
 
 export const config = { mode: "app" };
@@ -68,6 +70,8 @@ function RulesTab({ siteId }: { siteId: string }) {
   const [formThreshold, setFormThreshold] = useState("");
   const [formWindow, setFormWindow] = useState("5");
   const [formCooldown, setFormCooldown] = useState("60");
+  const [deletingRuleId, setDeletingRuleId] = useState<string | null>(null);
+  const [deleteLoading, setDeleteLoading] = useState(false);
 
   const fetchRules = useCallback(async () => {
     setLoading(true);
@@ -100,11 +104,15 @@ function RulesTab({ siteId }: { siteId: string }) {
     finally { setCreating(false); }
   };
 
-  const handleDelete = async (ruleId: string) => {
+  const handleDeleteConfirm = async () => {
+    if (!deletingRuleId) return;
+    setDeleteLoading(true);
     try {
-      await alertsApi.deleteRule(ruleId);
-      setRules(prev => prev.filter(r => r.rule_id !== ruleId));
+      await alertsApi.deleteRule(deletingRuleId);
+      setRules(prev => prev.filter(r => r.rule_id !== deletingRuleId));
+      setDeletingRuleId(null);
     } catch (err) { console.error("Failed to delete rule:", err); }
+    finally { setDeleteLoading(false); }
   };
 
   return (
@@ -130,7 +138,7 @@ function RulesTab({ siteId }: { siteId: string }) {
                 </div>
               </div>
               <div class="alerts-row-meta">
-                <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => handleDelete(rule.rule_id)}>
+                <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => setDeletingRuleId(rule.rule_id)}>
                   Delete
                 </button>
               </div>
@@ -186,19 +194,30 @@ function RulesTab({ siteId }: { siteId: string }) {
           </button>
         </div>
       </Modal>
+
+      <ConfirmDialog
+        open={!!deletingRuleId}
+        onClose={() => setDeletingRuleId(null)}
+        onConfirm={handleDeleteConfirm}
+        title="Delete Alert Rule"
+        message="This alert rule will be permanently disabled. This cannot be undone."
+        loading={deleteLoading}
+      />
     </div>
   );
 }
 
 function HistoryTab({ siteId }: { siteId: string }) {
+  const PAGE_SIZE = 20;
   const [history, setHistory] = useState<AlertHistoryEntry[]>([]);
   const [rules, setRules] = useState<AlertRule[]>([]);
   const [loading, setLoading] = useState(true);
+  const [page, setPage] = useState(1);
 
   useEffect(() => {
     setLoading(true);
     Promise.all([
-      alertsApi.history(siteId),
+      alertsApi.history(siteId, PAGE_SIZE, (page - 1) * PAGE_SIZE),
       alertsApi.rules(siteId),
     ]).then(([h, r]) => {
       setHistory(h || []);
@@ -207,7 +226,7 @@ function HistoryTab({ siteId }: { siteId: string }) {
       setHistory([]);
       setRules([]);
     }).finally(() => setLoading(false));
-  }, [siteId]);
+  }, [siteId, page]);
 
   const getRuleName = (ruleId: string) => {
     const rule = rules.find(r => r.rule_id === ruleId);
@@ -218,21 +237,24 @@ function HistoryTab({ siteId }: { siteId: string }) {
   if (!history.length) return <div class="obs-empty-state">No alerts have triggered</div>;
 
   return (
-    <div class="alerts-list">
-      {history.map(h => (
-        <div key={h.alert_id} class="alerts-row">
-          <StatusBadge status="error" size="sm" />
-          <div class="alerts-row-info">
-            <div class="alerts-row-name">{getRuleName(h.rule_id)}</div>
-            <div class="alerts-row-desc">
-              value: {h.metric_value} (threshold: {h.threshold})
+    <div>
+      <div class="alerts-list">
+        {history.map(h => (
+          <div key={h.alert_id} class="alerts-row">
+            <StatusBadge status="error" size="sm" />
+            <div class="alerts-row-info">
+              <div class="alerts-row-name">{getRuleName(h.rule_id)}</div>
+              <div class="alerts-row-desc">
+                value: {h.metric_value} (threshold: {h.threshold})
+              </div>
+            </div>
+            <div class="alerts-row-meta">
+              <span style={{ fontSize: "11px", color: "var(--obs-text-muted)" }}>{formatDate(h.triggered_at)}</span>
             </div>
           </div>
-          <div class="alerts-row-meta">
-            <span style={{ fontSize: "11px", color: "var(--obs-text-muted)" }}>{formatDate(h.triggered_at)}</span>
-          </div>
-        </div>
-      ))}
+        ))}
+      </div>
+      <Pagination page={page} pageSize={PAGE_SIZE} resultCount={history.length} onPageChange={(p) => { setPage(p); window.scrollTo(0, 0); }} />
     </div>
   );
 }

@@ -3,6 +3,7 @@ import { settingsApi } from "../api/settings.js";
 import type { Site, Webhook, User, ShareLink } from "../api/settings.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
+import ConfirmDialog from "../components/shared/ConfirmDialog.js";
 import "../styles/settings.css";
 
 export const config = { mode: "app" };
@@ -40,6 +41,8 @@ function SitesSection() {
   const [newKey, setNewKey] = useState<{ key: string; siteId: string } | null>(null);
   const [formName, setFormName] = useState("");
   const [formDomain, setFormDomain] = useState("");
+  const [deletingSiteId, setDeletingSiteId] = useState<string | null>(null);
+  const [deleteLoading, setDeleteLoading] = useState(false);
 
   // Share links
   const [shareLinks, setShareLinks] = useState<ShareLink[]>([]);
@@ -67,11 +70,15 @@ function SitesSection() {
     finally { setCreating(false); }
   };
 
-  const handleDelete = async (siteId: string) => {
+  const handleDeleteConfirm = async () => {
+    if (!deletingSiteId) return;
+    setDeleteLoading(true);
     try {
-      await settingsApi.deleteSite(siteId);
-      setSites(prev => prev.filter(s => s.site_id !== siteId));
+      await settingsApi.deleteSite(deletingSiteId);
+      setSites(prev => prev.filter(s => s.site_id !== deletingSiteId));
+      setDeletingSiteId(null);
     } catch (err) { console.error("Failed to delete site:", err); }
+    finally { setDeleteLoading(false); }
   };
 
   const handleGenerateKey = async (siteId: string) => {
@@ -123,7 +130,7 @@ function SitesSection() {
                 <span class="settings-row-value">{s.domain || s.site_id}</span>
                 <button class="obs-btn obs-btn--sm" onClick={() => handleGenerateKey(s.site_id)}>API Key</button>
                 <button class="obs-btn obs-btn--sm" onClick={() => handleShowShareLinks(s.site_id)}>Share</button>
-                <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => handleDelete(s.site_id)}>Delete</button>
+                <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => setDeletingSiteId(s.site_id)}>Delete</button>
                 <span class="settings-row-date">{formatDate(s.created_at)}</span>
               </div>
               {selectedSiteId === s.site_id && (
@@ -180,6 +187,15 @@ function SitesSection() {
           </button>
         </div>
       </Modal>
+
+      <ConfirmDialog
+        open={!!deletingSiteId}
+        onClose={() => setDeletingSiteId(null)}
+        onConfirm={handleDeleteConfirm}
+        title="Delete Site"
+        message="This will permanently delete the site and all its data. This cannot be undone."
+        loading={deleteLoading}
+      />
     </div>
   );
 }
@@ -198,6 +214,8 @@ function WebhooksSection() {
   const [formName, setFormName] = useState("");
   const [formType, setFormType] = useState("http");
   const [formUrl, setFormUrl] = useState("");
+  const [deletingWebhookId, setDeletingWebhookId] = useState<string | null>(null);
+  const [deleteLoading, setDeleteLoading] = useState(false);
 
   const refresh = async () => {
     const data = await settingsApi.webhooks(siteId);
@@ -221,11 +239,15 @@ function WebhooksSection() {
     finally { setCreating(false); }
   };
 
-  const handleDelete = async (webhookId: string) => {
+  const handleDeleteConfirm = async () => {
+    if (!deletingWebhookId) return;
+    setDeleteLoading(true);
     try {
-      await settingsApi.deleteWebhook(webhookId);
-      setWebhooks(prev => prev.filter(w => w.webhook_id !== webhookId));
+      await settingsApi.deleteWebhook(deletingWebhookId);
+      setWebhooks(prev => prev.filter(w => w.webhook_id !== deletingWebhookId));
+      setDeletingWebhookId(null);
     } catch (err) { console.error("Failed to delete webhook:", err); }
+    finally { setDeleteLoading(false); }
   };
 
   return (
@@ -245,7 +267,7 @@ function WebhooksSection() {
               <span class="settings-row-name">{w.name}</span>
               <span class="settings-row-value">{w.url}</span>
               <span style={{ fontSize: "11px", color: "var(--obs-text-muted)" }}>{w.webhook_type}</span>
-              <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => handleDelete(w.webhook_id)}>Delete</button>
+              <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => setDeletingWebhookId(w.webhook_id)}>Delete</button>
             </div>
           ))}
         </div>
@@ -278,6 +300,15 @@ function WebhooksSection() {
           </button>
         </div>
       </Modal>
+
+      <ConfirmDialog
+        open={!!deletingWebhookId}
+        onClose={() => setDeletingWebhookId(null)}
+        onConfirm={handleDeleteConfirm}
+        title="Delete Webhook"
+        message="This webhook will stop receiving notifications. This cannot be undone."
+        loading={deleteLoading}
+      />
     </div>
   );
 }
