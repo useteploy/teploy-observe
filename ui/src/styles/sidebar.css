@@ -96,5 +96,9 @@
   .obs-sidebar-logo { display: none; }
   .obs-sidebar-link span { display: none; }
   .obs-sidebar-link { justify-content: center; padding: 10px; }
-  .obs-main-content { margin-left: 56px; }
+  .obs-main-content { margin-left: 56px; padding: 12px !important; }
+}
+@media (max-width: 480px) {
+  .obs-sidebar { width: 0; overflow: hidden; }
+  .obs-main-content { margin-left: 0; }
 }

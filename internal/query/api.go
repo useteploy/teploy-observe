@@ -340,6 +340,21 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 		return result, err
 	}, neutron.WithTags("stats"))
 
+	type eventPropsInput struct {
+		SiteID    string `query:"site_id"`
+		From      string `query:"from"`
+		To        string `query:"to"`
+		EventType string `query:"event_type"`
+		Limit     int    `query:"limit"`
+	}
+	neutron.Get(api, "/event-properties", func(ctx context.Context, input eventPropsInput) ([]PropertyStat, error) {
+		from, _ := time.Parse(time.RFC3339, input.From)
+		to, _ := time.Parse(time.RFC3339, input.To)
+		if from.IsZero() { from = time.Now().UTC().Add(-24 * time.Hour) }
+		if to.IsZero() { to = time.Now().UTC() }
+		return svc.EventProperties(ctx, input.SiteID, from, to, input.EventType, input.Limit)
+	}, neutron.WithTags("stats"), neutron.WithSummary("Property breakdown for a custom event"))
+
 	// Session browser
 	neutron.Get(api, "/sessions", func(ctx context.Context, input SessionsInput) ([]SessionSummary, error) {
 		from, to := input.TimeRange()

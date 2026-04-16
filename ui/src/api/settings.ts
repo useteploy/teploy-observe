@@ -13,6 +13,10 @@ export interface APIKey {
   key_id: string; site_id: string; key_prefix: string; created_at: string;
 }
 
+export interface APIKeyInfo {
+  key_id: string; site_id: string; label: string; created_at: string; revoked: boolean;
+}
+
 export interface Webhook {
   webhook_id: string; site_id: string; name: string;
   webhook_type: string; url: string; enabled: string; created_at: string;
@@ -35,6 +39,10 @@ export const settingsApi = {
     del(`${BASE}/sites/${siteId}`),
   createAPIKey: (siteId: string) =>
     post<{ api_key: string }>(`${BASE}/sites/${siteId}/keys`, {}),
+  listAPIKeys: (siteId: string) =>
+    get<APIKeyInfo[]>(`${BASE}/sites/${siteId}/keys`),
+  revokeAPIKey: (keyId: string) =>
+    del(`${BASE}/keys/${keyId}`),
 
   // Share links
   shareLinks: (siteId: string) =>

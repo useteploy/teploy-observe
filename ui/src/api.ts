@@ -5,6 +5,7 @@ export type {
   OverviewStats, OverviewResponse, TimeSeriesPoint, TopPage, TopReferrer,
   BrowserStat, CountryStat, OSStat, DeviceStat, ChannelStat, LanguageStat,
   ScreenStat, UTMStat, EntryPageStat, ExitPageStat, CustomEventStat, RealtimeResult,
+  PropertyStat,
 } from "./api/analytics.js";
 
 import { analyticsApi } from "./api/analytics.js";

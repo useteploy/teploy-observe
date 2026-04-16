@@ -788,6 +788,83 @@ func (s *StatsService) CustomEvents(ctx context.Context, siteID string, from, to
 	return rows, nil
 }
 
+// PropertyStat represents a single property key/value count.
+type PropertyStat struct {
+	Key      string `json:"key"`
+	Value    string `json:"value"`
+	Count    int64  `json:"count"`
+	Visitors int64  `json:"visitors"`
+}
+
+// EventProperties returns property key→value breakdowns for a specific event type.
+// Aggregated in Go because Nucleus doesn't support jsonb_each or similar.
+func (s *StatsService) EventProperties(ctx context.Context, siteID string, from, to time.Time, eventType string, limit int) ([]PropertyStat, error) {
+	fromMs := dbutil.IntParam(from.UnixMilli())
+	toMs := dbutil.IntParam(to.UnixMilli())
+	if limit <= 0 {
+		limit = 20
+	}
+
+	type raw struct {
+		Properties string `json:"properties" db:"properties"`
+		SessionID  string `json:"session_id" db:"session_id"`
+	}
+	rows, err := nucleus.Query[raw](ctx, s.db.SQL(),
+		`SELECT COALESCE(properties, '') AS properties, session_id
+		 FROM events
+		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+		   AND event_type = $4 AND properties != ''
+		 LIMIT 5000`,
+		siteID, fromMs, toMs, eventType,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("event properties: %w", err)
+	}
+
+	type key struct{ k, v string }
+	counts := make(map[key]int64)
+	visitors := make(map[key]map[string]bool)
+
+	for _, r := range rows {
+		if r.Properties == "" || r.Properties == "{}" {
+			continue
+		}
+		var props map[string]any
+		if err := json.Unmarshal([]byte(r.Properties), &props); err != nil {
+			continue
+		}
+		for k, v := range props {
+			vStr := fmt.Sprintf("%v", v)
+			kv := key{k, vStr}
+			counts[kv]++
+			if visitors[kv] == nil {
+				visitors[kv] = make(map[string]bool)
+			}
+			visitors[kv][r.SessionID] = true
+		}
+	}
+
+	result := make([]PropertyStat, 0, len(counts))
+	for kv, c := range counts {
+		result = append(result, PropertyStat{
+			Key: kv.k, Value: kv.v, Count: c, Visitors: int64(len(visitors[kv])),
+		})
+	}
+
+	// Sort by count desc, truncate
+	for i := 0; i < len(result); i++ {
+		for j := i + 1; j < len(result); j++ {
+			if result[j].Count > result[i].Count {
+				result[i], result[j] = result[j], result[i]
+			}
+		}
+	}
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+
 // ============================================================================
 // Session browser
 // ============================================================================

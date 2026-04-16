@@ -50,6 +50,10 @@ export interface Correlation {
   baseline_rate: number; significant: boolean;
 }
 
+export interface PropertyStat {
+  key: string; value: string; count: number; visitors: number;
+}
+
 export const analyticsApi = {
   realtime: (siteId: string, minutes = 5) =>
     get<RealtimeResult>(`${BASE}/realtime?site_id=${siteId}&minutes=${minutes}`),
@@ -83,6 +87,8 @@ export const analyticsApi = {
     get<ExitPageStat[]>(`${BASE}/exit-pages?${qs(siteId, from, to, { limit, filters })}`),
   customEvents: (siteId: string, from: string, to: string, limit = 20, filters?: Record<string, string>) =>
     get<CustomEventStat[]>(`${BASE}/events?${qs(siteId, from, to, { limit, filters })}`),
+  eventProperties: (siteId: string, from: string, to: string, eventType: string) =>
+    get<PropertyStat[]>(`${BASE}/event-properties?${qs(siteId, from, to)}&event_type=${encodeURIComponent(eventType)}`),
   funnel: (siteId: string, from: string, to: string, steps: FunnelStep[]) =>
     post<FunnelResult[]>(`${BASE}/funnel`, { site_id: siteId, from, to, steps }),
   retention: (siteId: string, from: string, to: string, periodDays?: number) =>

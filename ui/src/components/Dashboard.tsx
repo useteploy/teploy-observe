@@ -6,6 +6,7 @@ import DatePicker from "./DatePicker.js";
 import FilterBar from "./FilterBar.js";
 import TabbedBreakdownPanel from "./TabbedBreakdownPanel.js";
 import CustomEventsPanel from "./CustomEventsPanel.js";
+import OnboardingGuide from "./OnboardingGuide.js";
 import "../styles/dashboard.css";
 
 function ExportButton() {
@@ -26,6 +27,8 @@ function ExportButton() {
 }
 
 function DashboardInner() {
+  const { state } = useFilters();
+
   return (
     <div class="obs-dashboard">
       <header class="obs-header">
@@ -40,6 +43,8 @@ function DashboardInner() {
       </header>
 
       <FilterBar />
+
+      <OnboardingGuide siteId={state.siteId} />
 
       <StatsCards />
 

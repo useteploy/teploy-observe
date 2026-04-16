@@ -29,6 +29,28 @@
   --obs-transition-slow: 300ms ease;
 }
 
+/* ─── Light Theme ─── */
+[data-theme="light"] {
+  --obs-bg: #f8f9fa;
+  --obs-surface: #ffffff;
+  --obs-card: #ffffff;
+  --obs-card-hover: #f3f4f6;
+  --obs-elevated: #f9fafb;
+  --obs-border: #e5e7eb;
+  --obs-border-subtle: #f0f0f2;
+  --obs-text: #111827;
+  --obs-text-secondary: #4b5563;
+  --obs-text-muted: #9ca3af;
+  --obs-accent: #4f46e5;
+  --obs-accent-hover: #6366f1;
+  --obs-success: #16a34a;
+  --obs-success-bg: rgba(22, 163, 74, 0.08);
+  --obs-danger: #dc2626;
+  --obs-danger-bg: rgba(220, 38, 38, 0.08);
+  --obs-warning: #d97706;
+  --obs-surface-hover: #f3f4f6;
+}
+
 /* ─── Reset & Base ─── */
 * {
   box-sizing: border-box;

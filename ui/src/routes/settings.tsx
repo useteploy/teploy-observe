@@ -1,6 +1,6 @@
 import { useState, useEffect } from "preact/hooks";
 import { settingsApi } from "../api/settings.js";
-import type { Site, Webhook, User, ShareLink } from "../api/settings.js";
+import type { Site, Webhook, User, ShareLink, APIKeyInfo } from "../api/settings.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
 import ConfirmDialog from "../components/shared/ConfirmDialog.js";
@@ -414,6 +414,78 @@ function UsersSection() {
 
 // ─── Password ───
 
+// ─── API Keys ───
+
+function APIKeysSection() {
+  const siteId = typeof window !== "undefined"
+    ? new URLSearchParams(window.location.search).get("site_id") || "default"
+    : "default";
+
+  const [keys, setKeys] = useState<APIKeyInfo[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [revokingId, setRevokingId] = useState<string | null>(null);
+  const [revokeLoading, setRevokeLoading] = useState(false);
+
+  useEffect(() => {
+    setLoading(true);
+    settingsApi.listAPIKeys(siteId)
+      .then(d => setKeys(d || []))
+      .catch(() => setKeys([]))
+      .finally(() => setLoading(false));
+  }, [siteId]);
+
+  const handleRevoke = async () => {
+    if (!revokingId) return;
+    setRevokeLoading(true);
+    try {
+      await settingsApi.revokeAPIKey(revokingId);
+      setKeys(prev => prev.map(k => k.key_id === revokingId ? { ...k, revoked: true } : k));
+      setRevokingId(null);
+    } catch (err) { console.error("Failed to revoke key:", err); }
+    finally { setRevokeLoading(false); }
+  };
+
+  return (
+    <div class="settings-section">
+      <div class="settings-section-header">
+        <h2 class="settings-section-title">API Keys</h2>
+      </div>
+
+      {loading ? <SettingsSkeleton /> : keys.length === 0 ? (
+        <div class="obs-empty-state">No API keys. Generate one from the Sites section above.</div>
+      ) : (
+        <div class="settings-list">
+          {keys.map(k => (
+            <div key={k.key_id} class="settings-row">
+              <StatusBadge status={k.revoked ? "disabled" : "enabled"} size="sm" />
+              <span class="settings-row-name">{k.label || "default"}</span>
+              <span class="settings-row-value" style={{ fontFamily: "var(--obs-font-mono, 'SF Mono', monospace)", fontSize: "11px" }}>
+                {k.key_id.slice(0, 8)}...
+              </span>
+              <span class="settings-row-date">{k.created_at}</span>
+              {!k.revoked && (
+                <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => setRevokingId(k.key_id)}>
+                  Revoke
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={!!revokingId}
+        onClose={() => setRevokingId(null)}
+        onConfirm={handleRevoke}
+        title="Revoke API Key"
+        message="This key will immediately stop working. Any services using it will lose access."
+        confirmLabel="Revoke"
+        loading={revokeLoading}
+      />
+    </div>
+  );
+}
+
 function PasswordSection() {
   const [currentPw, setCurrentPw] = useState("");
   const [newPw, setNewPw] = useState("");
@@ -497,6 +569,7 @@ export default function SettingsPage() {
       <SitesSection />
       <WebhooksSection />
       <UsersSection />
+      <APIKeysSection />
       <PasswordSection />
     </div>
   );

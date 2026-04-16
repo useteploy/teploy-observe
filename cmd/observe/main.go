@@ -363,6 +363,14 @@ func main() {
 		neutron.WithTags("sites"),
 		neutron.WithSummary("Generate API key for a site"),
 	)
+	neutron.Get(siteGroup, "/sites/{site_id}/keys", listAPIKeysHandler(authSvc),
+		neutron.WithTags("sites"),
+		neutron.WithSummary("List API keys for a site"),
+	)
+	neutron.Delete(siteGroup, "/keys/{key_id}", revokeAPIKeyHandler(authSvc),
+		neutron.WithTags("sites"),
+		neutron.WithSummary("Revoke an API key"),
+	)
 
 	// --- Feedback (public, no auth for user submissions) ---
 	r.HandleFunc("POST /api/v1/feedback", feedbackSubmitHandler(feedbackSvc))
@@ -816,6 +824,32 @@ func createAPIKeyHandler(authSvc *auth.AuthService) neutron.HandlerFunc[createAP
 			return createAPIKeyResponse{}, err
 		}
 		return createAPIKeyResponse{Key: key, Info: info}, nil
+	}
+}
+
+type listAPIKeysInput struct {
+	SiteID string `path:"site_id"`
+}
+
+func listAPIKeysHandler(authSvc *auth.AuthService) neutron.HandlerFunc[listAPIKeysInput, []auth.APIKeyInfo] {
+	return func(ctx context.Context, input listAPIKeysInput) ([]auth.APIKeyInfo, error) {
+		if input.SiteID == "" {
+			return nil, neutron.ErrBadRequest("site_id required")
+		}
+		return authSvc.ListAPIKeys(ctx, input.SiteID)
+	}
+}
+
+type revokeAPIKeyInput struct {
+	KeyID string `path:"key_id"`
+}
+
+func revokeAPIKeyHandler(authSvc *auth.AuthService) neutron.HandlerFunc[revokeAPIKeyInput, neutron.Empty] {
+	return func(ctx context.Context, input revokeAPIKeyInput) (neutron.Empty, error) {
+		if input.KeyID == "" {
+			return neutron.Empty{}, neutron.ErrBadRequest("key_id required")
+		}
+		return neutron.Empty{}, authSvc.RevokeAPIKey(ctx, input.KeyID)
 	}
 }
 
