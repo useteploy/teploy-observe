@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-dev/neutron-go/neutronauth"
 	"github.com/neutron-dev/neutron-go/nucleus"
 
 	"github.com/teploy/observe/internal/auth"
@@ -202,7 +203,6 @@ func main() {
 		neutron.WithTags("auth"),
 		neutron.WithSummary("Login and receive JWT token"),
 	)
-
 	// --- Ingestion API (API key auth, wildcard CORS, rate limited) ---
 	rateLimit := cfg.RateLimit
 	if rateLimit <= 0 {
@@ -246,6 +246,12 @@ func main() {
 
 	// --- Data export (JWT auth) ---
 	r.Handle("GET /api/v1/export", jwtMW(exportSvc.Handler()))
+
+	// --- Password change (JWT auth) ---
+	neutron.Post(r.Group("/api/v1/auth", jwtMW), "/password", changePasswordHandler(authSvc),
+		neutron.WithTags("auth"),
+		neutron.WithSummary("Change password"),
+	)
 
 	// --- Issue management API (JWT auth) ---
 	issueGroup := r.Group("/api/v1/issues", jwtMW)
@@ -600,18 +606,28 @@ func main() {
 	})
 
 	r.Handle("GET /assets/", http.FileServer(http.FS(uiSub)))
-	r.HandleFunc("GET /{$}", func(w http.ResponseWriter, req *http.Request) {
-		data, err := fs.ReadFile(uiSub, "index.html")
-		if err != nil {
+
+	// --- Public share dashboard ---
+	r.HandleFunc("GET /share/{token}", shareViewHandler(shareSvc, uiSub))
+
+	// SPA catch-all: serve index.html for all non-API, non-asset GET requests.
+	// This must be registered last so API routes take precedence.
+	indexHTML, _ := fs.ReadFile(uiSub, "index.html")
+	r.HandleFunc("GET /", func(w http.ResponseWriter, req *http.Request) {
+		// Let the file server handle real asset files
+		if strings.HasPrefix(req.URL.Path, "/assets/") || strings.HasPrefix(req.URL.Path, "/api/") ||
+			strings.HasPrefix(req.URL.Path, "/v1/") || strings.HasPrefix(req.URL.Path, "/t/") ||
+			strings.HasPrefix(req.URL.Path, "/l/") || req.URL.Path == "/healthz" {
+			http.NotFound(w, req)
+			return
+		}
+		if indexHTML == nil {
 			http.Error(w, "not found", 404)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(data)
+		w.Write(indexHTML)
 	})
-
-	// --- Public share dashboard ---
-	r.HandleFunc("GET /share/{token}", shareViewHandler(shareSvc, uiSub))
 
 	// Start background services directly (lifecycle hooks may not fire on all platforms)
 	buf.Start()
@@ -700,6 +716,28 @@ func loginHandler(authSvc *auth.AuthService) neutron.HandlerFunc[loginInput, log
 			return loginResponse{}, neutron.ErrUnauthorized("invalid credentials")
 		}
 		return loginResponse{Token: token}, nil
+	}
+}
+
+type changePasswordInput struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+func changePasswordHandler(authSvc *auth.AuthService) neutron.HandlerFunc[changePasswordInput, neutron.Empty] {
+	return func(ctx context.Context, input changePasswordInput) (neutron.Empty, error) {
+		claims, _ := neutronauth.ClaimsFromContext(ctx)
+		userID, _ := claims["sub"].(string)
+		if userID == "" {
+			return neutron.Empty{}, neutron.ErrUnauthorized("invalid token")
+		}
+		if input.CurrentPassword == "" || input.NewPassword == "" {
+			return neutron.Empty{}, neutron.ErrBadRequest("current_password and new_password required")
+		}
+		if err := authSvc.ChangePassword(ctx, userID, input.CurrentPassword, input.NewPassword); err != nil {
+			return neutron.Empty{}, neutron.ErrBadRequest(err.Error())
+		}
+		return neutron.Empty{}, nil
 	}
 }
 
