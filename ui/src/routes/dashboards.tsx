@@ -1,8 +1,61 @@
-import { useState, useEffect, useCallback } from "preact/hooks";
+import { useState, useEffect, useCallback, useRef } from "preact/hooks";
 import { get, post, del } from "../api/helpers.js";
+import { analyticsApi } from "../api/analytics.js";
+import type { TimeSeriesPoint } from "../api/analytics.js";
 import Modal from "../components/shared/Modal.js";
 import ConfirmDialog from "../components/shared/ConfirmDialog.js";
 import "../styles/dashboards.css";
+
+function MiniSparkline({ data, color = "var(--obs-accent)" }: { data: number[]; color?: string }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas || data.length < 2) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.scale(dpr, dpr);
+    const w = rect.width;
+    const h = rect.height;
+    const max = Math.max(...data, 1);
+    const pad = 2;
+
+    ctx.clearRect(0, 0, w, h);
+
+    // Fill area
+    ctx.beginPath();
+    ctx.moveTo(pad, h - pad);
+    data.forEach((v, i) => {
+      const x = pad + (i / (data.length - 1)) * (w - pad * 2);
+      const y = h - pad - (v / max) * (h - pad * 2);
+      ctx.lineTo(x, y);
+    });
+    ctx.lineTo(w - pad, h - pad);
+    ctx.closePath();
+    ctx.fillStyle = typeof color === "string" && color.startsWith("var(")
+      ? getComputedStyle(canvas).getPropertyValue(color.slice(4, -1)) + "18"
+      : (color + "18");
+    ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    data.forEach((v, i) => {
+      const x = pad + (i / (data.length - 1)) * (w - pad * 2);
+      const y = h - pad - (v / max) * (h - pad * 2);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = "#6366f1";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }, [data, color]);
+
+  if (data.length < 2) return null;
+  return <canvas ref={ref} style={{ width: "100%", height: "32px", display: "block", marginTop: "8px" }} />;
+}
 
 export const config = { mode: "app" };
 
@@ -47,27 +100,49 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
   const [panelType, setPanelType] = useState("metric");
   const [queryType, setQueryType] = useState("pageviews");
   const [panelValues, setPanelValues] = useState<Record<string, string>>({});
+  const [panelSparklines, setPanelSparklines] = useState<Record<string, number[]>>({});
 
   const fetchDetail = useCallback(async () => {
     setLoading(true);
     try {
       const data = await get<DashboardDetail>(`${BASE}/${dashboardId}?site_id=${siteId}`);
       setDetail(data);
-      // Fetch panel values
       if (data?.panels?.length) {
         const now = new Date();
-        const from = new Date(now.getTime() - 86400000).toISOString();
+        const from = new Date(now.getTime() - 7 * 86400000).toISOString();
         const to = now.toISOString();
+
+        // Fetch panel values + sparkline data in parallel
+        const valPromises = data.panels.filter(p => p.title).map(async (p) => {
+          try {
+            const r = await post<{ value: string }>(`${BASE}/${dashboardId}/panels/${p.panel_id}/execute`, { site_id: siteId, from, to });
+            return { id: p.panel_id, value: r?.value || "0" };
+          } catch { return { id: p.panel_id, value: "--" }; }
+        });
+
+        // Fetch timeseries for sparklines
+        let tsData: TimeSeriesPoint[] = [];
+        try {
+          tsData = await analyticsApi.timeseries(siteId, from, to, "day") || [];
+        } catch {}
+
+        const results = await Promise.all(valPromises);
         const vals: Record<string, string> = {};
+        const sparks: Record<string, number[]> = {};
+        for (const r of results) { vals[r.id] = r.value; }
+
+        // Map sparkline data to each panel based on query type
         for (const p of data.panels) {
-          if (p.title) {
-            try {
-              const r = await post<{ value: string }>(`${BASE}/${dashboardId}/panels/${p.panel_id}/execute`, { site_id: siteId, from, to });
-              vals[p.panel_id] = r?.value || "0";
-            } catch { vals[p.panel_id] = "--"; }
+          if (!p.title) continue;
+          if (p.query_type === "pageviews") {
+            sparks[p.panel_id] = tsData.map(d => d.pageviews);
+          } else if (p.query_type === "visitors") {
+            sparks[p.panel_id] = tsData.map(d => d.visitors);
           }
         }
+
         setPanelValues(vals);
+        setPanelSparklines(sparks);
       }
     } catch { setDetail(null); }
     finally { setLoading(false); }
@@ -134,6 +209,9 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
                 <div class="dashboard-panel-value">
                   {panelValues[panel.panel_id] ?? "--"}
                 </div>
+                {panelSparklines[panel.panel_id]?.length > 1 && (
+                  <MiniSparkline data={panelSparklines[panel.panel_id]} />
+                )}
                 <div style={{ fontSize: "11px", color: "var(--obs-text-muted)", marginTop: "4px" }}>
                   {panel.query_type} / {panel.panel_type}
                 </div>

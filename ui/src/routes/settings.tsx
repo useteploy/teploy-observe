@@ -263,7 +263,7 @@ function WebhooksSection() {
         <div class="settings-list">
           {webhooks.map(w => (
             <div key={w.webhook_id} class="settings-row">
-              <StatusBadge status={w.enabled === "true" || w.enabled === "1" ? "enabled" : "disabled"} size="sm" />
+              <StatusBadge status={w.enabled ? "enabled" : "disabled"} size="sm" />
               <span class="settings-row-name">{w.name}</span>
               <span class="settings-row-value">{w.url}</span>
               <span style={{ fontSize: "11px", color: "var(--obs-text-muted)" }}>{w.webhook_type}</span>

@@ -19,7 +19,7 @@ export interface APIKeyInfo {
 
 export interface Webhook {
   webhook_id: string; site_id: string; name: string;
-  webhook_type: string; url: string; enabled: string; created_at: string;
+  webhook_type: string; url: string; enabled: boolean; created_at: string;
 }
 
 export interface User {
