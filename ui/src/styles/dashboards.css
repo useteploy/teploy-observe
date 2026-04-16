@@ -1,0 +1,47 @@
+/* Custom dashboards page */
+
+.dashboards-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 12px;
+}
+.dashboard-card {
+  padding: 16px; background: var(--obs-surface); border-radius: var(--obs-radius-md);
+  cursor: pointer; border: 1px solid var(--obs-border-subtle);
+  transition: all var(--obs-transition);
+}
+.dashboard-card:hover { border-color: var(--obs-accent); }
+.dashboard-card-name { font-size: 14px; font-weight: 600; color: var(--obs-text); margin-bottom: 4px; }
+.dashboard-card-desc { font-size: 12px; color: var(--obs-text-secondary); margin-bottom: 8px; }
+.dashboard-card-meta { font-size: 11px; color: var(--obs-text-muted); }
+
+/* Panel grid inside a dashboard */
+.dashboard-panels {
+  display: grid; grid-template-columns: repeat(12, 1fr); gap: 12px; margin-top: 16px;
+}
+.dashboard-panel {
+  background: var(--obs-surface); border-radius: var(--obs-radius-md);
+  border: 1px solid var(--obs-border-subtle); padding: 16px;
+  min-height: 120px; display: flex; flex-direction: column;
+}
+.dashboard-panel-title {
+  font-size: 12px; font-weight: 600; color: var(--obs-text-secondary);
+  text-transform: uppercase; letter-spacing: 0.3px; margin-bottom: 8px;
+}
+.dashboard-panel-value {
+  font-size: 28px; font-weight: 700; color: var(--obs-text);
+  font-variant-numeric: tabular-nums;
+}
+.dashboard-panel-actions {
+  margin-top: auto; padding-top: 8px; display: flex; gap: 4px; justify-content: flex-end;
+}
+
+.dashboard-toolbar {
+  display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;
+}
+
+.add-panel-form { display: flex; flex-direction: column; gap: 12px; }
+
+@media (max-width: 768px) {
+  .dashboards-grid { grid-template-columns: 1fr; }
+  .dashboard-panels { grid-template-columns: repeat(6, 1fr); }
+}

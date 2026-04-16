@@ -429,7 +429,86 @@ function SearchFilters({ siteId, from, to, services, onSelectTrace }: {
 
 // ─── Main Page ───
 
-type View = "services" | "operations" | "trace" | "search";
+// ─── Dependency Graph ───
+
+function DependencyGraph({ siteId, from, to }: { siteId: string; from: string; to: string }) {
+  const [deps, setDeps] = useState<ServiceDependency[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    tracesApi.dependencies(siteId, from, to)
+      .then(d => setDeps(d || []))
+      .catch(() => setDeps([]))
+      .finally(() => setLoading(false));
+  }, [siteId, from, to]);
+
+  if (loading) return <ListSkeleton />;
+  if (!deps.length) return <div class="obs-empty-state">No service dependencies found</div>;
+
+  // Build node positions
+  const nodes = new Set<string>();
+  deps.forEach(d => { nodes.add(d.src_service); nodes.add(d.dst_service); });
+  const nodeList = Array.from(nodes);
+  const nodeMap = new Map<string, { x: number; y: number }>();
+  const cols = Math.ceil(Math.sqrt(nodeList.length));
+  nodeList.forEach((n, i) => {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    nodeMap.set(n, { x: 120 + col * 200, y: 80 + row * 120 });
+  });
+  const svgWidth = 120 + cols * 200;
+  const svgHeight = 80 + (Math.ceil(nodeList.length / cols)) * 120;
+  const maxCalls = Math.max(...deps.map(d => d.call_count), 1);
+
+  return (
+    <div style={{ overflow: "auto" }}>
+      <svg width={svgWidth} height={svgHeight} style={{ display: "block" }}>
+        {/* Edges */}
+        {deps.map((d, i) => {
+          const src = nodeMap.get(d.src_service);
+          const dst = nodeMap.get(d.dst_service);
+          if (!src || !dst) return null;
+          const opacity = 0.3 + (d.call_count / maxCalls) * 0.7;
+          const hasError = d.error_count > 0;
+          return (
+            <g key={i}>
+              <line x1={src.x} y1={src.y} x2={dst.x} y2={dst.y}
+                stroke={hasError ? "var(--obs-danger)" : "var(--obs-accent)"}
+                strokeWidth={1 + (d.call_count / maxCalls) * 3}
+                opacity={opacity}
+                markerEnd="url(#arrowhead)" />
+              <text x={(src.x + dst.x) / 2} y={(src.y + dst.y) / 2 - 6}
+                fill="var(--obs-text-muted)" fontSize="10" textAnchor="middle">
+                {d.call_count.toLocaleString()} calls
+              </text>
+            </g>
+          );
+        })}
+        {/* Arrowhead marker */}
+        <defs>
+          <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="var(--obs-accent)" />
+          </marker>
+        </defs>
+        {/* Nodes */}
+        {nodeList.map(n => {
+          const pos = nodeMap.get(n)!;
+          return (
+            <g key={n}>
+              <circle cx={pos.x} cy={pos.y} r="28" fill="var(--obs-surface)" stroke="var(--obs-border)" strokeWidth="2" />
+              <text x={pos.x} y={pos.y + 4} fill="var(--obs-text)" fontSize="11" textAnchor="middle" fontWeight="600">
+                {n.length > 12 ? n.slice(0, 11) + "..." : n}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+type View = "services" | "operations" | "trace" | "search" | "deps";
 
 export default function TracesPage() {
   const siteId = typeof window !== "undefined"
@@ -544,7 +623,11 @@ export default function TracesPage() {
     <div>
       <div class="obs-page-header">
         <h1 class="obs-page-title">Traces</h1>
-        <div class="obs-page-actions">
+        <div class="obs-page-actions" style={{ display: "flex", gap: "8px" }}>
+          <button class={`obs-btn ${view === "deps" ? "obs-btn--primary" : ""}`}
+            onClick={() => setView(view === "deps" ? "services" : "deps")}>
+            {view === "deps" ? "Show Services" : "Dependencies"}
+          </button>
           <button class={`obs-btn ${view === "search" ? "obs-btn--primary" : ""}`}
             onClick={() => setView(view === "search" ? "services" : "search")}>
             {view === "search" ? "Show Services" : "Search Traces"}
@@ -561,7 +644,9 @@ export default function TracesPage() {
         />
       </div>
 
-      {view === "search" ? (
+      {view === "deps" ? (
+        <DependencyGraph siteId={siteId} from={from} to={to} />
+      ) : view === "search" ? (
         <SearchFilters siteId={siteId} from={from} to={to} services={services} onSelectTrace={loadTrace} />
       ) : loading ? (
         <ServicesSkeleton />
