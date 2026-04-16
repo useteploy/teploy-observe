@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -34,42 +33,6 @@ type Log struct {
 	TraceID     string    `json:"trace_id"`
 	SpanID      string    `json:"span_id"`
 	Attributes  string    `json:"attributes"`
-}
-
-type logRow struct {
-	LogID       string `db:"log_id"`
-	TenantID    string `db:"tenant_id"`
-	SiteID      string `db:"site_id"`
-	Timestamp   string `db:"timestamp"`
-	Level       string `db:"level"`
-	Message     string `db:"message"`
-	ServiceName string `db:"service_name"`
-	TraceID     string `db:"trace_id"`
-	SpanID      string `db:"span_id"`
-	Attributes  string `db:"attributes"`
-}
-
-func parseEpochMillis(s string) time.Time {
-	if s == "" {
-		return time.Time{}
-	}
-	if ms, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return time.UnixMilli(ms).UTC()
-	}
-	return time.Time{}
-}
-
-func (r logRow) toDomain() Log {
-	return Log{
-		LogID: r.LogID, SiteID: r.SiteID,
-		Timestamp:   parseEpochMillis(r.Timestamp),
-		Level:       r.Level,
-		Message:     r.Message,
-		ServiceName: r.ServiceName,
-		TraceID:     r.TraceID,
-		SpanID:      r.SpanID,
-		Attributes:  r.Attributes,
-	}
 }
 
 // LogInput is the payload accepted for log ingestion.
@@ -159,15 +122,7 @@ func (s *LogService) SearchLogs(ctx context.Context, siteID string, from, to tim
 		 ORDER BY timestamp DESC
 		 LIMIT %d OFFSET %d`, where, limit, offset)
 
-	rows, err := nucleus.Query[logRow](ctx, s.db.SQL(), query, params...)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]Log, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.toDomain())
-	}
-	return out, nil
+	return nucleus.Query[Log](ctx, s.db.SQL(), query, params...)
 }
 
 // LevelCount holds the count of logs for a single level.
@@ -176,17 +131,12 @@ type LevelCount struct {
 	Count int64  `json:"count"`
 }
 
-type levelCountRow struct {
-	Level string `db:"level"`
-	Count string `db:"count"`
-}
-
 // LogStats returns the count of logs per level for a time range.
 func (s *LogService) LogStats(ctx context.Context, siteID string, from, to time.Time) ([]LevelCount, error) {
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
-	rows, err := nucleus.Query[levelCountRow](ctx, s.db.SQL(),
+	return nucleus.Query[LevelCount](ctx, s.db.SQL(),
 		`SELECT level, CAST(COUNT(*) AS TEXT) AS count
 		 FROM logs
 		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
@@ -194,15 +144,6 @@ func (s *LogService) LogStats(ctx context.Context, siteID string, from, to time.
 		 ORDER BY count DESC`,
 		siteID, fromMs, toMs,
 	)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]LevelCount, 0, len(rows))
-	for _, r := range rows {
-		n, _ := strconv.ParseInt(r.Count, 10, 64)
-		out = append(out, LevelCount{Level: r.Level, Count: n})
-	}
-	return out, nil
 }
 
 func generateID() (string, error) {

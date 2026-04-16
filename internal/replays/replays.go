@@ -37,50 +37,6 @@ type ReplaySession struct {
 	HasError  bool      `json:"has_error"`
 }
 
-type replaySessionRow struct {
-	ReplayID  string `db:"replay_id"`
-	TenantID  string `db:"tenant_id"`
-	SiteID    string `db:"site_id"`
-	SessionID string `db:"session_id"`
-	StartTime string `db:"start_time"`
-	Duration  string `db:"duration_ms"`
-	PageCount string `db:"page_count"`
-	URL       string `db:"url"`
-	Browser   string `db:"browser"`
-	OS        string `db:"os"`
-	Device    string `db:"device"`
-	HasError  string `db:"has_error"`
-}
-
-func parseEpochMillis(s string) time.Time {
-	if s == "" || s == "0" {
-		return time.Time{}
-	}
-	if ms, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return time.UnixMilli(ms).UTC()
-	}
-	return time.Time{}
-}
-
-func parseBool(s string) bool {
-	switch s {
-	case "true", "1", "TRUE":
-		return true
-	}
-	return false
-}
-
-func (r replaySessionRow) toDomain() ReplaySession {
-	dur, _ := strconv.ParseInt(r.Duration, 10, 64)
-	pc, _ := strconv.Atoi(r.PageCount)
-	return ReplaySession{
-		ReplayID: r.ReplayID, SiteID: r.SiteID, SessionID: r.SessionID,
-		StartTime: parseEpochMillis(r.StartTime), Duration: dur, PageCount: pc,
-		URL: r.URL, Browser: r.Browser, OS: r.OS, Device: r.Device,
-		HasError: parseBool(r.HasError),
-	}
-}
-
 // ReplayEvent is the domain type for replay events.
 type ReplayEvent struct {
 	EventID   string    `json:"event_id"`
@@ -88,23 +44,6 @@ type ReplayEvent struct {
 	Timestamp time.Time `json:"timestamp"`
 	EventType string    `json:"event_type"`
 	Data      string    `json:"data"`
-}
-
-type replayEventRow struct {
-	EventID   string `db:"event_id"`
-	TenantID  string `db:"tenant_id"`
-	ReplayID  string `db:"replay_id"`
-	Timestamp string `db:"timestamp"`
-	EventType string `db:"event_type"`
-	Data      string `db:"data"`
-}
-
-func (r replayEventRow) toDomain() ReplayEvent {
-	return ReplayEvent{
-		EventID: r.EventID, ReplayID: r.ReplayID,
-		Timestamp: parseEpochMillis(r.Timestamp),
-		EventType: r.EventType, Data: r.Data,
-	}
 }
 
 // IngestInput is the JSON body from the replay SDK.
@@ -191,7 +130,7 @@ func (s *ReplayService) ListReplays(ctx context.Context, siteID string, from, to
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
-	rows, err := nucleus.Query[replaySessionRow](ctx, s.db.SQL(),
+	return nucleus.Query[ReplaySession](ctx, s.db.SQL(),
 		fmt.Sprintf(`SELECT replay_id, tenant_id, site_id, session_id,
 			CAST(start_time AS TEXT) AS start_time,
 			duration_ms, page_count, url, browser, os, device, has_error
@@ -201,19 +140,11 @@ func (s *ReplayService) ListReplays(ctx context.Context, siteID string, from, to
 		 LIMIT %d OFFSET %d`, limit, offset),
 		siteID, fromMs, toMs,
 	)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]ReplaySession, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.toDomain())
-	}
-	return out, nil
 }
 
 // GetReplayEvents returns all events for a replay session.
 func (s *ReplayService) GetReplayEvents(ctx context.Context, replayID string) ([]ReplayEvent, error) {
-	rows, err := nucleus.Query[replayEventRow](ctx, s.db.SQL(),
+	return nucleus.Query[ReplayEvent](ctx, s.db.SQL(),
 		`SELECT event_id, tenant_id, replay_id,
 			CAST(timestamp AS TEXT) AS timestamp,
 			event_type,
@@ -223,14 +154,6 @@ func (s *ReplayService) GetReplayEvents(ctx context.Context, replayID string) ([
 		 ORDER BY timestamp ASC`,
 		replayID,
 	)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]ReplayEvent, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.toDomain())
-	}
-	return out, nil
 }
 
 func genID() string {

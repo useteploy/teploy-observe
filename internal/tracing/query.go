@@ -20,8 +20,7 @@ func NewQueryService(db *nucleus.Client) *QueryService {
 	return &QueryService{db: db}
 }
 
-// ServiceSummary is a service with its RED metrics. Numeric fields are
-// typed for consumers; see scan-row pattern in alerts.go for why.
+// ServiceSummary is a service with its RED metrics.
 type ServiceSummary struct {
 	ServiceName  string `json:"service_name"`
 	RequestCount int64  `json:"request_count"`
@@ -37,8 +36,8 @@ func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
-	// service_stats stores numeric columns as TEXT. Query raw values
-	// and aggregate them. Nucleus may not support CAST in aggregates.
+	// service_stats stores per-bucket rows. Aggregate in Go because
+	// Nucleus doesn't support CAST inside aggregate functions.
 	type rawStat struct {
 		ServiceName  string `db:"service_name"`
 		RequestCount string `db:"request_count"`
@@ -89,13 +88,8 @@ func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to
 			avg = a.durSum / a.reqs
 		}
 		result = append(result, ServiceSummary{
-			ServiceName:  name,
-			RequestCount: a.reqs,
-			ErrorCount:   a.errs,
-			AvgDuration:  avg,
-			P50:          a.p50,
-			P95:          a.p95,
-			P99:          a.p99,
+			ServiceName: name, RequestCount: a.reqs, ErrorCount: a.errs,
+			AvgDuration: avg, P50: a.p50, P95: a.p95, P99: a.p99,
 		})
 	}
 	return result, nil
@@ -167,13 +161,8 @@ func (q *QueryService) ListOperations(ctx context.Context, siteID, service strin
 			avg = a.durSum / a.reqs
 		}
 		result = append(result, OperationSummary{
-			OperationName: name,
-			RequestCount:  a.reqs,
-			ErrorCount:    a.errs,
-			AvgDuration:   avg,
-			P50:           a.p50,
-			P95:           a.p95,
-			P99:           a.p99,
+			OperationName: name, RequestCount: a.reqs, ErrorCount: a.errs,
+			AvgDuration: avg, P50: a.p50, P95: a.p95, P99: a.p99,
 		})
 	}
 	return result, nil
@@ -187,44 +176,12 @@ func parseInt(s string) int64 {
 // TraceSummary is a trace listed in search results.
 type TraceSummary struct {
 	TraceID     string    `json:"trace_id"`
-	RootService string    `json:"root_service"`
-	RootOp      string    `json:"root_operation"`
+	RootService string    `json:"root_service" db:"root_service"`
+	RootOp      string    `json:"root_operation" db:"root_op"`
 	StartTime   time.Time `json:"start_time"`
 	DurationMs  int64     `json:"duration_ms"`
 	SpanCount   int64     `json:"span_count"`
 	StatusCode  string    `json:"status_code"`
-}
-
-type traceSummaryRow struct {
-	TraceID     string `db:"trace_id"`
-	RootService string `db:"root_service"`
-	RootOp      string `db:"root_op"`
-	StartTime   string `db:"start_time"`
-	DurationMs  string `db:"duration_ms"`
-	SpanCount   string `db:"span_count"`
-	StatusCode  string `db:"status_code"`
-}
-
-func (r traceSummaryRow) toDomain() TraceSummary {
-	return TraceSummary{
-		TraceID:     r.TraceID,
-		RootService: r.RootService,
-		RootOp:      r.RootOp,
-		StartTime:   parseEpochMillis(r.StartTime),
-		DurationMs:  parseInt(r.DurationMs),
-		SpanCount:   parseInt(r.SpanCount),
-		StatusCode:  r.StatusCode,
-	}
-}
-
-func parseEpochMillis(s string) time.Time {
-	if s == "" {
-		return time.Time{}
-	}
-	if ms, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return time.UnixMilli(ms).UTC()
-	}
-	return time.Time{}
 }
 
 // SearchTraces finds traces matching filters.
@@ -276,15 +233,7 @@ func (q *QueryService) SearchTraces(ctx context.Context, siteID string, from, to
 		 ORDER BY start_time DESC
 		 LIMIT %d OFFSET %d`, where, limit, offset)
 
-	rows, err := nucleus.Query[traceSummaryRow](ctx, q.db.SQL(), q2, params...)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]TraceSummary, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.toDomain())
-	}
-	return out, nil
+	return nucleus.Query[TraceSummary](ctx, q.db.SQL(), q2, params...)
 }
 
 // Span is a stored span for the waterfall view.
@@ -305,45 +254,9 @@ type Span struct {
 	Events        string    `json:"events"`
 }
 
-type spanRow struct {
-	TraceID       string `db:"trace_id"`
-	SpanID        string `db:"span_id"`
-	ParentSpanID  string `db:"parent_span_id"`
-	ServiceName   string `db:"service_name"`
-	OperationName string `db:"operation_name"`
-	SpanKind      string `db:"span_kind"`
-	StartTime     string `db:"start_time"`
-	EndTime       string `db:"end_time"`
-	DurationMs    string `db:"duration_ms"`
-	StatusCode    string `db:"status_code"`
-	StatusMessage string `db:"status_message"`
-	Attributes    string `db:"attributes"`
-	Resource      string `db:"resource"`
-	Events        string `db:"events"`
-}
-
-func (r spanRow) toDomain() Span {
-	return Span{
-		TraceID:       r.TraceID,
-		SpanID:        r.SpanID,
-		ParentSpanID:  r.ParentSpanID,
-		ServiceName:   r.ServiceName,
-		OperationName: r.OperationName,
-		SpanKind:      r.SpanKind,
-		StartTime:     parseEpochMillis(r.StartTime),
-		EndTime:       parseEpochMillis(r.EndTime),
-		DurationMs:    parseInt(r.DurationMs),
-		StatusCode:    r.StatusCode,
-		StatusMessage: r.StatusMessage,
-		Attributes:    r.Attributes,
-		Resource:      r.Resource,
-		Events:        r.Events,
-	}
-}
-
 // GetTrace returns all spans for a trace, ordered for waterfall rendering.
 func (q *QueryService) GetTrace(ctx context.Context, traceID, siteID string) ([]Span, error) {
-	rows, err := nucleus.Query[spanRow](ctx, q.db.SQL(),
+	return nucleus.Query[Span](ctx, q.db.SQL(),
 		`SELECT trace_id, span_id, parent_span_id, service_name, operation_name,
 			span_kind,
 			CAST(start_time AS TEXT) AS start_time,
@@ -358,14 +271,6 @@ func (q *QueryService) GetTrace(ctx context.Context, traceID, siteID string) ([]
 		 ORDER BY start_time ASC`,
 		traceID, siteID,
 	)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]Span, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.toDomain())
-	}
-	return out, nil
 }
 
 // Dependency represents a service-to-service call edge.
@@ -374,25 +279,7 @@ type Dependency struct {
 	DstService  string `json:"dst_service"`
 	CallCount   int64  `json:"call_count"`
 	ErrorCount  int64  `json:"error_count"`
-	AvgDuration int64  `json:"avg_duration_ms"`
-}
-
-type dependencyRow struct {
-	SrcService  string `db:"src_service"`
-	DstService  string `db:"dst_service"`
-	CallCount   string `db:"call_count"`
-	ErrorCount  string `db:"error_count"`
-	AvgDuration string `db:"avg_duration"`
-}
-
-func (r dependencyRow) toDomain() Dependency {
-	return Dependency{
-		SrcService:  r.SrcService,
-		DstService:  r.DstService,
-		CallCount:   parseInt(r.CallCount),
-		ErrorCount:  parseInt(r.ErrorCount),
-		AvgDuration: parseInt(r.AvgDuration),
-	}
+	AvgDuration int64  `json:"avg_duration_ms" db:"avg_duration"`
 }
 
 // ServiceDependencies returns the dependency graph for all services.
@@ -400,7 +287,7 @@ func (q *QueryService) ServiceDependencies(ctx context.Context, siteID string, f
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
-	rows, err := nucleus.Query[dependencyRow](ctx, q.db.SQL(),
+	return nucleus.Query[Dependency](ctx, q.db.SQL(),
 		`SELECT src_service, dst_service,
 			CAST(SUM(CAST(call_count AS BIGINT)) AS TEXT) AS call_count,
 			CAST(SUM(CAST(error_count AS BIGINT)) AS TEXT) AS error_count,
@@ -413,14 +300,6 @@ func (q *QueryService) ServiceDependencies(ctx context.Context, siteID string, f
 		 ORDER BY call_count DESC`,
 		siteID, fromMs, toMs,
 	)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]Dependency, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.toDomain())
-	}
-	return out, nil
 }
 
 // TraceErrorHit is an error event correlated with a trace.
@@ -430,24 +309,6 @@ type TraceErrorHit struct {
 	ErrorValue string    `json:"error_value"`
 	Timestamp  time.Time `json:"timestamp"`
 	IssueID    string    `json:"issue_id"`
-}
-
-type traceErrorRow struct {
-	ErrorID    string `db:"error_id"`
-	ErrorType  string `db:"error_type"`
-	ErrorValue string `db:"error_value"`
-	Timestamp  string `db:"timestamp"`
-	IssueID    string `db:"issue_id"`
-}
-
-func (r traceErrorRow) toDomain() TraceErrorHit {
-	return TraceErrorHit{
-		ErrorID:    r.ErrorID,
-		ErrorType:  r.ErrorType,
-		ErrorValue: r.ErrorValue,
-		Timestamp:  parseEpochMillis(r.Timestamp),
-		IssueID:    r.IssueID,
-	}
 }
 
 // TraceErrors returns error events correlated with a trace by timestamp overlap.
@@ -466,24 +327,13 @@ func (q *QueryService) TraceErrors(ctx context.Context, traceID, siteID string) 
 		return nil, err
 	}
 
-	fromMs := b[0].MinT
-	toMs := b[0].MaxT
-
-	rows, err := nucleus.Query[traceErrorRow](ctx, q.db.SQL(),
+	return nucleus.Query[TraceErrorHit](ctx, q.db.SQL(),
 		`SELECT error_id, error_type, error_value,
 			CAST(timestamp AS TEXT) AS timestamp,
 			issue_id
 		 FROM error_events
 		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp <= $3
 		 ORDER BY timestamp ASC`,
-		siteID, fromMs, toMs,
+		siteID, b[0].MinT, b[0].MaxT,
 	)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]TraceErrorHit, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.toDomain())
-	}
-	return out, nil
 }

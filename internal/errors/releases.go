@@ -19,30 +19,12 @@ type ReleaseHealth struct {
 	LastSeen   time.Time `json:"last_seen"`
 }
 
-type releaseHealthRow struct {
-	ReleaseTag string `db:"release_tag"`
-	ErrorCount string `db:"error_count"`
-	IssueCount string `db:"issue_count"`
-	FirstSeen  string `db:"first_seen"`
-	LastSeen   string `db:"last_seen"`
-}
-
-func (r releaseHealthRow) toDomain() ReleaseHealth {
-	return ReleaseHealth{
-		ReleaseTag: r.ReleaseTag,
-		ErrorCount: parseInt64(r.ErrorCount),
-		IssueCount: parseInt64(r.IssueCount),
-		FirstSeen:  parseEpochMillis(r.FirstSeen),
-		LastSeen:   parseEpochMillis(r.LastSeen),
-	}
-}
-
 // ReleaseHealthList returns error health metrics per release for a time range.
 func (s *IssueService) ReleaseHealthList(ctx context.Context, siteID string, from, to time.Time) ([]ReleaseHealth, error) {
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
-	rows, err := nucleus.Query[releaseHealthRow](ctx, s.db.SQL(),
+	return nucleus.Query[ReleaseHealth](ctx, s.db.SQL(),
 		fmt.Sprintf(`SELECT
 			COALESCE(release_tag, 'unknown') AS release_tag,
 			CAST(COUNT(*) AS TEXT) AS error_count,
@@ -57,12 +39,4 @@ func (s *IssueService) ReleaseHealthList(ctx context.Context, siteID string, fro
 		 LIMIT 20`),
 		siteID, fromMs, toMs,
 	)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]ReleaseHealth, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.toDomain())
-	}
-	return out, nil
 }

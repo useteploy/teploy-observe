@@ -23,7 +23,7 @@ func NewAlertService(db *nucleus.Client, logger *slog.Logger, webhookSvc *Webhoo
 }
 
 // AlertRule is the domain type returned to API callers.
-// Numeric and boolean fields are typed; timestamps serialize as RFC3339.
+// The scanner handles text→typed conversion via json tag fallback.
 type AlertRule struct {
 	RuleID        string    `json:"rule_id"`
 	SiteID        string    `json:"site_id"`
@@ -50,85 +50,7 @@ type AlertHistoryEntry struct {
 	Status      string    `json:"status"`
 }
 
-// alertRuleRow mirrors the DB column shape. Nucleus MergeTree columns come
-// back as strings; we keep that shape confined to this package and convert
-// to the typed domain at the boundary.
-type alertRuleRow struct {
-	RuleID        string `db:"rule_id"`
-	TenantID      string `db:"tenant_id"`
-	SiteID        string `db:"site_id"`
-	Name          string `db:"name"`
-	Metric        string `db:"metric"`
-	Operator      string `db:"operator"`
-	Threshold     string `db:"threshold"`
-	WindowMinutes string `db:"window_minutes"`
-	CheckInterval string `db:"check_interval"`
-	Cooldown      string `db:"cooldown"`
-	Enabled       string `db:"enabled"`
-	CreatedBy     string `db:"created_by"`
-	CreatedAt     string `db:"created_at"`
-	Version       string `db:"version"`
-}
-
-type alertHistoryRow struct {
-	AlertID     string `db:"alert_id"`
-	RuleID      string `db:"rule_id"`
-	SiteID      string `db:"site_id"`
-	TriggeredAt string `db:"triggered_at"`
-	MetricValue string `db:"metric_value"`
-	Threshold   string `db:"threshold"`
-	Status      string `db:"status"`
-}
-
-func parseBool(s string) bool {
-	switch s {
-	case "true", "1", "TRUE", "True":
-		return true
-	}
-	return false
-}
-
-// parseEpochMillis parses a unix-ms string (common case from CAST in queries)
-// or falls back to time.Parse for RFC3339-ish strings.
-func parseEpochMillis(s string) time.Time {
-	if s == "" {
-		return time.Time{}
-	}
-	if ms, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return time.UnixMilli(ms).UTC()
-	}
-	if t, err := time.Parse(time.RFC3339, s); err == nil {
-		return t.UTC()
-	}
-	return time.Time{}
-}
-
-func (r alertRuleRow) toDomain() AlertRule {
-	thr, _ := strconv.ParseFloat(r.Threshold, 64)
-	win, _ := strconv.Atoi(r.WindowMinutes)
-	chk, _ := strconv.Atoi(r.CheckInterval)
-	cool, _ := strconv.Atoi(r.Cooldown)
-	return AlertRule{
-		RuleID: r.RuleID, SiteID: r.SiteID, Name: r.Name,
-		Metric: r.Metric, Operator: r.Operator,
-		Threshold: thr, WindowMinutes: win, CheckInterval: chk, Cooldown: cool,
-		Enabled: parseBool(r.Enabled), CreatedBy: r.CreatedBy,
-		CreatedAt: parseEpochMillis(r.CreatedAt),
-	}
-}
-
-func (r alertHistoryRow) toDomain() AlertHistoryEntry {
-	mv, _ := strconv.ParseFloat(r.MetricValue, 64)
-	thr, _ := strconv.ParseFloat(r.Threshold, 64)
-	return AlertHistoryEntry{
-		AlertID: r.AlertID, RuleID: r.RuleID, SiteID: r.SiteID,
-		TriggeredAt: parseEpochMillis(r.TriggeredAt),
-		MetricValue: mv, Threshold: thr, Status: r.Status,
-	}
-}
-
-// CreateRule persists a new alert rule. Numeric fields are stored as text
-// columns (MergeTree schema is stringly-typed; see alertRuleRow).
+// CreateRule persists a new alert rule.
 func (s *AlertService) CreateRule(ctx context.Context, rule AlertRule) (*AlertRule, error) {
 	rule.RuleID = genID()
 	now := time.Now().UTC()
@@ -168,18 +90,11 @@ func (s *AlertService) CreateRule(ctx context.Context, rule AlertRule) (*AlertRu
 }
 
 func (s *AlertService) ListRules(ctx context.Context, siteID string) ([]AlertRule, error) {
-	rows, err := nucleus.Query[alertRuleRow](ctx, s.db.SQL(),
-		`SELECT rule_id, tenant_id, site_id, name, metric, operator, threshold,
-			window_minutes, check_interval, cooldown, enabled, created_by, created_at, version
+	return nucleus.Query[AlertRule](ctx, s.db.SQL(),
+		`SELECT rule_id, site_id, name, metric, operator, threshold,
+			window_minutes, check_interval, cooldown, enabled, created_by,
+			CAST(created_at AS TEXT) AS created_at
 		 FROM alert_rules WHERE site_id = $1 ORDER BY created_at DESC`, siteID)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]AlertRule, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.toDomain())
-	}
-	return out, nil
 }
 
 func (s *AlertService) DeleteRule(ctx context.Context, ruleID string) error {
@@ -202,7 +117,7 @@ func (s *AlertService) ListHistory(ctx context.Context, siteID string, limit, of
 	if offset < 0 {
 		offset = 0
 	}
-	rows, err := nucleus.Query[alertHistoryRow](ctx, s.db.SQL(),
+	return nucleus.Query[AlertHistoryEntry](ctx, s.db.SQL(),
 		fmt.Sprintf(`SELECT alert_id, rule_id, site_id,
 			CAST(triggered_at AS TEXT) AS triggered_at,
 			metric_value, threshold, status
@@ -210,29 +125,21 @@ func (s *AlertService) ListHistory(ctx context.Context, siteID string, limit, of
 		 ORDER BY triggered_at DESC LIMIT %d OFFSET %d`, limit, offset),
 		siteID,
 	)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]AlertHistoryEntry, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.toDomain())
-	}
-	return out, nil
 }
 
 // CheckRules evaluates all enabled rules for a site and triggers alerts.
 func (s *AlertService) CheckRules(ctx context.Context) error {
-	rows, err := nucleus.Query[alertRuleRow](ctx, s.db.SQL(),
-		`SELECT rule_id, tenant_id, site_id, name, metric, operator, threshold,
-			window_minutes, check_interval, cooldown, enabled, created_by, created_at, version
+	rules, err := nucleus.Query[AlertRule](ctx, s.db.SQL(),
+		`SELECT rule_id, site_id, name, metric, operator, threshold,
+			window_minutes, check_interval, cooldown, enabled, created_by,
+			CAST(created_at AS TEXT) AS created_at
 		 FROM alert_rules WHERE enabled = 'true'`)
 	if err != nil {
 		return fmt.Errorf("check rules query: %w", err)
 	}
 
 	now := time.Now().UTC()
-	for _, row := range rows {
-		rule := row.toDomain()
+	for _, rule := range rules {
 		windowMins := rule.WindowMinutes
 		if windowMins <= 0 {
 			windowMins = 5
@@ -267,17 +174,14 @@ func (s *AlertService) CheckRules(ctx context.Context) error {
 		if rule.Cooldown > 0 {
 			cooldownFrom := dbutil.IntParam(now.Add(-time.Duration(rule.Cooldown) * time.Minute).UnixMilli())
 			type countRow struct {
-				Count string `db:"count"`
+				Count int64 `db:"count"`
 			}
 			crows, err := nucleus.Query[countRow](ctx, s.db.SQL(),
-				`SELECT CAST(COUNT(*) AS TEXT) AS count FROM alert_history
+				`SELECT COUNT(*) AS count FROM alert_history
 				 WHERE rule_id = $1 AND triggered_at >= $2`,
 				rule.RuleID, cooldownFrom)
-			if err == nil && len(crows) > 0 {
-				c, _ := strconv.ParseInt(crows[0].Count, 10, 64)
-				if c > 0 {
-					continue
-				}
+			if err == nil && len(crows) > 0 && crows[0].Count > 0 {
+				continue
 			}
 		}
 
@@ -310,13 +214,9 @@ func (s *AlertService) CheckRules(ctx context.Context) error {
 }
 
 // queryMetric runs the metric query for a rule window and returns the value.
-// Supported metrics: error_count, error_rate, pageviews, visitors.
-// Latency percentiles (p95/p99) are intentionally not supported yet — they
-// require the APM query layer over the spans table, which is a separate
-// build-out (see MASTER_PLAN Phase 3).
 func (s *AlertService) queryMetric(ctx context.Context, siteID, metric, fromMs, toMs string) (float64, error) {
 	type result struct {
-		Value string `db:"value"`
+		Value float64 `db:"value"`
 	}
 
 	var q string
@@ -337,6 +237,5 @@ func (s *AlertService) queryMetric(ctx context.Context, siteID, metric, fromMs, 
 	if err != nil || len(rows) == 0 {
 		return 0, err
 	}
-	v, _ := strconv.ParseFloat(rows[0].Value, 64)
-	return v, nil
+	return rows[0].Value, nil
 }

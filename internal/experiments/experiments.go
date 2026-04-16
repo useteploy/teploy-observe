@@ -36,50 +36,6 @@ type Experiment struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
-type experimentRow struct {
-	ExperimentID string `db:"experiment_id"`
-	TenantID     string `db:"tenant_id"`
-	SiteID       string `db:"site_id"`
-	Name         string `db:"name"`
-	FlagKey      string `db:"flag_key"`
-	GoalMetric   string `db:"goal_metric"`
-	GoalValue    string `db:"goal_value"`
-	Status       string `db:"status"`
-	MinSample    string `db:"min_sample"`
-	Variants     string `db:"variants"`
-	StartedAt    string `db:"started_at"`
-	EndedAt      string `db:"ended_at"`
-	CreatedAt    string `db:"created_at"`
-	Version      string `db:"version"`
-}
-
-func parseEpochMillis(s string) time.Time {
-	if s == "" || s == "0" {
-		return time.Time{}
-	}
-	if ms, err := strconv.ParseInt(s, 10, 64); err == nil {
-		if ms == 0 {
-			return time.Time{}
-		}
-		return time.UnixMilli(ms).UTC()
-	}
-	return time.Time{}
-}
-
-func (r experimentRow) toDomain() Experiment {
-	ms, _ := strconv.Atoi(r.MinSample)
-	return Experiment{
-		ExperimentID: r.ExperimentID, SiteID: r.SiteID,
-		Name: r.Name, FlagKey: r.FlagKey,
-		GoalMetric: r.GoalMetric, GoalValue: r.GoalValue,
-		Status: r.Status, MinSample: ms,
-		Variants:  r.Variants,
-		StartedAt: parseEpochMillis(r.StartedAt),
-		EndedAt:   parseEpochMillis(r.EndedAt),
-		CreatedAt: parseEpochMillis(r.CreatedAt),
-	}
-}
-
 type ExperimentResults struct {
 	Experiment  Experiment      `json:"experiment"`
 	Variants    []VariantResult `json:"variants"`
@@ -118,19 +74,11 @@ func (s *ExperimentService) Create(ctx context.Context, siteID, name, flagKey, g
 }
 
 func (s *ExperimentService) List(ctx context.Context, siteID string) ([]Experiment, error) {
-	rows, err := nucleus.Query[experimentRow](ctx, s.db.SQL(),
+	return nucleus.Query[Experiment](ctx, s.db.SQL(),
 		`SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample,
 			COALESCE(variants, '') AS variants,
 			started_at, ended_at, created_at, version
 		 FROM experiments WHERE site_id = $1 ORDER BY created_at DESC`, siteID)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]Experiment, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.toDomain())
-	}
-	return out, nil
 }
 
 func (s *ExperimentService) Start(ctx context.Context, experimentID string) error {
@@ -176,7 +124,7 @@ func (s *ExperimentService) RecordConversion(ctx context.Context, experimentID, 
 
 // Results computes experiment results with statistical significance.
 func (s *ExperimentService) Results(ctx context.Context, experimentID, siteID string) (*ExperimentResults, error) {
-	exps, err := nucleus.Query[experimentRow](ctx, s.db.SQL(),
+	exps, err := nucleus.Query[Experiment](ctx, s.db.SQL(),
 		`SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample,
 			COALESCE(variants, '') AS variants,
 			started_at, ended_at, created_at, version
@@ -230,7 +178,7 @@ func (s *ExperimentService) Results(ctx context.Context, experimentID, siteID st
 	}
 
 	return &ExperimentResults{
-		Experiment:  exps[0].toDomain(),
+		Experiment:  exps[0],
 		Variants:    variants,
 		Significant: significant,
 		Winner:      winner,

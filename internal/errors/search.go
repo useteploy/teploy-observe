@@ -94,7 +94,7 @@ func (s *SearchService) SearchErrors(ctx context.Context, siteID, query string, 
 	// so query one at a time (acceptable for search result sets < 50)
 	var events []ErrorEvent
 	for _, hit := range hits {
-		rows, err := nucleus.Query[errorEventRow](ctx, s.db.SQL(),
+		rows, err := nucleus.Query[ErrorEvent](ctx, s.db.SQL(),
 			`SELECT error_id, tenant_id, site_id, session_id, issue_id, group_hash,
 				CAST(timestamp AS TEXT) AS timestamp,
 				error_type, error_value, mechanism,
@@ -109,7 +109,7 @@ func (s *SearchService) SearchErrors(ctx context.Context, siteID, query string, 
 			hit.ErrorID, siteID,
 		)
 		if err == nil && len(rows) > 0 {
-			events = append(events, rows[0].toDomain())
+			events = append(events, rows[0])
 		}
 	}
 
@@ -152,7 +152,7 @@ func (s *SearchService) SearchIssues(ctx context.Context, siteID, query string, 
 	// Fetch full issue objects
 	var issues []Issue
 	for _, id := range issueIDs {
-		rows, err := nucleus.Query[issueRow](ctx, s.db.SQL(),
+		rows, err := nucleus.Query[Issue](ctx, s.db.SQL(),
 			`SELECT issue_id, tenant_id, site_id, group_hash, title, culprit, level, status,
 				first_seen, last_seen, event_count, user_count, release_tag, version
 			 FROM issues
@@ -160,7 +160,7 @@ func (s *SearchService) SearchIssues(ctx context.Context, siteID, query string, 
 			id, siteID,
 		)
 		if err == nil && len(rows) > 0 {
-			issues = append(issues, rows[0].toDomain())
+			issues = append(issues, rows[0])
 		}
 	}
 

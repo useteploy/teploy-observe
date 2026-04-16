@@ -38,51 +38,6 @@ type FeatureFlag struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
-type flagRow struct {
-	FlagID      string `db:"flag_id"`
-	TenantID    string `db:"tenant_id"`
-	SiteID      string `db:"site_id"`
-	FlagKey     string `db:"flag_key"`
-	Name        string `db:"name"`
-	Description string `db:"description"`
-	FlagType    string `db:"flag_type"`
-	Enabled     string `db:"enabled"`
-	RolloutPct  string `db:"rollout_pct"`
-	Variants    string `db:"variants"`
-	Targeting   string `db:"targeting"`
-	CreatedAt   string `db:"created_at"`
-	Version     string `db:"version"`
-}
-
-func parseEpochMillis(s string) time.Time {
-	if s == "" {
-		return time.Time{}
-	}
-	if ms, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return time.UnixMilli(ms).UTC()
-	}
-	return time.Time{}
-}
-
-func parseBool(s string) bool {
-	switch s {
-	case "true", "1", "TRUE", "True":
-		return true
-	}
-	return false
-}
-
-func (r flagRow) toDomain() FeatureFlag {
-	rp, _ := strconv.Atoi(r.RolloutPct)
-	return FeatureFlag{
-		FlagID: r.FlagID, SiteID: r.SiteID, FlagKey: r.FlagKey,
-		Name: r.Name, Description: r.Description, FlagType: r.FlagType,
-		Enabled: parseBool(r.Enabled), RolloutPct: rp,
-		Variants: r.Variants, Targeting: r.Targeting,
-		CreatedAt: parseEpochMillis(r.CreatedAt),
-	}
-}
-
 // Variant is one option in a multivariate flag.
 type Variant struct {
 	Key        string `json:"key"`
@@ -125,18 +80,10 @@ func (s *FlagService) Create(ctx context.Context, siteID, flagKey, name, descrip
 }
 
 func (s *FlagService) List(ctx context.Context, siteID string) ([]FeatureFlag, error) {
-	rows, err := nucleus.Query[flagRow](ctx, s.db.SQL(),
+	return nucleus.Query[FeatureFlag](ctx, s.db.SQL(),
 		`SELECT flag_id, tenant_id, site_id, flag_key, name, description, flag_type, enabled, rollout_pct,
 			COALESCE(variants, '') AS variants, COALESCE(targeting, '') AS targeting, created_at, version
 		 FROM feature_flags WHERE site_id = $1 ORDER BY created_at DESC`, siteID)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]FeatureFlag, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.toDomain())
-	}
-	return out, nil
 }
 
 func (s *FlagService) Toggle(ctx context.Context, flagID string, enabled bool) error {
@@ -220,7 +167,7 @@ func toStringSlice(v any) []string {
 
 // Evaluate checks a flag for a given user.
 func (s *FlagService) Evaluate(ctx context.Context, siteID, flagKey, userID string, userCtx map[string]string) (*EvaluationResult, error) {
-	rows, err := nucleus.Query[flagRow](ctx, s.db.SQL(),
+	rows, err := nucleus.Query[FeatureFlag](ctx, s.db.SQL(),
 		`SELECT flag_id, tenant_id, site_id, flag_key, name, description, flag_type, enabled, rollout_pct,
 			COALESCE(variants, '') AS variants, COALESCE(targeting, '') AS targeting, created_at, version
 		 FROM feature_flags WHERE site_id = $1 AND flag_key = $2`, siteID, flagKey)
@@ -228,7 +175,7 @@ func (s *FlagService) Evaluate(ctx context.Context, siteID, flagKey, userID stri
 		return &EvaluationResult{Enabled: false}, nil
 	}
 
-	flag := rows[0].toDomain()
+	flag := rows[0]
 	if !flag.Enabled {
 		return &EvaluationResult{Enabled: false}, nil
 	}
