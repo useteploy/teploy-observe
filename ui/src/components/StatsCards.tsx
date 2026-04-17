@@ -2,7 +2,17 @@ import { useEffect, useState } from "preact/hooks";
 import type { OverviewResponse, RealtimeResult } from "../api.js";
 import { api } from "../api.js";
 import { useFilters } from "../hooks/useFilters.js";
+import { useCountUp } from "../hooks/useCountUp.js";
 import { formatNumber, formatDuration, formatPercent, formatChange } from "../utils/format.js";
+
+function AnimatedStat({ target, format, live }: { target: number; format: (n: number) => string; live?: boolean }) {
+  const value = useCountUp(target);
+  return (
+    <div class="obs-stat-value" style={live ? "color:var(--obs-success)" : undefined}>
+      {format(value)}
+    </div>
+  );
+}
 
 function StatsCards() {
   const { state } = useFilters();
@@ -26,49 +36,58 @@ function StatsCards() {
 
   const cards: Array<{
     label: string;
-    value: string;
+    target: number | null;
+    format: (n: number) => string;
     live?: boolean;
     change?: { value: string; direction: string; color: string };
   }> = [
     {
       label: "Active now",
-      value: realtime != null ? formatNumber(realtime.active_visitors) : "--",
+      target: realtime?.active_visitors ?? null,
+      format: (n) => formatNumber(Math.round(n)),
       live: true,
     },
     {
       label: "Pageviews",
-      value: cur != null ? formatNumber(cur.pageviews) : "--",
+      target: cur?.pageviews ?? null,
+      format: (n) => formatNumber(Math.round(n)),
       change: prev != null && cur != null ? formatChange(cur.pageviews, prev.pageviews) : undefined,
     },
     {
       label: "Visitors",
-      value: cur != null ? formatNumber(cur.visitors) : "--",
+      target: cur?.visitors ?? null,
+      format: (n) => formatNumber(Math.round(n)),
       change: prev != null && cur != null ? formatChange(cur.visitors, prev.visitors) : undefined,
     },
     {
       label: "Sessions",
-      value: cur != null ? formatNumber(cur.sessions) : "--",
+      target: cur?.sessions ?? null,
+      format: (n) => formatNumber(Math.round(n)),
       change: prev != null && cur != null ? formatChange(cur.sessions, prev.sessions) : undefined,
     },
     {
       label: "Bounce Rate",
-      value: cur != null ? formatPercent(cur.bounce_rate) : "--",
+      target: cur?.bounce_rate ?? null,
+      format: formatPercent,
       change: prev != null && cur != null ? formatChange(cur.bounce_rate, prev.bounce_rate, true) : undefined,
     },
     {
       label: "Avg Duration",
-      value: cur != null ? formatDuration(cur.avg_duration) : "--",
+      target: cur?.avg_duration ?? null,
+      format: formatDuration,
       change: prev != null && cur != null ? formatChange(cur.avg_duration, prev.avg_duration) : undefined,
     },
   ];
 
   return (
     <div class="obs-grid-stats">
-      {cards.map((c) => (
-        <div key={c.label} class="obs-card">
-          <div class="obs-stat-value" style={c.live ? "color:var(--obs-success)" : undefined}>
-            {c.value}
-          </div>
+      {cards.map((c, i) => (
+        <div key={c.label} class="obs-card" style={{ animationDelay: `${i * 40}ms` }}>
+          {c.target !== null ? (
+            <AnimatedStat target={c.target} format={c.format} live={c.live} />
+          ) : (
+            <div class="obs-stat-value" style={c.live ? "color:var(--obs-success)" : undefined}>--</div>
+          )}
           <div class="obs-stat-label">
             {c.live && <span class="obs-live-dot" />}
             {c.label}

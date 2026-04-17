@@ -407,7 +407,7 @@ export default function ErrorsPage() {
         </div>
       ) : (
         <>
-          <div class="errors-issue-list">
+          <div class="errors-issue-list obs-stagger">
             {issues.map(issue => {
               const firstMs = new Date(issue.first_seen).getTime();
               const lastMs = new Date(issue.last_seen).getTime();

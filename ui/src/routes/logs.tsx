@@ -287,7 +287,7 @@ export default function LogsPage() {
         </div>
       ) : (
         <>
-          <div class="logs-list">
+          <div class="logs-list obs-stagger">
             {logs.map((entry) => (
               <LogRow
                 key={entry.log_id}

@@ -51,6 +51,7 @@
 .obs-sidebar-nav li { margin: 2px 0; }
 
 .obs-sidebar-link {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -60,9 +61,26 @@
   text-decoration: none;
   font-size: 13px;
   font-weight: 500;
-  transition: color var(--obs-transition), background var(--obs-transition);
+  transition: color var(--obs-transition), background var(--obs-transition), transform var(--obs-transition);
   white-space: nowrap;
   overflow: hidden;
+}
+
+.obs-sidebar-link:hover {
+  transform: translateX(2px);
+}
+
+.obs-sidebar-link--active::before {
+  content: '';
+  position: absolute;
+  left: -8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 20px;
+  background: var(--obs-accent);
+  border-radius: 0 2px 2px 0;
+  transition: all var(--obs-transition);
 }
 .obs-sidebar-link:hover {
   color: var(--obs-text);

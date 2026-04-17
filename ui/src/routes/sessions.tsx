@@ -260,7 +260,7 @@ export default function SessionsPage() {
         </div>
       ) : (
         <>
-          <div class="sessions-list">
+          <div class="sessions-list obs-stagger">
             {sessions.map(s => (
               <div key={s.replay_id} class="sessions-card" onClick={() => setSelected(s)}>
                 <div class="sessions-card-url">{s.url || "/"}</div>
