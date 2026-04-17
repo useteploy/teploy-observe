@@ -1,0 +1,46 @@
+name: Bug report
+description: Report a reproducible defect in Observe.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do NOT file security vulnerabilities here.  See SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Observe version
+      placeholder: v0.1.0 or a git SHA
+    validations:
+      required: true
+  - type: input
+    id: deploy
+    attributes:
+      label: Deployment
+      placeholder: Docker / systemd / Teploy / bare binary
+    validations:
+      required: true
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Reproducer
+      description: Minimum steps to reproduce, ideally including a curl command.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (if relevant)
+      render: text

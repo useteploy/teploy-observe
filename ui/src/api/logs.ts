@@ -14,6 +14,10 @@ export interface LogStats {
   level: string; count: number;
 }
 
+export interface LogHistogramBucket {
+  bucket: number; level: string; count: number;
+}
+
 export const logsApi = {
   search: (siteId: string, from: string, to: string, opts?: { query?: string; level?: string; service?: string; limit?: number; offset?: number }) => {
     let q = `site_id=${siteId}&from=${from}&to=${to}`;
@@ -26,4 +30,6 @@ export const logsApi = {
   },
   stats: (siteId: string, from: string, to: string) =>
     get<LogStats[]>(`${BASE}/logs/stats?site_id=${siteId}&from=${from}&to=${to}`),
+  histogram: (siteId: string, from: string, to: string, bucketMs = 5 * 60 * 1000) =>
+    get<LogHistogramBucket[]>(`${BASE}/logs/histogram?site_id=${siteId}&from=${from}&to=${to}&bucket_ms=${bucketMs}`),
 };

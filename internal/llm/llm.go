@@ -11,7 +11,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/teploy/observe/internal/dbutil"
+	"github.com/useteploy/observe/internal/dbutil"
 )
 
 type LLMService struct {
@@ -146,7 +146,7 @@ func (s *LLMService) Stats(ctx context.Context, siteID string, from, to time.Tim
 			CAST(SUM(CAST(cost_usd AS BIGINT)) AS TEXT) AS cost,
 			CAST(AVG(CAST(latency_ms AS BIGINT)) AS TEXT) AS latency,
 			CAST(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS TEXT) AS errors
-		 FROM llm_traces WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
+		 FROM llm_traces WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`,
 		siteID, fromMs, toMs,
 	)
 	if err != nil || len(rows) == 0 {
@@ -170,7 +170,7 @@ func (s *LLMService) ModelBreakdown(ctx context.Context, siteID string, from, to
 			CAST(SUM(CAST(total_tokens AS BIGINT)) AS TEXT) AS total_tokens,
 			CAST(SUM(CAST(cost_usd AS BIGINT)) AS TEXT) AS total_cost_usd,
 			CAST(AVG(CAST(latency_ms AS BIGINT)) AS TEXT) AS avg_latency_ms
-		 FROM llm_traces WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+		 FROM llm_traces WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 		 GROUP BY model, provider
 		 ORDER BY call_count DESC`,
 		siteID, fromMs, toMs,

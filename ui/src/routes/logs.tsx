@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { logsApi } from "../api/logs.js";
-import type { LogEntry, LogStats } from "../api/logs.js";
+import type { LogEntry, LogStats, LogHistogramBucket } from "../api/logs.js";
 import SearchInput from "../components/shared/SearchInput.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
 import Pagination from "../components/shared/Pagination.js";
+import ExportButton from "../components/shared/ExportButton.js";
+import EmptyState from "../components/shared/EmptyState.js";
 import "../styles/logs.css";
 
 export const config = { mode: "app" };
@@ -152,6 +154,56 @@ function LogRow({ entry, expanded, onToggle }: LogRowProps) {
   );
 }
 
+function LogHistogram({ data }: { data: LogHistogramBucket[] }) {
+  if (!data.length) return null;
+  // Group by bucket → {total, byLevel}
+  const byBucket = new Map<number, { total: number; byLevel: Record<string, number> }>();
+  for (const b of data) {
+    const cur = byBucket.get(b.bucket) || { total: 0, byLevel: {} };
+    cur.total += b.count;
+    cur.byLevel[b.level] = (cur.byLevel[b.level] || 0) + b.count;
+    byBucket.set(b.bucket, cur);
+  }
+  const sortedBuckets = Array.from(byBucket.keys()).sort((a, b) => a - b);
+  const max = Math.max(1, ...Array.from(byBucket.values()).map((v) => v.total));
+  const first = sortedBuckets[0];
+  const last = sortedBuckets[sortedBuckets.length - 1];
+  const stack = ["error", "warn", "info", "debug", "fatal"];
+  return (
+    <div class="logs-histogram">
+      <div class="logs-histogram-bars">
+        {sortedBuckets.map((bucket) => {
+          const d = byBucket.get(bucket)!;
+          const pct = (d.total / max) * 100;
+          const label = new Date(bucket).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
+          return (
+            <div key={bucket} class="logs-histogram-bar-wrap" title={`${label}: ${d.total}`}>
+              <div class="logs-histogram-bar" style={{ height: `${Math.max(pct, 2)}%` }}>
+                {stack.map((lv) => {
+                  const count = d.byLevel[lv] || 0;
+                  if (!count) return null;
+                  const lvPct = (count / d.total) * 100;
+                  return (
+                    <div
+                      key={lv}
+                      class={`logs-histogram-seg logs-histogram-seg--${lv}`}
+                      style={{ height: `${lvPct}%` }}
+                    />
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div class="logs-histogram-axis">
+        <span>{new Date(first).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false })}</span>
+        <span>{new Date(last).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false })}</span>
+      </div>
+    </div>
+  );
+}
+
 export default function LogsPage() {
   const siteId =
     typeof window !== "undefined"
@@ -161,12 +213,14 @@ export default function LogsPage() {
   const PAGE_SIZE = 50;
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [stats, setStats] = useState<LogStats[]>([]);
+  const [histogram, setHistogram] = useState<LogHistogramBucket[]>([]);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState("");
   const [activeLevel, setActiveLevel] = useState<string>("ALL");
   const [service, setService] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [page, setPage] = useState(1);
+  const [live, setLive] = useState(false);
 
   const fetchLogs = useCallback(async () => {
     setLoading(true);
@@ -184,17 +238,20 @@ export default function LogsPage() {
       if (activeLevel !== "ALL") opts.level = activeLevel;
       if (service.trim()) opts.service = service.trim();
 
-      const [logData, statData] = await Promise.all([
+      const [logData, statData, histData] = await Promise.all([
         logsApi.search(siteId, fromStr, toStr, opts),
         logsApi.stats(siteId, fromStr, toStr),
+        logsApi.histogram(siteId, fromStr, toStr),
       ]);
 
       setLogs(logData || []);
       setStats(statData || []);
+      setHistogram(histData || []);
     } catch (err) {
       console.error("Failed to fetch logs:", err);
       setLogs([]);
       setStats([]);
+      setHistogram([]);
     } finally {
       setLoading(false);
     }
@@ -203,6 +260,26 @@ export default function LogsPage() {
   useEffect(() => {
     fetchLogs();
   }, [fetchLogs]);
+
+  // Live tail via SSE. EventSource doesn't send auth headers, so attach the
+  // token as a query param (the server middleware will accept either).
+  useEffect(() => {
+    if (!live) return;
+    const token = typeof window !== "undefined" ? localStorage.getItem("obs_token") : "";
+    const url = `/api/v1/logs/stream?site_id=${encodeURIComponent(siteId)}${token ? `&token=${encodeURIComponent(token)}` : ""}`;
+    const es = new EventSource(url, { withCredentials: false });
+    es.onmessage = (e) => {
+      try {
+        const entry = JSON.parse(e.data) as LogEntry;
+        // Respect active level / service filters on the client.
+        if (activeLevel !== "ALL" && entry.level?.toLowerCase() !== activeLevel.toLowerCase()) return;
+        if (service.trim() && entry.service_name !== service.trim()) return;
+        setLogs((prev) => [entry, ...prev].slice(0, 200));
+      } catch { /* ignore */ }
+    };
+    es.onerror = () => { /* fail silently; browser will retry */ };
+    return () => es.close();
+  }, [live, siteId, activeLevel, service]);
 
   const handleSearch = () => {
     fetchLogs();
@@ -240,6 +317,27 @@ export default function LogsPage() {
           onInput={(e) => setService((e.target as HTMLInputElement).value)}
           onKeyDown={(e) => e.key === "Enter" && handleSearch()}
         />
+        <button
+          class={`logs-live-btn ${live ? "logs-live-btn--active" : ""}`}
+          onClick={() => setLive((v) => !v)}
+          aria-pressed={live}
+          title={live ? "Stop live tail" : "Start live tail"}
+        >
+          <span class="logs-live-dot" aria-hidden="true" />
+          {live ? "Live" : "Go live"}
+        </button>
+        <ExportButton
+          filename={`logs-${siteId}-${Date.now()}.csv`}
+          rows={logs}
+          columns={[
+            { key: "timestamp", label: "timestamp" },
+            { key: "level", label: "level" },
+            { key: "service_name", label: "service" },
+            { key: "message", label: "message" },
+            { key: "trace_id", label: "trace_id" },
+            { key: "attributes", label: "attributes" },
+          ]}
+        />
       </div>
 
       {/* Level Filters */}
@@ -256,6 +354,9 @@ export default function LogsPage() {
           </button>
         ))}
       </div>
+
+      {/* Volume histogram */}
+      <LogHistogram data={histogram} />
 
       {/* Stats Bar */}
       {stats.length > 0 && (
@@ -280,11 +381,26 @@ export default function LogsPage() {
       {loading ? (
         <LogEntrySkeleton />
       ) : logs.length === 0 ? (
-        <div class="obs-empty-state">
-          {query || activeLevel !== "ALL" || service
-            ? "No logs match the current filters"
-            : "No logs in the last 24 hours"}
-        </div>
+        query || activeLevel !== "ALL" || service ? (
+          <EmptyState
+            title="No logs match the current filters"
+            description="Adjust the filters or clear the search to see more results."
+            icon="zap"
+            actions={[
+              { label: "Clear filters", onClick: () => { setQuery(""); setActiveLevel("ALL"); setService(""); } },
+            ]}
+          />
+        ) : (
+          <EmptyState
+            title="No logs yet"
+            description="Send logs from your backend with a POST to /api/v1/logs using your API key. Toggle Live to see them stream in."
+            icon="layers"
+            actions={[
+              { label: "Get started", href: "/onboard", primary: true },
+              { label: "Read the docs", href: "/docs#logs" },
+            ]}
+          />
+        )
       ) : (
         <>
           <div class="logs-list obs-stagger">

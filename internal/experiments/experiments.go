@@ -48,6 +48,9 @@ type VariantResult struct {
 	Exposures      int64   `json:"exposures"`
 	Conversions    int64   `json:"conversions"`
 	ConversionRate float64 `json:"conversion_rate"`
+	// ProbBeatControl is the Bayesian probability that this variant has a higher
+	// true conversion rate than the control variant. Zero for the control itself.
+	ProbBeatControl float64 `json:"prob_beat_control"`
 }
 
 func (s *ExperimentService) Create(ctx context.Context, siteID, name, flagKey, goalMetric, goalValue, variants string, minSample int) (*Experiment, error) {
@@ -160,6 +163,12 @@ func (s *ExperimentService) Results(ctx context.Context, experimentID, siteID st
 			rate = float64(conv) / float64(total)
 		}
 		variants = append(variants, VariantResult{Variant: r.Variant, Exposures: total, Conversions: conv, ConversionRate: rate})
+	}
+
+	// Bayesian: compute probability each variant beats the control (first row).
+	// Uses Beta(1+conv, 1+nonconv) conjugate prior with a 4000-sample Monte Carlo.
+	if len(variants) >= 2 {
+		computeBayesianProbabilities(variants)
 	}
 
 	significant := false

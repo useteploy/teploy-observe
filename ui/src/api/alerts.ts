@@ -38,6 +38,8 @@ export const alertsApi = {
   }) => post<AlertRule>(`${BASE}/alerts/rules`, data),
   deleteRule: (ruleId: string) =>
     del(`${BASE}/alerts/rules/${ruleId}`),
+  silenceRule: (ruleId: string, minutes: number) =>
+    post<{ silence_until_ms: number }>(`${BASE}/alerts/rules/${ruleId}/silence`, { minutes }),
   history: (siteId: string, limit?: number, offset?: number) => {
     let q = `site_id=${siteId}`;
     if (limit) q += `&limit=${limit}`;

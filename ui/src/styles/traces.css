@@ -353,3 +353,216 @@
     width: 120px;
   }
 }
+
+/* ─── Top slow operations ─── */
+.traces-top-slow {
+  background: var(--obs-surface);
+  border: 1px solid var(--obs-border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+
+.traces-top-slow-header {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--obs-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 8px;
+}
+
+.traces-top-slow-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.traces-top-slow-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 8px;
+  background: var(--obs-bg-card, rgba(0, 0, 0, 0.02));
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.1s ease;
+  font-size: 12px;
+}
+
+.traces-top-slow-row:hover {
+  background: var(--obs-bg-card-hover, rgba(0, 0, 0, 0.05));
+}
+
+.traces-top-slow-rank {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--obs-accent, #6366f1);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.traces-top-slow-name {
+  flex: 1;
+  font-weight: 500;
+  color: var(--obs-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.traces-top-slow-metric {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  color: var(--obs-text-secondary);
+  font-family: var(--obs-font-mono, monospace);
+  min-width: 72px;
+}
+
+.traces-top-slow-metric > span {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--obs-text-muted);
+}
+
+/* ─── Flame graph ─── */
+.traces-view-toggle {
+  display: inline-flex;
+  border: 1px solid var(--obs-border);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-left: auto;
+}
+
+.traces-view-btn {
+  padding: 5px 12px;
+  background: var(--obs-surface);
+  border: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--obs-text-secondary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.traces-view-btn:hover {
+  background: var(--obs-bg-card-hover, rgba(0, 0, 0, 0.04));
+  color: var(--obs-text);
+}
+
+.traces-view-btn--active {
+  background: var(--obs-accent, #6366f1);
+  color: #fff;
+}
+
+.traces-flame {
+  background: var(--obs-surface);
+  border: 1px solid var(--obs-border);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.traces-flame-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--obs-border);
+}
+
+.traces-flame-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--obs-text-secondary);
+}
+
+.traces-flame-legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+.traces-flame-stage {
+  position: relative;
+  width: 100%;
+  min-height: 80px;
+  background: var(--obs-bg-card, rgba(0, 0, 0, 0.02));
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.traces-flame-span {
+  position: absolute;
+  border-radius: 2px;
+  overflow: hidden;
+  cursor: pointer;
+  transition: filter 0.1s ease;
+  display: flex;
+  align-items: center;
+  padding: 0 6px;
+  box-sizing: border-box;
+}
+
+.traces-flame-span:hover {
+  filter: brightness(1.15);
+}
+
+.traces-flame-label {
+  color: rgba(255, 255, 255, 0.95);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  flex: 1;
+  pointer-events: none;
+}
+
+.traces-flame-tooltip {
+  position: absolute;
+  background: var(--obs-surface);
+  border: 1px solid var(--obs-border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 11px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  pointer-events: none;
+  z-index: 10;
+  min-width: 180px;
+}
+
+.traces-flame-tooltip-title {
+  font-weight: 600;
+  color: var(--obs-text);
+  margin-bottom: 6px;
+  word-break: break-all;
+}
+
+.traces-flame-tooltip-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--obs-text-secondary);
+  font-family: var(--obs-font-mono, monospace);
+  padding: 1px 0;
+}
+
+.traces-flame-tooltip-row span:last-child {
+  color: var(--obs-text);
+  font-weight: 500;
+}
+
+.traces-flame-tooltip-err span:last-child {
+  color: #ef4444;
+}

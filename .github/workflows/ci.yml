@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Build
+        working-directory: teploy-observe
+        run: go build ./...
+      - name: Test
+        working-directory: teploy-observe
+        run: go test ./...
+      - name: Vet
+        working-directory: teploy-observe
+        run: go vet ./...
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: tystack/typescript/pnpm-lock.yaml
+      - name: Install
+        working-directory: tystack/typescript
+        run: pnpm install --frozen-lockfile
+      - name: Build observe dashboard
+        working-directory: tystack/typescript
+        run: pnpm -C apps/observe build
+
+  audit:
+    runs-on: ubuntu-latest
+    needs: [go, ui]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: tystack/typescript/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tystack/nucleus
+      - name: Build Nucleus
+        working-directory: tystack/nucleus
+        run: cargo build --release --features server --bin nucleus
+      - name: Install pnpm deps
+        working-directory: tystack/typescript
+        run: pnpm install --frozen-lockfile
+      - name: Build UI + Go binary
+        working-directory: teploy-observe
+        run: ./scripts/ui-sync.sh
+      - name: Start Nucleus + Observe
+        working-directory: teploy-observe
+        run: |
+          ./scripts/dev.sh &
+          for i in {1..30}; do
+            if curl -fs http://localhost:3000/healthz >/dev/null; then break; fi
+            sleep 1
+          done
+      - name: Run audit
+        working-directory: teploy-observe
+        run: ./scripts/audit.sh
+      - name: Run smoketest
+        working-directory: teploy-observe
+        run: ./scripts/smoketest.sh

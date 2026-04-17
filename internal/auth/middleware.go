@@ -1,13 +1,84 @@
 package auth
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
 	"github.com/neutron-dev/neutron-go/neutron"
 
-	"github.com/teploy/observe/internal/ingest"
+	"github.com/useteploy/observe/internal/ingest"
 )
+
+type roleCtxKey struct{}
+
+// WithRole stores the authenticated user's role in the context. Used by
+// JWTAuthMiddleware and tested by RequireRole.
+func WithRole(ctx context.Context, role string) context.Context {
+	return context.WithValue(ctx, roleCtxKey{}, role)
+}
+
+// RoleFromContext returns the role placed by JWTAuthMiddleware, or "" if not
+// set (e.g., first-run grace period).
+func RoleFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(roleCtxKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// RequireRole wraps a handler so only callers whose JWT carries one of the
+// allowed roles may pass. During the first-run grace period (no admin users
+// yet), all requests are allowed through — otherwise an unauthenticated user
+// would be locked out of the onboarding flow.
+func RequireRole(authSvc *AuthService, allowed ...string) neutron.Middleware {
+	allowSet := make(map[string]struct{}, len(allowed))
+	for _, r := range allowed {
+		allowSet[r] = struct{}{}
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !authSvc.HasAdminUsers(r.Context()) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			role := RoleFromContext(r.Context())
+			if role == "" {
+				neutron.WriteError(w, r, neutron.ErrUnauthorized("missing role claim"))
+				return
+			}
+			if _, ok := allowSet[role]; !ok {
+				neutron.WriteError(w, r, neutron.ErrForbidden("insufficient role: "+role))
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// queryTokenAllowedPaths lists URL path prefixes where ?token=<jwt> is accepted
+// on GET requests. EventSource / download contexts can't set Authorization
+// headers, so they carry auth in the query string. All other routes must use
+// the Authorization header.
+var queryTokenAllowedPaths = []string{
+	"/api/v1/export",
+	"/api/v1/logs/stream",
+	"/api/v1/live",
+	"/api/v1/stats/live",
+}
+
+func queryTokenAllowed(r *http.Request) bool {
+	if r.Method != http.MethodGet {
+		return false
+	}
+	path := r.URL.Path
+	for _, prefix := range queryTokenAllowedPaths {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
 
 // JWTAuthMiddleware returns middleware that validates JWT tokens from the
 // Authorization: Bearer <token> header. If no admin users exist yet
@@ -22,24 +93,32 @@ func JWTAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 			}
 
 			header := r.Header.Get("Authorization")
-			if header == "" {
+			var token string
+			if strings.HasPrefix(header, "Bearer ") {
+				token = strings.TrimPrefix(header, "Bearer ")
+			} else if q := r.URL.Query().Get("token"); q != "" && queryTokenAllowed(r) {
+				token = q
+			} else if header == "" {
 				neutron.WriteError(w, r, neutron.ErrUnauthorized("missing authorization header"))
 				return
-			}
-
-			if !strings.HasPrefix(header, "Bearer ") {
+			} else {
 				neutron.WriteError(w, r, neutron.ErrUnauthorized("invalid authorization scheme"))
 				return
 			}
 
-			token := strings.TrimPrefix(header, "Bearer ")
-			_, err := authSvc.ValidateToken(token)
+			claims, err := authSvc.ValidateToken(token)
 			if err != nil {
 				neutron.WriteError(w, r, neutron.ErrUnauthorized(err.Error()))
 				return
 			}
-
-			next.ServeHTTP(w, r)
+			// Stash role for downstream RequireRole middleware. Missing role
+			// claim defaults to RoleViewer so we fail closed on reads.
+			role, _ := claims["role"].(string)
+			if role == "" {
+				role = RoleViewer
+			}
+			ctx := WithRole(r.Context(), role)
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }

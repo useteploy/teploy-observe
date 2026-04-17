@@ -10,11 +10,13 @@ const INTERVALS = ["hour", "day", "week", "month"] as const;
 
 function TimeSeriesChart() {
   const { state, dispatch } = useFilters();
-  const { siteId, from, to, interval, filters } = state;
+  const { siteId, from, to, interval, filters, compare } = state;
 
   const wrapperRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [data, setData] = useState<TimeSeriesPoint[]>([]);
+  const [prevData, setPrevData] = useState<TimeSeriesPoint[]>([]);
+  const [markers, setMarkers] = useState<Array<{ id: string; title: string; severity: string; started_at: number; ended_at: number }>>([]);
   const [loading, setLoading] = useState(true);
   const [tooltip, setTooltip] = useState<{
     x: number; y: number; date: string; pageviews: number; visitors: number;
@@ -25,13 +27,52 @@ function TimeSeriesChart() {
 
   useEffect(() => {
     setLoading(true);
-    api.timeseries(siteId, from, to, interval, filters).then((d) => {
-      const result = d || [];
-      setData(result);
-      dataRef.current = result;
+    const fetchCurrent = api.timeseries(siteId, from, to, interval, filters);
+    if (!compare) {
+      fetchCurrent.then((d) => {
+        const result = d || [];
+        setData(result);
+        setPrevData([]);
+        dataRef.current = result;
+        setLoading(false);
+      }).catch(() => setLoading(false));
+      return;
+    }
+    // Compare mode: fetch the previous-period window too.
+    const fromMs = new Date(from).getTime();
+    const toMs = new Date(to).getTime();
+    const duration = Math.max(1, toMs - fromMs);
+    const prevFrom = new Date(fromMs - duration).toISOString();
+    const prevTo = new Date(fromMs).toISOString();
+    Promise.all([
+      fetchCurrent,
+      api.timeseries(siteId, prevFrom, prevTo, interval, filters).catch(() => [] as TimeSeriesPoint[]),
+    ]).then(([cur, prev]) => {
+      const curList = cur || [];
+      const prevList = prev || [];
+      setData(curList);
+      // Shift previous buckets forward by the window so they align visually with the current range.
+      setPrevData(prevList.map((p) => ({ ...p, bucket: p.bucket + duration })));
+      dataRef.current = curList;
       setLoading(false);
     }).catch(() => setLoading(false));
-  }, [siteId, from, to, interval, JSON.stringify(filters)]);
+  }, [siteId, from, to, interval, compare, JSON.stringify(filters)]);
+
+  // Fetch incidents overlapping the current window. Best-effort — 404 / error
+  // means "no markers," not a chart failure.
+  useEffect(() => {
+    const fromMs = new Date(from).getTime();
+    const toMs = new Date(to).getTime();
+    fetch(`/api/v1/incidents?site_id=${encodeURIComponent(siteId)}&from=${fromMs}&to=${toMs}`, {
+      headers: { Authorization: "Bearer " + (typeof localStorage !== "undefined" ? localStorage.getItem("observe_token") || "" : "") },
+    })
+      .then((r) => r.ok ? r.json() : [])
+      .then((list) => setMarkers(Array.isArray(list) ? list.map((inc: any) => ({
+        id: inc.incident_id, title: inc.title, severity: inc.severity,
+        started_at: inc.started_at, ended_at: inc.ended_at,
+      })) : []))
+      .catch(() => setMarkers([]));
+  }, [siteId, from, to]);
 
   const draw = useCallback(() => {
     if (!canvasRef.current || data.length === 0) return;
@@ -51,9 +92,17 @@ function TimeSeriesChart() {
     const plotW = w - pad.left - pad.right;
     const plotH = h - pad.top - pad.bottom;
 
-    const maxPV = Math.max(...data.map((d) => d.pageviews), 1);
-    const maxV = Math.max(...data.map((d) => d.visitors), 1);
-    const maxVal = Math.max(maxPV, maxV);
+    const pvMax = Math.max(
+      ...data.map((d) => d.pageviews),
+      ...prevData.map((d) => d.pageviews),
+      1,
+    );
+    const vMax = Math.max(
+      ...data.map((d) => d.visitors),
+      ...prevData.map((d) => d.visitors),
+      1,
+    );
+    const maxVal = Math.max(pvMax, vMax);
     const minT = Math.min(...data.map((d) => d.bucket));
     const maxT = Math.max(...data.map((d) => d.bucket));
     const rangeT = maxT - minT || 1;
@@ -68,6 +117,30 @@ function TimeSeriesChart() {
       ctx.beginPath();
       ctx.moveTo(pad.left, y);
       ctx.lineTo(w - pad.right, y);
+      ctx.stroke();
+    }
+
+    // Incident markers: shaded vertical bands underneath the series lines.
+    // ended_at === 0 means "ongoing" — render to the right edge.
+    for (const m of markers) {
+      const sx = pad.left + ((m.started_at - minT) / rangeT) * plotW;
+      const ex = m.ended_at === 0
+        ? pad.left + plotW
+        : pad.left + ((m.ended_at - minT) / rangeT) * plotW;
+      const clipL = Math.max(pad.left, Math.min(sx, pad.left + plotW));
+      const clipR = Math.max(pad.left, Math.min(ex, pad.left + plotW));
+      if (clipR - clipL < 1) {
+        // Single-point marker — draw a 2px line.
+        ctx.fillStyle = sevFill(m.severity);
+        ctx.fillRect(clipL, pad.top, 2, plotH);
+        continue;
+      }
+      ctx.fillStyle = sevFill(m.severity);
+      ctx.fillRect(clipL, pad.top, clipR - clipL, plotH);
+      ctx.strokeStyle = sevStroke(m.severity);
+      ctx.beginPath();
+      ctx.moveTo(clipL, pad.top);
+      ctx.lineTo(clipL, pad.top + plotH);
       ctx.stroke();
     }
 
@@ -128,6 +201,38 @@ function TimeSeriesChart() {
       }
     }
 
+    // Previous-period lines (drawn first so current sits on top).
+    if (prevData.length > 0) {
+      const prevPoints = (key: "pageviews" | "visitors") =>
+        prevData.map((pt) => ({
+          x: pad.left + ((pt.bucket - minT) / rangeT) * plotW,
+          y: pad.top + plotH - (pt[key] / maxVal) * plotH,
+        }));
+
+      ctx.save();
+      ctx.setLineDash([4, 4]);
+      ctx.globalAlpha = 0.4;
+      ctx.lineWidth = 1.5;
+
+      const prevPV = prevPoints("pageviews");
+      if (prevPV.length > 1) {
+        ctx.beginPath();
+        drawBezierPath(ctx, prevPV);
+        ctx.strokeStyle = PAGEVIEW_COLOR;
+        ctx.stroke();
+      }
+
+      const prevV = prevPoints("visitors");
+      if (prevV.length > 1) {
+        ctx.beginPath();
+        drawBezierPath(ctx, prevV);
+        ctx.strokeStyle = VISITOR_COLOR;
+        ctx.stroke();
+      }
+
+      ctx.restore();
+    }
+
     // Pageviews filled area
     const pvPoints = getPoints("pageviews");
     ctx.beginPath();
@@ -163,7 +268,7 @@ function TimeSeriesChart() {
     ctx.strokeStyle = VISITOR_COLOR;
     ctx.lineWidth = 2;
     ctx.stroke();
-  }, [data, interval]);
+  }, [data, prevData, interval, markers]);
 
   useEffect(() => {
     draw();
@@ -310,3 +415,21 @@ function TimeSeriesChart() {
 
 TimeSeriesChart.displayName = "TimeSeriesChart";
 export default TimeSeriesChart;
+
+// Translucent fill for incident markers, keyed on severity.
+function sevFill(s: string): string {
+  switch (s) {
+    case "critical": return "rgba(229, 72, 77, 0.14)";
+    case "warning":  return "rgba(245, 165, 36, 0.12)";
+    default:          return "rgba(110, 168, 254, 0.10)";
+  }
+}
+
+// Opaque stroke for the incident marker's leading edge.
+function sevStroke(s: string): string {
+  switch (s) {
+    case "critical": return "rgba(229, 72, 77, 0.9)";
+    case "warning":  return "rgba(245, 165, 36, 0.8)";
+    default:          return "rgba(110, 168, 254, 0.7)";
+  }
+}

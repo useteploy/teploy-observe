@@ -1,0 +1,54 @@
+[Unit]
+Description=Observe — self-hosted analytics, errors, logs, traces, replays
+Documentation=https://github.com/teploy/observe
+After=network-online.target nucleus.service
+Wants=network-online.target nucleus.service
+
+[Service]
+Type=simple
+User=observe
+Group=observe
+WorkingDirectory=/var/lib/observe
+
+# Environment — override any of these via drop-in:
+#   systemctl edit observe.service
+# and place your secrets in an [Service] section with Environment= lines.
+EnvironmentFile=-/etc/observe/observe.env
+Environment=OBSERVE_ADDR=:3000
+Environment=OBSERVE_NUCLEUS_URL=postgres://localhost:5432/observe
+Environment=OBSERVE_SITE_ID=default
+
+ExecStart=/usr/local/bin/observe
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Graceful shutdown — Observe flushes buffers on SIGTERM.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+Restart=always
+RestartSec=5s
+
+# Hardening — adjust if your setup requires wider access.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/observe /var/log/observe
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# Resource limits
+LimitNOFILE=65536
+
+# Log to journal (view with: journalctl -u observe -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=observe
+
+[Install]
+WantedBy=multi-user.target

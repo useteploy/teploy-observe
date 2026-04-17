@@ -51,6 +51,11 @@ export interface ReleaseHealth {
   last_seen: string;
 }
 
+export interface DailyCount {
+  day: string;
+  count: number;
+}
+
 export const errorsApi = {
   issues: (siteId: string, status?: string, limit?: number, offset?: number) => {
     let q = `site_id=${siteId}`;
@@ -71,4 +76,6 @@ export const errorsApi = {
     get<Issue[]>(`${BASE}/issues/search?site_id=${siteId}&q=${encodeURIComponent(query)}`),
   releases: (siteId: string) =>
     get<ReleaseHealth[]>(`${BASE}/releases?site_id=${siteId}`),
+  daily: (siteId: string, days = 14) =>
+    get<DailyCount[]>(`${BASE}/issues/daily?site_id=${siteId}&days=${days}`),
 };

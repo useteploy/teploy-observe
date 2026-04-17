@@ -144,6 +144,28 @@ type FunnelInput struct {
 	Steps  []FunnelStep `json:"steps"`
 }
 
+// FunnelBreakdownInput augments FunnelInput with a breakdown dimension.
+type FunnelBreakdownInput struct {
+	SiteID      string       `json:"site_id"`
+	From        string       `json:"from"`
+	To          string       `json:"to"`
+	Steps       []FunnelStep `json:"steps"`
+	BreakdownBy string       `json:"breakdown_by"`
+	MinSize     int          `json:"min_size"`
+}
+
+func (i FunnelBreakdownInput) TimeRange() (time.Time, time.Time) {
+	from, _ := time.Parse(time.RFC3339, i.From)
+	to, _ := time.Parse(time.RFC3339, i.To)
+	if from.IsZero() {
+		from = time.Now().UTC().Add(-24 * time.Hour)
+	}
+	if to.IsZero() {
+		to = time.Now().UTC()
+	}
+	return from, to
+}
+
 func (i FunnelInput) TimeRange() (time.Time, time.Time) {
 	from, _ := time.Parse(time.RFC3339, i.From)
 	to, _ := time.Parse(time.RFC3339, i.To)
@@ -413,6 +435,16 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 	neutron.Post(api, "/funnel", func(ctx context.Context, input FunnelInput) ([]FunnelResult, error) {
 		from, to := input.TimeRange()
 		return svc.Funnel(ctx, input.SiteID, from, to, input.Steps)
+	}, neutron.WithTags("stats"))
+
+	// Funnel analysis with breakdown by a property (browser, country, device, os).
+	neutron.Post(api, "/funnel/breakdown", func(ctx context.Context, input FunnelBreakdownInput) ([]FunnelBreakdownResult, error) {
+		from, to := input.TimeRange()
+		min := input.MinSize
+		if min <= 0 {
+			min = 5
+		}
+		return svc.FunnelByBreakdown(ctx, input.SiteID, from, to, input.Steps, input.BreakdownBy, min)
 	}, neutron.WithTags("stats"))
 
 	// Retention cohort analysis

@@ -13,7 +13,7 @@ import (
 	"github.com/neutron-dev/neutron-go/nucleus"
 	"github.com/neutron-dev/neutron-go/neutronauth"
 
-	"github.com/teploy/observe/internal/dbutil"
+	"github.com/useteploy/observe/internal/dbutil"
 )
 
 // AuthService handles JWT token management, admin user authentication,
@@ -30,6 +30,24 @@ type adminUserRow struct {
 	Username     string `db:"username"`
 	PasswordHash string `db:"password_hash"`
 	CreatedAt    string `db:"created_at"`
+	Role         string `db:"role"`
+}
+
+// Role constants.
+const (
+	RoleAdmin  = "admin"
+	RoleEditor = "editor"
+	RoleViewer = "viewer"
+)
+
+// normalizeRole returns a known role or RoleViewer if unrecognized.
+func normalizeRole(r string) string {
+	switch r {
+	case RoleAdmin, RoleEditor, RoleViewer:
+		return r
+	default:
+		return RoleViewer
+	}
 }
 
 // countRow is used for COUNT queries.
@@ -53,11 +71,14 @@ func NewAuthService(db *nucleus.Client, jwtSecret string, logger *slog.Logger) *
 	}
 }
 
-// GenerateToken creates a signed JWT with a 24-hour expiry.
-func (s *AuthService) GenerateToken(userID, username string) (string, error) {
+// GenerateToken creates a signed JWT with a 24-hour expiry. role is stored
+// in the token so middleware can enforce RBAC without hitting the database
+// on every request.
+func (s *AuthService) GenerateToken(userID, username, role string) (string, error) {
 	claims := neutronauth.Claims{
 		"sub":      userID,
 		"username": username,
+		"role":     normalizeRole(role),
 	}
 	return neutronauth.GenerateToken(claims, s.jwtSecret, 24*time.Hour)
 }
@@ -84,8 +105,8 @@ func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string
 	now := dbutil.IntParam(time.Now().UnixMilli())
 
 	_, err = sql.Exec(ctx,
-		"INSERT INTO admin_users (id, username, password_hash, created_at) VALUES ($1, $2, $3, $4)",
-		id, username, hash, now,
+		"INSERT INTO admin_users (id, username, password_hash, created_at, role) VALUES ($1, $2, $3, $4, $5)",
+		id, username, hash, now, RoleAdmin,
 	)
 	if err != nil {
 		return fmt.Errorf("auth: create default admin: %w", err)
@@ -100,7 +121,7 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (str
 	sql := s.db.SQL()
 
 	user, err := nucleus.QueryOne[adminUserRow](ctx, sql,
-		"SELECT id, username, password_hash, created_at FROM admin_users WHERE username = $1",
+		"SELECT id, username, password_hash, created_at, role FROM admin_users WHERE username = $1",
 		username,
 	)
 	if err != nil {
@@ -111,7 +132,7 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (str
 		return "", fmt.Errorf("auth: invalid credentials")
 	}
 
-	return s.GenerateToken(user.ID, user.Username)
+	return s.GenerateToken(user.ID, user.Username, user.Role)
 }
 
 // HasAdminUsers returns true if at least one admin user exists.
@@ -127,7 +148,7 @@ func (s *AuthService) HasAdminUsers(ctx context.Context) bool {
 // ChangePassword updates the password for the given user ID.
 func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPassword, newPassword string) error {
 	user, err := nucleus.QueryOne[adminUserRow](ctx, s.db.SQL(),
-		"SELECT id, username, password_hash, created_at FROM admin_users WHERE id = $1", userID,
+		"SELECT id, username, password_hash, created_at, role FROM admin_users WHERE id = $1", userID,
 	)
 	if err != nil {
 		return fmt.Errorf("user not found")
@@ -139,10 +160,9 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 		return fmt.Errorf("new password must be at least 8 characters")
 	}
 	newHash := hashPassword(newPassword)
-	now := dbutil.IntParam(time.Now().UnixMilli())
 	_, err = s.db.SQL().Exec(ctx,
-		"INSERT INTO admin_users (id, username, password_hash, created_at) VALUES ($1, $2, $3, $4)",
-		user.ID, user.Username, newHash, now,
+		"UPDATE admin_users SET password_hash = $1 WHERE id = $2",
+		newHash, user.ID,
 	)
 	return err
 }

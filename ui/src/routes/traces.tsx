@@ -5,6 +5,7 @@ import SearchInput from "../components/shared/SearchInput.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
 import Tabs from "../components/shared/Tabs.js";
+import EmptyState from "../components/shared/EmptyState.js";
 import "../styles/traces.css";
 
 export const config = { mode: "app" };
@@ -108,6 +109,93 @@ function flattenTree(nodes: SpanNode[]): SpanNode[] {
   }
   for (const n of nodes) walk(n);
   return result;
+}
+
+// ─── Trace Flame Graph ───
+
+const SERVICE_COLORS = [
+  "#6366f1", "#22c55e", "#f59e0b", "#ef4444",
+  "#0ea5e9", "#a855f7", "#14b8a6", "#ec4899",
+];
+
+function hashServiceColor(name: string): string {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) | 0;
+  return SERVICE_COLORS[Math.abs(h) % SERVICE_COLORS.length];
+}
+
+function TraceFlame({ spans }: { spans: Span[] }) {
+  const [hover, setHover] = useState<{ span: SpanNode; x: number; y: number } | null>(null);
+
+  if (!spans.length) return <div class="obs-empty-state">No spans found</div>;
+
+  const tree = buildSpanTree(spans);
+  const flat = flattenTree(tree);
+  const minStart = Math.min(...flat.map((s) => new Date(s.start_time).getTime()));
+  const maxEnd = Math.max(...flat.map((s) => new Date(s.end_time).getTime()));
+  const total = Math.max(1, maxEnd - minStart);
+  const maxDepth = Math.max(...flat.map((s) => s.depth)) + 1;
+
+  const rowH = 22;
+  const pad = 4;
+  const height = maxDepth * (rowH + pad) + pad;
+
+  // Collect unique services for the legend.
+  const services = Array.from(new Set(flat.map((s) => s.service_name || "unknown")));
+
+  return (
+    <div class="traces-flame">
+      <div class="traces-flame-legend">
+        {services.map((svc) => (
+          <span key={svc} class="traces-flame-legend-item">
+            <span class="traces-flame-legend-swatch" style={{ background: hashServiceColor(svc) }} />
+            {svc}
+          </span>
+        ))}
+      </div>
+      <div class="traces-flame-stage" style={{ height: `${height}px` }} onMouseLeave={() => setHover(null)}>
+        {flat.map((s) => {
+          const start = new Date(s.start_time).getTime() - minStart;
+          const end = new Date(s.end_time).getTime() - minStart;
+          const leftPct = (start / total) * 100;
+          const widthPct = Math.max(0.1, ((end - start) / total) * 100);
+          const top = s.depth * (rowH + pad) + pad;
+          const errored = s.status_code === "error";
+          const bg = errored ? "#ef4444" : hashServiceColor(s.service_name || "unknown");
+          return (
+            <div
+              key={s.span_id}
+              class="traces-flame-span"
+              style={{
+                left: `${leftPct}%`,
+                top: `${top}px`,
+                width: `${widthPct}%`,
+                height: `${rowH}px`,
+                background: bg,
+              }}
+              onMouseMove={(e) => {
+                const rect = (e.currentTarget.parentElement as HTMLElement).getBoundingClientRect();
+                setHover({ span: s, x: e.clientX - rect.left, y: e.clientY - rect.top });
+              }}
+            >
+              <span class="traces-flame-label">{s.operation_name}</span>
+            </div>
+          );
+        })}
+        {hover && (
+          <div class="traces-flame-tooltip" style={{ left: `${Math.min(hover.x + 12, 90)}%`, top: `${hover.y + 12}px` }}>
+            <div class="traces-flame-tooltip-title">{hover.span.operation_name}</div>
+            <div class="traces-flame-tooltip-row"><span>Service</span><span>{hover.span.service_name || "unknown"}</span></div>
+            <div class="traces-flame-tooltip-row"><span>Duration</span><span>{hover.span.duration_ms}ms</span></div>
+            <div class="traces-flame-tooltip-row"><span>Depth</span><span>{hover.span.depth}</span></div>
+            {hover.span.status_code === "error" && (
+              <div class="traces-flame-tooltip-row traces-flame-tooltip-err"><span>Status</span><span>error</span></div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 // ─── Trace Waterfall ───
@@ -269,6 +357,7 @@ function OperationsTable({ siteId, service, from, to, onSelectTrace }: {
   const [traceList, setTraceList] = useState<TraceSummary[]>([]);
   const [loadingTraces, setLoadingTraces] = useState(false);
   const [selectedOp, setSelectedOp] = useState<string | null>(null);
+  const [sortKey, setSortKey] = useState<"p95_ms" | "avg_duration_ms" | "request_count" | "error_count" | "operation_name">("p95_ms");
 
   useEffect(() => {
     setLoading(true);
@@ -291,22 +380,49 @@ function OperationsTable({ siteId, service, from, to, onSelectTrace }: {
   if (loading) return <ListSkeleton />;
   if (!operations.length) return <div class="obs-empty-state">No operations found for {service}</div>;
 
+  const topSlow = [...operations].sort((a, b) => (b.p95_ms || 0) - (a.p95_ms || 0)).slice(0, 5);
+
+  const sortedByKey = (key: "p95_ms" | "avg_duration_ms" | "request_count" | "error_count" | "operation_name") =>
+    [...operations].sort((a, b) => {
+      if (key === "operation_name") return a.operation_name.localeCompare(b.operation_name);
+      return (b[key] as number) - (a[key] as number);
+    });
+
+  const sorted = sortedByKey(sortKey);
+
   return (
     <div>
+      <div class="traces-top-slow">
+        <div class="traces-top-slow-header">Top 5 slowest by p95</div>
+        <div class="traces-top-slow-list">
+          {topSlow.map((op, i) => (
+            <div key={op.operation_name} class="traces-top-slow-row" onClick={() => handleOpClick(op.operation_name)}>
+              <span class="traces-top-slow-rank">{i + 1}</span>
+              <span class="traces-top-slow-name">{op.operation_name}</span>
+              <span class="traces-top-slow-metric"><span>p95</span>{formatDuration(op.p95_ms)}</span>
+              <span class="traces-top-slow-metric"><span>p99</span>{formatDuration(op.p99_ms)}</span>
+              <span class="traces-top-slow-metric"><span>req</span>{op.request_count.toLocaleString()}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
       <div class="traces-ops-table">
         <div class="traces-waterfall-header">
-          <div style={{ flex: 2 }}>Operation</div>
-          <div style={{ flex: 1, textAlign: "right" }}>Requests</div>
-          <div style={{ flex: 1, textAlign: "right" }}>Errors</div>
-          <div style={{ flex: 1, textAlign: "right" }}>Avg Duration</div>
+          <div style={{ flex: 2, cursor: "pointer" }} onClick={() => setSortKey("operation_name")}>Operation{sortKey === "operation_name" && " ↕"}</div>
+          <div style={{ flex: 1, textAlign: "right", cursor: "pointer" }} onClick={() => setSortKey("request_count")}>Requests{sortKey === "request_count" && " ↓"}</div>
+          <div style={{ flex: 1, textAlign: "right", cursor: "pointer" }} onClick={() => setSortKey("error_count")}>Errors{sortKey === "error_count" && " ↓"}</div>
+          <div style={{ flex: 1, textAlign: "right", cursor: "pointer" }} onClick={() => setSortKey("avg_duration_ms")}>Avg{sortKey === "avg_duration_ms" && " ↓"}</div>
+          <div style={{ flex: 1, textAlign: "right", cursor: "pointer" }} onClick={() => setSortKey("p95_ms")}>p95{sortKey === "p95_ms" && " ↓"}</div>
         </div>
-        {operations.map(op => (
+        {sorted.map(op => (
           <div key={op.operation_name} class={`traces-span-row ${selectedOp === op.operation_name ? "traces-span-row--selected" : ""}`}
             onClick={() => handleOpClick(op.operation_name)}>
             <div style={{ flex: 2, fontSize: "13px", fontWeight: 500, color: "var(--obs-text)" }}>{op.operation_name}</div>
             <div style={{ flex: 1, textAlign: "right", fontSize: "12px", color: "var(--obs-text-secondary)", fontVariantNumeric: "tabular-nums" }}>{op.request_count.toLocaleString()}</div>
             <div style={{ flex: 1, textAlign: "right", fontSize: "12px", color: op.error_count > 0 ? "var(--obs-danger)" : "var(--obs-text-secondary)", fontVariantNumeric: "tabular-nums" }}>{op.error_count.toLocaleString()}</div>
             <div style={{ flex: 1, textAlign: "right", fontSize: "12px", color: "var(--obs-text-secondary)", fontVariantNumeric: "tabular-nums" }}>{formatDuration(op.avg_duration_ms)}</div>
+            <div style={{ flex: 1, textAlign: "right", fontSize: "12px", color: "var(--obs-text-secondary)", fontVariantNumeric: "tabular-nums" }}>{formatDuration(op.p95_ms)}</div>
           </div>
         ))}
       </div>
@@ -534,6 +650,7 @@ export default function TracesPage() {
   const [traceId, setTraceId] = useState<string | null>(null);
   const [traceSpans, setTraceSpans] = useState<Span[]>([]);
   const [loadingTrace, setLoadingTrace] = useState(false);
+  const [traceView, setTraceView] = useState<"waterfall" | "flame">("waterfall");
   const [searchId, setSearchId] = useState("");
 
   const now = new Date();
@@ -606,8 +723,22 @@ export default function TracesPage() {
         </button>
         <div class="obs-page-header">
           <h1 class="obs-page-title">Trace {traceId.slice(0, 16)}...</h1>
+          <div class="traces-view-toggle">
+            <button
+              class={`traces-view-btn ${traceView === "waterfall" ? "traces-view-btn--active" : ""}`}
+              onClick={() => setTraceView("waterfall")}
+            >Waterfall</button>
+            <button
+              class={`traces-view-btn ${traceView === "flame" ? "traces-view-btn--active" : ""}`}
+              onClick={() => setTraceView("flame")}
+            >Flame</button>
+          </div>
         </div>
-        {loadingTrace ? <ListSkeleton /> : <TraceWaterfall spans={traceSpans} traceId={traceId} siteId={siteId} />}
+        {loadingTrace ? <ListSkeleton /> : (
+          traceView === "flame"
+            ? <TraceFlame spans={traceSpans} />
+            : <TraceWaterfall spans={traceSpans} traceId={traceId} siteId={siteId} />
+        )}
       </div>
     );
   }
@@ -686,7 +817,15 @@ export default function TracesPage() {
       ) : loading ? (
         <ServicesSkeleton />
       ) : services.length === 0 ? (
-        <div class="obs-empty-state">No services reporting traces</div>
+        <EmptyState
+          title="No services reporting traces"
+          description="Observe speaks OTLP. Point your OpenTelemetry exporter at /api/v1/ingest/v1/traces using your API key. RED metrics roll up automatically."
+          icon="layers"
+          actions={[
+            { label: "Get started", href: "/onboard", primary: true },
+            { label: "Read the docs", href: "/docs#traces" },
+          ]}
+        />
       ) : (
         <div class="traces-service-grid">
           {services.map(svc => {

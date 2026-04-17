@@ -9,7 +9,7 @@ Two processes. 100MB idle. Runs anywhere.
 ### Docker Compose (recommended)
 
 ```bash
-git clone https://github.com/teploy/observe.git
+git clone https://github.com/useteploy/observe.git
 cd observe
 docker-compose up
 ```

@@ -9,7 +9,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/teploy/observe/internal/dbutil"
+	"github.com/useteploy/observe/internal/dbutil"
 )
 
 var randRead = rand.Read
@@ -78,7 +78,7 @@ func (s *StatsService) GoalConversions(ctx context.Context, siteID string, from,
 	}
 	totalRows, err := nucleus.Query[countRow](ctx, s.db.SQL(),
 		`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count
-		 FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
+		 FROM events WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`,
 		siteID, fromMs, toMs,
 	)
 	totalVisitors := int64(0)
@@ -92,11 +92,11 @@ func (s *StatsService) GoalConversions(ctx context.Context, siteID string, from,
 		switch g.GoalType {
 		case "page":
 			q = `SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count
-				 FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+				 FROM events WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 				   AND event_type = 'pageview' AND pathname = $4`
 		case "event":
 			q = `SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count
-				 FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+				 FROM events WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 				   AND event_type = $4`
 		default:
 			continue

@@ -64,15 +64,25 @@ function ResultsPanel({ experimentId }: { experimentId: string }) {
         )}
       </div>
 
-      {results.variants.map(v => {
+      {results.variants.map((v, idx) => {
         const barWidth = maxRate > 0 ? (v.conversion_rate / maxRate) * 100 : 0;
         const isWinner = results.winner === v.variant;
+        const isControl = idx === 0;
+        const prob = v.prob_beat_control;
+        const probPct = Math.round(prob * 100);
+        const probClass =
+          isControl ? "experiments-prob--control" :
+          prob >= 0.95 ? "experiments-prob--strong" :
+          prob >= 0.75 ? "experiments-prob--lean" :
+          prob >= 0.25 ? "experiments-prob--neutral" :
+          "experiments-prob--weak";
 
         return (
           <div key={v.variant} class="experiments-result-row" style={{ flexDirection: "column", alignItems: "stretch", gap: "6px" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
               <span class="experiments-result-variant" style={{ minWidth: "100px" }}>
                 {v.variant}
+                {isControl && <span class="experiments-result-control-tag" style={{ marginLeft: "6px" }}>control</span>}
                 {isWinner && <span class="experiments-result-winner" style={{ marginLeft: "6px" }}>Winner</span>}
               </span>
               <span class="experiments-result-stat">{v.exposures.toLocaleString()} exposures</span>
@@ -80,6 +90,11 @@ function ResultsPanel({ experimentId }: { experimentId: string }) {
               <span class="experiments-result-stat" style={{ fontWeight: 600, color: "var(--obs-text)" }}>
                 {(v.conversion_rate * 100).toFixed(2)}%
               </span>
+              {!isControl && (
+                <span class={`experiments-prob ${probClass}`} title="Bayesian probability this variant beats control">
+                  P(beats control) {probPct}%
+                </span>
+              )}
               {results.significant && isWinner && (
                 <span style={{ fontSize: "10px", padding: "2px 6px", borderRadius: "var(--obs-radius-full)", background: "rgba(34, 197, 94, 0.1)", color: "var(--obs-success)", fontWeight: 600 }}>
                   Significant
@@ -95,6 +110,11 @@ function ResultsPanel({ experimentId }: { experimentId: string }) {
                 transition: "width 0.3s ease",
               }} />
             </div>
+            {!isControl && (
+              <div class="experiments-prob-bar" title={`${probPct}% probability variant beats control`}>
+                <div class={`experiments-prob-bar-fill ${probClass}`} style={{ width: `${Math.max(probPct, 2)}%` }} />
+              </div>
+            )}
           </div>
         );
       })}

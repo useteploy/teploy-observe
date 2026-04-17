@@ -242,6 +242,55 @@ func (s *IssueService) LatestEvents(ctx context.Context, issueID, siteID string,
 	)
 }
 
+// DailyCount represents error volume for a single day (UTC).
+type DailyCount struct {
+	Day   string `json:"day" db:"day"`
+	Count int64  `json:"count" db:"count"`
+}
+
+// DailyCounts returns error counts per UTC day for the last `days` days.
+// Missing days are zero-filled so the client can render a continuous bar chart.
+func (s *IssueService) DailyCounts(ctx context.Context, siteID string, days int) ([]DailyCount, error) {
+	if days <= 0 || days > 90 {
+		days = 14
+	}
+	now := time.Now().UTC()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	fromTime := today.AddDate(0, 0, -(days - 1))
+	fromMs := strconv.FormatInt(fromTime.UnixMilli(), 10)
+
+	type rawRow struct {
+		Bucket int64 `db:"bucket"`
+		Count  int64 `db:"count"`
+	}
+	rows, err := nucleus.Query[rawRow](ctx, s.db.SQL(),
+		`SELECT (CAST(timestamp AS BIGINT) / 86400000) * 86400000 AS bucket,
+		        COUNT(*) AS count
+		 FROM error_events
+		 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT)
+		 GROUP BY (CAST(timestamp AS BIGINT) / 86400000) * 86400000
+		 ORDER BY bucket ASC`,
+		siteID, fromMs,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	byDay := make(map[string]int64, len(rows))
+	for _, r := range rows {
+		t := time.UnixMilli(r.Bucket).UTC()
+		byDay[t.Format("2006-01-02")] = r.Count
+	}
+
+	result := make([]DailyCount, 0, days)
+	for i := 0; i < days; i++ {
+		d := today.AddDate(0, 0, -(days-1-i))
+		key := d.Format("2006-01-02")
+		result = append(result, DailyCount{Day: key, Count: byDay[key]})
+	}
+	return result, nil
+}
+
 func generateID() string {
 	b := make([]byte, 16)
 	rand.Read(b)

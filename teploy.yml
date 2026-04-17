@@ -1,0 +1,66 @@
+# Observe — Teploy deployment template.
+#
+# First time:
+#   teploy setup          # installs Docker + Caddy on the server
+#   teploy deploy         # builds image, ships it, switches traffic
+#
+# Subsequent deploys:
+#   teploy deploy
+#
+# Required env (export before running):
+#   TEPLOY_OBSERVE_JWT_SECRET      — 32+ random bytes, `openssl rand -hex 32`
+#   TEPLOY_OBSERVE_SESSION_SALT    — another random 32-byte string
+#   TEPLOY_OBSERVE_ADMIN_PASSWORD  — initial admin password (change via /settings after)
+
+app: observe
+domain: observe.example.com
+server: observe.example.com
+
+image: observe
+port: 3000
+platform: linux/amd64
+
+# Build the image locally each deploy (uses the repo Dockerfile).
+# Switch to pulling a prebuilt image by removing this and setting image: ghcr.io/...
+build_local: true
+
+# Graceful shutdown — give ingest buffer 30s to flush before SIGKILL.
+stop_timeout: 30
+
+# Nucleus runs as a Teploy accessory (separate container, sidecar to observe).
+# Observe talks to it via the docker network at `nucleus:5432`.
+accessories:
+  nucleus:
+    image: ghcr.io/neutron-build/nucleus:latest
+    port: 5432
+    env:
+      NUCLEUS_ALLOW_NO_AUTH: "1"
+    volumes:
+      nucleus_data: /data
+
+env:
+  OBSERVE_ADDR: ":3000"
+  OBSERVE_NUCLEUS_URL: "postgres://nucleus:5432/observe"
+  OBSERVE_SITE_ID: "default"
+  OBSERVE_SESSION_SALT: "${TEPLOY_OBSERVE_SESSION_SALT}"
+  OBSERVE_JWT_SECRET: "${TEPLOY_OBSERVE_JWT_SECRET}"
+  OBSERVE_ADMIN_USER: "admin"
+  OBSERVE_ADMIN_PASSWORD: "${TEPLOY_OBSERVE_ADMIN_PASSWORD}"
+  OBSERVE_BUFFER_SIZE: "100000"
+  OBSERVE_FLUSH_INTERVAL_MS: "2000"
+  OBSERVE_FLUSH_SIZE: "500"
+  OBSERVE_RAW_RETENTION_DAYS: "30"
+  OBSERVE_HOURLY_RETENTION_DAYS: "365"
+  OBSERVE_SEED_DEMO: "false"
+
+volumes:
+  observe_state: /var/lib/observe
+
+# Optional: Slack webhook on deploy success/failure.
+# notifications:
+#   webhook: https://hooks.slack.com/services/YOUR/WEBHOOK/URL
+
+hooks:
+  post_deploy: |
+    echo "Observe deployed to https://${TEPLOY_DOMAIN}/"
+    echo "Admin: admin / \${OBSERVE_ADMIN_PASSWORD} — change via /settings."

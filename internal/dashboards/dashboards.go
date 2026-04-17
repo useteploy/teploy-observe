@@ -120,12 +120,20 @@ func (s *DashboardService) AddPanel(ctx context.Context, dashboardID string, pan
 }
 
 func (s *DashboardService) ListPanels(ctx context.Context, dashboardID string) ([]Panel, error) {
+	// dashboard_panels is ReplacingMergeTree (insert-on-update). De-dupe to the
+	// highest-version row per panel_id so edits take effect.
 	return nucleus.Query[Panel](ctx, s.db.SQL(),
 		`SELECT panel_id, tenant_id, dashboard_id, panel_type, title, query_type,
 			COALESCE(query_config, '') AS query_config,
 			position_x, position_y, width, height, version
-		 FROM dashboard_panels WHERE dashboard_id = $1
-		 ORDER BY position_y, position_x`, dashboardID)
+		 FROM dashboard_panels
+		 WHERE dashboard_id = $1
+		   AND CAST(version AS BIGINT) = (
+		     SELECT MAX(CAST(version AS BIGINT))
+		     FROM dashboard_panels dp2
+		     WHERE dp2.panel_id = dashboard_panels.panel_id
+		   )
+		 ORDER BY CAST(position_y AS BIGINT), CAST(position_x AS BIGINT)`, dashboardID)
 }
 
 func (s *DashboardService) UpdatePanel(ctx context.Context, panel Panel) error {
@@ -163,7 +171,7 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 		type r struct{ Count string `db:"count"` }
 		rows, err := nucleus.Query[r](ctx, sql,
 			`SELECT CAST(COUNT(*) AS TEXT) AS count FROM events
-			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3 AND event_type = 'pageview'`,
+			 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT) AND event_type = 'pageview'`,
 			siteID, from, to)
 		if err != nil || len(rows) == 0 { return map[string]string{"value": "0"}, nil }
 		return map[string]string{"value": rows[0].Count}, nil
@@ -172,7 +180,7 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 		type r struct{ Count string `db:"count"` }
 		rows, err := nucleus.Query[r](ctx, sql,
 			`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count FROM events
-			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
+			 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`,
 			siteID, from, to)
 		if err != nil || len(rows) == 0 { return map[string]string{"value": "0"}, nil }
 		return map[string]string{"value": rows[0].Count}, nil
@@ -181,7 +189,7 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 		type r struct{ Count string `db:"count"` }
 		rows, err := nucleus.Query[r](ctx, sql,
 			`SELECT CAST(COUNT(*) AS TEXT) AS count FROM error_events
-			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
+			 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`,
 			siteID, from, to)
 		if err != nil || len(rows) == 0 { return map[string]string{"value": "0"}, nil }
 		return map[string]string{"value": rows[0].Count}, nil

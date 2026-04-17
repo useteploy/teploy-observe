@@ -4,6 +4,7 @@ import { analyticsApi } from "../api/analytics.js";
 import type { TimeSeriesPoint } from "../api/analytics.js";
 import Modal from "../components/shared/Modal.js";
 import ConfirmDialog from "../components/shared/ConfirmDialog.js";
+import EmptyState from "../components/shared/EmptyState.js";
 import "../styles/dashboards.css";
 
 function MiniSparkline({ data, color = "var(--obs-accent)" }: { data: number[]; color?: string }) {
@@ -57,6 +58,137 @@ function MiniSparkline({ data, color = "var(--obs-accent)" }: { data: number[]; 
   return <canvas ref={ref} style={{ width: "100%", height: "32px", display: "block", marginTop: "8px" }} />;
 }
 
+function PanelTimeSeries({ data, labels, label }: { data: number[]; labels: string[]; label: string }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  const [hover, setHover] = useState<{ i: number; x: number; y: number } | null>(null);
+
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas || data.length < 2) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.scale(dpr, dpr);
+    const w = rect.width;
+    const h = rect.height;
+    const padL = 40, padR = 12, padT = 8, padB = 24;
+    const plotW = w - padL - padR;
+    const plotH = h - padT - padB;
+    const max = Math.max(...data, 1);
+
+    ctx.clearRect(0, 0, w, h);
+
+    // Gridlines (4 horizontal)
+    ctx.strokeStyle = "rgba(128,128,128,0.15)";
+    ctx.lineWidth = 1;
+    ctx.font = "10px system-ui, sans-serif";
+    ctx.fillStyle = "rgba(128,128,128,0.85)";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    for (let g = 0; g <= 4; g++) {
+      const y = padT + (g / 4) * plotH;
+      ctx.beginPath();
+      ctx.moveTo(padL, y);
+      ctx.lineTo(w - padR, y);
+      ctx.stroke();
+      const val = Math.round(max * (1 - g / 4));
+      ctx.fillText(String(val), padL - 6, y);
+    }
+
+    // Area fill
+    ctx.beginPath();
+    ctx.moveTo(padL, padT + plotH);
+    data.forEach((v, i) => {
+      const x = padL + (data.length === 1 ? 0 : (i / (data.length - 1)) * plotW);
+      const y = padT + plotH - (v / max) * plotH;
+      ctx.lineTo(x, y);
+    });
+    ctx.lineTo(padL + plotW, padT + plotH);
+    ctx.closePath();
+    const cs = getComputedStyle(canvas);
+    const accent = cs.getPropertyValue("--obs-accent").trim() || "#6366f1";
+    ctx.fillStyle = accent + "22";
+    ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    data.forEach((v, i) => {
+      const x = padL + (data.length === 1 ? 0 : (i / (data.length - 1)) * plotW);
+      const y = padT + plotH - (v / max) * plotH;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // x-axis labels — first, middle, last
+    if (labels.length >= 2) {
+      ctx.fillStyle = "rgba(128,128,128,0.85)";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "top";
+      ctx.fillText(labels[0], padL, h - padB + 6);
+      ctx.textAlign = "right";
+      ctx.fillText(labels[labels.length - 1], w - padR, h - padB + 6);
+      if (labels.length >= 3) {
+        ctx.textAlign = "center";
+        ctx.fillText(labels[Math.floor(labels.length / 2)], padL + plotW / 2, h - padB + 6);
+      }
+    }
+
+    // Hover marker
+    if (hover !== null) {
+      const i = hover.i;
+      const x = padL + (data.length === 1 ? 0 : (i / (data.length - 1)) * plotW);
+      const y = padT + plotH - (data[i] / max) * plotH;
+      ctx.beginPath();
+      ctx.arc(x, y, 4, 0, 2 * Math.PI);
+      ctx.fillStyle = accent;
+      ctx.fill();
+      ctx.strokeStyle = "#fff";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }, [data, labels, hover]);
+
+  const onMove = (e: MouseEvent) => {
+    const canvas = ref.current;
+    if (!canvas || data.length < 2) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const padL = 40, padR = 12;
+    const plotW = rect.width - padL - padR;
+    const rel = Math.max(0, Math.min(1, (x - padL) / plotW));
+    const i = Math.round(rel * (data.length - 1));
+    setHover({ i, x: e.clientX - rect.left, y: e.clientY - rect.top });
+  };
+
+  if (data.length < 2) {
+    return <div class="dashboard-panel-empty">Not enough data yet.</div>;
+  }
+
+  const tip = hover !== null ? { label: labels[hover.i], value: data[hover.i] } : null;
+
+  return (
+    <div class="dashboard-panel-chart" onMouseLeave={() => setHover(null)}>
+      <canvas
+        ref={ref}
+        onMouseMove={onMove}
+        style={{ width: "100%", height: "180px", display: "block" }}
+        aria-label={label + " over time"}
+      />
+      {tip && (
+        <div class="dashboard-panel-tooltip" style={{ left: `${hover!.x}px`, top: `${hover!.y - 40}px` }}>
+          <div class="dashboard-panel-tooltip-label">{tip.label}</div>
+          <div class="dashboard-panel-tooltip-value">{tip.value.toLocaleString()}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export const config = { mode: "app" };
 
 const BASE = "/api/v1/dashboards";
@@ -101,6 +233,7 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
   const [queryType, setQueryType] = useState("pageviews");
   const [panelValues, setPanelValues] = useState<Record<string, string>>({});
   const [panelSparklines, setPanelSparklines] = useState<Record<string, number[]>>({});
+  const [chartLabels, setChartLabels] = useState<string[]>([]);
 
   const fetchDetail = useCallback(async () => {
     setLoading(true);
@@ -141,8 +274,13 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
           }
         }
 
+        const labels = tsData.map(d =>
+          new Date(d.bucket).toLocaleDateString("en-US", { month: "short", day: "numeric" })
+        );
+
         setPanelValues(vals);
         setPanelSparklines(sparks);
+        setChartLabels(labels);
       }
     } catch { setDetail(null); }
     finally { setLoading(false); }
@@ -197,20 +335,66 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
       </div>
 
       {!detail.panels?.length ? (
-        <div class="obs-empty-state">No panels yet. Add one to get started.</div>
+        <EmptyState
+          title="No panels yet"
+          description="Panels show a single number, a time-series chart, or a custom query. Drop one in and it updates live as events arrive."
+          icon="layers"
+          actions={[
+            { label: "Add first panel", onClick: () => setShowAddPanel(true), primary: true },
+          ]}
+        />
       ) : (
         <div class="dashboard-panels">
-          {detail.panels.filter(p => p.title).map(panel => {
+          {detail.panels.filter(p => p.title).map((panel, idx, all) => {
             const w = parseInt(panel.width) || 6;
+            const series = panelSparklines[panel.panel_id];
+            const isTimeSeries = panel.panel_type === "timeseries";
+            const updateLayout = async (patch: { width?: string; position_y?: string }) => {
+              await post(`${BASE}/${dashboardId}/panels/${panel.panel_id}/layout`, patch);
+              fetchDetail();
+            };
+            const setWidth = (next: number) => updateLayout({ width: String(next) });
+            const move = (dir: -1 | 1) => {
+              const otherIdx = idx + dir;
+              if (otherIdx < 0 || otherIdx >= all.length) return;
+              const other = all[otherIdx];
+              const myY = parseInt(panel.position_y) || idx;
+              const otherY = parseInt(other.position_y) || otherIdx;
+              // swap position_y values
+              Promise.all([
+                post(`${BASE}/${dashboardId}/panels/${panel.panel_id}/layout`, { position_y: String(otherY) }),
+                post(`${BASE}/${dashboardId}/panels/${other.panel_id}/layout`, { position_y: String(myY) }),
+              ]).then(fetchDetail);
+            };
             return (
-              <div key={panel.panel_id} class="dashboard-panel"
+              <div key={panel.panel_id} class={`dashboard-panel ${isTimeSeries ? "dashboard-panel--chart" : ""}`}
                 style={{ gridColumn: `span ${Math.min(w, 12)}` }}>
-                <div class="dashboard-panel-title">{panel.title}</div>
-                <div class="dashboard-panel-value">
-                  {panelValues[panel.panel_id] ?? "--"}
+                <div class="dashboard-panel-head">
+                  <div class="dashboard-panel-title">{panel.title}</div>
+                  <div class="dashboard-panel-controls">
+                    <button class="dashboard-panel-ctrl" aria-label="Move up" disabled={idx === 0} onClick={() => move(-1)}>↑</button>
+                    <button class="dashboard-panel-ctrl" aria-label="Move down" disabled={idx === all.length - 1} onClick={() => move(1)}>↓</button>
+                    <span class="dashboard-panel-ctrl-sep" />
+                    {[4, 6, 8, 12].map((n) => (
+                      <button key={n}
+                        class={`dashboard-panel-ctrl ${w === n ? "dashboard-panel-ctrl--active" : ""}`}
+                        aria-label={`Set width ${n}/12`}
+                        onClick={() => setWidth(n)}
+                      >{n}</button>
+                    ))}
+                  </div>
                 </div>
-                {panelSparklines[panel.panel_id]?.length > 1 && (
-                  <MiniSparkline data={panelSparklines[panel.panel_id]} />
+                {isTimeSeries ? (
+                  series && series.length > 1
+                    ? <PanelTimeSeries data={series} labels={chartLabels} label={panel.query_type} />
+                    : <div class="dashboard-panel-empty">Not enough data yet.</div>
+                ) : (
+                  <>
+                    <div class="dashboard-panel-value">
+                      {panelValues[panel.panel_id] ?? "--"}
+                    </div>
+                    {series?.length > 1 && <MiniSparkline data={series} />}
+                  </>
                 )}
                 <div style={{ fontSize: "11px", color: "var(--obs-text-muted)", marginTop: "4px" }}>
                   {panel.query_type} / {panel.panel_type}

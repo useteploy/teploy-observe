@@ -318,3 +318,97 @@
     width: 100%;
   }
 }
+
+/* ─── Volume histogram ─── */
+.logs-histogram {
+  background: var(--obs-surface);
+  border: 1px solid var(--obs-border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+
+.logs-histogram-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 60px;
+}
+
+.logs-histogram-bar-wrap {
+  flex: 1;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  min-width: 2px;
+}
+
+.logs-histogram-bar {
+  width: 100%;
+  display: flex;
+  flex-direction: column-reverse;
+  border-radius: 2px 2px 0 0;
+  overflow: hidden;
+  min-height: 2px;
+}
+
+.logs-histogram-seg--debug { background: #71717a; }
+.logs-histogram-seg--info  { background: #6366f1; }
+.logs-histogram-seg--warn  { background: #f59e0b; }
+.logs-histogram-seg--error { background: #ef4444; }
+.logs-histogram-seg--fatal { background: #991b1b; }
+
+.logs-histogram-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--obs-text-muted);
+  margin-top: 4px;
+  font-family: var(--obs-font-mono, monospace);
+}
+
+/* ─── Live tail ─── */
+.logs-live-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: var(--obs-surface);
+  border: 1px solid var(--obs-border);
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--obs-text-secondary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.logs-live-btn:hover {
+  background: var(--obs-bg-card-hover, rgba(0, 0, 0, 0.03));
+  color: var(--obs-text);
+}
+
+.logs-live-btn--active {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.35);
+  color: #dc2626;
+}
+
+.logs-live-btn .logs-live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--obs-text-muted);
+}
+
+.logs-live-btn--active .logs-live-dot {
+  background: #ef4444;
+  box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6);
+  animation: logs-live-pulse 1.4s ease-out infinite;
+}
+
+@keyframes logs-live-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6); }
+  70%  { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}

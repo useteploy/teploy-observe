@@ -13,7 +13,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/teploy/observe/internal/dbutil"
+	"github.com/useteploy/observe/internal/dbutil"
 )
 
 type ReportService struct {
@@ -159,7 +159,7 @@ func (s *ReportService) gatherData(ctx context.Context, sched ReportSchedule) Re
 
 	// Pageviews
 	rows, _ := nucleus.Query[countRow](ctx, s.db.SQL(),
-		`SELECT CAST(COUNT(*) AS TEXT) AS count FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3 AND event_type = 'pageview'`,
+		`SELECT CAST(COUNT(*) AS TEXT) AS count FROM events WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT) AND event_type = 'pageview'`,
 		sched.SiteID, fromMs, toMs)
 	if len(rows) > 0 {
 		data.Pageviews = rows[0].Count
@@ -167,7 +167,7 @@ func (s *ReportService) gatherData(ctx context.Context, sched ReportSchedule) Re
 
 	// Visitors
 	rows, _ = nucleus.Query[countRow](ctx, s.db.SQL(),
-		`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
+		`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count FROM events WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`,
 		sched.SiteID, fromMs, toMs)
 	if len(rows) > 0 {
 		data.Visitors = rows[0].Count
@@ -175,7 +175,7 @@ func (s *ReportService) gatherData(ctx context.Context, sched ReportSchedule) Re
 
 	// Errors
 	rows, _ = nucleus.Query[countRow](ctx, s.db.SQL(),
-		`SELECT CAST(COUNT(*) AS TEXT) AS count FROM error_events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
+		`SELECT CAST(COUNT(*) AS TEXT) AS count FROM error_events WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`,
 		sched.SiteID, fromMs, toMs)
 	if len(rows) > 0 {
 		data.Errors = rows[0].Count

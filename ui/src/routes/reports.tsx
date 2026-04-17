@@ -3,6 +3,7 @@ import { get, post, del } from "../api/helpers.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
 import ConfirmDialog from "../components/shared/ConfirmDialog.js";
+import EmptyState from "../components/shared/EmptyState.js";
 import "../styles/settings.css";
 
 export const config = { mode: "app" };
@@ -96,7 +97,14 @@ export default function ReportsPage() {
           ))}
         </div>
       ) : reports.length === 0 ? (
-        <div class="obs-empty-state">No scheduled reports. Create one to receive analytics summaries by email.</div>
+        <EmptyState
+          title="No scheduled reports"
+          description="Reports email a weekly or daily analytics summary to recipients of your choice. Set SMTP credentials in the environment to enable delivery."
+          icon="signal"
+          actions={[
+            { label: "Schedule a report", onClick: () => setShowCreate(true), primary: true },
+          ]}
+        />
       ) : (
         <div class="settings-list">
           {reports.map(r => (

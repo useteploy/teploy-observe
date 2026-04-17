@@ -117,24 +117,56 @@ func (s *IntegrationService) Fire(ctx context.Context, siteID string, payload Al
 	}
 	for _, intg := range intgs {
 		go func(i Integration) {
-			var err error
-			switch i.IntType {
-			case "jira":
-				err = s.fireJira(i.Config, payload)
-			case "github":
-				err = s.fireGitHub(i.Config, payload)
-			case "pagerduty":
-				err = s.firePagerDuty(i.Config, payload)
-			case "email":
-				err = s.fireEmail(i.Config, payload)
-			case "slack":
-				err = s.fireSlack(i.Config, payload)
-			}
+			err := s.fireOne(i, payload)
 			if err != nil {
 				s.logger.Error("integration fire failed", "type", i.IntType, "name", i.Name, "err", err)
 			}
 		}(intg)
 	}
+}
+
+// fireOne dispatches to the correct per-type fire fn.
+func (s *IntegrationService) fireOne(i Integration, payload AlertPayload) error {
+	switch i.IntType {
+	case "jira":
+		return s.fireJira(i.Config, payload)
+	case "github":
+		return s.fireGitHub(i.Config, payload)
+	case "pagerduty":
+		return s.firePagerDuty(i.Config, payload)
+	case "email":
+		return s.fireEmail(i.Config, payload)
+	case "slack":
+		return s.fireSlack(i.Config, payload)
+	}
+	return fmt.Errorf("unknown integration type: %s", i.IntType)
+}
+
+// Test delivers a canned sample payload through the integration so users can
+// verify wiring. Returns an error string for the UI.
+func (s *IntegrationService) Test(ctx context.Context, integrationID string) error {
+	rows, err := nucleus.Query[Integration](ctx, s.db.SQL(),
+		`SELECT integration_id, tenant_id, site_id, name, int_type,
+		        COALESCE(config, '') AS config, enabled, created_at, version
+		 FROM integrations WHERE integration_id = $1`, integrationID)
+	if err != nil {
+		return fmt.Errorf("lookup integration: %w", err)
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("integration not found")
+	}
+	sample := AlertPayload{
+		Title:     "Observe test alert",
+		Message:   "This is a test delivery from Observe. No action required.",
+		Severity:  "info",
+		SiteID:    rows[0].SiteID,
+		RuleName:  "integration_test",
+		Metric:    "pageviews",
+		Value:     "42",
+		Threshold: "0",
+		URL:       "",
+	}
+	return s.fireOne(rows[0], sample)
 }
 
 func (s *IntegrationService) fireJira(configJSON string, p AlertPayload) error {

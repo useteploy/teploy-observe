@@ -10,7 +10,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/teploy/observe/internal/dbutil"
+	"github.com/useteploy/observe/internal/dbutil"
 )
 
 // Correlation represents a property value correlated with a target event.
@@ -42,7 +42,7 @@ func (s *StatsService) CorrelationAnalysis(ctx context.Context, siteID, targetEv
 	rows, err := nucleus.Query[correlationEvent](ctx, s.db.SQL(),
 		`SELECT session_id, event_type, COALESCE(properties, '') AS properties
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 		 ORDER BY session_id`,
 		siteID, fromMs, toMs,
 	)

@@ -1,0 +1,105 @@
+version: 2
+
+project_name: observe
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: observe
+    main: ./cmd/observe
+    binary: observe
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+
+archives:
+  - id: observe-tar
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{- if eq .Arch "amd64" }}x86_64{{- else }}{{ .Arch }}{{ end }}
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: '{{ incpatch .Version }}-next'
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^chore:'
+      - '^test:'
+
+dockers:
+  - image_templates:
+      - 'ghcr.io/useteploy/observe:{{ .Version }}-amd64'
+    dockerfile: Dockerfile
+    use: buildx
+    build_flag_templates:
+      - --platform=linux/amd64
+      - --label=org.opencontainers.image.title={{ .ProjectName }}
+      - --label=org.opencontainers.image.version={{ .Version }}
+      - --label=org.opencontainers.image.source=https://github.com/useteploy/observe
+      - --label=org.opencontainers.image.licenses=AGPL-3.0-or-later
+    extra_files:
+      - cmd
+      - internal
+      - migrations
+      - go.mod
+      - go.sum
+  - image_templates:
+      - 'ghcr.io/useteploy/observe:{{ .Version }}-arm64'
+    dockerfile: Dockerfile
+    use: buildx
+    build_flag_templates:
+      - --platform=linux/arm64
+      - --label=org.opencontainers.image.title={{ .ProjectName }}
+      - --label=org.opencontainers.image.version={{ .Version }}
+      - --label=org.opencontainers.image.source=https://github.com/useteploy/observe
+      - --label=org.opencontainers.image.licenses=AGPL-3.0-or-later
+    goarch: arm64
+    extra_files:
+      - cmd
+      - internal
+      - migrations
+      - go.mod
+      - go.sum
+
+docker_manifests:
+  - name_template: 'ghcr.io/useteploy/observe:{{ .Version }}'
+    image_templates:
+      - 'ghcr.io/useteploy/observe:{{ .Version }}-amd64'
+      - 'ghcr.io/useteploy/observe:{{ .Version }}-arm64'
+  - name_template: 'ghcr.io/useteploy/observe:latest'
+    image_templates:
+      - 'ghcr.io/useteploy/observe:{{ .Version }}-amd64'
+      - 'ghcr.io/useteploy/observe:{{ .Version }}-arm64'
+
+brews:
+  - name: observe
+    repository:
+      owner: useteploy
+      name: homebrew-observe
+      token: '{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}'
+    homepage: 'https://observe.dev'
+    description: 'Self-hosted, single-binary replacement for PostHog + Umami + SigNoz + Sentry'
+    license: 'AGPL-3.0-or-later'
+    install: |
+      bin.install "observe"
+    test: |
+      system "#{bin}/observe", "--version"

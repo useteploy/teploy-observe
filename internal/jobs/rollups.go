@@ -58,7 +58,7 @@ func (r *RollupService) RunHourlyRollup(ctx context.Context) error {
 			0 AS total_duration,
 			$3 AS version
 		FROM events
-		WHERE timestamp >= $1 AND timestamp < $2
+		WHERE timestamp >= CAST($1 AS BIGINT) AND timestamp < CAST($2 AS BIGINT)
 		GROUP BY tenant_id, site_id, (CAST(timestamp AS BIGINT) / 3600000) * 3600000, pathname, event_type`),
 		startMs, endMs, version,
 	)
@@ -119,7 +119,7 @@ func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 			0 AS total_duration,
 			$3 AS version
 		FROM events
-		WHERE timestamp >= $1 AND timestamp < $2
+		WHERE timestamp >= CAST($1 AS BIGINT) AND timestamp < CAST($2 AS BIGINT)
 		GROUP BY tenant_id, site_id, (CAST(timestamp AS BIGINT) / 86400000) * 86400000, pathname, event_type,
 		         referrer, browser, os, country, device,
 		         utm_source, utm_medium, utm_campaign`),
@@ -154,7 +154,7 @@ func (r *RollupService) updateHLL(ctx context.Context, startMs, endMs int64, buc
 		fmt.Sprintf(`SELECT site_id, session_id,
 			(CAST(timestamp AS BIGINT) / %d) * %d AS bucket
 		 FROM events
-		 WHERE timestamp >= $1 AND timestamp < $2`,
+		 WHERE timestamp >= CAST($1 AS BIGINT) AND timestamp < CAST($2 AS BIGINT)`,
 			bucketMs, bucketMs),
 		startMs, endMs,
 	)
@@ -251,7 +251,7 @@ func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 			COALESCE(utm_medium, '') AS utm_medium,
 			COALESCE(utm_campaign, '') AS utm_campaign
 		 FROM events
-		 WHERE timestamp >= $1
+		 WHERE timestamp >= CAST($1 AS BIGINT)
 		 ORDER BY session_id, timestamp`,
 		cutoff,
 	)

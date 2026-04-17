@@ -58,7 +58,13 @@ export const analyticsApi = {
   realtime: (siteId: string, minutes = 5) =>
     get<RealtimeResult>(`${BASE}/realtime?site_id=${siteId}&minutes=${minutes}`),
   overview: (siteId: string, from: string, to: string, compare?: string | null, filters?: Record<string, string>) =>
-    get<OverviewResponse>(`${BASE}/overview?${qs(siteId, from, to, { compare: compare || undefined, filters })}`),
+    get<OverviewResponse | OverviewStats>(
+      `${BASE}/overview?${qs(siteId, from, to, { compare: compare || undefined, filters })}`
+    ).then((r): OverviewResponse => {
+      // Normalize: backend returns flat stats when no compare, {current, previous} when compare is set.
+      if (r && typeof r === "object" && "current" in r) return r as OverviewResponse;
+      return { current: r as OverviewStats };
+    }),
   timeseries: (siteId: string, from: string, to: string, interval?: string, filters?: Record<string, string>) =>
     get<TimeSeriesPoint[]>(`${BASE}/timeseries?${qs(siteId, from, to, { interval, filters })}`),
   pages: (siteId: string, from: string, to: string, limit = 10, filters?: Record<string, string>) =>
@@ -91,6 +97,11 @@ export const analyticsApi = {
     get<PropertyStat[]>(`${BASE}/event-properties?${qs(siteId, from, to)}&event_type=${encodeURIComponent(eventType)}`),
   funnel: (siteId: string, from: string, to: string, steps: FunnelStep[]) =>
     post<FunnelResult[]>(`${BASE}/funnel`, { site_id: siteId, from, to, steps }),
+  funnelBreakdown: (siteId: string, from: string, to: string, steps: FunnelStep[], breakdownBy: string, minSize = 5) =>
+    post<Array<{ breakdown: string; results: FunnelResult[] }>>(
+      `${BASE}/funnel/breakdown`,
+      { site_id: siteId, from, to, steps, breakdown_by: breakdownBy, min_size: minSize },
+    ),
   retention: (siteId: string, from: string, to: string, periodDays?: number) =>
     get<RetentionCohort[]>(`${BASE}/retention?${qs(siteId, from, to)}${periodDays ? `&period_days=${periodDays}` : ""}`),
   journeys: (siteId: string, from: string, to: string) =>

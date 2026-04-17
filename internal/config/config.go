@@ -28,6 +28,10 @@ type Config struct {
 	JWTSecret     string
 	AdminUser     string
 	AdminPassword string
+
+	// DemoMode locks the deployment to a read-only public demo state.
+	// Writes on /api/v1/* (except auth/login and ingest) return 403.
+	DemoMode bool
 }
 
 func Load() Config {
@@ -45,6 +49,7 @@ func Load() Config {
 		JWTSecret:           envOr("OBSERVE_JWT_SECRET", ""),
 		AdminUser:           envOr("OBSERVE_ADMIN_USER", "admin"),
 		AdminPassword:       envOr("OBSERVE_ADMIN_PASSWORD", "observe"),
+		DemoMode:            envOr("OBSERVE_DEMO_MODE", "") == "true",
 	}
 	return c
 }

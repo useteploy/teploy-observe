@@ -11,7 +11,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/teploy/observe/internal/sourcemaps"
+	"github.com/useteploy/observe/internal/sourcemaps"
 )
 
 // ErrorInput is the JSON body for POST /api/v1/errors (SDK envelope format).

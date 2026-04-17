@@ -1,0 +1,26 @@
+{
+  "name": "@observe/sentry-shim",
+  "version": "0.1.0",
+  "description": "Drop-in Sentry SDK shim backed by Observe. Swap @sentry/browser for this and existing calls keep working.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@observe/browser": "^0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  },
+  "license": "MIT"
+}

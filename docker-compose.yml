@@ -1,12 +1,17 @@
+# Observe — self-hosted analytics, errors, logs, traces, replays.
+#
+# Dev (no TLS, localhost:3000):
+#   docker compose up
+#
+# Production (with Caddy + auto-TLS; expose 80/443, set OBSERVE_DOMAIN):
+#   OBSERVE_DOMAIN=observe.example.com docker compose --profile tls up -d
+#
+# First login defaults: admin / observe — change immediately via /settings.
+
 services:
   nucleus:
     image: ghcr.io/neutron-build/nucleus:latest
-    # Or build from source:
-    # build:
-    #   context: ../tystack/nucleus
-    #   dockerfile: Dockerfile
-    ports:
-      - "5432:5432"
+    restart: unless-stopped
     volumes:
       - nucleus_data:/data
     command: ["start", "--port", "5432", "--cluster-port", "5433", "--data", "/data", "--max-memory", "512"]
@@ -22,21 +27,25 @@ services:
 
   observe:
     build: .
+    restart: unless-stopped
     ports:
+      # Exposed directly for the default (no-TLS) profile.
+      # With the "tls" profile, Caddy handles 80/443 and observe stays internal.
       - "3000:3000"
     environment:
       OBSERVE_ADDR: ":3000"
       OBSERVE_NUCLEUS_URL: "postgres://nucleus:5432/observe"
       OBSERVE_SITE_ID: "default"
-      OBSERVE_SESSION_SALT: "change-me-in-production"
+      OBSERVE_SESSION_SALT: "${OBSERVE_SESSION_SALT:-change-me-in-production}"
       OBSERVE_BUFFER_SIZE: "100000"
       OBSERVE_FLUSH_INTERVAL_MS: "2000"
       OBSERVE_FLUSH_SIZE: "500"
       OBSERVE_RAW_RETENTION_DAYS: "30"
       OBSERVE_HOURLY_RETENTION_DAYS: "365"
-      OBSERVE_JWT_SECRET: "change-me-in-production"
-      OBSERVE_ADMIN_USER: "admin"
-      OBSERVE_ADMIN_PASSWORD: "observe"
+      OBSERVE_JWT_SECRET: "${OBSERVE_JWT_SECRET:-change-me-in-production}"
+      OBSERVE_ADMIN_USER: "${OBSERVE_ADMIN_USER:-admin}"
+      OBSERVE_ADMIN_PASSWORD: "${OBSERVE_ADMIN_PASSWORD:-observe}"
+      OBSERVE_SEED_DEMO: "${OBSERVE_SEED_DEMO:-true}"
     depends_on:
       nucleus:
         condition: service_healthy
@@ -46,7 +55,32 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  # Optional: Caddy reverse proxy with automatic TLS via Let's Encrypt.
+  # Enable with:  docker compose --profile tls up -d
+  # Requires OBSERVE_DOMAIN to point at this host and ports 80/443 open.
+  caddy:
+    image: caddy:2-alpine
     restart: unless-stopped
+    profiles: [tls]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    command:
+      - caddy
+      - reverse-proxy
+      - --from
+      - "${OBSERVE_DOMAIN:-observe.localhost}"
+      - --to
+      - "observe:3000"
+    depends_on:
+      observe:
+        condition: service_healthy
 
 volumes:
   nucleus_data:
+  caddy_data:
+  caddy_config:

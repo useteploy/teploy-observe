@@ -71,6 +71,14 @@ func (s *FlagService) Create(ctx context.Context, siteID, flagKey, name, descrip
 	if err != nil {
 		return nil, fmt.Errorf("create flag: %w", err)
 	}
+	s.appendHistory(ctx, id, FlagHistoryEntry{
+		Timestamp:  now.UnixMilli(),
+		Action:     "created",
+		Enabled:    false,
+		RolloutPct: rolloutPct,
+		Variants:   variants,
+		Targeting:  targeting,
+	})
 	return &FeatureFlag{
 		FlagID: id, SiteID: siteID, FlagKey: flagKey, Name: name,
 		Description: description, FlagType: flagType, Enabled: false,
@@ -86,6 +94,50 @@ func (s *FlagService) List(ctx context.Context, siteID string) ([]FeatureFlag, e
 		 FROM feature_flags WHERE site_id = $1 ORDER BY created_at DESC`, siteID)
 }
 
+// FlagHistoryEntry captures a change to a flag for the audit log.
+type FlagHistoryEntry struct {
+	Timestamp  int64  `json:"timestamp"`
+	Action     string `json:"action"` // "created" | "toggle" | "update"
+	Enabled    bool   `json:"enabled"`
+	RolloutPct int    `json:"rollout_pct,omitempty"`
+	Variants   string `json:"variants,omitempty"`
+	Targeting  string `json:"targeting,omitempty"`
+	ChangedBy  string `json:"changed_by,omitempty"`
+}
+
+func historyKey(flagID string) string { return "flag_history:" + flagID }
+
+// appendHistory adds an entry to the flag's history (KV-backed, bounded to 100 entries).
+func (s *FlagService) appendHistory(ctx context.Context, flagID string, entry FlagHistoryEntry) {
+	kv := s.db.KV()
+	key := historyKey(flagID)
+	raw, _ := kv.Get(ctx, key)
+	var list []FlagHistoryEntry
+	if raw != nil {
+		_ = json.Unmarshal(raw, &list)
+	}
+	list = append([]FlagHistoryEntry{entry}, list...) // newest first
+	if len(list) > 100 {
+		list = list[:100]
+	}
+	updated, _ := json.Marshal(list)
+	_ = kv.Set(ctx, key, updated)
+}
+
+// History returns the change log for a flag (most-recent first).
+func (s *FlagService) History(ctx context.Context, flagID string) ([]FlagHistoryEntry, error) {
+	kv := s.db.KV()
+	raw, err := kv.Get(ctx, historyKey(flagID))
+	if err != nil || raw == nil {
+		return []FlagHistoryEntry{}, nil
+	}
+	var list []FlagHistoryEntry
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return []FlagHistoryEntry{}, nil
+	}
+	return list, nil
+}
+
 func (s *FlagService) Toggle(ctx context.Context, flagID string, enabled bool) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	val := "false"
@@ -97,7 +149,15 @@ func (s *FlagService) Toggle(ctx context.Context, flagID string, enabled bool) e
 		 SELECT flag_id, tenant_id, site_id, flag_key, name, description, flag_type, $2, rollout_pct, variants, targeting, created_at, $3
 		 FROM feature_flags WHERE flag_id = $1`,
 		flagID, val, now)
-	return err
+	if err != nil {
+		return err
+	}
+	s.appendHistory(ctx, flagID, FlagHistoryEntry{
+		Timestamp: time.Now().UTC().UnixMilli(),
+		Action:    "toggle",
+		Enabled:   enabled,
+	})
+	return nil
 }
 
 // TargetingRule defines a condition for flag targeting.

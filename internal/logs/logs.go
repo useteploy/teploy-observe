@@ -10,16 +10,17 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/teploy/observe/internal/dbutil"
+	"github.com/useteploy/observe/internal/dbutil"
 )
 
 // LogService handles log ingestion and querying.
 type LogService struct {
 	db *nucleus.Client
+	Bx *Broadcaster
 }
 
 func NewLogService(db *nucleus.Client) *LogService {
-	return &LogService{db: db}
+	return &LogService{db: db, Bx: NewBroadcaster()}
 }
 
 // Log represents a stored log entry. Timestamps serialize as RFC3339 strings.
@@ -62,7 +63,8 @@ func (s *LogService) IngestLog(ctx context.Context, input LogInput) (string, err
 		attrsJSON = string(raw)
 	}
 
-	nowMs := dbutil.IntParam(time.Now().UTC().UnixMilli())
+	now := time.Now().UTC()
+	nowMs := dbutil.IntParam(now.UnixMilli())
 
 	_, err = s.db.SQL().Exec(ctx,
 		`INSERT INTO logs (
@@ -74,6 +76,10 @@ func (s *LogService) IngestLog(ctx context.Context, input LogInput) (string, err
 	)
 	if err != nil {
 		return "", fmt.Errorf("insert log: %w", err)
+	}
+
+	if s.Bx != nil {
+		s.Bx.Publish(logToPublish(id, input, now))
 	}
 
 	return id, nil
@@ -90,7 +96,7 @@ func (s *LogService) SearchLogs(ctx context.Context, siteID string, from, to tim
 		offset = 0
 	}
 
-	where := "site_id = $1 AND timestamp >= $2 AND timestamp < $3"
+	where := "site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)"
 	params := []any{siteID, fromMs, toMs}
 	idx := 4
 
@@ -137,12 +143,43 @@ func (s *LogService) LogStats(ctx context.Context, siteID string, from, to time.
 	toMs := dbutil.IntParam(to.UnixMilli())
 
 	return nucleus.Query[LevelCount](ctx, s.db.SQL(),
-		`SELECT level, CAST(COUNT(*) AS TEXT) AS count
+		`SELECT level, COUNT(*) AS count
 		 FROM logs
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+		 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
 		 GROUP BY level
 		 ORDER BY count DESC`,
 		siteID, fromMs, toMs,
+	)
+}
+
+// HistogramBucket represents log counts per level for a single time bucket.
+type HistogramBucket struct {
+	Bucket int64            `json:"bucket" db:"bucket"`
+	Level  string           `json:"level" db:"level"`
+	Count  int64            `json:"count" db:"count"`
+}
+
+// Histogram returns per-level log counts bucketed by `bucketMs` milliseconds
+// across the given time range.
+func (s *LogService) Histogram(ctx context.Context, siteID string, from, to time.Time, bucketMs int64) ([]HistogramBucket, error) {
+	if bucketMs <= 0 {
+		bucketMs = 5 * 60 * 1000 // 5 minutes
+	}
+	fromMs := dbutil.IntParam(from.UnixMilli())
+	toMs := dbutil.IntParam(to.UnixMilli())
+	bucketStr := dbutil.IntParam(bucketMs)
+
+	return nucleus.Query[HistogramBucket](ctx, s.db.SQL(),
+		`SELECT (CAST(timestamp AS BIGINT) / CAST($4 AS BIGINT)) * CAST($4 AS BIGINT) AS bucket,
+		        level,
+		        COUNT(*) AS count
+		 FROM logs
+		 WHERE site_id = $1
+		   AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT)
+		   AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
+		 GROUP BY (CAST(timestamp AS BIGINT) / CAST($4 AS BIGINT)) * CAST($4 AS BIGINT), level
+		 ORDER BY bucket ASC`,
+		siteID, fromMs, toMs, bucketStr,
 	)
 }
 

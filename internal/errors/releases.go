@@ -7,7 +7,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/teploy/observe/internal/dbutil"
+	"github.com/useteploy/observe/internal/dbutil"
 )
 
 // ReleaseHealth represents error health for a single release.
@@ -27,12 +27,14 @@ func (s *IssueService) ReleaseHealthList(ctx context.Context, siteID string, fro
 	return nucleus.Query[ReleaseHealth](ctx, s.db.SQL(),
 		fmt.Sprintf(`SELECT
 			COALESCE(release_tag, 'unknown') AS release_tag,
-			CAST(COUNT(*) AS TEXT) AS error_count,
-			CAST(COUNT(DISTINCT group_hash) AS TEXT) AS issue_count,
-			CAST(MIN(CAST(timestamp AS BIGINT)) AS TEXT) AS first_seen,
-			CAST(MAX(CAST(timestamp AS BIGINT)) AS TEXT) AS last_seen
+			COUNT(*) AS error_count,
+			COUNT(DISTINCT group_hash) AS issue_count,
+			MIN(CAST(timestamp AS BIGINT)) AS first_seen,
+			MAX(CAST(timestamp AS BIGINT)) AS last_seen
 		 FROM error_events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+		 WHERE site_id = $1
+		   AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT)
+		   AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
 		   AND release_tag != ''
 		 GROUP BY release_tag
 		 ORDER BY last_seen DESC

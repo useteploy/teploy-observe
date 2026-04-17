@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { flagsApi } from "../api/flags.js";
-import type { FeatureFlag } from "../api/flags.js";
+import type { FeatureFlag, FlagHistoryEntry } from "../api/flags.js";
 import Modal from "../components/shared/Modal.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
+import EmptyState from "../components/shared/EmptyState.js";
 import "../styles/flags.css";
 
 export const config = { mode: "app" };
@@ -157,9 +158,18 @@ function FlagDetail({ flag }: { flag: FeatureFlag }) {
   const [testUserId, setTestUserId] = useState("");
   const [testResult, setTestResult] = useState<{ enabled: boolean; variant?: string } | null>(null);
   const [testing, setTesting] = useState(false);
+  const [history, setHistory] = useState<FlagHistoryEntry[]>([]);
 
   const targeting = parseTargeting(flag.targeting);
   const variants = parseVariants(flag.variants);
+
+  useEffect(() => {
+    let alive = true;
+    flagsApi.history(flag.flag_id)
+      .then((h) => { if (alive) setHistory(h || []); })
+      .catch(() => { if (alive) setHistory([]); });
+    return () => { alive = false; };
+  }, [flag.flag_id]);
 
   const handleTest = async () => {
     if (!testUserId.trim()) return;
@@ -227,6 +237,31 @@ function FlagDetail({ flag }: { flag: FeatureFlag }) {
                 variant: <strong>{testResult.variant}</strong>
               </span>
             )}
+          </div>
+        )}
+      </div>
+
+      {/* History */}
+      <div style={{ borderTop: "1px solid var(--obs-border-subtle)", paddingTop: "12px", marginTop: "12px" }}>
+        <div style={{ fontSize: "11px", fontWeight: 600, color: "var(--obs-text-muted)", textTransform: "uppercase", marginBottom: "6px" }}>
+          History ({history.length})
+        </div>
+        {history.length === 0 ? (
+          <div style={{ fontSize: "12px", color: "var(--obs-text-muted)" }}>No changes recorded.</div>
+        ) : (
+          <div class="flags-history">
+            {history.map((h, i) => (
+              <div key={i} class={`flags-history-entry flags-history-entry--${h.action}`}>
+                <span class="flags-history-action">{h.action}</span>
+                <span class="flags-history-detail">
+                  {h.action === "toggle" && (h.enabled ? "enabled" : "disabled")}
+                  {h.action === "created" && `initial rollout ${h.rollout_pct ?? 100}%`}
+                </span>
+                <span class="flags-history-time">
+                  {new Date(h.timestamp).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })}
+                </span>
+              </div>
+            ))}
           </div>
         )}
       </div>
@@ -317,7 +352,14 @@ export default function FlagsPage() {
       {loading ? (
         <FlagsSkeleton />
       ) : flags.length === 0 ? (
-        <div class="obs-empty-state">No feature flags created yet</div>
+        <EmptyState
+          title="No feature flags yet"
+          description="Gate features by user, rollout %, or targeting rules. Call POST /api/v1/flags/evaluate from your backend — responses take under 10ms."
+          icon="layers"
+          actions={[
+            { label: "Create first flag", onClick: () => setShowCreate(true), primary: true },
+          ]}
+        />
       ) : (
         <div class="flags-list">
           {flags.map(flag => {

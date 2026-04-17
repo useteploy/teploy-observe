@@ -1,0 +1,115 @@
+/* ─── Observe-of-Observe (/meta) ─── */
+
+.meta-version {
+  font-size: 12px;
+  color: var(--obs-text-muted);
+  font-family: var(--obs-font-mono, monospace);
+}
+
+.meta-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+  margin-bottom: 24px;
+}
+
+.meta-stat {
+  background: var(--obs-surface);
+  border: 1px solid var(--obs-border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+.meta-stat-label {
+  font-size: 11px;
+  color: var(--obs-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 4px;
+}
+
+.meta-stat-value {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--obs-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.meta-section {
+  margin-bottom: 24px;
+}
+
+.meta-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--obs-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 0 0 8px;
+}
+
+.meta-table {
+  width: 100%;
+  background: var(--obs-surface);
+  border: 1px solid var(--obs-border);
+  border-radius: 8px;
+  border-collapse: collapse;
+  overflow: hidden;
+}
+
+.meta-table th,
+.meta-table td {
+  padding: 8px 14px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--obs-border);
+}
+
+.meta-table thead th {
+  background: var(--obs-bg-card, rgba(0, 0, 0, 0.02));
+  color: var(--obs-text-secondary);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  text-align: left;
+}
+
+.meta-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.meta-table code {
+  font-family: var(--obs-font-mono, monospace);
+  font-size: 12px;
+  color: var(--obs-text);
+}
+
+.meta-policies {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.meta-policy-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: var(--obs-bg-card, rgba(99, 102, 241, 0.08));
+  border-radius: 16px;
+  font-size: 11px;
+  color: var(--obs-text-secondary);
+}
+
+.meta-policy-chip code {
+  font-family: var(--obs-font-mono, monospace);
+  color: var(--obs-text);
+  font-size: 11px;
+}
+
+.meta-footer {
+  margin-top: 24px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--obs-text-muted);
+}

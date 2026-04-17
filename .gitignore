@@ -3,6 +3,9 @@
 *.exe
 *.test
 
+# Compiled bench binary (rebuilt with `go build` in ./bench)
+bench/observe-bench
+
 # Nucleus data
 nucleus_data/
 
@@ -33,3 +36,10 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Claude Code worktrees + session state — should never be committed
+.claude/
+
+# Internal planning and launch notes — local only, not shipped to the repo
+MASTER_PLAN.md
+marketing/launch/

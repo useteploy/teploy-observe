@@ -8,7 +8,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/teploy/observe/internal/dbutil"
+	"github.com/useteploy/observe/internal/dbutil"
 )
 
 // QueryService provides trace and service query methods for the dashboard.
@@ -50,7 +50,7 @@ func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to
 	rows, err := nucleus.Query[rawStat](ctx, q.db.SQL(),
 		`SELECT service_name, request_count, error_count, duration_sum, p50_ms, p95_ms, p99_ms
 		 FROM service_stats
-		 WHERE site_id = $1 AND ts_bucket >= $2 AND ts_bucket < $3`,
+		 WHERE site_id = $1 AND CAST(ts_bucket AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(ts_bucket AS BIGINT) < CAST($3 AS BIGINT)`,
 		siteID, fromMs, toMs,
 	)
 	if err != nil {
@@ -123,7 +123,7 @@ func (q *QueryService) ListOperations(ctx context.Context, siteID, service strin
 	rows, err := nucleus.Query[rawStat](ctx, q.db.SQL(),
 		`SELECT operation_name, request_count, error_count, duration_sum, p50_ms, p95_ms, p99_ms
 		 FROM service_stats
-		 WHERE site_id = $1 AND service_name = $2 AND ts_bucket >= $3 AND ts_bucket < $4`,
+		 WHERE site_id = $1 AND service_name = $2 AND CAST(ts_bucket AS BIGINT) >= CAST($3 AS BIGINT) AND CAST(ts_bucket AS BIGINT) < CAST($4 AS BIGINT)`,
 		siteID, service, fromMs, toMs,
 	)
 	if err != nil {
@@ -195,7 +195,7 @@ func (q *QueryService) SearchTraces(ctx context.Context, siteID string, from, to
 		offset = 0
 	}
 
-	where := "site_id = $1 AND start_time >= $2 AND start_time < $3"
+	where := "site_id = $1 AND start_time >= CAST($2 AS BIGINT) AND start_time < CAST($3 AS BIGINT)"
 	params := []any{siteID, fromMs, toMs}
 	idx := 4
 
@@ -295,7 +295,7 @@ func (q *QueryService) ServiceDependencies(ctx context.Context, siteID string, f
 				THEN SUM(CAST(avg_duration AS BIGINT) * CAST(call_count AS BIGINT)) / SUM(CAST(call_count AS BIGINT))
 				ELSE 0 END AS TEXT) AS avg_duration
 		 FROM service_dependencies
-		 WHERE site_id = $1 AND ts_bucket >= $2 AND ts_bucket < $3
+		 WHERE site_id = $1 AND CAST(ts_bucket AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(ts_bucket AS BIGINT) < CAST($3 AS BIGINT)
 		 GROUP BY src_service, dst_service
 		 ORDER BY call_count DESC`,
 		siteID, fromMs, toMs,
@@ -332,7 +332,7 @@ func (q *QueryService) TraceErrors(ctx context.Context, traceID, siteID string) 
 			CAST(timestamp AS TEXT) AS timestamp,
 			issue_id
 		 FROM error_events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp <= $3
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp <= CAST($3 AS BIGINT)
 		 ORDER BY timestamp ASC`,
 		siteID, b[0].MinT, b[0].MaxT,
 	)

@@ -5,6 +5,7 @@ import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
 import ConfirmDialog from "../components/shared/ConfirmDialog.js";
 import Pagination from "../components/shared/Pagination.js";
+import EmptyState from "../components/shared/EmptyState.js";
 import "../styles/settings.css";
 
 export const config = { mode: "app" };
@@ -125,7 +126,15 @@ function RulesTab({ siteId }: { siteId: string }) {
       </div>
 
       {loading ? <AlertsSkeleton /> : rules.length === 0 ? (
-        <div class="obs-empty-state">No alert rules configured</div>
+        <EmptyState
+          title="No alert rules configured"
+          description="Create a rule to get notified when pageviews drop, error rates spike, or visitors disappear. Rules run on a schedule and fire through your configured webhooks."
+          icon="alert"
+          actions={[
+            { label: "Create first rule", onClick: () => setShowCreate(true), primary: true },
+            { label: "Configure webhooks", href: "/settings" },
+          ]}
+        />
       ) : (
         <div class="alerts-list">
           {rules.map(rule => (
@@ -138,6 +147,26 @@ function RulesTab({ siteId }: { siteId: string }) {
                 </div>
               </div>
               <div class="alerts-row-meta">
+                <select
+                  class="obs-select obs-select--sm"
+                  value=""
+                  onChange={async (e) => {
+                    const target = e.target as HTMLSelectElement;
+                    const mins = Number(target.value);
+                    target.value = "";
+                    if (Number.isNaN(mins)) return;
+                    await alertsApi.silenceRule(rule.rule_id, mins);
+                  }}
+                  aria-label="Silence rule"
+                  title="Silence this rule"
+                >
+                  <option value="">Silence…</option>
+                  <option value="15">15 minutes</option>
+                  <option value="60">1 hour</option>
+                  <option value="240">4 hours</option>
+                  <option value="1440">1 day</option>
+                  <option value="0">Unsilence</option>
+                </select>
                 <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => setDeletingRuleId(rule.rule_id)}>
                   Delete
                 </button>
@@ -234,7 +263,13 @@ function HistoryTab({ siteId }: { siteId: string }) {
   };
 
   if (loading) return <AlertsSkeleton />;
-  if (!history.length) return <div class="obs-empty-state">No alerts have triggered</div>;
+  if (!history.length) return (
+    <EmptyState
+      title="No alerts have triggered"
+      description="When a rule crosses its threshold, entries appear here. Silenced rules don't produce history."
+      icon="alert"
+    />
+  );
 
   return (
     <div>

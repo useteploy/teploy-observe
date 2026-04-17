@@ -1,6 +1,9 @@
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { replaysApi } from "../api/replays.js";
 import type { ReplaySession, ReplayEvent } from "../api/replays.js";
+import ReplayPlayer from "../components/ReplayPlayer.js";
+import ExportButton from "../components/shared/ExportButton.js";
+import EmptyState from "../components/shared/EmptyState.js";
 import { get } from "../api/helpers.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
@@ -66,6 +69,7 @@ function SessionDetail({ session, onBack }: { session: ReplaySession; onBack: ()
   const [pageviews, setPageviews] = useState<SessionEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [showPlayer, setShowPlayer] = useState(false);
 
   useEffect(() => {
     setLoading(true);
@@ -121,7 +125,19 @@ function SessionDetail({ session, onBack }: { session: ReplaySession; onBack: ()
             {session.has_error && <StatusBadge status="error" size="sm" />}
           </div>
         </div>
+        <button
+          class="sessions-play-btn"
+          disabled={events.length === 0}
+          onClick={() => setShowPlayer(true)}
+        >
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
+          Play replay
+        </button>
       </div>
+
+      {showPlayer && (
+        <ReplayPlayer events={events} onClose={() => setShowPlayer(false)} />
+      )}
 
       {loading ? (
         <SessionsSkeleton />
@@ -250,14 +266,49 @@ export default function SessionsPage() {
         <span style={{ fontSize: "12px", color: "var(--obs-text-muted)" }}>
           Last 24 hours
         </span>
+        <div style={{ marginLeft: "auto" }}>
+          <ExportButton
+            filename={`sessions-${siteId}-${Date.now()}.csv`}
+            rows={sessions}
+            columns={[
+              { key: "replay_id", label: "replay_id" },
+              { key: "session_id", label: "session_id" },
+              { key: "start_time", label: "start_time" },
+              { key: "duration_ms", label: "duration_ms" },
+              { key: "page_count", label: "pages" },
+              { key: "url", label: "url" },
+              { key: "browser", label: "browser" },
+              { key: "os", label: "os" },
+              { key: "device", label: "device" },
+              { key: "has_error", label: "has_error" },
+            ]}
+          />
+        </div>
       </div>
 
       {loading ? (
         <SessionsSkeleton />
       ) : sessions.length === 0 ? (
-        <div class="obs-empty-state">
-          {errorOnly ? "No sessions with errors" : "No session replays recorded"}
-        </div>
+        errorOnly ? (
+          <EmptyState
+            title="No errored sessions"
+            description="Nice — no sessions in the last 24 hours encountered an unhandled error. Toggle the filter off to see all sessions."
+            icon="signal"
+            actions={[
+              { label: "Show all sessions", onClick: () => setErrorOnly(false) },
+            ]}
+          />
+        ) : (
+          <EmptyState
+            title="No session replays yet"
+            description="Replays let you watch real users navigate your site — mouse, clicks, scrolls, DOM mutations. Add observe-replay.js alongside observe.js."
+            icon="play"
+            actions={[
+              { label: "Install replay tracker", href: "/onboard", primary: true },
+              { label: "Read the docs", href: "/docs#replays" },
+            ]}
+          />
+        )
       ) : (
         <>
           <div class="sessions-list obs-stagger">

@@ -116,7 +116,129 @@
   display: flex; align-items: center; gap: 12px; padding: 14px 16px;
   background: var(--obs-surface); border-radius: var(--obs-radius);
 }
+.retention-view-toggle {
+  display: inline-flex;
+  border: 1px solid var(--obs-border);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+
+.retention-view-btn {
+  padding: 5px 14px;
+  background: var(--obs-surface);
+  border: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--obs-text-secondary);
+  cursor: pointer;
+}
+
+.retention-view-btn--active {
+  background: var(--obs-accent, #6366f1);
+  color: #fff;
+}
+
+.retention-overlay {
+  background: var(--obs-surface);
+  border: 1px solid var(--obs-border);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.retention-overlay-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--obs-border);
+  font-size: 11px;
+}
+
+.retention-overlay-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--obs-text-secondary);
+}
+
+.retention-overlay-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
 .insights-skeleton-bar {
   height: 14px; background: var(--obs-surface-hover); border-radius: 4px;
   animation: shimmer 1.5s ease-in-out infinite alternate;
+}
+
+/* Funnel breakdown */
+.funnel-breakdown-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.funnel-breakdown-card {
+  background: var(--obs-surface);
+  border: 1px solid var(--obs-border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.funnel-breakdown-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--obs-text);
+  margin-bottom: 4px;
+}
+
+.funnel-breakdown-summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 12px;
+  color: var(--obs-text-secondary);
+  margin-bottom: 10px;
+}
+
+.funnel-breakdown-conv {
+  font-weight: 600;
+  color: var(--obs-accent, #6366f1);
+  font-variant-numeric: tabular-nums;
+}
+
+.funnel-breakdown-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.funnel-breakdown-step {
+  position: relative;
+  background: var(--obs-bg-card, rgba(0, 0, 0, 0.02));
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.funnel-breakdown-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: linear-gradient(90deg, var(--obs-accent, #6366f1) 0%, rgba(99,102,241,0.5) 100%);
+  transition: width 0.4s ease;
+}
+
+.funnel-breakdown-step-label {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--obs-text);
+  font-variant-numeric: tabular-nums;
+  z-index: 1;
 }

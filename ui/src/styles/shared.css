@@ -20,10 +20,88 @@
   animation: obs-shimmer 1.5s ease-in-out infinite;
 }
 
+/* ─── Demo banner ─── */
+.obs-demo-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 20px;
+  background: linear-gradient(90deg, rgba(245,158,11,0.14), rgba(99,102,241,0.14));
+  border-bottom: 1px solid var(--obs-border);
+  font-size: 13px;
+  color: var(--obs-text);
+}
+
+.obs-demo-banner strong {
+  font-weight: 600;
+}
+
+.obs-demo-banner a {
+  color: var(--obs-accent, #6366f1);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
 /* ─── Empty State ─── */
 .obs-empty-state {
   text-align: center; padding: 48px 24px; color: var(--obs-text-muted);
   font-size: 14px;
+}
+
+.obs-empty-state--v2 {
+  padding: 56px 24px;
+  max-width: 480px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.obs-empty-icon {
+  width: 56px;
+  height: 56px;
+  border-radius: 14px;
+  background: var(--obs-bg-card, rgba(99, 102, 241, 0.08));
+  color: var(--obs-accent, #6366f1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 4px;
+}
+
+.obs-empty-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--obs-text);
+}
+
+.obs-empty-desc {
+  font-size: 13px;
+  color: var(--obs-text-secondary);
+  line-height: 1.55;
+  max-width: 380px;
+}
+
+.obs-empty-desc code {
+  background: var(--obs-bg-card, rgba(0, 0, 0, 0.04));
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+.obs-empty-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.obs-empty-extra {
+  width: 100%;
+  margin-top: 8px;
 }
 
 /* ─── Search Input ─── */

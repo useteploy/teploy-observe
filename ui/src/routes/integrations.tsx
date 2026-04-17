@@ -3,6 +3,7 @@ import { get, post, del } from "../api/helpers.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
 import ConfirmDialog from "../components/shared/ConfirmDialog.js";
+import EmptyState from "../components/shared/EmptyState.js";
 import "../styles/settings.css";
 
 export const config = { mode: "app" };
@@ -33,6 +34,8 @@ export default function IntegrationsPage() {
   const [creating, setCreating] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
+  const [testingId, setTestingId] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<Record<string, { ok: boolean; message: string }>>({});
 
   const [formName, setFormName] = useState("");
   const [formType, setFormType] = useState("slack");
@@ -102,7 +105,14 @@ export default function IntegrationsPage() {
           ))}
         </div>
       ) : items.length === 0 ? (
-        <div class="obs-empty-state">No integrations configured. Connect Slack, Jira, PagerDuty, or email.</div>
+        <EmptyState
+          title="No integrations yet"
+          description="Connect Slack, Jira, PagerDuty, GitHub, or email to receive alerts. Each integration gets a Send test button once configured."
+          icon="package"
+          actions={[
+            { label: "Add integration", onClick: () => setShowCreate(true), primary: true },
+          ]}
+        />
       ) : (
         <div class="settings-list">
           {items.map(item => (
@@ -112,6 +122,31 @@ export default function IntegrationsPage() {
               <span style={{ fontSize: "11px", padding: "2px 8px", borderRadius: "var(--obs-radius-full)", background: "var(--obs-surface-hover)", color: "var(--obs-text-secondary)" }}>
                 {TYPES.find(t => t.value === item.type)?.label || item.type}
               </span>
+              <button
+                class="obs-btn obs-btn--sm"
+                disabled={testingId === item.integration_id}
+                onClick={async () => {
+                  setTestingId(item.integration_id);
+                  try {
+                    const r = await post<{ ok: boolean; message: string }>(`${BASE}/${item.integration_id}/test`, {});
+                    setTestResult((prev) => ({ ...prev, [item.integration_id]: r }));
+                  } catch (err: any) {
+                    setTestResult((prev) => ({ ...prev, [item.integration_id]: { ok: false, message: err?.message || "test failed" } }));
+                  } finally {
+                    setTestingId(null);
+                  }
+                }}
+              >
+                {testingId === item.integration_id ? "Testing..." : "Send test"}
+              </button>
+              {testResult[item.integration_id] && (
+                <span
+                  class={`integrations-test-result ${testResult[item.integration_id].ok ? "integrations-test-result--ok" : "integrations-test-result--err"}`}
+                  title={testResult[item.integration_id].message}
+                >
+                  {testResult[item.integration_id].ok ? "✓ delivered" : "✗ failed"}
+                </span>
+              )}
               <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => setDeletingId(item.integration_id)}>Delete</button>
             </div>
           ))}

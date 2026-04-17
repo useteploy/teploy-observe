@@ -4,69 +4,88 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 )
 
-// RetentionService cleans up old data according to configured retention periods.
-type RetentionService struct {
-	db                  *nucleus.Client
-	logger              *slog.Logger
-	rawRetentionDays    int
-	hourlyRetentionDays int
+// RetentionPolicy defines the TTL (in days) for a table + the SQL column to compare against.
+type RetentionPolicy struct {
+	Table       string
+	Column      string // BIGINT-as-text column, typically "timestamp", "start_time", or "ts_bucket"
+	Days        int
 }
 
-func NewRetentionService(db *nucleus.Client, logger *slog.Logger, rawDays, hourlyDays int) *RetentionService {
-	return &RetentionService{
-		db:                  db,
-		logger:              logger,
-		rawRetentionDays:    rawDays,
-		hourlyRetentionDays: hourlyDays,
+// RetentionService cleans up old data according to configured retention periods.
+type RetentionService struct {
+	db       *nucleus.Client
+	logger   *slog.Logger
+	policies []RetentionPolicy
+}
+
+// DefaultPolicies returns the out-of-box retention policies. Called with the two
+// legacy env-configured durations for raw events + hourly rollups so existing
+// deployments keep their behavior.
+func DefaultPolicies(rawDays, hourlyDays int) []RetentionPolicy {
+	return []RetentionPolicy{
+		{"events", "timestamp", rawDays},
+		{"events_recent", "timestamp", 7},
+		{"stats_hourly", "ts_bucket", hourlyDays},
+		{"sessions", "last_ts", 90},
+		{"error_events", "timestamp", 180},
+		{"logs", "timestamp", 30},
+		{"spans", "start_time", 14},
+		{"service_stats", "ts_bucket", 30},
+		{"replay_sessions", "start_time", 14},
 	}
 }
 
-// RunCleanup deletes data older than the configured retention periods.
-// Runs once per day.
+// NewRetentionService keeps the old two-arg constructor for backwards compat.
+func NewRetentionService(db *nucleus.Client, logger *slog.Logger, rawDays, hourlyDays int) *RetentionService {
+	return NewRetentionServiceWithPolicies(db, logger, DefaultPolicies(rawDays, hourlyDays))
+}
+
+// NewRetentionServiceWithPolicies allows callers to supply a fully custom policy set.
+func NewRetentionServiceWithPolicies(db *nucleus.Client, logger *slog.Logger, policies []RetentionPolicy) *RetentionService {
+	return &RetentionService{db: db, logger: logger, policies: policies}
+}
+
+// Policies returns a copy of the configured policies (for /meta endpoints).
+func (r *RetentionService) Policies() []RetentionPolicy {
+	out := make([]RetentionPolicy, len(r.policies))
+	copy(out, r.policies)
+	return out
+}
+
+// RunCleanup deletes data older than each policy's cutoff.
+// Errors on any one policy are logged but don't halt the others.
 func (r *RetentionService) RunCleanup(ctx context.Context) error {
 	sql := r.db.SQL()
 	now := time.Now().UTC()
+	var firstErr error
 
-	// Delete raw events older than retention period
-	rawCutoff := (now.Add(-time.Duration(r.rawRetentionDays) * 24 * time.Hour).UnixMilli())
-	affected, err := sql.Exec(ctx,
-		`DELETE FROM events WHERE timestamp < $1`, rawCutoff)
-	if err != nil {
-		return fmt.Errorf("retention: delete raw events: %w", err)
+	for _, p := range r.policies {
+		if p.Days <= 0 {
+			continue
+		}
+		cutoff := now.Add(-time.Duration(p.Days) * 24 * time.Hour).UnixMilli()
+		// Parameter is cast to BIGINT; column is also cast so text-typed BIGINT
+		// columns in Nucleus compare numerically rather than lexicographically.
+		query := fmt.Sprintf(
+			`DELETE FROM %s WHERE CAST(%s AS BIGINT) < CAST($1 AS BIGINT)`,
+			p.Table, p.Column,
+		)
+		affected, err := sql.Exec(ctx, query, strconv.FormatInt(cutoff, 10))
+		if err != nil {
+			r.logger.Warn("retention: delete failed", "table", p.Table, "err", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("retention: %s: %w", p.Table, err)
+			}
+			continue
+		}
+		r.logger.Info("retention: cleanup",
+			"table", p.Table, "deleted", affected, "cutoff_days", p.Days)
 	}
-	r.logger.Info("retention: raw events", "deleted", affected, "cutoff_days", r.rawRetentionDays)
-
-	// Delete recent events older than 7 days
-	recentCutoff := (now.Add(-7 * 24 * time.Hour).UnixMilli())
-	affected, err = sql.Exec(ctx,
-		`DELETE FROM events_recent WHERE timestamp < $1`, recentCutoff)
-	if err != nil {
-		return fmt.Errorf("retention: delete recent events: %w", err)
-	}
-	r.logger.Info("retention: recent events", "deleted", affected)
-
-	// Delete hourly rollups older than retention period
-	hourlyCutoff := (now.Add(-time.Duration(r.hourlyRetentionDays) * 24 * time.Hour).UnixMilli())
-	affected, err = sql.Exec(ctx,
-		`DELETE FROM stats_hourly WHERE ts_bucket < $1`, hourlyCutoff)
-	if err != nil {
-		return fmt.Errorf("retention: delete hourly rollups: %w", err)
-	}
-	r.logger.Info("retention: hourly rollups", "deleted", affected, "cutoff_days", r.hourlyRetentionDays)
-
-	// Sessions older than 90 days
-	sessionCutoff := (now.Add(-90 * 24 * time.Hour).UnixMilli())
-	affected, err = sql.Exec(ctx,
-		`DELETE FROM sessions WHERE last_ts < $1`, sessionCutoff)
-	if err != nil {
-		return fmt.Errorf("retention: delete old sessions: %w", err)
-	}
-	r.logger.Info("retention: old sessions", "deleted", affected)
-
-	return nil
+	return firstErr
 }

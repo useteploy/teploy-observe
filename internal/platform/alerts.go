@@ -9,13 +9,17 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/teploy/observe/internal/dbutil"
+	"github.com/useteploy/observe/internal/dbutil"
 )
 
 type AlertService struct {
 	db         *nucleus.Client
 	logger     *slog.Logger
 	webhookSvc *WebhookService
+	// OnTrigger is an optional callback invoked whenever a rule fires.
+	// Wired from main.go to incidents.Service so alerts automatically
+	// create a visual marker across charts.
+	OnTrigger func(ctx context.Context, rule AlertRule, value float64)
 }
 
 func NewAlertService(db *nucleus.Client, logger *slog.Logger, webhookSvc *WebhookService) *AlertService {
@@ -127,6 +131,42 @@ func (s *AlertService) ListHistory(ctx context.Context, siteID string, limit, of
 	)
 }
 
+// Silence mutes a rule for the given duration. duration <= 0 clears the silence.
+func (s *AlertService) Silence(ctx context.Context, ruleID string, duration time.Duration) error {
+	kv := s.db.KV()
+	key := "alert_silence:" + ruleID
+	if duration <= 0 {
+		return kv.Set(ctx, key, []byte("0"))
+	}
+	until := time.Now().Add(duration).UnixMilli()
+	return kv.Set(ctx, key, []byte(strconv.FormatInt(until, 10)))
+}
+
+// isSilenced returns true when the rule is currently muted.
+func (s *AlertService) isSilenced(ctx context.Context, ruleID string) bool {
+	kv := s.db.KV()
+	raw, err := kv.Get(ctx, "alert_silence:"+ruleID)
+	if err != nil || raw == nil {
+		return false
+	}
+	until, _ := strconv.ParseInt(string(raw), 10, 64)
+	return until > time.Now().UnixMilli()
+}
+
+// SilenceStatus returns the UnixMilli silence expiry (0 if not silenced).
+func (s *AlertService) SilenceStatus(ctx context.Context, ruleID string) int64 {
+	kv := s.db.KV()
+	raw, err := kv.Get(ctx, "alert_silence:"+ruleID)
+	if err != nil || raw == nil {
+		return 0
+	}
+	until, _ := strconv.ParseInt(string(raw), 10, 64)
+	if until <= time.Now().UnixMilli() {
+		return 0
+	}
+	return until
+}
+
 // CheckRules evaluates all enabled rules for a site and triggers alerts.
 func (s *AlertService) CheckRules(ctx context.Context) error {
 	rules, err := nucleus.Query[AlertRule](ctx, s.db.SQL(),
@@ -140,6 +180,9 @@ func (s *AlertService) CheckRules(ctx context.Context) error {
 
 	now := time.Now().UTC()
 	for _, rule := range rules {
+		if s.isSilenced(ctx, rule.RuleID) {
+			continue
+		}
 		windowMins := rule.WindowMinutes
 		if windowMins <= 0 {
 			windowMins = 5
@@ -178,7 +221,7 @@ func (s *AlertService) CheckRules(ctx context.Context) error {
 			}
 			crows, err := nucleus.Query[countRow](ctx, s.db.SQL(),
 				`SELECT COUNT(*) AS count FROM alert_history
-				 WHERE rule_id = $1 AND triggered_at >= $2`,
+				 WHERE rule_id = $1 AND triggered_at >= CAST($2 AS BIGINT)`,
 				rule.RuleID, cooldownFrom)
 			if err == nil && len(crows) > 0 && crows[0].Count > 0 {
 				continue
@@ -198,6 +241,9 @@ func (s *AlertService) CheckRules(ctx context.Context) error {
 			continue
 		}
 		s.logger.Info("alert triggered", "rule", rule.Name, "metric", rule.Metric, "value", value, "threshold", rule.Threshold)
+		if s.OnTrigger != nil {
+			s.OnTrigger(ctx, rule, value)
+		}
 		if s.webhookSvc != nil {
 			s.webhookSvc.Fire(ctx, rule.SiteID, AlertPayload{
 				AlertID:   alertID,
@@ -222,13 +268,13 @@ func (s *AlertService) queryMetric(ctx context.Context, siteID, metric, fromMs, 
 	var q string
 	switch metric {
 	case "pageviews":
-		q = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3 AND event_type = 'pageview'`
+		q = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM events WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT) AND event_type = 'pageview'`
 	case "visitors":
-		q = `SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS value FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`
+		q = `SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS value FROM events WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`
 	case "error_count":
-		q = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM error_events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`
+		q = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM error_events WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`
 	case "error_rate":
-		q = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM error_events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`
+		q = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM error_events WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`
 	default:
 		return 0, fmt.Errorf("unknown metric: %s", metric)
 	}

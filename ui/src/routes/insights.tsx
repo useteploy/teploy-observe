@@ -35,6 +35,8 @@ function FunnelsPanel({ siteId, from, to }: { siteId: string; from: string; to: 
   const [results, setResults] = useState<FunnelResult[]>([]);
   const [loading, setLoading] = useState(false);
   const [analyzed, setAnalyzed] = useState(false);
+  const [breakdownBy, setBreakdownBy] = useState<string>("");
+  const [breakdownResults, setBreakdownResults] = useState<Array<{ breakdown: string; results: FunnelResult[] }>>([]);
 
   const updateStep = (idx: number, field: "type" | "value", val: string) => {
     setSteps(prev => prev.map((s, i) => i === idx ? { ...s, [field]: val } : s));
@@ -48,9 +50,19 @@ function FunnelsPanel({ siteId, from, to }: { siteId: string; from: string; to: 
     setLoading(true);
     setAnalyzed(true);
     try {
-      const data = await analyticsApi.funnel(siteId, from, to, validSteps);
-      setResults(data || []);
-    } catch { setResults([]); }
+      if (breakdownBy) {
+        const bd = await analyticsApi.funnelBreakdown(siteId, from, to, validSteps, breakdownBy);
+        setBreakdownResults(bd || []);
+        setResults([]);
+      } else {
+        const data = await analyticsApi.funnel(siteId, from, to, validSteps);
+        setResults(data || []);
+        setBreakdownResults([]);
+      }
+    } catch {
+      setResults([]);
+      setBreakdownResults([]);
+    }
     finally { setLoading(false); }
   };
 
@@ -75,8 +87,17 @@ function FunnelsPanel({ siteId, from, to }: { siteId: string; from: string; to: 
             )}
           </div>
         ))}
-        <div style={{ display: "flex", gap: "8px", marginTop: "4px" }}>
+        <div style={{ display: "flex", gap: "8px", marginTop: "4px", alignItems: "center" }}>
           <button class="obs-btn obs-btn--sm" onClick={addStep}>Add Step</button>
+          <span style={{ fontSize: "12px", color: "var(--obs-text-muted)", marginLeft: "8px" }}>Breakdown by</span>
+          <select class="obs-select obs-select--sm" value={breakdownBy}
+            onChange={(e) => setBreakdownBy((e.target as HTMLSelectElement).value)}>
+            <option value="">None</option>
+            <option value="browser">Browser</option>
+            <option value="country">Country</option>
+            <option value="device">Device</option>
+            <option value="os">OS</option>
+          </select>
           <button class="obs-btn obs-btn--primary obs-btn--sm" onClick={analyze}
             disabled={loading || steps.filter(s => s.value.trim()).length < 2}>
             {loading ? "Analyzing..." : "Analyze Funnel"}
@@ -84,7 +105,38 @@ function FunnelsPanel({ siteId, from, to }: { siteId: string; from: string; to: 
         </div>
       </div>
 
-      {loading ? <InsightsSkeleton /> : analyzed && results.length === 0 ? (
+      {loading ? <InsightsSkeleton /> : analyzed && breakdownResults.length > 0 ? (
+        <div class="funnel-breakdown-grid">
+          {breakdownResults.map((bd) => {
+            const firstN = bd.results[0]?.visitors || 0;
+            const lastN = bd.results[bd.results.length - 1]?.visitors || 0;
+            const finalConv = bd.results[bd.results.length - 1]?.conversion || 0;
+            return (
+              <div key={bd.breakdown} class="funnel-breakdown-card">
+                <div class="funnel-breakdown-title">{bd.breakdown}</div>
+                <div class="funnel-breakdown-summary">
+                  <span><strong>{firstN.toLocaleString()}</strong> → <strong>{lastN.toLocaleString()}</strong></span>
+                  <span class="funnel-breakdown-conv">{finalConv.toFixed(1)}%</span>
+                </div>
+                <div class="funnel-breakdown-steps">
+                  {bd.results.map((r, i) => (
+                    <div key={i} class="funnel-breakdown-step">
+                      <div
+                        class="funnel-breakdown-bar"
+                        style={{ width: `${firstN > 0 ? (r.visitors / firstN) * 100 : 0}%` }}
+                      />
+                      <div class="funnel-breakdown-step-label">
+                        <span>{r.step.value}</span>
+                        <span>{r.visitors.toLocaleString()} ({r.conversion.toFixed(1)}%)</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : analyzed && results.length === 0 && breakdownResults.length === 0 ? (
         <div class="obs-empty-state">No data for this funnel</div>
       ) : results.length > 0 ? (
         <div>
@@ -135,6 +187,7 @@ function FunnelsPanel({ siteId, from, to }: { siteId: string; from: string; to: 
 function RetentionPanel({ siteId, from, to }: { siteId: string; from: string; to: string }) {
   const [cohorts, setCohorts] = useState<RetentionCohort[]>([]);
   const [loading, setLoading] = useState(true);
+  const [view, setView] = useState<"heatmap" | "overlay">("heatmap");
 
   useEffect(() => {
     setLoading(true);
@@ -151,41 +204,107 @@ function RetentionPanel({ siteId, from, to }: { siteId: string; from: string; to
 
   const cellColor = (pct: number): string => {
     if (pct <= 0) return "transparent";
-    // Smooth 10-step gradient
     const alpha = Math.min(0.4, (pct / 100) * 0.45 + 0.02);
     return `rgba(34, 197, 94, ${alpha.toFixed(3)})`;
   };
 
+  // Curve colors for overlay view — cycle through the existing palette.
+  const overlayColors = ["#6366f1", "#22c55e", "#f59e0b", "#ef4444", "#0ea5e9", "#a855f7", "#14b8a6", "#ec4899"];
+
   return (
-    <div class="retention-grid">
-      <table class="retention-table">
-        <thead>
-          <tr>
-            <th>Cohort</th>
-            <th>Size</th>
-            {Array.from({ length: maxPeriods }).map((_, i) => (
-              <th key={i}>P{i}</th>
+    <div>
+      <div class="retention-view-toggle">
+        <button
+          class={`retention-view-btn ${view === "heatmap" ? "retention-view-btn--active" : ""}`}
+          onClick={() => setView("heatmap")}
+        >Heatmap</button>
+        <button
+          class={`retention-view-btn ${view === "overlay" ? "retention-view-btn--active" : ""}`}
+          onClick={() => setView("overlay")}
+        >Overlay</button>
+      </div>
+
+      {view === "heatmap" ? (
+        <div class="retention-grid">
+          <table class="retention-table">
+            <thead>
+              <tr>
+                <th>Cohort</th>
+                <th>Size</th>
+                {Array.from({ length: maxPeriods }).map((_, i) => (
+                  <th key={i}>P{i}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {cohorts.map(c => (
+                <tr key={c.cohort_date}>
+                  <td style={{ textAlign: "left", fontWeight: 500, color: "var(--obs-text)" }}>{c.cohort_date}</td>
+                  <td>{c.cohort_size.toLocaleString()}</td>
+                  {c.periods.map((pct, i) => (
+                    <td key={i} class="retention-cell"
+                      style={{ background: cellColor(pct), color: pct > 0 ? "var(--obs-text)" : "var(--obs-text-muted)" }}>
+                      {pct.toFixed(0)}%
+                    </td>
+                  ))}
+                  {Array.from({ length: maxPeriods - c.periods.length }).map((_, i) => (
+                    <td key={`empty-${i}`} style={{ color: "var(--obs-text-muted)" }}>--</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div class="retention-overlay">
+          <svg viewBox={`0 0 600 260`} style={{ width: "100%", height: "260px", display: "block" }}>
+            {/* Gridlines */}
+            {[0, 25, 50, 75, 100].map((yPct) => {
+              const y = 20 + ((100 - yPct) / 100) * 200;
+              return (
+                <g key={yPct}>
+                  <line x1={40} x2={590} y1={y} y2={y} stroke="rgba(128,128,128,0.15)" strokeWidth={1} />
+                  <text x={36} y={y + 4} textAnchor="end" fontSize={10} fill="currentColor" opacity={0.5}>{yPct}%</text>
+                </g>
+              );
+            })}
+            {/* x-axis tick labels */}
+            {Array.from({ length: maxPeriods }).map((_, i) => {
+              if (maxPeriods === 1) return null;
+              const x = 40 + (i / (maxPeriods - 1)) * 550;
+              return (
+                <text key={i} x={x} y={240} textAnchor="middle" fontSize={10} fill="currentColor" opacity={0.5}>P{i}</text>
+              );
+            })}
+            {cohorts.map((c, idx) => {
+              const color = overlayColors[idx % overlayColors.length];
+              const points = c.periods.map((pct, i) => {
+                const x = 40 + (maxPeriods > 1 ? (i / (maxPeriods - 1)) * 550 : 275);
+                const y = 20 + ((100 - pct) / 100) * 200;
+                return `${x},${y}`;
+              }).join(" ");
+              return (
+                <g key={c.cohort_date}>
+                  <polyline points={points} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" />
+                  {c.periods.map((pct, i) => {
+                    const x = 40 + (maxPeriods > 1 ? (i / (maxPeriods - 1)) * 550 : 275);
+                    const y = 20 + ((100 - pct) / 100) * 200;
+                    return <circle key={i} cx={x} cy={y} r={3} fill={color} />;
+                  })}
+                </g>
+              );
+            })}
+          </svg>
+          <div class="retention-overlay-legend">
+            {cohorts.map((c, idx) => (
+              <span key={c.cohort_date} class="retention-overlay-legend-item">
+                <span class="retention-overlay-swatch" style={{ background: overlayColors[idx % overlayColors.length] }} />
+                {c.cohort_date} <span style={{ color: "var(--obs-text-muted)" }}>({c.cohort_size})</span>
+              </span>
             ))}
-          </tr>
-        </thead>
-        <tbody>
-          {cohorts.map(c => (
-            <tr key={c.cohort_date}>
-              <td style={{ textAlign: "left", fontWeight: 500, color: "var(--obs-text)" }}>{c.cohort_date}</td>
-              <td>{c.cohort_size.toLocaleString()}</td>
-              {c.periods.map((pct, i) => (
-                <td key={i} class="retention-cell"
-                  style={{ background: cellColor(pct), color: pct > 0 ? "var(--obs-text)" : "var(--obs-text-muted)" }}>
-                  {pct.toFixed(0)}%
-                </td>
-              ))}
-              {Array.from({ length: maxPeriods - c.periods.length }).map((_, i) => (
-                <td key={`empty-${i}`} style={{ color: "var(--obs-text-muted)" }}>--</td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,0 +1,32 @@
+                    GNU AFFERO GENERAL PUBLIC LICENSE
+                       Version 3, 19 November 2007
+
+ Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+
+Observe is licensed under the GNU Affero General Public License, Version 3
+(AGPLv3).  You may copy, modify, and distribute Observe under the terms of
+that license.
+
+Key terms:
+
+  * You may run Observe for any purpose, including commercial.
+  * You may modify Observe and redistribute your modifications, provided you
+    also distribute the modified source code under AGPLv3.
+  * If you run a modified version of Observe as a network service (for
+    example, a SaaS product derived from Observe), you must offer the
+    complete corresponding source code to every user of that network service.
+
+The complete license text is published at:
+
+    https://www.gnu.org/licenses/agpl-3.0.html
+
+A copy of AGPLv3 accompanies each tagged Observe release.  If you redistribute
+Observe, include a verbatim copy of the license text with the distribution.
+
+Observe's SDK subdirectories (sdk/browser, sdk/sentry-shim, sdk/python, sdk/go)
+carry their own LICENSE files and are published under the MIT license so they
+can be embedded in closed-source applications.
+
+Copyright (c) 2026 Tyler (Observe project).

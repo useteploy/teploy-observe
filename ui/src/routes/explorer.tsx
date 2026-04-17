@@ -19,6 +19,10 @@ export default function ExplorerPage() {
   const [elapsed, setElapsed] = useState(0);
   const [sortCol, setSortCol] = useState<string | null>(null);
   const [sortAsc, setSortAsc] = useState(true);
+  const [question, setQuestion] = useState("");
+  const [askLoading, setAskLoading] = useState(false);
+  const [askError, setAskError] = useState<string | null>(null);
+  const [plan, setPlan] = useState<QueryResult | null>(null);
 
   useEffect(() => {
     get<string[]>("/api/v1/query/tables")
@@ -45,6 +49,40 @@ export default function ExplorerPage() {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
       runQuery();
+    }
+  };
+
+  const askAI = async () => {
+    if (!question.trim()) return;
+    setAskLoading(true);
+    setAskError(null);
+    try {
+      const data = await post<{ sql: string; model?: string; error?: string }>(
+        "/api/v1/ai/query",
+        { question: question.trim(), site_id: "default" }
+      );
+      if (data.error) {
+        setAskError(data.error);
+      } else if (data.sql) {
+        setSql(data.sql);
+      } else {
+        setAskError("AI returned no SQL");
+      }
+    } catch (err: any) {
+      setAskError(err.message || "AI request failed");
+    } finally {
+      setAskLoading(false);
+    }
+  };
+
+  const explainQuery = async () => {
+    if (!sql.trim()) return;
+    setPlan(null);
+    try {
+      const data = await post<QueryResult>("/api/v1/query/explain", { sql: sql.trim() });
+      setPlan(data);
+    } catch (err: any) {
+      setPlan({ columns: [], rows: [], row_count: 0, error: err.message });
     }
   };
 
@@ -80,6 +118,24 @@ export default function ExplorerPage() {
         </div>
 
         <div class="explorer-main">
+          <div class="explorer-ask" style={{ marginBottom: "8px", display: "flex", gap: "8px" }}>
+            <input
+              type="text"
+              class="obs-input"
+              style={{ flex: 1 }}
+              placeholder="Ask in English: e.g. 'how many errors yesterday'"
+              value={question}
+              onInput={(e) => setQuestion((e.target as HTMLInputElement).value)}
+              onKeyDown={(e) => { if (e.key === "Enter") askAI(); }}
+            />
+            <button class="obs-btn" onClick={askAI} disabled={askLoading || !question.trim()}>
+              {askLoading ? "Thinking..." : "Ask AI"}
+            </button>
+          </div>
+          {askError && (
+            <div class="explorer-error" style={{ marginBottom: "8px" }}>{askError}</div>
+          )}
+
           <textarea
             class="explorer-editor"
             value={sql}
@@ -92,6 +148,9 @@ export default function ExplorerPage() {
             <button class="obs-btn obs-btn--primary" onClick={runQuery} disabled={loading || !sql.trim()}>
               {loading ? "Running..." : "Run Query"}
             </button>
+            <button class="obs-btn" onClick={explainQuery} disabled={!sql.trim()}>
+              Explain
+            </button>
             <span class="explorer-meta" style={{ fontSize: "11px", color: "var(--obs-text-muted)" }}>
               Ctrl+Enter to run
             </span>
@@ -101,6 +160,12 @@ export default function ExplorerPage() {
               </span>
             )}
           </div>
+
+          {plan && (
+            <div class="explorer-plan" style={{ marginTop: "8px", padding: "8px", background: "var(--obs-bg-alt, #0c0c10)", fontSize: "12px", fontFamily: "ui-monospace, monospace", whiteSpace: "pre-wrap" }}>
+              {plan.error ? plan.error : plan.rows.map(r => r["QUERY PLAN"]).join("\n")}
+            </div>
+          )}
 
           {result?.error && (
             <div class="explorer-error">{result.error}</div>

@@ -1,0 +1,29 @@
+{
+  "name": "@observe/browser",
+  "version": "0.1.0",
+  "description": "Browser SDK for Observe — self-hosted analytics, errors, logs, sessions.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc --noEmit"
+  },
+  "keywords": ["analytics", "observability", "errors", "sessions", "self-hosted"],
+  "author": "Observe",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/useteploy/observe", "directory": "sdk/browser" },
+  "homepage": "https://observe.dev",
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  },
+  "sideEffects": false
+}

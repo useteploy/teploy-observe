@@ -9,7 +9,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/teploy/observe/internal/dbutil"
+	"github.com/useteploy/observe/internal/dbutil"
 )
 
 // Site represents a tracked website.
@@ -85,6 +85,69 @@ func (s *SiteService) Get(ctx context.Context, siteID string) (Site, error) {
 		return Site{}, fmt.Errorf("sites: get: %w", err)
 	}
 	return site, nil
+}
+
+// EnsureDefault creates a site with site_id="default" if none exists.
+// Used on first boot so UI defaults that reference "default" work out of the box.
+func (s *SiteService) EnsureDefault(ctx context.Context) error {
+	sql := s.db.SQL()
+
+	type countRow struct {
+		Count int64 `db:"count"`
+	}
+	rows, err := nucleus.Query[countRow](ctx, sql,
+		"SELECT COUNT(*) AS count FROM sites WHERE site_id = $1",
+		"default",
+	)
+	if err != nil {
+		return fmt.Errorf("sites: ensure default: %w", err)
+	}
+	if len(rows) > 0 && rows[0].Count > 0 {
+		return nil
+	}
+
+	now := dbutil.IntParam(time.Now().UnixMilli())
+	_, err = sql.Exec(ctx,
+		"INSERT INTO sites (site_id, tenant_id, domain, name, created_at, session_salt) VALUES ($1, $2, $3, $4, $5, $6)",
+		"default", "default", "localhost", "Default Site", now, generateID(),
+	)
+	if err != nil {
+		return fmt.Errorf("sites: insert default: %w", err)
+	}
+	return nil
+}
+
+// ListRatelimits returns {site_id: ratelimit_per_second} for every site.
+// Used at boot to hydrate the in-memory rate limiter cache.
+func (s *SiteService) ListRatelimits(ctx context.Context) (map[string]int, error) {
+	type row struct {
+		SiteID string `db:"site_id"`
+		Rate   int    `db:"ratelimit_per_second"`
+	}
+	sql := s.db.SQL()
+	rows, err := nucleus.Query[row](ctx, sql,
+		"SELECT site_id, ratelimit_per_second FROM sites",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sites: list ratelimits: %w", err)
+	}
+	out := make(map[string]int, len(rows))
+	for _, r := range rows {
+		out[r.SiteID] = r.Rate
+	}
+	return out, nil
+}
+
+// SetRatelimit updates the per-site events-per-second cap. 0 means "default".
+func (s *SiteService) SetRatelimit(ctx context.Context, siteID string, ratePerSecond int) error {
+	_, err := s.db.SQL().Exec(ctx,
+		"UPDATE sites SET ratelimit_per_second = $1 WHERE site_id = $2",
+		ratePerSecond, siteID,
+	)
+	if err != nil {
+		return fmt.Errorf("sites: set ratelimit: %w", err)
+	}
+	return nil
 }
 
 // Delete removes a site by ID.

@@ -7,7 +7,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/teploy/observe/internal/dbutil"
+	"github.com/useteploy/observe/internal/dbutil"
 )
 
 // RetentionCohort represents one row of the retention grid.
@@ -41,7 +41,7 @@ func (s *StatsService) Retention(ctx context.Context, siteID string, from, to ti
 	rows, err := nucleus.Query[sessionFirstLast](ctx, s.db.SQL(),
 		`SELECT session_id, first_ts
 		 FROM sessions
-		 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3`,
+		 WHERE site_id = $1 AND first_ts >= CAST($2 AS BIGINT) AND first_ts < CAST($3 AS BIGINT)`,
 		siteID, fromMs, toMs,
 	)
 	if err != nil {
@@ -61,7 +61,7 @@ func (s *StatsService) Retention(ctx context.Context, siteID string, from, to ti
 	events, err := nucleus.Query[eventRow](ctx, s.db.SQL(),
 		`SELECT session_id, CAST(timestamp AS TEXT) AS timestamp
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT)
 		 ORDER BY session_id, timestamp ASC`,
 		siteID, fromMs,
 	)

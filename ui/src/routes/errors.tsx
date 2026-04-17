@@ -1,11 +1,13 @@
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { errorsApi } from "../api/errors.js";
-import type { Issue, ErrorEvent, ReleaseHealth } from "../api/errors.js";
+import type { Issue, ErrorEvent, ReleaseHealth, DailyCount } from "../api/errors.js";
 import SearchInput from "../components/shared/SearchInput.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
 import Tabs from "../components/shared/Tabs.js";
 import Pagination from "../components/shared/Pagination.js";
+import ExportButton from "../components/shared/ExportButton.js";
+import EmptyState from "../components/shared/EmptyState.js";
 import "../styles/errors.css";
 
 export const config = { mode: "app" };
@@ -318,6 +320,56 @@ function IssueDetail({ issue, siteId, onBack }: { issue: Issue; siteId: string; 
   );
 }
 
+// ─── Daily error volume chart ───
+
+function DailyChart({ siteId }: { siteId: string }) {
+  const [data, setData] = useState<DailyCount[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    errorsApi.daily(siteId, 14)
+      .then((r) => { if (alive) setData(r || []); })
+      .catch(() => { if (alive) setData([]); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [siteId]);
+
+  if (loading) return <div class="errors-chart errors-chart--loading" />;
+  if (!data.length) return null;
+
+  const max = Math.max(1, ...data.map(d => d.count));
+  const total = data.reduce((s, d) => s + d.count, 0);
+
+  return (
+    <div class="errors-chart">
+      <div class="errors-chart-header">
+        <span class="errors-chart-label">Last 14 days</span>
+        <span class="errors-chart-total">{total.toLocaleString()} error{total === 1 ? "" : "s"}</span>
+      </div>
+      <div class="errors-chart-bars">
+        {data.map((d) => {
+          const pct = (d.count / max) * 100;
+          const label = new Date(d.day + "T00:00:00Z").toLocaleDateString("en-US", { month: "short", day: "numeric" });
+          return (
+            <div key={d.day} class="errors-chart-bar-wrap" title={`${label}: ${d.count}`}>
+              <div
+                class="errors-chart-bar"
+                style={{ height: `${d.count === 0 ? 2 : Math.max(pct, 4)}%` }}
+                data-empty={d.count === 0 ? "true" : undefined}
+              />
+            </div>
+          );
+        })}
+      </div>
+      <div class="errors-chart-xaxis">
+        <span>{new Date(data[0].day + "T00:00:00Z").toLocaleDateString("en-US", { month: "short", day: "numeric" })}</span>
+        <span>{new Date(data[data.length - 1].day + "T00:00:00Z").toLocaleDateString("en-US", { month: "short", day: "numeric" })}</span>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main Page ───
 
 export default function ErrorsPage() {
@@ -368,10 +420,27 @@ export default function ErrorsPage() {
         <h1 class="obs-page-title">Errors</h1>
       </div>
 
+      <DailyChart siteId={siteId} />
+
       <ReleaseHealthBar siteId={siteId} />
 
       <div class="errors-toolbar">
         <SearchInput value={query} onInput={setQuery} placeholder="Search errors..." onSubmit={fetchIssues} />
+        <ExportButton
+          filename={`issues-${siteId}-${Date.now()}.csv`}
+          rows={issues}
+          columns={[
+            { key: "title", label: "title" },
+            { key: "culprit", label: "culprit" },
+            { key: "level", label: "level" },
+            { key: "status", label: "status" },
+            { key: "event_count", label: "events" },
+            { key: "user_count", label: "users" },
+            { key: "first_seen", label: "first_seen" },
+            { key: "last_seen", label: "last_seen" },
+            { key: "release_tag", label: "release" },
+          ]}
+        />
       </div>
 
       <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "16px" }}>
@@ -402,9 +471,26 @@ export default function ErrorsPage() {
       {loading ? (
         <IssueListSkeleton />
       ) : issues.length === 0 ? (
-        <div class="obs-empty-state">
-          {query || activeStatus !== "ALL" || activeLevel !== "ALL" ? "No issues match the current filters" : "No errors captured yet"}
-        </div>
+        query || activeStatus !== "ALL" || activeLevel !== "ALL" ? (
+          <EmptyState
+            title="No issues match the filters"
+            description="Try clearing the status/level filters or your search query."
+            icon="alert"
+            actions={[
+              { label: "Clear filters", onClick: () => { setQuery(""); setActiveStatus("ALL"); setActiveLevel("ALL"); } },
+            ]}
+          />
+        ) : (
+          <EmptyState
+            title="No errors captured yet"
+            description="Add the observe-errors.js tracker to catch runtime exceptions, unhandled promise rejections, and console errors with full stack traces and breadcrumbs."
+            icon="alert"
+            actions={[
+              { label: "Install error tracker", href: "/onboard", primary: true },
+              { label: "Read the docs", href: "/docs#errors" },
+            ]}
+          />
+        )
       ) : (
         <>
           <div class="errors-issue-list obs-stagger">

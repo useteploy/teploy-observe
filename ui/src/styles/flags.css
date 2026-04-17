@@ -263,3 +263,87 @@
     gap: 6px;
   }
 }
+
+.flags-history {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.flags-history-entry {
+  display: grid;
+  grid-template-columns: 80px 1fr auto;
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 10px;
+  background: var(--obs-bg-card, rgba(0, 0, 0, 0.02));
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.flags-history-action {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--obs-accent, #6366f1);
+}
+
+.flags-history-entry--created .flags-history-action { color: #16a34a; }
+.flags-history-entry--toggle .flags-history-action { color: #6366f1; }
+.flags-history-entry--update .flags-history-action { color: #f59e0b; }
+
+.flags-history-detail {
+  color: var(--obs-text);
+}
+
+.flags-history-time {
+  color: var(--obs-text-muted);
+  font-family: var(--obs-font-mono, monospace);
+  font-size: 11px;
+}
+
+/* ─── Experiments Bayesian probability ─── */
+.experiments-prob {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: var(--obs-radius-full, 999px);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.experiments-prob--strong  { background: rgba(34,197,94,0.14); color: #16a34a; }
+.experiments-prob--lean    { background: rgba(132,204,22,0.14); color: #65a30d; }
+.experiments-prob--neutral { background: rgba(161,161,170,0.15); color: #71717a; }
+.experiments-prob--weak    { background: rgba(239,68,68,0.12); color: #dc2626; }
+
+.experiments-prob-bar {
+  height: 4px;
+  background: var(--obs-border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.experiments-prob-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.4s ease;
+}
+
+.experiments-prob-bar-fill.experiments-prob--strong  { background: #16a34a; }
+.experiments-prob-bar-fill.experiments-prob--lean    { background: #65a30d; }
+.experiments-prob-bar-fill.experiments-prob--neutral { background: #a1a1aa; }
+.experiments-prob-bar-fill.experiments-prob--weak    { background: #dc2626; }
+
+.experiments-result-control-tag {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: var(--obs-radius-full, 999px);
+  background: rgba(99, 102, 241, 0.12);
+  color: #6366f1;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}

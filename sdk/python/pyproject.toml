@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "observe-sdk"
+version = "0.1.0"
+description = "Python SDK for Observe — self-hosted analytics, errors, logs, traces."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Observe" }]
+requires-python = ">=3.8"
+keywords = ["analytics", "observability", "errors", "logs", "self-hosted"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Homepage = "https://observe.dev"
+Repository = "https://github.com/teploy/observe"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["observe_sdk*"]

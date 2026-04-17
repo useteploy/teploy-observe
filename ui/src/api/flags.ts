@@ -38,6 +38,7 @@ export interface VariantResult {
   exposures: number;
   conversions: number;
   conversion_rate: number;
+  prob_beat_control: number;
 }
 
 export interface ExperimentResults {
@@ -47,6 +48,16 @@ export interface ExperimentResults {
   winner: string;
 }
 
+export interface FlagHistoryEntry {
+  timestamp: number;
+  action: "created" | "toggle" | "update";
+  enabled: boolean;
+  rollout_pct?: number;
+  variants?: string;
+  targeting?: string;
+  changed_by?: string;
+}
+
 export const flagsApi = {
   list: (siteId: string) =>
     get<FeatureFlag[]>(`${BASE}/flags?site_id=${siteId}`),
@@ -54,6 +65,8 @@ export const flagsApi = {
     post<FeatureFlag>(`${BASE}/flags`, data),
   toggle: (flagId: string, enabled: boolean) =>
     post<{ ok: boolean }>(`${BASE}/flags/${flagId}/toggle`, { enabled }),
+  history: (flagId: string) =>
+    get<FlagHistoryEntry[]>(`${BASE}/flags/${flagId}/history`),
   evaluate: (siteId: string, flagKey: string, userId: string, context?: Record<string, string>) =>
     post<{ enabled: boolean; variant?: string }>(`${BASE}/flags/evaluate`, { site_id: siteId, flag_key: flagKey, user_id: userId, context }),
 };

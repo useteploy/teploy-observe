@@ -7,6 +7,7 @@ const NAV_ITEMS = [
   { key: "campaigns", label: "Campaigns", icon: "M17.5 2h-11C5.67 2 5 2.67 5 3.5V22l7-3 7 3V3.5c0-.83-.67-1.5-1.5-1.5zM17 19l-5-2.18L7 19V4h10v15z", href: "/campaigns" },
   { key: "insights", label: "Insights", icon: "M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 14H5v-2h7v2zm5-4H5v-2h12v2zm0-4H5V7h12v2z", href: "/insights" },
   { key: "errors", label: "Errors", icon: "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z", href: "/errors" },
+  { key: "releases", label: "Releases", icon: "M7 14l5-5 5 5z", href: "/releases" },
   { key: "traces", label: "Traces", icon: "M3 4h18v2H3V4zm0 7h18v2H3v-2zm0 7h18v2H3v-2z", href: "/traces" },
   { key: "logs", label: "Logs", icon: "M3 3h18v18H3V3zm2 2v14h14V5H5zm2 2h10v2H7V7zm0 4h10v2H7v-2zm0 4h7v2H7v-2z", href: "/logs" },
   { key: "flags", label: "Flags", icon: "M14.4 6L14 4H5v17h2v-7h5.6l.4 2h7V6h-5.6z", href: "/flags" },

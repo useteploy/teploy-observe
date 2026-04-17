@@ -8,7 +8,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/teploy/observe/internal/dbutil"
+	"github.com/useteploy/observe/internal/dbutil"
 )
 
 // FunnelStep defines one step in a funnel (event type or pathname match).
@@ -47,7 +47,7 @@ func (s *StatsService) Funnel(ctx context.Context, siteID string, from, to time.
 	rows, err := nucleus.Query[funnelEvent](ctx, s.db.SQL(),
 		`SELECT session_id, event_type, COALESCE(pathname, '') AS pathname, timestamp
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 		 ORDER BY session_id, timestamp ASC`,
 		siteID, fromMs, toMs,
 	)
@@ -93,6 +93,119 @@ func (s *StatsService) Funnel(ctx context.Context, siteID string, from, to time.
 	}
 
 	return results, nil
+}
+
+// FunnelBreakdownResult groups funnel outcomes by a property dimension.
+type FunnelBreakdownResult struct {
+	Breakdown string         `json:"breakdown"`
+	Results   []FunnelResult `json:"results"`
+}
+
+// FunnelByBreakdown computes the funnel separately for each distinct value of
+// `breakdownBy` (e.g. "browser", "country", "device", "os"). Unsupported
+// breakdowns return an error. Groups with fewer than minSize sessions are dropped.
+func (s *StatsService) FunnelByBreakdown(ctx context.Context, siteID string, from, to time.Time, steps []FunnelStep, breakdownBy string, minSize int) ([]FunnelBreakdownResult, error) {
+	if len(steps) == 0 {
+		return nil, nil
+	}
+	col, ok := map[string]string{
+		"browser": "COALESCE(browser, 'unknown')",
+		"country": "COALESCE(country, 'unknown')",
+		"device":  "COALESCE(device, 'unknown')",
+		"os":      "COALESCE(os, 'unknown')",
+	}[breakdownBy]
+	if !ok {
+		return nil, fmt.Errorf("unsupported breakdown: %s", breakdownBy)
+	}
+
+	fromMs := dbutil.IntParam(from.UnixMilli())
+	toMs := dbutil.IntParam(to.UnixMilli())
+
+	type breakdownRow struct {
+		SessionID string `db:"session_id"`
+		EventType string `db:"event_type"`
+		Pathname  string `db:"pathname"`
+		Timestamp int64  `db:"timestamp"`
+		Breakdown string `db:"breakdown"`
+	}
+	rows, err := nucleus.Query[breakdownRow](ctx, s.db.SQL(),
+		fmt.Sprintf(`SELECT session_id, event_type, COALESCE(pathname, '') AS pathname, timestamp, %s AS breakdown
+		 FROM events
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
+		 ORDER BY session_id, timestamp ASC`, col),
+		siteID, fromMs, toMs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("funnel breakdown query: %w", err)
+	}
+
+	// Group events by (breakdown, session).
+	type key struct{ Breakdown, Session string }
+	grouped := make(map[key][]funnelEvent)
+	sessionBreakdown := make(map[string]string)
+	for _, r := range rows {
+		// A session can span different breakdown values in theory; keep the first seen.
+		if _, seen := sessionBreakdown[r.SessionID]; !seen {
+			sessionBreakdown[r.SessionID] = r.Breakdown
+		}
+		k := key{Breakdown: sessionBreakdown[r.SessionID], Session: r.SessionID}
+		grouped[k] = append(grouped[k], funnelEvent{
+			SessionID: r.SessionID,
+			EventType: r.EventType,
+			Pathname:  r.Pathname,
+			Timestamp: r.Timestamp,
+		})
+	}
+
+	// Walk per-breakdown.
+	perBreakdown := make(map[string][]int) // breakdown -> stepCounts[]
+	for k, events := range grouped {
+		sort.Slice(events, func(i, j int) bool { return events[i].Timestamp < events[j].Timestamp })
+		counts, ok := perBreakdown[k.Breakdown]
+		if !ok {
+			counts = make([]int, len(steps))
+			perBreakdown[k.Breakdown] = counts
+		}
+		stepIdx := 0
+		for _, e := range events {
+			if stepIdx >= len(steps) {
+				break
+			}
+			if matchesStep(e, steps[stepIdx]) {
+				counts[stepIdx]++
+				stepIdx++
+			}
+		}
+	}
+
+	out := make([]FunnelBreakdownResult, 0, len(perBreakdown))
+	for b, counts := range perBreakdown {
+		if counts[0] < minSize {
+			continue
+		}
+		res := make([]FunnelResult, len(steps))
+		for i, step := range steps {
+			res[i] = FunnelResult{Step: step, Visitors: counts[i]}
+			if counts[0] > 0 {
+				res[i].Conversion = float64(counts[i]) / float64(counts[0]) * 100
+			}
+			if i > 0 && counts[i-1] > 0 {
+				res[i].DropOff = float64(counts[i-1]-counts[i]) / float64(counts[i-1]) * 100
+			}
+		}
+		out = append(out, FunnelBreakdownResult{Breakdown: b, Results: res})
+	}
+	// Stable order: highest starting cohort first.
+	sort.Slice(out, func(i, j int) bool {
+		if len(out[i].Results) == 0 {
+			return false
+		}
+		if len(out[j].Results) == 0 {
+			return true
+		}
+		return out[i].Results[0].Visitors > out[j].Results[0].Visitors
+	})
+	return out, nil
 }
 
 func matchesStep(e funnelEvent, step FunnelStep) bool {

@@ -10,7 +10,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/teploy/observe/internal/dbutil"
+	"github.com/useteploy/observe/internal/dbutil"
 )
 
 // StatsService provides analytics query methods for the dashboard.
@@ -75,7 +75,7 @@ func (s *StatsService) RealtimeVisitors(ctx context.Context, siteID string, minu
 	rows, err := nucleus.Query[RealtimeResult](ctx, s.db.SQL(),
 		`SELECT COUNT(DISTINCT session_id) AS active_visitors
 		 FROM events_recent
-		 WHERE site_id = $1 AND timestamp >= $2`,
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT)`,
 		siteID, cutoff,
 	)
 	if err != nil {
@@ -117,7 +117,7 @@ func (s *StatsService) PageviewTimeSeries(ctx context.Context, siteID string, fr
 		        COUNT(*) AS pageviews,
 		        COUNT(DISTINCT session_id) AS visitors
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 		   AND event_type = 'pageview'%s
 		 GROUP BY (CAST(timestamp AS BIGINT) / %d) * %d
 		 ORDER BY (CAST(timestamp AS BIGINT) / %d) * %d`, bucketMs, bucketMs, fSQL, bucketMs, bucketMs, bucketMs, bucketMs)
@@ -126,7 +126,7 @@ func (s *StatsService) PageviewTimeSeries(ctx context.Context, siteID string, fr
 		        SUM(pageviews) AS pageviews,
 		        SUM(visitors) AS visitors
 		 FROM %s
-		 WHERE site_id = $1 AND %s >= $2 AND %s < $3
+		 WHERE site_id = $1 AND %s >= CAST($2 AS BIGINT) AND %s < CAST($3 AS BIGINT)
 		   AND event_type = 'pageview'%s
 		 GROUP BY %s
 		 ORDER BY %s`, ts, table, ts, ts, fSQL, ts, ts)
@@ -163,7 +163,7 @@ func (s *StatsService) TopPages(ctx context.Context, siteID string, from, to tim
 		        COUNT(*) AS pageviews,
 		        COUNT(DISTINCT session_id) AS visitors
 		 FROM events
-		 WHERE site_id = $1 AND %s >= $2 AND %s < $3
+		 WHERE site_id = $1 AND %s >= CAST($2 AS BIGINT) AND %s < CAST($3 AS BIGINT)
 		   AND event_type = 'pageview'%s
 		 GROUP BY pathname
 		 ORDER BY pageviews DESC
@@ -173,7 +173,7 @@ func (s *StatsService) TopPages(ctx context.Context, siteID string, from, to tim
 		        SUM(pageviews) AS pageviews,
 		        SUM(visitors) AS visitors
 		 FROM %s
-		 WHERE site_id = $1 AND %s >= $2 AND %s < $3
+		 WHERE site_id = $1 AND %s >= CAST($2 AS BIGINT) AND %s < CAST($3 AS BIGINT)
 		   AND event_type = 'pageview'%s
 		 GROUP BY pathname
 		 ORDER BY pageviews DESC
@@ -209,7 +209,7 @@ func (s *StatsService) TopReferrers(ctx context.Context, siteID string, from, to
 		q = fmt.Sprintf(`SELECT referrer,
 		        COUNT(DISTINCT session_id) AS visitors
 		 FROM events
-		 WHERE site_id = $1 AND %s >= $2 AND %s < $3
+		 WHERE site_id = $1 AND %s >= CAST($2 AS BIGINT) AND %s < CAST($3 AS BIGINT)
 		   AND referrer != '' AND event_type = 'pageview'%s
 		 GROUP BY referrer
 		 ORDER BY visitors DESC
@@ -220,7 +220,7 @@ func (s *StatsService) TopReferrers(ctx context.Context, siteID string, from, to
 			q = fmt.Sprintf(`SELECT referrer,
 			        COUNT(DISTINCT session_id) AS visitors
 			 FROM events
-			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+			 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 			   AND referrer != '' AND event_type = 'pageview'%s
 			 GROUP BY referrer
 			 ORDER BY visitors DESC
@@ -229,7 +229,7 @@ func (s *StatsService) TopReferrers(ctx context.Context, siteID string, from, to
 			q = fmt.Sprintf(`SELECT referrer,
 			        SUM(visitors) AS visitors
 			 FROM stats_daily
-			 WHERE site_id = $1 AND %s >= $2 AND %s < $3
+			 WHERE site_id = $1 AND %s >= CAST($2 AS BIGINT) AND %s < CAST($3 AS BIGINT)
 			   AND referrer != '' AND event_type = 'pageview'%s
 			 GROUP BY referrer
 			 ORDER BY visitors DESC
@@ -266,7 +266,7 @@ func (s *StatsService) TopBrowsers(ctx context.Context, siteID string, from, to 
 		q = fmt.Sprintf(`SELECT browser,
 		        SUM(visitors) AS visitors
 		 FROM stats_daily
-		 WHERE site_id = $1 AND %s >= $2 AND %s < $3
+		 WHERE site_id = $1 AND %s >= CAST($2 AS BIGINT) AND %s < CAST($3 AS BIGINT)
 		   AND browser != ''%s
 		 GROUP BY browser
 		 ORDER BY visitors DESC
@@ -276,7 +276,7 @@ func (s *StatsService) TopBrowsers(ctx context.Context, siteID string, from, to 
 		q = fmt.Sprintf(`SELECT browser,
 		        COUNT(DISTINCT session_id) AS visitors
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 		   AND browser != ''%s
 		 GROUP BY browser
 		 ORDER BY visitors DESC
@@ -312,7 +312,7 @@ func (s *StatsService) TopCountries(ctx context.Context, siteID string, from, to
 		q = fmt.Sprintf(`SELECT country,
 		        SUM(visitors) AS visitors
 		 FROM stats_daily
-		 WHERE site_id = $1 AND %s >= $2 AND %s < $3
+		 WHERE site_id = $1 AND %s >= CAST($2 AS BIGINT) AND %s < CAST($3 AS BIGINT)
 		   AND country != ''%s
 		 GROUP BY country
 		 ORDER BY visitors DESC
@@ -321,7 +321,7 @@ func (s *StatsService) TopCountries(ctx context.Context, siteID string, from, to
 		q = fmt.Sprintf(`SELECT country,
 		        COUNT(DISTINCT session_id) AS visitors
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 		   AND country != ''%s
 		 GROUP BY country
 		 ORDER BY visitors DESC
@@ -357,7 +357,7 @@ func (s *StatsService) TopOS(ctx context.Context, siteID string, from, to time.T
 		q = fmt.Sprintf(`SELECT os,
 		        SUM(visitors) AS visitors
 		 FROM stats_daily
-		 WHERE site_id = $1 AND %s >= $2 AND %s < $3
+		 WHERE site_id = $1 AND %s >= CAST($2 AS BIGINT) AND %s < CAST($3 AS BIGINT)
 		   AND os != ''%s
 		 GROUP BY os
 		 ORDER BY visitors DESC
@@ -366,7 +366,7 @@ func (s *StatsService) TopOS(ctx context.Context, siteID string, from, to time.T
 		q = fmt.Sprintf(`SELECT os,
 		        COUNT(DISTINCT session_id) AS visitors
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 		   AND os != ''%s
 		 GROUP BY os
 		 ORDER BY visitors DESC
@@ -402,7 +402,7 @@ func (s *StatsService) TopDevices(ctx context.Context, siteID string, from, to t
 		q = fmt.Sprintf(`SELECT device,
 		        SUM(visitors) AS visitors
 		 FROM stats_daily
-		 WHERE site_id = $1 AND %s >= $2 AND %s < $3
+		 WHERE site_id = $1 AND %s >= CAST($2 AS BIGINT) AND %s < CAST($3 AS BIGINT)
 		   AND device != ''%s
 		 GROUP BY device
 		 ORDER BY visitors DESC
@@ -411,7 +411,7 @@ func (s *StatsService) TopDevices(ctx context.Context, siteID string, from, to t
 		q = fmt.Sprintf(`SELECT device,
 		        COUNT(DISTINCT session_id) AS visitors
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 		   AND device != ''%s
 		 GROUP BY device
 		 ORDER BY visitors DESC
@@ -450,7 +450,7 @@ func (s *StatsService) TopChannels(ctx context.Context, siteID string, from, to 
 		        COALESCE(utm_source, '') AS utm_source,
 		        COALESCE(utm_medium, '') AS utm_medium
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3%s`, fSQL)
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)%s`, fSQL)
 
 	rows, err := nucleus.Query[channelRow](ctx, s.db.SQL(), q, allParams...)
 	if err != nil {
@@ -521,14 +521,14 @@ func (s *StatsService) Overview(ctx context.Context, siteID string, from, to tim
 		        COUNT(DISTINCT session_id) AS visitors,
 		        COUNT(DISTINCT visit_id) AS sessions
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 		   AND event_type = 'pageview'%s`, fSQL)
 	} else {
 		q = fmt.Sprintf(`SELECT SUM(pageviews) AS pageviews,
 		        SUM(visitors) AS visitors,
 		        SUM(sessions) AS sessions
 		 FROM %s
-		 WHERE site_id = $1 AND %s >= $2 AND %s < $3
+		 WHERE site_id = $1 AND %s >= CAST($2 AS BIGINT) AND %s < CAST($3 AS BIGINT)
 		   AND event_type = 'pageview'%s`, table, ts, ts, fSQL)
 	}
 
@@ -552,7 +552,7 @@ func (s *StatsService) Overview(ctx context.Context, siteID string, from, to tim
 		        COUNT(*) AS total_sessions,
 		        SUM(CAST(last_ts AS BIGINT) - CAST(first_ts AS BIGINT)) AS duration_sum
 		 FROM sessions
-		 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3%s`, fSQL)
+		 WHERE site_id = $1 AND first_ts >= CAST($2 AS BIGINT) AND first_ts < CAST($3 AS BIGINT)%s`, fSQL)
 
 	sessRows, err := nucleus.Query[sessionStats](ctx, s.db.SQL(), sessQ, sessParams...)
 	if err != nil {
@@ -610,7 +610,7 @@ func (s *StatsService) TopLanguages(ctx context.Context, siteID string, from, to
 	q := fmt.Sprintf(`SELECT language,
 	        COUNT(DISTINCT session_id) AS visitors
 	 FROM events
-	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+	 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 	   AND language != ''%s
 	 GROUP BY language
 	 ORDER BY visitors DESC
@@ -641,7 +641,7 @@ func (s *StatsService) TopScreens(ctx context.Context, siteID string, from, to t
 	q := fmt.Sprintf(`SELECT CAST(screen_width AS TEXT) || 'x' || CAST(screen_height AS TEXT) AS screen,
 	        COUNT(DISTINCT session_id) AS visitors
 	 FROM events
-	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+	 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 	   AND CAST(screen_width AS INTEGER) > 0%s
 	 GROUP BY CAST(screen_width AS TEXT) || 'x' || CAST(screen_height AS TEXT)
 	 ORDER BY visitors DESC
@@ -680,7 +680,7 @@ func (s *StatsService) TopUTM(ctx context.Context, siteID string, from, to time.
 	q := fmt.Sprintf(`SELECT %s AS value,
 	        COUNT(DISTINCT session_id) AS visitors
 	 FROM events
-	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+	 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 	   AND %s != ''%s
 	 GROUP BY %s
 	 ORDER BY visitors DESC
@@ -711,7 +711,7 @@ func (s *StatsService) TopEntryPages(ctx context.Context, siteID string, from, t
 	q := fmt.Sprintf(`SELECT entry_url AS pathname,
 	        COUNT(*) AS visitors
 	 FROM sessions
-	 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3
+	 WHERE site_id = $1 AND first_ts >= CAST($2 AS BIGINT) AND first_ts < CAST($3 AS BIGINT)
 	   AND entry_url != ''%s
 	 GROUP BY entry_url
 	 ORDER BY visitors DESC
@@ -742,7 +742,7 @@ func (s *StatsService) TopExitPages(ctx context.Context, siteID string, from, to
 	q := fmt.Sprintf(`SELECT exit_url AS pathname,
 	        COUNT(*) AS visitors
 	 FROM sessions
-	 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3
+	 WHERE site_id = $1 AND first_ts >= CAST($2 AS BIGINT) AND first_ts < CAST($3 AS BIGINT)
 	   AND exit_url != ''%s
 	 GROUP BY exit_url
 	 ORDER BY visitors DESC
@@ -775,7 +775,7 @@ func (s *StatsService) CustomEvents(ctx context.Context, siteID string, from, to
 	        COUNT(*) AS count,
 	        COUNT(DISTINCT session_id) AS visitors
 	 FROM events
-	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+	 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 	   AND event_type != 'pageview'%s
 	 GROUP BY event_type
 	 ORDER BY count DESC
@@ -812,7 +812,7 @@ func (s *StatsService) EventProperties(ctx context.Context, siteID string, from,
 	rows, err := nucleus.Query[raw](ctx, s.db.SQL(),
 		`SELECT COALESCE(properties, '') AS properties, session_id
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 		   AND event_type = $4 AND properties != ''
 		 LIMIT 5000`,
 		siteID, fromMs, toMs, eventType,
@@ -899,7 +899,7 @@ func (s *StatsService) Sessions(ctx context.Context, siteID string, from, to tim
 	        entry_url, exit_url,
 	        browser, os, country, device, is_bounce
 	 FROM sessions
-	 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3
+	 WHERE site_id = $1 AND first_ts >= CAST($2 AS BIGINT) AND first_ts < CAST($3 AS BIGINT)
 	 ORDER BY first_ts DESC
 	 LIMIT %d`, limit)
 
@@ -960,7 +960,7 @@ func (s *StatsService) EventPropertyKeys(ctx context.Context, siteID, eventName 
 
 	rows, err := nucleus.Query[eventRow](ctx, s.db.SQL(),
 		`SELECT properties FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 		   AND event_type = $4 AND properties IS NOT NULL`,
 		siteID, fromMs, toMs, eventName,
 	)
@@ -1010,7 +1010,7 @@ func (s *StatsService) EventPropertyValues(ctx context.Context, siteID, eventNam
 	// may not handle parameterized JSONB ->> operator positions).
 	q := fmt.Sprintf(`SELECT properties ->> '%s' AS value, COUNT(*) AS count
 	 FROM events
-	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+	 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 	   AND event_type = $4
 	   AND properties ->> '%s' IS NOT NULL
 	 GROUP BY properties ->> '%s'

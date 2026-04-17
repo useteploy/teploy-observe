@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"strings"
 	"time"
@@ -18,36 +19,41 @@ import (
 	"github.com/neutron-dev/neutron-go/neutronauth"
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/teploy/observe/internal/auth"
-	"github.com/teploy/observe/internal/config"
-	obserrors "github.com/teploy/observe/internal/errors"
-	"github.com/teploy/observe/internal/export"
-	"github.com/teploy/observe/internal/ingest"
-	"github.com/teploy/observe/internal/jobs"
-	"github.com/teploy/observe/internal/live"
-	"github.com/teploy/observe/internal/query"
-	"github.com/teploy/observe/internal/share"
-	"github.com/teploy/observe/internal/sites"
-	"github.com/teploy/observe/internal/dashboards"
-	"github.com/teploy/observe/internal/experiments"
-	"github.com/teploy/observe/internal/explorer"
-	"github.com/teploy/observe/internal/flags"
-	"github.com/teploy/observe/internal/feedback"
-	"github.com/teploy/observe/internal/infra"
-	"github.com/teploy/observe/internal/llm"
-	"github.com/teploy/observe/internal/groups"
-	"github.com/teploy/observe/internal/integrations"
-	"github.com/teploy/observe/internal/logs"
-	"github.com/teploy/observe/internal/monitoring"
-	"github.com/teploy/observe/internal/platform"
-	"github.com/teploy/observe/internal/reports"
-	"github.com/teploy/observe/internal/replays"
-	"github.com/teploy/observe/internal/sourcemaps"
-	"github.com/teploy/observe/internal/sso"
-	"github.com/teploy/observe/internal/surveys"
-	"github.com/teploy/observe/internal/tracking"
-	"github.com/teploy/observe/internal/tracing"
-	"github.com/teploy/observe/internal/views"
+	"github.com/useteploy/observe/internal/auth"
+	"github.com/useteploy/observe/internal/config"
+	obserrors "github.com/useteploy/observe/internal/errors"
+	"github.com/useteploy/observe/internal/export"
+	"github.com/useteploy/observe/internal/backup"
+	"github.com/useteploy/observe/internal/aiquery"
+	"github.com/useteploy/observe/internal/incidents"
+	"github.com/useteploy/observe/internal/ingest"
+	"github.com/useteploy/observe/internal/jobs"
+	"github.com/useteploy/observe/internal/live"
+	"github.com/useteploy/observe/internal/meta"
+	"github.com/useteploy/observe/internal/query"
+	"github.com/useteploy/observe/internal/seed"
+	"github.com/useteploy/observe/internal/share"
+	"github.com/useteploy/observe/internal/sites"
+	"github.com/useteploy/observe/internal/dashboards"
+	"github.com/useteploy/observe/internal/experiments"
+	"github.com/useteploy/observe/internal/explorer"
+	"github.com/useteploy/observe/internal/flags"
+	"github.com/useteploy/observe/internal/feedback"
+	"github.com/useteploy/observe/internal/infra"
+	"github.com/useteploy/observe/internal/llm"
+	"github.com/useteploy/observe/internal/groups"
+	"github.com/useteploy/observe/internal/integrations"
+	"github.com/useteploy/observe/internal/logs"
+	"github.com/useteploy/observe/internal/monitoring"
+	"github.com/useteploy/observe/internal/platform"
+	"github.com/useteploy/observe/internal/reports"
+	"github.com/useteploy/observe/internal/replays"
+	"github.com/useteploy/observe/internal/sourcemaps"
+	"github.com/useteploy/observe/internal/sso"
+	"github.com/useteploy/observe/internal/surveys"
+	"github.com/useteploy/observe/internal/tracking"
+	"github.com/useteploy/observe/internal/tracing"
+	"github.com/useteploy/observe/internal/views"
 )
 
 //go:embed migrations/*.sql
@@ -59,6 +65,24 @@ var uiFS embed.FS
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfg := config.Load()
+
+	// Subcommand dispatch. Default (no args) runs the HTTP server.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "backup":
+			runBackup(cfg, logger)
+			return
+		case "restore":
+			runRestore(cfg, logger)
+			return
+		case "version":
+			fmt.Println("observe 0.1.0")
+			return
+		case "help", "-h", "--help":
+			printHelp()
+			return
+		}
+	}
 
 	// Connect to Nucleus with retry
 	ctx := context.Background()
@@ -104,9 +128,31 @@ func main() {
 
 	// Site service
 	siteSvc := sites.NewSiteService(db)
+	if err := siteSvc.EnsureDefault(ctx); err != nil {
+		logger.Error("failed to ensure default site", "err", err)
+		os.Exit(1)
+	}
 
-	// Ingestion buffer
+	// Seed demo data for empty tables unless disabled.
+	if os.Getenv("OBSERVE_SEED_DEMO") != "false" {
+		seed.Run(ctx, db, logger)
+	}
+
+	// Ingestion buffer with WAL-backed durability. The queue directory
+	// survives process restarts; pending events are replayed on Attach.
+	queueDir := os.Getenv("OBSERVE_QUEUE_DIR")
+	if queueDir == "" {
+		queueDir = filepath.Join(os.Getenv("OBSERVE_DATA_DIR"), "queue")
+	}
 	buf := ingest.NewBuffer(db, cfg.BufferSize, cfg.FlushSize, cfg.FlushInterval, logger)
+	maxQueueBytes := int64(64 * 1024 * 1024) // 64 MiB per WAL file before compaction
+	if eventsQ, err := ingest.NewDiskQueue(queueDir, "events", 500*time.Millisecond, maxQueueBytes, logger); err == nil {
+		if err := buf.AttachQueue(eventsQ); err != nil {
+			logger.Warn("ingest queue: attach failed", "err", err)
+		}
+	} else {
+		logger.Warn("ingest queue: init failed, running in-memory only", "err", err)
+	}
 
 	// Stats service
 	statsSvc := query.NewStatsService(db)
@@ -156,6 +202,31 @@ func main() {
 	linkSvc := tracking.NewLinkService(db)
 	dashSvc := dashboards.NewDashboardService(db)
 	replaySvc := replays.NewReplayService(db)
+	aiSvc := aiquery.NewService(db, logger)
+	aiSchema := aiquery.NewSchemaCard(db)
+	scheduledExportSvc := jobs.NewExportService(db, explorerSvc, logger)
+	incidentSvc := incidents.NewService(db)
+
+	// Auto-declare an incident whenever an alert rule fires. Dedup in
+	// the incident service by keying on rule_id + open state — a
+	// repeatedly-firing rule should open one incident and stay open.
+	alertSvc.OnTrigger = func(ctx context.Context, rule platform.AlertRule, value float64) {
+		active, _ := incidentSvc.ActiveByRule(ctx, rule.RuleID)
+		if len(active) > 0 {
+			return
+		}
+		_, err := incidentSvc.Create(ctx, incidents.CreateInput{
+			SiteID:      rule.SiteID,
+			Title:       rule.Name,
+			Description: fmt.Sprintf("alert rule fired: %s=%.2f (threshold %.2f)", rule.Metric, value, rule.Threshold),
+			Severity:    "warning",
+			Source:      incidents.SourceAlert,
+			RuleID:      rule.RuleID,
+		}, "alert")
+		if err != nil {
+			logger.Warn("incident auto-create failed", "rule", rule.RuleID, "err", err)
+		}
+	}
 
 	// Error buffer (async processing for throughput)
 	errorBuf := obserrors.NewErrorBuffer(errorHandler, 50000, 100, 2*time.Second, logger)
@@ -164,6 +235,9 @@ func main() {
 	rollups := jobs.NewRollupService(db, logger)
 	retention := jobs.NewRetentionService(db, logger, cfg.RawRetentionDays, cfg.HourlyRetentionDays)
 	scheduler := jobs.NewScheduler(rollups, retention, logger)
+
+	// Self-observability service
+	metaSvc := meta.New(db, retention, "0.1.0")
 
 	// Build app
 	app := neutron.New(
@@ -192,8 +266,11 @@ func main() {
 			},
 		}),
 		neutron.WithMiddleware(ingest.RequestInfoMiddleware),
+		neutron.WithMiddleware(config.DemoModeMiddleware(cfg.DemoMode)),
 		neutron.WithNucleusChecker(db),
 		neutron.WithOpenAPIInfo("Teploy Observe", "0.1.0"),
+		// /docs is reserved for the in-product docs page; Swagger UI lives at /api/docs.
+		neutron.DisableDefaultDocs(),
 	)
 
 	r := app.Router()
@@ -209,13 +286,25 @@ func main() {
 		rateLimit = 1000
 	}
 	rateLimiter := ingest.NewRateLimiter(rateLimit, time.Second, rateLimit*2)
+	// Hydrate per-site caps from the sites table so the first ingest after
+	// a restart honors admin overrides.
+	if caps, err := siteSvc.ListRatelimits(ctx); err == nil {
+		for siteID, rps := range caps {
+			if rps > 0 && rps != rateLimit {
+				rateLimiter.SetSiteCap(siteID, rps)
+			}
+		}
+	} else {
+		logger.Warn("could not load per-site ratelimits", "err", err)
+	}
 	ingestCORS := neutron.CORS(neutron.CORSOptions{
 		AllowOrigins: []string{"*"},
 		AllowMethods: []string{"POST", "OPTIONS"},
 		AllowHeaders: []string{"Content-Type", "X-API-Key"},
 		MaxAge:       86400,
 	})
-	ingestGroup := r.Group("/api/v1", ingestCORS, rateLimiter.Middleware, auth.APIKeyAuthMiddleware(authSvc, cfg.SiteID))
+	// Auth runs before the limiter so the limiter can key on site_id.
+	ingestGroup := r.Group("/api/v1", ingestCORS, auth.APIKeyAuthMiddleware(authSvc, cfg.SiteID), rateLimiter.Middleware)
 	neutron.Post(ingestGroup, "/events", ingest.Handler(buf, cfg.SessionSalt),
 		neutron.WithTags("ingest"),
 		neutron.WithSummary("Ingest analytics event"),
@@ -239,6 +328,12 @@ func main() {
 
 	// --- Stats API (JWT auth) ---
 	jwtMW := auth.JWTAuthMiddleware(authSvc)
+	// Role enforcers layered on top of JWT. Admin = full access to config and
+	// destructive endpoints. Editor+Admin = content mutations (flags,
+	// dashboards, queries, etc). Viewer = reads only (no explicit MW; JWT alone
+	// grants read access).
+	requireAdmin := auth.RequireRole(authSvc, auth.RoleAdmin)
+	requireEditor := auth.RequireRole(authSvc, auth.RoleAdmin, auth.RoleEditor)
 	query.RegisterRoutes(r, statsSvc, jwtMW)
 
 	// --- Live event stream (JWT auth, registered on root router to avoid group prefix bug) ---
@@ -267,7 +362,7 @@ func main() {
 		neutron.WithTags("issues"),
 		neutron.WithSummary("Update issue status"),
 	)
-	neutron.Get(issueGroup, "/{issue_id}/events", issueEventsHandler(issueSvc),
+	neutron.Get(issueGroup, "/{issue_id}/events", issueEventsHandler(issueSvc, srcmapSvc),
 		neutron.WithTags("issues"),
 		neutron.WithSummary("List error events for an issue"),
 	)
@@ -278,6 +373,10 @@ func main() {
 	neutron.Get(issueGroup, "/search", searchIssuesHandler(searchSvc),
 		neutron.WithTags("issues"),
 		neutron.WithSummary("Full-text search across error messages"),
+	)
+	neutron.Get(issueGroup, "/daily", dailyErrorCountsHandler(issueSvc),
+		neutron.WithTags("issues"),
+		neutron.WithSummary("Daily error counts (zero-filled) for a time window"),
 	)
 
 	// --- Trace query API (JWT auth) ---
@@ -309,30 +408,34 @@ func main() {
 
 	// --- Platform API (JWT auth, admin-only for writes) ---
 	platformGroup := r.Group("/api/v1/platform", jwtMW)
+	platformAdmin := platformGroup.Group("", requireAdmin)
 	neutron.Get(platformGroup, "/users", listUsersHandler(userSvc),
 		neutron.WithTags("platform"), neutron.WithSummary("List users"))
-	neutron.Post(platformGroup, "/users", createUserHandler(userSvc),
+	neutron.Post(platformAdmin, "/users", createUserHandler(userSvc),
 		neutron.WithTags("platform"), neutron.WithSummary("Create/invite user"))
-	neutron.Post(platformGroup, "/users/{user_id}/role", updateUserRoleHandler(userSvc),
+	neutron.Post(platformAdmin, "/users/{user_id}/role", updateUserRoleHandler(userSvc),
 		neutron.WithTags("platform"), neutron.WithSummary("Update user role"))
 	neutron.Get(platformGroup, "/alerts/rules", listAlertRulesHandler(alertSvc),
 		neutron.WithTags("platform"), neutron.WithSummary("List alert rules"))
-	neutron.Post(platformGroup, "/alerts/rules", createAlertRuleHandler(alertSvc),
+	neutron.Post(platformAdmin, "/alerts/rules", createAlertRuleHandler(alertSvc),
 		neutron.WithTags("platform"), neutron.WithSummary("Create alert rule"))
-	neutron.Delete(platformGroup, "/alerts/rules/{rule_id}", deleteAlertRuleHandler(alertSvc),
+	neutron.Post(platformAdmin, "/alerts/rules/{rule_id}/silence", silenceAlertRuleHandler(alertSvc),
+		neutron.WithTags("alerts"), neutron.WithSummary("Silence an alert rule for a duration"))
+	neutron.Delete(platformAdmin, "/alerts/rules/{rule_id}", deleteAlertRuleHandler(alertSvc),
 		neutron.WithTags("platform"), neutron.WithSummary("Delete alert rule"))
 	neutron.Get(platformGroup, "/alerts/history", alertHistoryHandler(alertSvc),
 		neutron.WithTags("platform"), neutron.WithSummary("Alert history"))
 	neutron.Get(platformGroup, "/webhooks", listWebhooksHandler(webhookSvc),
 		neutron.WithTags("platform"), neutron.WithSummary("List webhooks"))
-	neutron.Post(platformGroup, "/webhooks", createWebhookHandler(webhookSvc),
+	neutron.Post(platformAdmin, "/webhooks", createWebhookHandler(webhookSvc),
 		neutron.WithTags("platform"), neutron.WithSummary("Create webhook"))
-	neutron.Delete(platformGroup, "/webhooks/{webhook_id}", deleteWebhookHandler(webhookSvc),
+	neutron.Delete(platformAdmin, "/webhooks/{webhook_id}", deleteWebhookHandler(webhookSvc),
 		neutron.WithTags("platform"), neutron.WithSummary("Delete webhook"))
 
-	// --- Share link management API (JWT auth) ---
+	// --- Share link management API (JWT auth; editor+ for writes) ---
 	shareGroup := r.Group("/api/v1", jwtMW)
-	neutron.Post(shareGroup, "/sites/{site_id}/share", createShareHandler(shareSvc),
+	shareEditor := shareGroup.Group("", requireEditor)
+	neutron.Post(shareEditor, "/sites/{site_id}/share", createShareHandler(shareSvc),
 		neutron.WithTags("share"),
 		neutron.WithSummary("Create a share link for a site"),
 	)
@@ -340,26 +443,27 @@ func main() {
 		neutron.WithTags("share"),
 		neutron.WithSummary("List share links for a site"),
 	)
-	neutron.Delete(shareGroup, "/share/{token}", revokeShareHandler(shareSvc),
+	neutron.Delete(shareEditor, "/share/{token}", revokeShareHandler(shareSvc),
 		neutron.WithTags("share"),
 		neutron.WithSummary("Revoke a share link"),
 	)
 
-	// --- Site management API (JWT auth) ---
+	// --- Site management API (JWT auth; admin-only for sites/keys writes) ---
 	siteGroup := r.Group("/api/v1", jwtMW)
+	siteAdmin := siteGroup.Group("", requireAdmin)
 	neutron.Get(siteGroup, "/sites", listSitesHandler(siteSvc),
 		neutron.WithTags("sites"),
 		neutron.WithSummary("List all sites"),
 	)
-	neutron.Post(siteGroup, "/sites", createSiteHandler(siteSvc),
+	neutron.Post(siteAdmin, "/sites", createSiteHandler(siteSvc),
 		neutron.WithTags("sites"),
 		neutron.WithSummary("Create a new site"),
 	)
-	neutron.Delete(siteGroup, "/sites/{site_id}", deleteSiteHandler(siteSvc),
+	neutron.Delete(siteAdmin, "/sites/{site_id}", deleteSiteHandler(siteSvc),
 		neutron.WithTags("sites"),
 		neutron.WithSummary("Delete a site"),
 	)
-	neutron.Post(siteGroup, "/sites/{site_id}/keys", createAPIKeyHandler(authSvc),
+	neutron.Post(siteAdmin, "/sites/{site_id}/keys", createAPIKeyHandler(authSvc),
 		neutron.WithTags("sites"),
 		neutron.WithSummary("Generate API key for a site"),
 	)
@@ -367,52 +471,62 @@ func main() {
 		neutron.WithTags("sites"),
 		neutron.WithSummary("List API keys for a site"),
 	)
-	neutron.Delete(siteGroup, "/keys/{key_id}", revokeAPIKeyHandler(authSvc),
+	neutron.Delete(siteAdmin, "/keys/{key_id}", revokeAPIKeyHandler(authSvc),
 		neutron.WithTags("sites"),
 		neutron.WithSummary("Revoke an API key"),
+	)
+	neutron.Put(siteAdmin, "/sites/{site_id}/ratelimit", setSiteRatelimitHandler(siteSvc, rateLimiter),
+		neutron.WithTags("sites"),
+		neutron.WithSummary("Set events-per-second cap for a site"),
 	)
 
 	// --- Feedback (public, no auth for user submissions) ---
 	r.HandleFunc("POST /api/v1/feedback", feedbackSubmitHandler(feedbackSvc))
 
-	// --- Integrations (JWT auth) ---
+	// --- Integrations (JWT auth; admin-only writes) ---
 	intGroup := r.Group("/api/v1/integrations", jwtMW)
+	intAdmin := intGroup.Group("", requireAdmin)
 	neutron.Get(intGroup, "", listIntegrationsHandler(integrationSvc),
 		neutron.WithTags("integrations"), neutron.WithSummary("List integrations"))
-	neutron.Post(intGroup, "", createIntegrationHandler(integrationSvc),
+	neutron.Post(intAdmin, "", createIntegrationHandler(integrationSvc),
 		neutron.WithTags("integrations"), neutron.WithSummary("Create integration"))
-	neutron.Delete(intGroup, "/{integration_id}", deleteIntegrationHandler(integrationSvc),
+	neutron.Post(intAdmin, "/{integration_id}/test", testIntegrationHandler(integrationSvc),
+		neutron.WithTags("integrations"), neutron.WithSummary("Deliver a test payload"))
+	neutron.Delete(intAdmin, "/{integration_id}", deleteIntegrationHandler(integrationSvc),
 		neutron.WithTags("integrations"), neutron.WithSummary("Delete integration"))
 
-	// --- Saved views (JWT auth) ---
+	// --- Saved views (JWT auth; editor+ for writes) ---
 	viewGroup := r.Group("/api/v1/views", jwtMW)
+	viewEditor := viewGroup.Group("", requireEditor)
 	neutron.Get(viewGroup, "", listViewsHandler(viewSvc),
 		neutron.WithTags("views"), neutron.WithSummary("List saved views"))
-	neutron.Post(viewGroup, "", createViewHandler(viewSvc),
+	neutron.Post(viewEditor, "", createViewHandler(viewSvc),
 		neutron.WithTags("views"), neutron.WithSummary("Create saved view"))
-	neutron.Delete(viewGroup, "/{view_id}", deleteViewHandler(viewSvc),
+	neutron.Delete(viewEditor, "/{view_id}", deleteViewHandler(viewSvc),
 		neutron.WithTags("views"), neutron.WithSummary("Delete saved view"))
 
 	// --- Feedback list (JWT auth) ---
 	neutron.Get(r.Group("/api/v1/feedback", jwtMW), "/list", listFeedbackHandler(feedbackSvc),
 		neutron.WithTags("feedback"), neutron.WithSummary("List user feedback"))
 
-	// --- Reports (JWT auth) ---
+	// --- Reports (JWT auth; editor+ for writes) ---
 	reportGroup := r.Group("/api/v1/reports", jwtMW)
+	reportEditor := reportGroup.Group("", requireEditor)
 	neutron.Get(reportGroup, "", listReportsHandler(reportSvc),
 		neutron.WithTags("reports"), neutron.WithSummary("List report schedules"))
-	neutron.Post(reportGroup, "", createReportHandler(reportSvc),
+	neutron.Post(reportEditor, "", createReportHandler(reportSvc),
 		neutron.WithTags("reports"), neutron.WithSummary("Create report schedule"))
-	neutron.Delete(reportGroup, "/{schedule_id}", deleteReportHandler(reportSvc),
+	neutron.Delete(reportEditor, "/{schedule_id}", deleteReportHandler(reportSvc),
 		neutron.WithTags("reports"), neutron.WithSummary("Delete report schedule"))
 
-	// --- Groups (JWT auth) ---
+	// --- Groups (JWT auth; admin-only writes) ---
 	grpGroup := r.Group("/api/v1/groups", jwtMW)
+	grpAdmin := grpGroup.Group("", requireAdmin)
 	neutron.Get(grpGroup, "", listGroupsHandler(groupSvc),
 		neutron.WithTags("groups"), neutron.WithSummary("List groups"))
-	neutron.Post(grpGroup, "", createGroupHandler(groupSvc),
+	neutron.Post(grpAdmin, "", createGroupHandler(groupSvc),
 		neutron.WithTags("groups"), neutron.WithSummary("Create group"))
-	neutron.Post(grpGroup, "/{group_id}/members", addGroupMemberHandler(groupSvc),
+	neutron.Post(grpAdmin, "/{group_id}/members", addGroupMemberHandler(groupSvc),
 		neutron.WithTags("groups"), neutron.WithSummary("Add member to group"))
 
 	// --- SSO (public endpoints) ---
@@ -420,7 +534,7 @@ func main() {
 	r.HandleFunc("POST /api/v1/sso/callback", ssoSvc.SAMLCallbackHandler())
 	neutron.Get(r.Group("/api/v1/sso", jwtMW), "/configs", listSSOHandler(ssoSvc),
 		neutron.WithTags("sso"), neutron.WithSummary("List SSO configs"))
-	neutron.Post(r.Group("/api/v1/sso", jwtMW), "/configs", createSSOHandler(ssoSvc),
+	neutron.Post(r.Group("/api/v1/sso", jwtMW, requireAdmin), "/configs", createSSOHandler(ssoSvc),
 		neutron.WithTags("sso"), neutron.WithSummary("Create SSO config"))
 
 	// --- LLM observability (API key auth for ingest, JWT for queries) ---
@@ -459,52 +573,75 @@ func main() {
 	neutron.Get(infraGroup, "/hosts/{hostname}/history", infraHistoryHandler(infraSvc),
 		neutron.WithTags("infra"), neutron.WithSummary("Host metric history"))
 
-	// --- Log pipelines (JWT auth) ---
+	// --- Log pipelines (JWT auth; admin-only writes) ---
 	pipeGroup := r.Group("/api/v1/log-pipelines", jwtMW)
+	pipeAdmin := pipeGroup.Group("", requireAdmin)
 	neutron.Get(pipeGroup, "", listPipelinesHandler(pipelineSvc),
 		neutron.WithTags("logs"), neutron.WithSummary("List log pipelines"))
-	neutron.Post(pipeGroup, "", createPipelineHandler(pipelineSvc),
+	neutron.Post(pipeAdmin, "", createPipelineHandler(pipelineSvc),
 		neutron.WithTags("logs"), neutron.WithSummary("Create log pipeline"))
 
 	// --- OTLP standard endpoint (compatible with all OTLP HTTP exporters) ---
 	otlpHandler := tracing.NewOTLPHandler(traceIngest)
 	r.Handle("POST /v1/traces", otlpHandler)
 
-	// --- SQL Explorer (JWT auth) ---
-	r.Handle("POST /api/v1/query", jwtMW(explorerQueryHandler(explorerSvc)))
+	// --- SQL Explorer (JWT + editor role; query tables stays read-only) ---
+	r.Handle("POST /api/v1/query", jwtMW(requireEditor(explorerQueryHandler(explorerSvc))))
+	r.Handle("POST /api/v1/query/explain", jwtMW(requireEditor(explorerExplainHandler(explorerSvc))))
 	r.Handle("GET /api/v1/query/tables", jwtMW(explorerTablesHandler(explorerSvc)))
 
-	// --- Feature flags (JWT auth + public evaluate) ---
+	// --- AI query assistant (admin reads/writes config; editor+ may ask) ---
+	r.Handle("GET /api/v1/ai/config", jwtMW(requireAdmin(aiConfigGetHandler(aiSvc))))
+	r.Handle("PUT /api/v1/ai/config", jwtMW(requireAdmin(aiConfigPutHandler(aiSvc))))
+	r.Handle("POST /api/v1/ai/query", jwtMW(requireEditor(aiQueryHandler(aiSvc, aiSchema, llmSvc))))
+
+	// --- Scheduled SQL exports (admin only: writes data externally) ---
+	r.Handle("GET /api/v1/exports/scheduled", jwtMW(requireAdmin(exportsListHandler(scheduledExportSvc))))
+	r.Handle("POST /api/v1/exports/scheduled", jwtMW(requireAdmin(exportsCreateHandler(scheduledExportSvc))))
+	r.Handle("DELETE /api/v1/exports/scheduled/{export_id}", jwtMW(requireAdmin(exportsDeleteHandler(scheduledExportSvc))))
+	r.Handle("POST /api/v1/exports/scheduled/{export_id}/run", jwtMW(requireAdmin(exportsRunNowHandler(scheduledExportSvc))))
+
+	// --- Incidents (admin+editor may create/close; all roles may read) ---
+	r.Handle("GET /api/v1/incidents", jwtMW(incidentsListHandler(incidentSvc)))
+	r.Handle("POST /api/v1/incidents", jwtMW(requireEditor(incidentsCreateHandler(incidentSvc))))
+	r.Handle("POST /api/v1/incidents/{incident_id}/close", jwtMW(requireEditor(incidentsCloseHandler(incidentSvc))))
+
+	// --- Feature flags (JWT auth + public evaluate; editor+ writes) ---
 	flagGroup := r.Group("/api/v1/flags", jwtMW)
+	flagEditor := flagGroup.Group("", requireEditor)
 	neutron.Get(flagGroup, "", listFlagsHandler(flagSvc),
 		neutron.WithTags("flags"), neutron.WithSummary("List feature flags"))
-	neutron.Post(flagGroup, "", createFlagHandler(flagSvc),
+	neutron.Post(flagEditor, "", createFlagHandler(flagSvc),
 		neutron.WithTags("flags"), neutron.WithSummary("Create feature flag"))
-	neutron.Post(flagGroup, "/{flag_id}/toggle", toggleFlagHandler(flagSvc),
+	neutron.Post(flagEditor, "/{flag_id}/toggle", toggleFlagHandler(flagSvc),
 		neutron.WithTags("flags"), neutron.WithSummary("Toggle feature flag"))
+	neutron.Get(flagGroup, "/{flag_id}/history", flagHistoryHandler(flagSvc),
+		neutron.WithTags("flags"), neutron.WithSummary("Flag change log"))
 	// Public evaluate endpoint (no JWT, uses API key or site_id)
 	r.HandleFunc("POST /api/v1/flags/evaluate", flagEvaluateHandler(flagSvc))
 
-	// --- Experiments (JWT auth) ---
+	// --- Experiments (JWT auth; editor+ writes) ---
 	expGroup := r.Group("/api/v1/experiments", jwtMW)
+	expEditor := expGroup.Group("", requireEditor)
 	neutron.Get(expGroup, "", listExperimentsHandler(experimentSvc),
 		neutron.WithTags("experiments"), neutron.WithSummary("List experiments"))
-	neutron.Post(expGroup, "", createExperimentHandler(experimentSvc),
+	neutron.Post(expEditor, "", createExperimentHandler(experimentSvc),
 		neutron.WithTags("experiments"), neutron.WithSummary("Create experiment"))
-	neutron.Post(expGroup, "/{experiment_id}/start", startExperimentHandler(experimentSvc),
+	neutron.Post(expEditor, "/{experiment_id}/start", startExperimentHandler(experimentSvc),
 		neutron.WithTags("experiments"), neutron.WithSummary("Start experiment"))
-	neutron.Post(expGroup, "/{experiment_id}/stop", stopExperimentHandler(experimentSvc),
+	neutron.Post(expEditor, "/{experiment_id}/stop", stopExperimentHandler(experimentSvc),
 		neutron.WithTags("experiments"), neutron.WithSummary("Stop experiment"))
 	neutron.Get(expGroup, "/{experiment_id}/results", experimentResultsHandler(experimentSvc),
 		neutron.WithTags("experiments"), neutron.WithSummary("Get experiment results"))
 
-	// --- Surveys (JWT auth + public endpoints) ---
+	// --- Surveys (JWT auth + public endpoints; editor+ writes) ---
 	surveyGroup := r.Group("/api/v1/surveys", jwtMW)
+	surveyEditor := surveyGroup.Group("", requireEditor)
 	neutron.Get(surveyGroup, "", listSurveysHandler(surveySvc),
 		neutron.WithTags("surveys"), neutron.WithSummary("List surveys"))
-	neutron.Post(surveyGroup, "", createSurveyHandler(surveySvc),
+	neutron.Post(surveyEditor, "", createSurveyHandler(surveySvc),
 		neutron.WithTags("surveys"), neutron.WithSummary("Create survey"))
-	neutron.Post(surveyGroup, "/{survey_id}/activate", activateSurveyHandler(surveySvc),
+	neutron.Post(surveyEditor, "/{survey_id}/activate", activateSurveyHandler(surveySvc),
 		neutron.WithTags("surveys"), neutron.WithSummary("Activate survey"))
 	neutron.Get(surveyGroup, "/{survey_id}/responses", surveyResponsesHandler(surveySvc),
 		neutron.WithTags("surveys"), neutron.WithSummary("List survey responses"))
@@ -524,6 +661,26 @@ func main() {
 	neutron.Post(ingestGroup, "/replays", replayIngestHandler(replaySvc),
 		neutron.WithTags("replays"), neutron.WithSummary("Ingest session replay events"))
 
+	// --- API docs (Swagger UI) ---
+	r.Handle("GET /api/docs", neutron.SwaggerUI(app.OpenAPI()))
+	r.Handle("GET /api/docs/", neutron.SwaggerUI(app.OpenAPI()))
+
+	// --- Self-observability (/meta) ---
+	metaGroup := r.Group("/api/v1", jwtMW)
+	neutron.Get(metaGroup, "/meta", func(ctx context.Context, _ neutron.Empty) (meta.Snapshot, error) {
+		return metaSvc.Snapshot(ctx)
+	}, neutron.WithTags("meta"), neutron.WithSummary("Observe self-observability snapshot"))
+
+	// --- Public config (UI reads this to know about demo mode, etc.) ---
+	r.HandleFunc("GET /api/v1/config", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		demo := "false"
+		if cfg.DemoMode {
+			demo = "true"
+		}
+		_, _ = w.Write([]byte(`{"demo_mode":` + demo + `}`))
+	})
+
 	// --- Source maps (JWT auth) ---
 	r.Handle("POST /api/v1/sourcemaps/upload", jwtMW(srcmapUploadHandler(srcmapSvc)))
 
@@ -533,45 +690,54 @@ func main() {
 		neutron.WithTags("logs"), neutron.WithSummary("Search logs"))
 	neutron.Get(logGroup, "/stats", logStatsHandler(logSvc),
 		neutron.WithTags("logs"), neutron.WithSummary("Log counts per level"))
+	neutron.Get(logGroup, "/histogram", logHistogramHandler(logSvc),
+		neutron.WithTags("logs"), neutron.WithSummary("Log volume histogram by level"))
+	r.Handle("GET /api/v1/logs/stream", jwtMW(logStreamHandler(logSvc)))
 
-	// --- Goals API (JWT auth) ---
+	// --- Goals API (JWT auth; editor+ writes) ---
 	goalGroup := r.Group("/api/v1/goals", jwtMW)
+	goalEditor := goalGroup.Group("", requireEditor)
 	neutron.Get(goalGroup, "", listGoalsHandler(statsSvc),
 		neutron.WithTags("goals"), neutron.WithSummary("List goals with conversions"))
-	neutron.Post(goalGroup, "", createGoalHandler(statsSvc),
+	neutron.Post(goalEditor, "", createGoalHandler(statsSvc),
 		neutron.WithTags("goals"), neutron.WithSummary("Create goal"))
 
-	// --- Uptime monitors (JWT auth) ---
+	// --- Uptime monitors (JWT auth; admin-only writes) ---
 	uptimeGroup := r.Group("/api/v1/monitors", jwtMW)
+	uptimeAdmin := uptimeGroup.Group("", requireAdmin)
 	neutron.Get(uptimeGroup, "", listMonitorsHandler(uptimeSvc),
 		neutron.WithTags("monitors"), neutron.WithSummary("List uptime monitors"))
-	neutron.Post(uptimeGroup, "", createMonitorHandler(uptimeSvc),
+	neutron.Post(uptimeAdmin, "", createMonitorHandler(uptimeSvc),
 		neutron.WithTags("monitors"), neutron.WithSummary("Create uptime monitor"))
 	neutron.Get(uptimeGroup, "/{monitor_id}/results", monitorResultsHandler(uptimeSvc),
 		neutron.WithTags("monitors"), neutron.WithSummary("Get monitor results"))
 
-	// --- Cron monitors (JWT auth + public checkin) ---
+	// --- Cron monitors (JWT auth + public checkin; editor+ writes) ---
 	cronGroup := r.Group("/api/v1/crons", jwtMW)
+	cronEditor := cronGroup.Group("", requireEditor)
 	neutron.Get(cronGroup, "", listCronsHandler(cronSvc),
 		neutron.WithTags("crons"), neutron.WithSummary("List cron monitors"))
-	neutron.Post(cronGroup, "", createCronHandler(cronSvc),
+	neutron.Post(cronEditor, "", createCronHandler(cronSvc),
 		neutron.WithTags("crons"), neutron.WithSummary("Create cron monitor"))
 	// Public checkin endpoint (no auth)
 	r.HandleFunc("POST /api/v1/checkin/{slug}", cronCheckinHandler(cronSvc))
 	r.HandleFunc("GET /api/v1/checkin/{slug}", cronCheckinHandler(cronSvc))
 
-	// --- Dashboards (JWT auth) ---
+	// --- Dashboards (JWT auth; editor+ writes) ---
 	dashGroup := r.Group("/api/v1/dashboards", jwtMW)
+	dashEditor := dashGroup.Group("", requireEditor)
 	neutron.Get(dashGroup, "", listDashboardsHandler(dashSvc),
 		neutron.WithTags("dashboards"), neutron.WithSummary("List dashboards"))
-	neutron.Post(dashGroup, "", createDashboardHandler(dashSvc),
+	neutron.Post(dashEditor, "", createDashboardHandler(dashSvc),
 		neutron.WithTags("dashboards"), neutron.WithSummary("Create dashboard"))
 	neutron.Get(dashGroup, "/{dashboard_id}", getDashboardHandler(dashSvc),
 		neutron.WithTags("dashboards"), neutron.WithSummary("Get dashboard with panels"))
-	neutron.Post(dashGroup, "/{dashboard_id}/panels", addPanelHandler(dashSvc),
+	neutron.Post(dashEditor, "/{dashboard_id}/panels", addPanelHandler(dashSvc),
 		neutron.WithTags("dashboards"), neutron.WithSummary("Add panel to dashboard"))
-	neutron.Delete(dashGroup, "/{dashboard_id}", deleteDashboardHandler(dashSvc),
+	neutron.Delete(dashEditor, "/{dashboard_id}", deleteDashboardHandler(dashSvc),
 		neutron.WithTags("dashboards"), neutron.WithSummary("Delete dashboard"))
+	neutron.Post(dashEditor, "/{dashboard_id}/panels/{panel_id}/layout", updatePanelLayoutHandler(dashSvc),
+		neutron.WithTags("dashboards"), neutron.WithSummary("Update panel position & size"))
 	neutron.Post(dashGroup, "/{dashboard_id}/panels/{panel_id}/execute", executePanelHandler(dashSvc),
 		neutron.WithTags("dashboards"), neutron.WithSummary("Execute panel query"))
 
@@ -666,6 +832,15 @@ func main() {
 		}
 	}()
 
+	// Scheduled export runner (every minute)
+	go func() {
+		time.Sleep(10 * time.Second)
+		for {
+			scheduledExportSvc.RunDue(context.Background(), time.Now())
+			time.Sleep(time.Minute)
+		}
+	}()
+
 	// Report scheduler (every hour)
 	go func() {
 		time.Sleep(45 * time.Second)
@@ -700,11 +875,75 @@ func main() {
 		os.Exit(0)
 	}()
 
+	if os.Getenv("OBSERVE_LOG_ROUTES") == "1" {
+		r.PrintRoutes()
+	}
+
 	logger.Info("starting observe", "addr", cfg.Addr)
 	if err := app.Run(cfg.Addr); err != nil {
 		logger.Error("server error", "err", err)
 		os.Exit(1)
 	}
+}
+
+// ─── Subcommands ────────────────────────────────────────────────────────────
+
+func printHelp() {
+	fmt.Println(`Observe — self-hosted analytics, errors, logs, traces, replays.
+
+Usage:
+  observe              Start the HTTP server (default).
+  observe backup       Stream a tar archive of all tables to stdout.
+  observe restore      Read a tar archive from stdin and insert into tables.
+  observe version      Print the observe version.
+  observe help         Show this message.
+
+Env vars:
+  OBSERVE_ADDR                 HTTP bind address (default :3000)
+  OBSERVE_NUCLEUS_URL          Nucleus/Postgres DSN
+  OBSERVE_JWT_SECRET           JWT signing secret (required in prod)
+  OBSERVE_ADMIN_USER           First-boot admin username (default: admin)
+  OBSERVE_ADMIN_PASSWORD       First-boot admin password (default: observe)
+  OBSERVE_DEMO_MODE            "true" blocks write ops for public demos
+  OBSERVE_SEED_DEMO            "false" skips first-boot demo seeding
+
+Example backup:
+  observe backup | zstd > observe-$(date +%F).tar.zst
+  zstdcat observe-2026-04-17.tar.zst | observe restore`)
+}
+
+func connectForCLI(cfg config.Config, logger *slog.Logger) *nucleus.Client {
+	ctx := context.Background()
+	db, err := nucleus.Connect(ctx, cfg.NucleusURL)
+	if err != nil {
+		logger.Error("failed to connect to nucleus", "err", err)
+		os.Exit(1)
+	}
+	return db
+}
+
+func runBackup(cfg config.Config, logger *slog.Logger) {
+	db := connectForCLI(cfg, logger)
+	defer db.Close()
+
+	ctx := context.Background()
+	// Tar goes to stdout; per-table errors to stderr so the tar stream stays pristine.
+	if err := backup.DumpWithLog(ctx, db, os.Stdout, os.Stderr); err != nil {
+		fmt.Fprintf(os.Stderr, "backup completed with errors: %v\n", err)
+		os.Exit(2)
+	}
+}
+
+func runRestore(cfg config.Config, logger *slog.Logger) {
+	db := connectForCLI(cfg, logger)
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := backup.Restore(ctx, db, os.Stdin); err != nil {
+		logger.Error("restore failed", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("restore complete")
 }
 
 // --- Auth handlers ---
@@ -755,17 +994,16 @@ func changePasswordHandler(authSvc *auth.AuthService) neutron.HandlerFunc[change
 
 // --- Site handlers ---
 
-type listSitesResponse struct {
-	Sites []sites.Site `json:"sites"`
-}
-
-func listSitesHandler(siteSvc *sites.SiteService) neutron.HandlerFunc[neutron.Empty, listSitesResponse] {
-	return func(ctx context.Context, _ neutron.Empty) (listSitesResponse, error) {
+func listSitesHandler(siteSvc *sites.SiteService) neutron.HandlerFunc[neutron.Empty, []sites.Site] {
+	return func(ctx context.Context, _ neutron.Empty) ([]sites.Site, error) {
 		list, err := siteSvc.List(ctx)
 		if err != nil {
-			return listSitesResponse{}, err
+			return nil, err
 		}
-		return listSitesResponse{Sites: list}, nil
+		if list == nil {
+			list = []sites.Site{}
+		}
+		return list, nil
 	}
 }
 
@@ -788,6 +1026,32 @@ func createSiteHandler(siteSvc *sites.SiteService) neutron.HandlerFunc[createSit
 
 type deleteSiteInput struct {
 	SiteID string `path:"site_id"`
+}
+
+type setSiteRatelimitInput struct {
+	SiteID        string `path:"site_id"`
+	RatePerSecond int    `json:"rate_per_second"`
+}
+
+type setSiteRatelimitResult struct {
+	SiteID        string `json:"site_id"`
+	RatePerSecond int    `json:"rate_per_second"`
+}
+
+func setSiteRatelimitHandler(siteSvc *sites.SiteService, rl *ingest.RateLimiter) neutron.HandlerFunc[setSiteRatelimitInput, setSiteRatelimitResult] {
+	return func(ctx context.Context, input setSiteRatelimitInput) (setSiteRatelimitResult, error) {
+		if input.SiteID == "" {
+			return setSiteRatelimitResult{}, neutron.ErrBadRequest("site_id is required")
+		}
+		if input.RatePerSecond < 0 {
+			return setSiteRatelimitResult{}, neutron.ErrBadRequest("rate_per_second must be >= 0")
+		}
+		if err := siteSvc.SetRatelimit(ctx, input.SiteID, input.RatePerSecond); err != nil {
+			return setSiteRatelimitResult{}, err
+		}
+		rl.SetSiteCap(input.SiteID, input.RatePerSecond)
+		return setSiteRatelimitResult{SiteID: input.SiteID, RatePerSecond: input.RatePerSecond}, nil
+	}
 }
 
 func deleteSiteHandler(siteSvc *sites.SiteService) neutron.HandlerFunc[deleteSiteInput, neutron.Empty] {
@@ -913,20 +1177,19 @@ type listShareInput struct {
 	SiteID string `path:"site_id"`
 }
 
-type listShareResponse struct {
-	Links []share.ShareLink `json:"links"`
-}
-
-func listShareHandler(shareSvc *share.ShareService) neutron.HandlerFunc[listShareInput, listShareResponse] {
-	return func(ctx context.Context, input listShareInput) (listShareResponse, error) {
+func listShareHandler(shareSvc *share.ShareService) neutron.HandlerFunc[listShareInput, []share.ShareLink] {
+	return func(ctx context.Context, input listShareInput) ([]share.ShareLink, error) {
 		if input.SiteID == "" {
-			return listShareResponse{}, neutron.ErrBadRequest("site_id is required")
+			return nil, neutron.ErrBadRequest("site_id is required")
 		}
 		links, err := shareSvc.List(ctx, input.SiteID)
 		if err != nil {
-			return listShareResponse{}, err
+			return nil, err
 		}
-		return listShareResponse{Links: links}, nil
+		if links == nil {
+			links = []share.ShareLink{}
+		}
+		return links, nil
 	}
 }
 
@@ -1037,7 +1300,7 @@ type issueEventsInput struct {
 	Limit   int    `query:"limit"`
 }
 
-func issueEventsHandler(svc *obserrors.IssueService) neutron.HandlerFunc[issueEventsInput, []obserrors.ErrorEvent] {
+func issueEventsHandler(svc *obserrors.IssueService, srcmap *sourcemaps.SourceMapService) neutron.HandlerFunc[issueEventsInput, []obserrors.ErrorEvent] {
 	return func(ctx context.Context, input issueEventsInput) ([]obserrors.ErrorEvent, error) {
 		if input.SiteID == "" || input.IssueID == "" {
 			return nil, neutron.ErrBadRequest("site_id and issue_id required")
@@ -1048,6 +1311,18 @@ func issueEventsHandler(svc *obserrors.IssueService) neutron.HandlerFunc[issueEv
 		}
 		if events == nil {
 			events = []obserrors.ErrorEvent{}
+		}
+		// Symbolicate stack traces in place when a source map is available for the release.
+		if srcmap != nil {
+			for i := range events {
+				if events[i].StackTrace == "" || events[i].ReleaseTag == "" {
+					continue
+				}
+				resolved, err := srcmap.ResolveStackTrace(ctx, input.SiteID, events[i].ReleaseTag, events[i].StackTrace)
+				if err == nil && resolved != "" {
+					events[i].StackTrace = resolved
+				}
+			}
 		}
 		return events, nil
 	}
@@ -1296,6 +1571,245 @@ func explorerQueryHandler(svc *explorer.ExplorerService) http.HandlerFunc {
 	}
 }
 
+func incidentsListHandler(svc *incidents.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		siteID := r.URL.Query().Get("site_id")
+		if siteID == "" {
+			siteID = "default"
+		}
+		fromStr := r.URL.Query().Get("from")
+		toStr := r.URL.Query().Get("to")
+		var list []incidents.Incident
+		var err error
+		if fromStr != "" && toStr != "" {
+			var from, to int64
+			fmt.Sscanf(fromStr, "%d", &from)
+			fmt.Sscanf(toStr, "%d", &to)
+			list, err = svc.InRange(r.Context(), siteID, from, to)
+		} else {
+			list, err = svc.Active(r.Context(), siteID)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(500)
+			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			return
+		}
+		if list == nil {
+			list = []incidents.Incident{}
+		}
+		json.NewEncoder(w).Encode(list)
+	}
+}
+
+func incidentsCreateHandler(svc *incidents.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var input incidents.CreateInput
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		out, err := svc.Create(r.Context(), input, "user")
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(400)
+			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			return
+		}
+		w.WriteHeader(201)
+		json.NewEncoder(w).Encode(out)
+	}
+}
+
+func incidentsCloseHandler(svc *incidents.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("incident_id")
+		if id == "" {
+			http.Error(w, "incident_id required", http.StatusBadRequest)
+			return
+		}
+		if err := svc.Close(r.Context(), id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(204)
+	}
+}
+
+func exportsListHandler(svc *jobs.ExportService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		list, err := svc.List(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(500)
+			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			return
+		}
+		if list == nil {
+			list = []jobs.ScheduledExport{}
+		}
+		json.NewEncoder(w).Encode(list)
+	}
+}
+
+func exportsCreateHandler(svc *jobs.ExportService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var input jobs.CreateInput
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		out, err := svc.Create(r.Context(), input)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(400)
+			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			return
+		}
+		w.WriteHeader(201)
+		json.NewEncoder(w).Encode(out)
+	}
+}
+
+func exportsDeleteHandler(svc *jobs.ExportService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("export_id")
+		if id == "" {
+			http.Error(w, "export_id required", http.StatusBadRequest)
+			return
+		}
+		if err := svc.Delete(r.Context(), id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(204)
+	}
+}
+
+func exportsRunNowHandler(svc *jobs.ExportService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("export_id")
+		if id == "" {
+			http.Error(w, "export_id required", http.StatusBadRequest)
+			return
+		}
+		err := svc.RunExport(r.Context(), id)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(500)
+			fmt.Fprintf(w, `{"ok":false,"error":%q}`, err.Error())
+			return
+		}
+		fmt.Fprintf(w, `{"ok":true}`)
+	}
+}
+
+func aiConfigGetHandler(svc *aiquery.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cfg, err := svc.GetConfig(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(500)
+			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			return
+		}
+		json.NewEncoder(w).Encode(cfg)
+	}
+}
+
+func aiConfigPutHandler(svc *aiquery.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var input aiquery.Config
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if err := svc.SetConfig(r.Context(), input); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		cfg, _ := svc.GetConfig(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(cfg)
+	}
+}
+
+func aiQueryHandler(svc *aiquery.Service, card *aiquery.SchemaCard, llmSvc *llm.LLMService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var input struct {
+			Question string `json:"question"`
+			SiteID   string `json:"site_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil || input.Question == "" {
+			http.Error(w, "question required", http.StatusBadRequest)
+			return
+		}
+		siteID := input.SiteID
+		if siteID == "" {
+			siteID = "default"
+		}
+		ctx := r.Context()
+		schema, err := card.Get(ctx)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		result, err := svc.Generate(ctx, input.Question, schema)
+		// Dogfood: record the AI call in llm_traces whether success or error.
+		go func(ok bool, errMsg string) {
+			bg, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			status := "ok"
+			if !ok {
+				status = "error"
+			}
+			_, _ = llmSvc.Ingest(bg, llm.LLMInput{
+				SiteID:           siteID,
+				Provider:         "aiquery",
+				Model:            result.Model,
+				Operation:        "explorer_nl_to_sql",
+				PromptTokens:     result.TokensIn,
+				CompletionTokens: result.TokensOut,
+				LatencyMs:        int(result.LatencyMs),
+				Status:           status,
+				ErrorMessage:     errMsg,
+				Prompt:           input.Question,
+				Completion:       result.SQL,
+			})
+		}(err == nil, errStr(err))
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(502)
+			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			return
+		}
+		json.NewEncoder(w).Encode(result)
+	}
+}
+
+func errStr(e error) string {
+	if e == nil {
+		return ""
+	}
+	return e.Error()
+}
+
+func explorerExplainHandler(svc *explorer.ExplorerService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var input struct {
+			SQL string `json:"sql"`
+		}
+		json.NewDecoder(r.Body).Decode(&input)
+		if input.SQL == "" {
+			http.Error(w, "sql required", http.StatusBadRequest)
+			return
+		}
+		result, _ := svc.Explain(r.Context(), input.SQL)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	}
+}
+
 func explorerTablesHandler(svc *explorer.ExplorerService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tables, _ := svc.ListTables(r.Context())
@@ -1344,6 +1858,19 @@ type toggleFlagInput struct {
 func toggleFlagHandler(svc *flags.FlagService) neutron.HandlerFunc[toggleFlagInput, neutron.Empty] {
 	return func(ctx context.Context, input toggleFlagInput) (neutron.Empty, error) {
 		return neutron.Empty{}, svc.Toggle(ctx, input.FlagID, input.Enabled)
+	}
+}
+
+type flagHistoryInput struct {
+	FlagID string `path:"flag_id"`
+}
+
+func flagHistoryHandler(svc *flags.FlagService) neutron.HandlerFunc[flagHistoryInput, []flags.FlagHistoryEntry] {
+	return func(ctx context.Context, input flagHistoryInput) ([]flags.FlagHistoryEntry, error) {
+		if input.FlagID == "" {
+			return nil, neutron.ErrBadRequest("flag_id required")
+		}
+		return svc.History(ctx, input.FlagID)
 	}
 }
 
@@ -1585,6 +2112,26 @@ func deleteIntegrationHandler(svc *integrations.IntegrationService) neutron.Hand
 	}
 }
 
+type testIntegrationInput struct {
+	IntegrationID string `path:"integration_id"`
+}
+type testIntegrationResponse struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message,omitempty"`
+}
+
+func testIntegrationHandler(svc *integrations.IntegrationService) neutron.HandlerFunc[testIntegrationInput, testIntegrationResponse] {
+	return func(ctx context.Context, input testIntegrationInput) (testIntegrationResponse, error) {
+		if input.IntegrationID == "" {
+			return testIntegrationResponse{}, neutron.ErrBadRequest("integration_id required")
+		}
+		if err := svc.Test(ctx, input.IntegrationID); err != nil {
+			return testIntegrationResponse{OK: false, Message: err.Error()}, nil
+		}
+		return testIntegrationResponse{OK: true, Message: "Test delivered"}, nil
+	}
+}
+
 // --- Feedback handlers ---
 
 func feedbackSubmitHandler(svc *feedback.FeedbackService) http.HandlerFunc {
@@ -1726,6 +2273,79 @@ func logStatsHandler(svc *logs.LogService) neutron.HandlerFunc[logStatsInput, []
 		}
 		from, to := parseTimeRange(input.From, input.To)
 		return svc.LogStats(ctx, input.SiteID, from, to)
+	}
+}
+
+type logHistogramInput struct {
+	SiteID   string `query:"site_id"`
+	From     string `query:"from"`
+	To       string `query:"to"`
+	BucketMs int64  `query:"bucket_ms"`
+}
+
+func logHistogramHandler(svc *logs.LogService) neutron.HandlerFunc[logHistogramInput, []logs.HistogramBucket] {
+	return func(ctx context.Context, input logHistogramInput) ([]logs.HistogramBucket, error) {
+		if input.SiteID == "" {
+			return nil, neutron.ErrBadRequest("site_id required")
+		}
+		from, to := parseTimeRange(input.From, input.To)
+		return svc.Histogram(ctx, input.SiteID, from, to, input.BucketMs)
+	}
+}
+
+// logStreamHandler returns a Server-Sent Events handler that streams new logs
+// for the given site_id as they arrive.
+func logStreamHandler(svc *logs.LogService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		siteID := r.URL.Query().Get("site_id")
+		if siteID == "" {
+			http.Error(w, "site_id required", http.StatusBadRequest)
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+
+		sub := svc.Bx.Subscribe(siteID)
+		defer svc.Bx.Close(sub)
+
+		// Hello event so clients know the stream is open.
+		_, _ = fmt.Fprintf(w, ": connected\n\n")
+		flusher.Flush()
+
+		keepalive := time.NewTicker(25 * time.Second)
+		defer keepalive.Stop()
+
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-keepalive.C:
+				if _, err := fmt.Fprintf(w, ": ping\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
+			case log, ok := <-sub.Ch:
+				if !ok {
+					return
+				}
+				raw, err := json.Marshal(log)
+				if err != nil {
+					continue
+				}
+				if _, err := fmt.Fprintf(w, "data: %s\n\n", raw); err != nil {
+					return
+				}
+				flusher.Flush()
+			}
+		}
 	}
 }
 
@@ -1947,6 +2567,44 @@ func addPanelHandler(svc *dashboards.DashboardService) neutron.HandlerFunc[addPa
 	}
 }
 
+type updatePanelLayoutInput struct {
+	DashboardID string `path:"dashboard_id"`
+	PanelID     string `path:"panel_id"`
+	PositionX   string `json:"position_x"`
+	PositionY   string `json:"position_y"`
+	Width       string `json:"width"`
+	Height      string `json:"height"`
+}
+
+func updatePanelLayoutHandler(svc *dashboards.DashboardService) neutron.HandlerFunc[updatePanelLayoutInput, neutron.Empty] {
+	return func(ctx context.Context, input updatePanelLayoutInput) (neutron.Empty, error) {
+		if input.PanelID == "" {
+			return neutron.Empty{}, neutron.ErrBadRequest("panel_id required")
+		}
+		// Fetch existing to preserve type/title/query fields.
+		panels, err := svc.ListPanels(ctx, input.DashboardID)
+		if err != nil {
+			return neutron.Empty{}, err
+		}
+		var target *dashboards.Panel
+		for i := range panels {
+			if panels[i].PanelID == input.PanelID {
+				target = &panels[i]
+				break
+			}
+		}
+		if target == nil {
+			return neutron.Empty{}, neutron.ErrBadRequest("panel not found")
+		}
+		if input.PositionX != "" { target.PositionX = input.PositionX }
+		if input.PositionY != "" { target.PositionY = input.PositionY }
+		if input.Width != "" { target.Width = input.Width }
+		if input.Height != "" { target.Height = input.Height }
+		target.DashboardID = input.DashboardID
+		return neutron.Empty{}, svc.UpdatePanel(ctx, *target)
+	}
+}
+
 type deleteDashboardInput struct {
 	DashboardID string `path:"dashboard_id"`
 }
@@ -2085,20 +2743,17 @@ func srcmapUploadHandler(svc *sourcemaps.SourceMapService) http.HandlerFunc {
 // --- Platform handlers ---
 
 type listUsersInput struct{}
-type listUsersResponse struct {
-	Users []platform.User `json:"users"`
-}
 
-func listUsersHandler(svc *platform.UserService) neutron.HandlerFunc[listUsersInput, listUsersResponse] {
-	return func(ctx context.Context, _ listUsersInput) (listUsersResponse, error) {
+func listUsersHandler(svc *platform.UserService) neutron.HandlerFunc[listUsersInput, []platform.User] {
+	return func(ctx context.Context, _ listUsersInput) ([]platform.User, error) {
 		users, err := svc.List(ctx)
 		if err != nil {
-			return listUsersResponse{}, err
+			return nil, err
 		}
 		if users == nil {
 			users = []platform.User{}
 		}
-		return listUsersResponse{Users: users}, nil
+		return users, nil
 	}
 }
 
@@ -2202,6 +2857,27 @@ type deleteAlertRuleInput struct {
 func deleteAlertRuleHandler(svc *platform.AlertService) neutron.HandlerFunc[deleteAlertRuleInput, neutron.Empty] {
 	return func(ctx context.Context, input deleteAlertRuleInput) (neutron.Empty, error) {
 		return neutron.Empty{}, svc.DeleteRule(ctx, input.RuleID)
+	}
+}
+
+type silenceAlertRuleInput struct {
+	RuleID    string `path:"rule_id"`
+	Minutes   int    `json:"minutes"`
+}
+type silenceAlertRuleResponse struct {
+	SilenceUntilMs int64 `json:"silence_until_ms"`
+}
+
+func silenceAlertRuleHandler(svc *platform.AlertService) neutron.HandlerFunc[silenceAlertRuleInput, silenceAlertRuleResponse] {
+	return func(ctx context.Context, input silenceAlertRuleInput) (silenceAlertRuleResponse, error) {
+		if input.RuleID == "" {
+			return silenceAlertRuleResponse{}, neutron.ErrBadRequest("rule_id required")
+		}
+		d := time.Duration(input.Minutes) * time.Minute
+		if err := svc.Silence(ctx, input.RuleID, d); err != nil {
+			return silenceAlertRuleResponse{}, err
+		}
+		return silenceAlertRuleResponse{SilenceUntilMs: svc.SilenceStatus(ctx, input.RuleID)}, nil
 	}
 }
 
@@ -2417,6 +3093,20 @@ func searchIssuesHandler(svc *obserrors.SearchService) neutron.HandlerFunc[searc
 			issues = []obserrors.Issue{}
 		}
 		return issues, nil
+	}
+}
+
+type dailyErrorCountsInput struct {
+	SiteID string `query:"site_id"`
+	Days   int    `query:"days"`
+}
+
+func dailyErrorCountsHandler(svc *obserrors.IssueService) neutron.HandlerFunc[dailyErrorCountsInput, []obserrors.DailyCount] {
+	return func(ctx context.Context, input dailyErrorCountsInput) ([]obserrors.DailyCount, error) {
+		if input.SiteID == "" {
+			return nil, neutron.ErrBadRequest("site_id required")
+		}
+		return svc.DailyCounts(ctx, input.SiteID, input.Days)
 	}
 }
 
