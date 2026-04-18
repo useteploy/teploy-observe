@@ -21,7 +21,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://observe.dev"
+Homepage = "https://github.com/useteploy/teploy-observe"
 Repository = "https://github.com/teploy/observe"
 
 [tool.setuptools.packages.find]

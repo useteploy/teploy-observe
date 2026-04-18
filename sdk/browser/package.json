@@ -21,7 +21,7 @@
   "author": "Observe",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/useteploy/teploy-observe", "directory": "sdk/browser" },
-  "homepage": "https://observe.dev",
+  "homepage": "https://github.com/useteploy/teploy-observe",
   "devDependencies": {
     "typescript": "^5.4.5"
   },

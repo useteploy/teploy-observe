@@ -1,6 +1,6 @@
 # @observe/browser
 
-Browser SDK for [Observe](https://observe.dev) — self-hosted analytics, errors, logs, sessions.
+Browser SDK for [Observe](https://github.com/useteploy/teploy-observe) — self-hosted analytics, errors, logs, sessions.
 
 ## Install
 

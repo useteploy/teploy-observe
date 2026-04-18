@@ -1,6 +1,6 @@
 #!/bin/sh
 # Observe installer. Usage:
-#   curl -sL https://observe.dev/install.sh | sh
+#   curl -sL https://raw.githubusercontent.com/useteploy/teploy-observe/main/scripts/install.sh | sh
 #
 # Flags (set as env vars):
 #   OBSERVE_VERSION=v0.5.0        pin a release tag (default: latest)

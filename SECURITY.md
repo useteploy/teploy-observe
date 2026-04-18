@@ -7,7 +7,7 @@ are supported only on the `main` branch.
 
 ## Reporting a vulnerability
 
-Email `security@observe.dev` with a description of the issue, a
+Report via GitHub Security Advisories at https://github.com/useteploy/teploy-observe/security/advisories/new with a description of the issue, a
 reproducer, and the affected version.  Please do **not** file a public
 GitHub issue for security reports.
 

@@ -187,7 +187,7 @@
       <a href="#features">Features</a>
       <a href="#compare">Compare</a>
       <a href="https://github.com/teploy/observe">GitHub</a>
-      <a class="btn ghost" href="https://demo.observe.dev">Live demo</a>
+      <a class="btn ghost" href="https://github.com/useteploy/teploy-observe">Live demo</a>
     </nav>
   </div>
 </header>
@@ -201,11 +201,11 @@
     </p>
     <div class="hero-ctas">
       <a class="btn" href="#install">Install in 60 seconds</a>
-      <a class="btn ghost" href="https://demo.observe.dev">Try the demo →</a>
+      <a class="btn ghost" href="https://github.com/useteploy/teploy-observe">Try the demo →</a>
     </div>
 
     <div class="install" id="install">
-      <code>curl -sL https://observe.dev/install.sh | sh</code>
+      <code>curl -sL https://raw.githubusercontent.com/useteploy/teploy-observe/main/scripts/install.sh | sh</code>
       <button id="copy-install">Copy</button>
     </div>
   </div>
@@ -304,14 +304,14 @@
     <div>
       <a href="/docs/api">API</a>
       <a href="https://github.com/teploy/observe">GitHub</a>
-      <a href="https://demo.observe.dev">Demo</a>
+      <a href="https://github.com/useteploy/teploy-observe">Demo</a>
     </div>
   </div>
 </footer>
 
 <script>
   document.getElementById("copy-install").addEventListener("click", () => {
-    navigator.clipboard.writeText("curl -sL https://observe.dev/install.sh | sh");
+    navigator.clipboard.writeText("curl -sL https://raw.githubusercontent.com/useteploy/teploy-observe/main/scripts/install.sh | sh");
     const b = document.getElementById("copy-install");
     const prev = b.textContent;
     b.textContent = "✓ Copied";

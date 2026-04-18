@@ -15,7 +15,7 @@ Point the build directory at `marketing/` — no build step required.
 ### Via Observe's bundled Caddy
 Copy `index.html` into your Observe deployment and serve it at a separate host:
 ```
-caddy reverse-proxy --from observe.dev --to localhost:3000 \
+caddy reverse-proxy --from <your-domain> --to localhost:3000 \
   --handle "file_server /marketing"
 ```
 
