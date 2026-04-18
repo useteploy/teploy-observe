@@ -1,114 +1,127 @@
 # Teploy Observe
 
-All-in-one observability platform. Analytics, error tracking, APM, logs, session replay, monitoring, feature flags, experiments, and more -- in a single binary.
+Self-hosted observability in one binary. Analytics, error tracking, APM,
+logs, session replay, monitoring, feature flags, experiments — and three
+things no competitor bundles:
 
-Two processes. 100MB idle. Runs anywhere.
+1. **AI query assistant** on the SQL explorer. English in, SQL out (your
+   LLM key, your cost). Every call logged back to the LLM-tracing table.
+2. **Incident-mode markers.** When an alert fires, every time-series
+   chart overlays a translucent vertical band for the window.
+3. **Scheduled SQL exports** to any S3-compatible bucket (S3, R2, MinIO).
 
-## Quick Start
+Two processes. ~100MB idle. Runs on a $5 VPS.
 
-### Docker Compose (recommended)
+## Install
+
+### Homebrew (macOS, Linux)
+
+```bash
+brew install useteploy/tap/observe
+```
+
+### Scoop (Windows)
+
+```bash
+scoop bucket add useteploy https://github.com/useteploy/scoop-bucket
+scoop install observe
+```
+
+### Docker
 
 ```bash
 git clone https://github.com/useteploy/teploy-observe.git
-cd observe
-docker-compose up
+cd teploy-observe
+docker compose up
 ```
 
 Open `http://localhost:3000`. Default login: `admin` / `observe`.
 
-### Manual Setup
-
-Download the Observe binary and a Nucleus binary, then:
+### Install script
 
 ```bash
-# Start Nucleus
-./nucleus start --host 0.0.0.0 --no-tls --max-memory 512
-
-# Start Observe
-export OBSERVE_NUCLEUS_URL="postgres://localhost:5432/observe"
-export OBSERVE_JWT_SECRET="your-secret-here"
-export OBSERVE_ADMIN_USER="admin"
-export OBSERVE_ADMIN_PASSWORD="your-password"
-./observe
+curl -sL https://raw.githubusercontent.com/useteploy/teploy-observe/main/scripts/install.sh | sh
 ```
 
-Open `http://localhost:3000`.
+### Build from source
+
+```bash
+git clone https://github.com/useteploy/teploy-observe.git
+cd teploy-observe
+go build ./cmd/observe        # neutron-go is vendored; no network setup
+```
+
+You also need a Nucleus database binary — see the Docker compose file for
+the exact image and version.
 
 ## Features
 
 ### Analytics
-- Pageviews, visitors, sessions, bounce rate, duration
-- Top pages, referrers, UTM tracking, channel classification
-- Browser, OS, device, country, language breakdowns
-- Custom events with property drill-down
-- Funnels, retention cohorts, user journeys
-- Goals and conversion tracking
-- Real-time active visitors
-- Cookie-free, GDPR-compliant
+- Pageviews, visitors, sessions, bounce rate, duration.
+- Top pages, referrers, UTM tracking, channel classification.
+- Browser, OS, device, country, language breakdowns.
+- Custom events with property drill-down.
+- Funnels, retention cohorts, user journeys, goals.
+- Real-time active visitors.
+- Cookie-free, GDPR-compliant.
 
-### Error Tracking
-- Automatic error grouping (MD5 of type + in-app frames)
-- Stack trace viewer with source map support
-- Full-text search across error messages (BM25)
-- Issue management (open / resolved / ignored)
-- Release health tracking
-- Breadcrumb timeline
-- Error-to-session cross-correlation
+### Error tracking
+- Automatic grouping (MD5 of type + in-app frames).
+- Stack trace viewer with source-map support.
+- Full-text search across messages (BM25).
+- Issue status (open / resolved / ignored), release health, breadcrumbs.
+- Error-to-session cross-correlation.
 
-### APM / Distributed Tracing
-- OTLP HTTP/JSON trace ingestion
-- Service list with RED metrics (rate, errors, duration)
-- Trace waterfall and flamegraph views
-- Service dependency map
-- Latency percentiles (p50/p95/p99)
+### APM / distributed tracing
+- OTLP HTTP/JSON ingest.
+- Service list with RED metrics, waterfall + flame-graph views,
+  dependency map, p50/p95/p99 latency.
 
 ### Logs
-- Log ingestion with level, service, trace correlation
-- Full-text search
-- Log pipelines (JSON parse, regex extract, field rename, masking, sampling)
+- Level, service, trace-id correlation, full-text search.
+- Pipelines (JSON parse, regex extract, rename, mask, sample).
 
-### Session Replay
-- DOM snapshot + mouse/click/scroll/mutation recording
-- Playback with timeline scrubbing
-- Error correlation
+### Session replay
+- DOM snapshot + mouse / click / scroll / mutation recording.
+- Playback with timeline scrubbing and error correlation.
 
 ### Monitoring
-- Uptime HTTP monitors with response time tracking
-- Cron heartbeat monitors with missed check detection
-- Background checker with configurable intervals
+- Uptime HTTP monitors with response-time tracking.
+- Cron heartbeat monitors with missed-check detection.
 
-### LLM / AI Observability
-- Track model calls (prompt/completion tokens, cost, latency)
-- Auto cost estimation for GPT-4, Claude, etc.
-- Model breakdown and usage stats
+### LLM observability
+- Track model calls (tokens, cost, latency).
+- Cost estimation for GPT / Claude / Gemini.
+- The AI query assistant dogfoods this — every generated-SQL call writes
+  a row.
 
-### Infrastructure
-- Host metrics (CPU, memory, disk, network, load)
-- Agent report endpoint
-
-### Product Tools
-- Feature flags (boolean + multivariate, rollout %, user targeting)
-- A/B experiments (statistical significance, chi-squared testing)
-- Surveys (text, rating, NPS, multiple choice)
-- Custom dashboards with metric panels
+### Product tools
+- Feature flags (boolean + multivariate, rollout %, user targeting).
+- A/B experiments (frequentist p-value + Bayesian probability-to-beat).
+- Surveys, custom dashboards with panels.
 
 ### Platform
-- Multi-user with roles (admin, editor, viewer)
-- Alerting (threshold-based on any metric, cooldown)
-- Integrations (Jira, GitHub, PagerDuty, Slack, email)
-- Webhooks on alert trigger
-- SSO / SAML
-- Email report digests (daily/weekly)
-- Data export (CSV/JSON)
-- SQL query explorer
-- Tracked links and pixel tracking
-- User feedback widget
-- Saved views
+- **RBAC** enforced — JWT carries a role claim (`admin` / `editor` /
+  `viewer`). Writes require editor or admin; destructive config routes
+  require admin.
+- **Ingest is WAL-backed** — every event is durably written to
+  `$OBSERVE_QUEUE_DIR` before in-memory buffering. SIGKILL replays on
+  restart.
+- **Per-site rate limiting** — each site has its own token bucket. One
+  noisy site can't starve a quiet one. Admin-editable via
+  `PUT /api/v1/sites/{id}/ratelimit`.
+- Alerting (threshold per metric, cooldown, silence). Alert-fire
+  auto-opens an incident marker.
+- Integrations (Jira, GitHub, PagerDuty, Slack, email) + webhooks.
+- SSO / SAML, email digests, data export (CSV/JSON).
+- SQL query explorer with lexer-guarded read-only enforcement
+  (rejects `/* comment */ INSERT ...` and stacked statements).
+- `POST /api/v1/query/explain` returns the Nucleus plan.
 
-## JS SDKs
+## Tracker install
 
 ```html
-<!-- Analytics (pageviews, custom events, web vitals) -->
+<!-- Analytics -->
 <script defer src="https://your-observe.com/t/observe.js"
   data-site-id="YOUR_SITE_ID"></script>
 
@@ -120,7 +133,7 @@ Open `http://localhost:3000`.
 <script defer src="https://your-observe.com/t/observe-replay.js"
   data-site-id="YOUR_SITE_ID"></script>
 
-<!-- User feedback widget -->
+<!-- Feedback widget -->
 <script defer src="https://your-observe.com/t/observe-feedback.js"
   data-site-id="YOUR_SITE_ID"></script>
 ```
@@ -128,98 +141,117 @@ Open `http://localhost:3000`.
 ### Analytics API
 
 ```javascript
-// Track custom event
 observe.track("signup", { plan: "pro" });
-
-// Track revenue
 observe.revenue(49.99, "USD", { product: "annual" });
-
-// Track web vitals
 observe.trackVitals();
 ```
 
 ### Error API
 
 ```javascript
-// Manual capture
 observeErrors.captureException(error);
 observeErrors.captureMessage("Something went wrong");
 observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button" });
 ```
 
-## Environment Variables
+### Server-side SDKs
+
+| Language | Package | Install |
+|----------|---------|---------|
+| Python | `teploy-observe` | `pip install teploy-observe` |
+| Go | `sdk/go` | `go get github.com/useteploy/teploy-observe/sdk/go` |
+
+## Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OBSERVE_ADDR` | `:3000` | Listen address |
-| `OBSERVE_NUCLEUS_URL` | `postgres://localhost:5432/observe` | Nucleus connection |
-| `OBSERVE_JWT_SECRET` | (random) | JWT signing secret |
-| `OBSERVE_ADMIN_USER` | `admin` | Default admin username |
-| `OBSERVE_ADMIN_PASSWORD` | `observe` | Default admin password |
-| `OBSERVE_SESSION_SALT` | `observe-default-salt` | Session hashing salt |
-| `OBSERVE_RATE_LIMIT` | `1000` | Requests per second per IP |
-| `OBSERVE_BUFFER_SIZE` | `100000` | Max buffered events |
-| `OBSERVE_FLUSH_SIZE` | `500` | Flush at this many events |
-| `OBSERVE_FLUSH_INTERVAL_MS` | `2000` | Flush interval (ms) |
-| `OBSERVE_RAW_RETENTION_DAYS` | `30` | Raw event retention |
-| `OBSERVE_HOURLY_RETENTION_DAYS` | `365` | Hourly rollup retention |
-| `OBSERVE_SMTP_HOST` | | SMTP server for email reports |
-| `OBSERVE_SMTP_PORT` | `587` | SMTP port |
-| `OBSERVE_SMTP_USER` | | SMTP username |
-| `OBSERVE_SMTP_PASS` | | SMTP password |
-| `OBSERVE_SMTP_FROM` | | From email address |
+| `OBSERVE_ADDR` | `:3000` | Listen address. |
+| `OBSERVE_NUCLEUS_URL` | `postgres://localhost:5432/observe` | Nucleus connection. |
+| `OBSERVE_JWT_SECRET` | (random) | JWT signing secret — set in prod to persist sessions across restarts. |
+| `OBSERVE_ADMIN_USER` | `admin` | Bootstrap admin username. |
+| `OBSERVE_ADMIN_PASSWORD` | `observe` | Bootstrap admin password. Change on first login. |
+| `OBSERVE_SESSION_SALT` | `observe-default-salt` | Session-ID hashing salt. |
+| `OBSERVE_RATE_LIMIT` | `1000` | Default per-site events/sec. Per-site overrides via API. |
+| `OBSERVE_BUFFER_SIZE` | `100000` | Max buffered events in memory. |
+| `OBSERVE_FLUSH_SIZE` | `500` | Flush threshold (events). |
+| `OBSERVE_FLUSH_INTERVAL_MS` | `2000` | Flush threshold (time). |
+| `OBSERVE_DATA_DIR` | `./data` | Root dir for WAL, queue, local state. |
+| `OBSERVE_QUEUE_DIR` | `$OBSERVE_DATA_DIR/queue` | Ingest WAL directory. |
+| `OBSERVE_RAW_RETENTION_DAYS` | `30` | Raw event retention. |
+| `OBSERVE_HOURLY_RETENTION_DAYS` | `365` | Hourly rollup retention. |
+| `OBSERVE_LOG_ROUTES` | `0` | Set to `1` to print route table at boot. |
+| `OBSERVE_SMTP_HOST` | | SMTP server for email reports. |
+| `OBSERVE_SMTP_PORT` | `587` | SMTP port. |
+| `OBSERVE_SMTP_USER` | | SMTP username. |
+| `OBSERVE_SMTP_PASS` | | SMTP password. |
+| `OBSERVE_SMTP_FROM` | | From email address. |
 
-## API Endpoints
+## API
 
-### Ingestion (API Key auth via `X-API-Key` header)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/v1/events` | Ingest analytics event |
-| POST | `/api/v1/events/batch` | Ingest batch of events |
-| POST | `/api/v1/errors` | Ingest error event |
-| POST | `/api/v1/logs` | Ingest log entry |
-| POST | `/v1/traces` | OTLP trace ingestion |
-| POST | `/api/v1/llm/ingest` | Ingest LLM trace |
-| POST | `/api/v1/infra/report` | Report host metrics |
-| POST | `/api/v1/replays` | Ingest session replay |
-| POST | `/api/v1/feedback` | Submit user feedback |
-
-### Dashboard Queries (JWT auth via `Authorization: Bearer` header)
+### Ingestion (API key auth via `X-API-Key` header)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/v1/stats/overview` | Overview metrics |
-| GET | `/api/v1/stats/timeseries` | Time series chart data |
-| GET | `/api/v1/stats/pages` | Top pages |
-| GET | `/api/v1/stats/referrers` | Top referrers |
-| GET | `/api/v1/stats/journeys` | User journey paths |
-| GET | `/api/v1/stats/correlations` | Property correlations |
-| GET | `/api/v1/stats/retention` | Retention cohorts |
-| POST | `/api/v1/stats/funnel` | Funnel analysis |
-| GET | `/api/v1/issues` | Error issue list |
-| GET | `/api/v1/traces/services` | Service list with RED metrics |
-| GET | `/api/v1/traces/search` | Search traces |
-| GET | `/api/v1/logs/search` | Search logs |
-| GET | `/api/v1/llm/stats` | LLM usage stats |
-| GET | `/api/v1/infra/hosts` | Monitored hosts |
-| POST | `/api/v1/query` | SQL query explorer |
+| POST | `/api/v1/events` | Ingest analytics event. |
+| POST | `/api/v1/events/batch` | Ingest batch of events. |
+| POST | `/api/v1/errors` | Ingest error event. |
+| POST | `/api/v1/logs` | Ingest log entry. |
+| POST | `/v1/traces` | OTLP trace ingestion. |
+| POST | `/api/v1/llm/ingest` | Ingest LLM trace. |
+| POST | `/api/v1/infra/report` | Host metrics. |
+| POST | `/api/v1/replays` | Session replay events. |
+| POST | `/api/v1/feedback` | User feedback. |
+
+### Dashboard (JWT auth via `Authorization: Bearer`)
+
+| Method | Path | Role | Description |
+|--------|------|------|-------------|
+| GET | `/api/v1/stats/*` | any | Overview, timeseries, pages, referrers, journeys, correlations, retention. |
+| GET | `/api/v1/issues` | any | Error issue list. |
+| GET | `/api/v1/traces/*` | any | Service RED metrics, search, waterfall. |
+| GET | `/api/v1/logs/search` | any | Log search. |
+| POST | `/api/v1/query` | editor+ | SQL explorer (read-only, lexer-guarded). |
+| POST | `/api/v1/query/explain` | editor+ | Return the Nucleus plan. |
+| POST | `/api/v1/ai/query` | editor+ | NL → SQL via configured LLM. |
+| GET/PUT | `/api/v1/ai/config` | admin | Instance LLM provider / key. |
+| GET | `/api/v1/incidents` | any | List / filter incidents. |
+| POST | `/api/v1/incidents` | editor+ | Declare manual incident. |
+| POST | `/api/v1/incidents/{id}/close` | editor+ | Close. |
+| GET/POST/DELETE | `/api/v1/exports/scheduled` | admin | Scheduled SQL exports to S3. |
+| POST | `/api/v1/sites` | admin | Create site. |
+| DELETE | `/api/v1/sites/{id}` | admin | Delete site. |
+| PUT | `/api/v1/sites/{id}/ratelimit` | admin | Set per-site events/sec cap. |
+| POST | `/api/v1/platform/*` | admin | Users, alert rules, webhooks. |
 
 ## Architecture
 
 ```
-Browser/SDKs --> Observe (Go, 23MB) --> Nucleus (Rust, 32MB)
-                    |                       |
-                    |-- Analytics buffer     |-- MergeTree (events)
-                    |-- Error buffer         |-- KV (cache, HLL)
-                    |-- Background jobs      |-- FTS (search)
-                    |-- JWT/API key auth     |-- ReplacingMergeTree (rollups)
-                    |-- Rate limiter         |
-                    |-- Embedded UI          |
+Browser / SDKs
+     |
+     v
+Observe (Go, ~26MB)  --- JWT / API key auth, RBAC middleware
+     |                   per-site rate limiter
+     |                   disk-backed ingest WAL
+     |                   background jobs (rollups, retention,
+     |                                    exports, alerts)
+     |                   embedded SPA dashboard
+     |                   AI query assistant (admin-supplied LLM key)
+     |
+     v  pgwire
+Nucleus (Rust, ~32MB) --- SQL + multi-model (KV, columnar, FTS,
+                          vector, doc, graph, time-series)
+                          MergeTree, ReplacingMergeTree
+                          WAL, TLS, query cache
 ```
 
-Two processes. No Redis. No Kafka. No ClickHouse. No ZooKeeper.
+Two processes. No Redis, no Kafka, no ClickHouse, no ZooKeeper.
 
 ## License
 
-MIT
+**Server**: AGPL-3.0-or-later. See `LICENSE`.
+
+**SDKs** (`sdk/browser`, `sdk/sentry-shim`, `sdk/python`, `sdk/go`):
+MIT. Each SDK subdirectory has its own `LICENSE`.
+
+See `CONTRIBUTING.md` for contribution guidelines and `SECURITY.md` for
+vulnerability reports.
