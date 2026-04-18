@@ -8,7 +8,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/useteploy/observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
 // QueryService provides trace and service query methods for the dashboard.

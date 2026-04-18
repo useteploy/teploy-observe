@@ -13,7 +13,7 @@ import (
 	"github.com/neutron-dev/neutron-go/nucleus"
 	"github.com/neutron-dev/neutron-go/neutronauth"
 
-	"github.com/useteploy/observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
 // AuthService handles JWT token management, admin user authentication,

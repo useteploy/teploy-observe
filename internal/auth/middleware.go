@@ -7,7 +7,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/neutron"
 
-	"github.com/useteploy/observe/internal/ingest"
+	"github.com/useteploy/teploy-observe/internal/ingest"
 )
 
 type roleCtxKey struct{}

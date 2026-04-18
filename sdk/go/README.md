@@ -5,13 +5,13 @@ Go SDK for [Observe](https://observe.dev) — self-hosted analytics, errors, log
 ## Install
 
 ```
-go get github.com/useteploy/observe/sdk/go
+go get github.com/useteploy/teploy-observe/sdk/go
 ```
 
 ## Usage
 
 ```go
-import observe "github.com/useteploy/observe/sdk/go"
+import observe "github.com/useteploy/teploy-observe/sdk/go"
 
 func main() {
     client, err := observe.New(observe.Options{

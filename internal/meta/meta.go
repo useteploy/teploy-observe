@@ -9,7 +9,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/useteploy/observe/internal/jobs"
+	"github.com/useteploy/teploy-observe/internal/jobs"
 )
 
 // Snapshot is the wire shape of GET /api/v1/meta.

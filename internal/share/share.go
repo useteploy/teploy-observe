@@ -9,7 +9,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/useteploy/observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
 // ShareService manages share link tokens for public dashboard access.

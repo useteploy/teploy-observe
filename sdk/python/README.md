@@ -1,11 +1,11 @@
-# observe-sdk (Python)
+# teploy-observe (Python)
 
 Python SDK for [Observe](https://observe.dev) — self-hosted analytics, errors, logs, traces.
 
 ## Install
 
 ```
-pip install observe-sdk
+pip install teploy-observe
 ```
 
 Zero dependencies; stdlib only.

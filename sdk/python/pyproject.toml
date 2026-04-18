@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "observe-sdk"
+name = "teploy-observe"
 version = "0.1.0"
 description = "Python SDK for Observe — self-hosted analytics, errors, logs, traces."
 readme = "README.md"

@@ -21,8 +21,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/useteploy/observe/internal/dbutil"
-	"github.com/useteploy/observe/internal/explorer"
+	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/explorer"
 )
 
 // S3Destination is the encrypted-at-rest config payload for S3/R2 exports.

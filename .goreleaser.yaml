@@ -47,14 +47,14 @@ changelog:
 
 dockers:
   - image_templates:
-      - 'ghcr.io/useteploy/observe:{{ .Version }}-amd64'
+      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-amd64'
     dockerfile: Dockerfile
     use: buildx
     build_flag_templates:
       - --platform=linux/amd64
       - --label=org.opencontainers.image.title={{ .ProjectName }}
       - --label=org.opencontainers.image.version={{ .Version }}
-      - --label=org.opencontainers.image.source=https://github.com/useteploy/observe
+      - --label=org.opencontainers.image.source=https://github.com/useteploy/teploy-observe
       - --label=org.opencontainers.image.licenses=AGPL-3.0-or-later
     extra_files:
       - cmd
@@ -63,14 +63,14 @@ dockers:
       - go.mod
       - go.sum
   - image_templates:
-      - 'ghcr.io/useteploy/observe:{{ .Version }}-arm64'
+      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-arm64'
     dockerfile: Dockerfile
     use: buildx
     build_flag_templates:
       - --platform=linux/arm64
       - --label=org.opencontainers.image.title={{ .ProjectName }}
       - --label=org.opencontainers.image.version={{ .Version }}
-      - --label=org.opencontainers.image.source=https://github.com/useteploy/observe
+      - --label=org.opencontainers.image.source=https://github.com/useteploy/teploy-observe
       - --label=org.opencontainers.image.licenses=AGPL-3.0-or-later
     goarch: arm64
     extra_files:
@@ -81,14 +81,14 @@ dockers:
       - go.sum
 
 docker_manifests:
-  - name_template: 'ghcr.io/useteploy/observe:{{ .Version }}'
+  - name_template: 'ghcr.io/useteploy/teploy-observe:{{ .Version }}'
     image_templates:
-      - 'ghcr.io/useteploy/observe:{{ .Version }}-amd64'
-      - 'ghcr.io/useteploy/observe:{{ .Version }}-arm64'
-  - name_template: 'ghcr.io/useteploy/observe:latest'
+      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-amd64'
+      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-arm64'
+  - name_template: 'ghcr.io/useteploy/teploy-observe:latest'
     image_templates:
-      - 'ghcr.io/useteploy/observe:{{ .Version }}-amd64'
-      - 'ghcr.io/useteploy/observe:{{ .Version }}-arm64'
+      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-amd64'
+      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-arm64'
 
 brews:
   - name: observe

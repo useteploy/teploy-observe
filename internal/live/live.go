@@ -10,7 +10,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/useteploy/observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
 // LiveService provides real-time event streaming via SSE.

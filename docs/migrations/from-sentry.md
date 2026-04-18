@@ -75,7 +75,7 @@ sentry.CaptureException(err)
 
 **Observe:**
 ```go
-import observe "github.com/useteploy/observe/sdk/go"
+import observe "github.com/useteploy/teploy-observe/sdk/go"
 
 client, _ := observe.New(observe.Options{
     Endpoint: "https://observe.example.com",

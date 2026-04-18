@@ -10,8 +10,8 @@ import (
 
 	"github.com/neutron-dev/neutron-go/neutron"
 
-	"github.com/useteploy/observe/internal/geo"
-	"github.com/useteploy/observe/internal/session"
+	"github.com/useteploy/teploy-observe/internal/geo"
+	"github.com/useteploy/teploy-observe/internal/session"
 )
 
 // IngestInput is the JSON body for POST /api/v1/events.

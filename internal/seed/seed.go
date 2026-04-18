@@ -13,9 +13,9 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/useteploy/observe/internal/logs"
-	"github.com/useteploy/observe/internal/replays"
-	"github.com/useteploy/observe/internal/tracing"
+	"github.com/useteploy/teploy-observe/internal/logs"
+	"github.com/useteploy/teploy-observe/internal/replays"
+	"github.com/useteploy/teploy-observe/internal/tracing"
 )
 
 const defaultSiteID = "default"
