@@ -94,7 +94,7 @@ brews:
   - name: observe
     repository:
       owner: useteploy
-      name: homebrew-observe
+      name: homebrew-tap
       token: '{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}'
     homepage: 'https://observe.dev'
     description: 'Self-hosted, single-binary replacement for PostHog + Umami + SigNoz + Sentry'
@@ -103,3 +103,13 @@ brews:
       bin.install "observe"
     test: |
       system "#{bin}/observe", "--version"
+
+scoops:
+  - name: observe
+    repository:
+      owner: useteploy
+      name: scoop-bucket
+      token: '{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}'
+    homepage: 'https://observe.dev'
+    description: 'Self-hosted, single-binary replacement for PostHog + Umami + SigNoz + Sentry'
+    license: 'AGPL-3.0-or-later'
