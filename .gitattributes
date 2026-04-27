@@ -1,0 +1,12 @@
+# GitHub language stats
+# Vendored Go modules — don't count toward language breakdown.
+vendor/** linguist-vendored
+
+# Generated UI bundle — counts toward "generated," not language breakdown.
+cmd/observe/ui/dist/** linguist-generated
+
+# Reference / comparison codebases under ref/ — not our code.
+ref/** linguist-vendored
+
+# Generated geo data — binary, not human-authored.
+internal/geo/geo_ranges.bin binary linguist-generated

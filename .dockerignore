@@ -1,0 +1,32 @@
+# Build context excludes — keep image small and fast.
+
+# Local dev state
+.git
+.github
+.claude
+.idea
+.vscode
+*.swp
+.DS_Store
+
+# Tests + benches not needed in the runtime image
+e2e/
+bench/
+docs/
+ref/
+
+# Reference codebases (already gitignored, defensive)
+ref/
+
+# Local data + build outputs
+*.log
+*.db
+nucleus_data/
+data/
+
+# Markdown noise
+README.md
+CHANGELOG.md
+CONTRIBUTING.md
+SECURITY.md
+BENCHMARKS.md
