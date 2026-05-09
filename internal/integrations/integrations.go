@@ -109,7 +109,8 @@ type AlertPayload struct {
 	URL       string `json:"url"`
 }
 
-// Fire sends an alert to all enabled integrations for a site.
+// Fire sends an alert to all enabled integrations for a site. Each attempt
+// is recorded in integration_deliveries so users can inspect history and replay.
 func (s *IntegrationService) Fire(ctx context.Context, siteID string, payload AlertPayload) {
 	intgs, err := s.List(ctx, siteID)
 	if err != nil {
@@ -117,12 +118,43 @@ func (s *IntegrationService) Fire(ctx context.Context, siteID string, payload Al
 	}
 	for _, intg := range intgs {
 		go func(i Integration) {
-			err := s.fireOne(i, payload)
-			if err != nil {
-				s.logger.Error("integration fire failed", "type", i.IntType, "name", i.Name, "err", err)
-			}
+			s.fireAndRecord(context.Background(), i, payload, false, false)
 		}(intg)
 	}
+}
+
+// fireAndRecord runs fireOne and writes a delivery row regardless of outcome.
+func (s *IntegrationService) fireAndRecord(ctx context.Context, i Integration, payload AlertPayload, isTest, isReplay bool) error {
+	start := time.Now()
+	err := s.fireOne(i, payload)
+	dur := time.Since(start).Milliseconds()
+	status := "ok"
+	errMsg := ""
+	if err != nil {
+		status = "failed"
+		errMsg = err.Error()
+		s.logger.Error("integration fire failed", "type", i.IntType, "name", i.Name, "err", err)
+	}
+	body, _ := json.Marshal(payload)
+	_, recErr := s.db.SQL().Exec(ctx,
+		`INSERT INTO integration_deliveries
+			(delivery_id, tenant_id, integration_id, site_id, payload, status, error_message, duration_ms, created_at, is_test, is_replay)
+		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		genID(), i.IntegrationID, i.SiteID, string(body), status, errMsg, dur,
+		strconv.FormatInt(time.Now().UTC().UnixMilli(), 10),
+		boolStr(isTest), boolStr(isReplay),
+	)
+	if recErr != nil {
+		s.logger.Warn("integration delivery record failed", "err", recErr)
+	}
+	return err
+}
+
+func boolStr(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
 }
 
 // fireOne dispatches to the correct per-type fire fn.
@@ -166,7 +198,71 @@ func (s *IntegrationService) Test(ctx context.Context, integrationID string) err
 		Threshold: "0",
 		URL:       "",
 	}
-	return s.fireOne(rows[0], sample)
+	return s.fireAndRecord(ctx, rows[0], sample, true, false)
+}
+
+// Delivery is one historical attempt to deliver a payload through an integration.
+type Delivery struct {
+	DeliveryID    string `json:"delivery_id" db:"delivery_id"`
+	IntegrationID string `json:"integration_id" db:"integration_id"`
+	SiteID        string `json:"site_id" db:"site_id"`
+	Payload       string `json:"payload" db:"payload"`
+	Status        string `json:"status" db:"status"`
+	ErrorMessage  string `json:"error_message" db:"error_message"`
+	DurationMs    int64  `json:"duration_ms" db:"duration_ms"`
+	CreatedAt     int64  `json:"created_at" db:"created_at"`
+	IsTest        string `json:"is_test" db:"is_test"`
+	IsReplay      string `json:"is_replay" db:"is_replay"`
+}
+
+// ListDeliveries returns the most recent delivery attempts for an integration.
+func (s *IntegrationService) ListDeliveries(ctx context.Context, integrationID string, limit int) ([]Delivery, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 20
+	}
+	q := fmt.Sprintf(
+		`SELECT delivery_id, integration_id, site_id, payload, status,
+		        COALESCE(error_message, '') AS error_message,
+		        CAST(duration_ms AS BIGINT) AS duration_ms,
+		        CAST(created_at AS BIGINT) AS created_at,
+		        is_test, is_replay
+		 FROM integration_deliveries
+		 WHERE integration_id = $1
+		 ORDER BY created_at DESC
+		 LIMIT %d`, limit)
+	return nucleus.Query[Delivery](ctx, s.db.SQL(), q, integrationID)
+}
+
+// Replay re-fires the payload from a prior delivery through the same integration.
+func (s *IntegrationService) Replay(ctx context.Context, deliveryID string) error {
+	rows, err := nucleus.Query[Delivery](ctx, s.db.SQL(),
+		`SELECT delivery_id, integration_id, site_id, payload, status,
+		        COALESCE(error_message, '') AS error_message,
+		        CAST(duration_ms AS BIGINT) AS duration_ms,
+		        CAST(created_at AS BIGINT) AS created_at,
+		        is_test, is_replay
+		 FROM integration_deliveries WHERE delivery_id = $1 LIMIT 1`, deliveryID)
+	if err != nil {
+		return fmt.Errorf("lookup delivery: %w", err)
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("delivery not found")
+	}
+	intgs, err := nucleus.Query[Integration](ctx, s.db.SQL(),
+		`SELECT integration_id, tenant_id, site_id, name, int_type,
+		        COALESCE(config, '') AS config, enabled, created_at, version
+		 FROM integrations WHERE integration_id = $1`, rows[0].IntegrationID)
+	if err != nil {
+		return fmt.Errorf("lookup integration: %w", err)
+	}
+	if len(intgs) == 0 {
+		return fmt.Errorf("integration not found")
+	}
+	var payload AlertPayload
+	if err := json.Unmarshal([]byte(rows[0].Payload), &payload); err != nil {
+		return fmt.Errorf("decode payload: %w", err)
+	}
+	return s.fireAndRecord(ctx, intgs[0], payload, false, true)
 }
 
 func (s *IntegrationService) fireJira(configJSON string, p AlertPayload) error {

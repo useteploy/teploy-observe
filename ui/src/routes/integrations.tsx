@@ -15,6 +15,19 @@ interface Integration {
   type: string; config: string; enabled: string; created_at: string;
 }
 
+interface Delivery {
+  delivery_id: string;
+  integration_id: string;
+  site_id: string;
+  payload: string;
+  status: string;
+  error_message: string;
+  duration_ms: number;
+  created_at: number;
+  is_test: string;
+  is_replay: string;
+}
+
 const TYPES = [
   { value: "slack", label: "Slack" },
   { value: "email", label: "Email" },
@@ -36,6 +49,53 @@ export default function IntegrationsPage() {
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, { ok: boolean; message: string }>>({});
+  const [historyId, setHistoryId] = useState<string | null>(null);
+  const [deliveries, setDeliveries] = useState<Record<string, Delivery[]>>({});
+  const [historyLoading, setHistoryLoading] = useState<string | null>(null);
+  const [replayingId, setReplayingId] = useState<string | null>(null);
+
+  const loadDeliveries = async (integrationID: string) => {
+    setHistoryLoading(integrationID);
+    try {
+      const rows = await get<Delivery[]>(`${BASE}/${integrationID}/deliveries?limit=20`);
+      setDeliveries((prev) => ({ ...prev, [integrationID]: rows || [] }));
+    } catch {
+      setDeliveries((prev) => ({ ...prev, [integrationID]: [] }));
+    } finally {
+      setHistoryLoading(null);
+    }
+  };
+
+  const toggleHistory = async (integrationID: string) => {
+    if (historyId === integrationID) {
+      setHistoryId(null);
+      return;
+    }
+    setHistoryId(integrationID);
+    if (!deliveries[integrationID]) {
+      await loadDeliveries(integrationID);
+    }
+  };
+
+  const handleReplay = async (deliveryID: string, integrationID: string) => {
+    setReplayingId(deliveryID);
+    try {
+      await post(`${BASE}/deliveries/${deliveryID}/replay`, {});
+      await loadDeliveries(integrationID);
+    } catch (err) {
+      console.error("Failed to replay delivery:", err);
+    } finally {
+      setReplayingId(null);
+    }
+  };
+
+  const formatRelative = (ms: number): string => {
+    const diff = Date.now() - ms;
+    if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
+    if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+    if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+    return new Date(ms).toLocaleString();
+  };
 
   const [formName, setFormName] = useState("");
   const [formType, setFormType] = useState("slack");
@@ -116,38 +176,84 @@ export default function IntegrationsPage() {
       ) : (
         <div class="settings-list">
           {items.map(item => (
-            <div key={item.integration_id} class="settings-row">
-              <StatusBadge status={item.enabled === "true" ? "enabled" : "disabled"} size="sm" />
-              <span class="settings-row-name">{item.name}</span>
-              <span style={{ fontSize: "11px", padding: "2px 8px", borderRadius: "var(--obs-radius-full)", background: "var(--obs-surface-hover)", color: "var(--obs-text-secondary)" }}>
-                {TYPES.find(t => t.value === item.type)?.label || item.type}
-              </span>
-              <button
-                class="obs-btn obs-btn--sm"
-                disabled={testingId === item.integration_id}
-                onClick={async () => {
-                  setTestingId(item.integration_id);
-                  try {
-                    const r = await post<{ ok: boolean; message: string }>(`${BASE}/${item.integration_id}/test`, {});
-                    setTestResult((prev) => ({ ...prev, [item.integration_id]: r }));
-                  } catch (err: any) {
-                    setTestResult((prev) => ({ ...prev, [item.integration_id]: { ok: false, message: err?.message || "test failed" } }));
-                  } finally {
-                    setTestingId(null);
-                  }
-                }}
-              >
-                {testingId === item.integration_id ? "Testing..." : "Send test"}
-              </button>
-              {testResult[item.integration_id] && (
-                <span
-                  class={`integrations-test-result ${testResult[item.integration_id].ok ? "integrations-test-result--ok" : "integrations-test-result--err"}`}
-                  title={testResult[item.integration_id].message}
-                >
-                  {testResult[item.integration_id].ok ? "✓ delivered" : "✗ failed"}
+            <div key={item.integration_id} style={{ borderBottom: "1px solid var(--obs-border-subtle)" }}>
+              <div class="settings-row" style={{ borderBottom: "none" }}>
+                <StatusBadge status={item.enabled === "true" ? "enabled" : "disabled"} size="sm" />
+                <span class="settings-row-name">{item.name}</span>
+                <span style={{ fontSize: "11px", padding: "2px 8px", borderRadius: "var(--obs-radius-full)", background: "var(--obs-surface-hover)", color: "var(--obs-text-secondary)" }}>
+                  {TYPES.find(t => t.value === item.type)?.label || item.type}
                 </span>
+                <button
+                  class="obs-btn obs-btn--sm"
+                  disabled={testingId === item.integration_id}
+                  onClick={async () => {
+                    setTestingId(item.integration_id);
+                    try {
+                      const r = await post<{ ok: boolean; message: string }>(`${BASE}/${item.integration_id}/test`, {});
+                      setTestResult((prev) => ({ ...prev, [item.integration_id]: r }));
+                      if (historyId === item.integration_id) {
+                        await loadDeliveries(item.integration_id);
+                      }
+                    } catch (err: any) {
+                      setTestResult((prev) => ({ ...prev, [item.integration_id]: { ok: false, message: err?.message || "test failed" } }));
+                    } finally {
+                      setTestingId(null);
+                    }
+                  }}
+                >
+                  {testingId === item.integration_id ? "Testing..." : "Send test"}
+                </button>
+                {testResult[item.integration_id] && (
+                  <span
+                    class={`integrations-test-result ${testResult[item.integration_id].ok ? "integrations-test-result--ok" : "integrations-test-result--err"}`}
+                    title={testResult[item.integration_id].message}
+                  >
+                    {testResult[item.integration_id].ok ? "✓ delivered" : "✗ failed"}
+                  </span>
+                )}
+                <button
+                  class="obs-btn obs-btn--sm"
+                  onClick={() => toggleHistory(item.integration_id)}
+                >
+                  {historyId === item.integration_id ? "Hide history" : "History"}
+                </button>
+                <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => setDeletingId(item.integration_id)}>Delete</button>
+              </div>
+              {historyId === item.integration_id && (
+                <div style={{ padding: "8px 16px 14px 16px", background: "var(--obs-surface-hover)" }}>
+                  {historyLoading === item.integration_id ? (
+                    <div style={{ fontSize: "12px", color: "var(--obs-text-muted)" }}>Loading…</div>
+                  ) : !deliveries[item.integration_id] || deliveries[item.integration_id].length === 0 ? (
+                    <div style={{ fontSize: "12px", color: "var(--obs-text-muted)" }}>No deliveries yet. Hit "Send test" or wait for an alert.</div>
+                  ) : (
+                    <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                      {deliveries[item.integration_id].map(d => (
+                        <div key={d.delivery_id} style={{ display: "flex", alignItems: "center", gap: "10px", fontSize: "12px", padding: "4px 0" }}>
+                          <span class={`integrations-test-result ${d.status === "ok" ? "integrations-test-result--ok" : "integrations-test-result--err"}`}
+                            title={d.error_message || ""}
+                            style={{ minWidth: "70px", textAlign: "center" }}>
+                            {d.status === "ok" ? "✓ ok" : "✗ failed"}
+                          </span>
+                          <span style={{ color: "var(--obs-text-muted)", minWidth: "90px" }}>{formatRelative(d.created_at)}</span>
+                          <span style={{ color: "var(--obs-text-secondary)", fontVariantNumeric: "tabular-nums", minWidth: "60px" }}>{d.duration_ms}ms</span>
+                          {d.is_test === "true" && <span style={{ fontSize: "10px", color: "var(--obs-accent)", textTransform: "uppercase" }}>test</span>}
+                          {d.is_replay === "true" && <span style={{ fontSize: "10px", color: "var(--obs-warning)", textTransform: "uppercase" }}>replay</span>}
+                          <span style={{ flex: 1, color: "var(--obs-text-muted)", fontFamily: "var(--obs-font-mono, monospace)", fontSize: "11px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {d.error_message || d.payload.slice(0, 80)}
+                          </span>
+                          <button
+                            class="obs-btn obs-btn--sm"
+                            disabled={replayingId === d.delivery_id}
+                            onClick={() => handleReplay(d.delivery_id, item.integration_id)}
+                          >
+                            {replayingId === d.delivery_id ? "Replaying…" : "Replay"}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               )}
-              <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => setDeletingId(item.integration_id)}>Delete</button>
             </div>
           ))}
         </div>
