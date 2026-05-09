@@ -234,7 +234,160 @@ func seedTraces(ctx context.Context, db *nucleus.Client) error {
 			return fmt.Errorf("ingest trace %d: %w", i, err)
 		}
 	}
+
+	// Synthesize one trace per perf-issue detector so a fresh install shows
+	// real findings on the Performance tab. Each helper builds an OTLP
+	// envelope with exactly the span shape that detector looks for.
+	for _, build := range []func() tracing.ExportTraceRequest{
+		buildNPlusOneTrace,
+		buildSlowDBTrace,
+		buildConsecutiveDBTrace,
+		buildSlowHTTPTrace,
+	} {
+		if _, err := ingest.IngestSync(ctx, defaultSiteID, build()); err != nil {
+			return fmt.Errorf("ingest perf-detector trace: %w", err)
+		}
+	}
 	return nil
+}
+
+// buildNPlusOneTrace creates a parent + 5 sibling DB spans whose statements
+// share a fingerprint. NPlusOneDB needs >=4 to fire, 5 keeps it well above.
+func buildNPlusOneTrace() tracing.ExportTraceRequest {
+	startNs := time.Now().UTC().Add(-5 * time.Minute).UnixNano()
+	traceID := genID() + genID()
+	parent := genID()[:16]
+
+	spans := []tracing.OTLPSpan{{
+		TraceID: traceID, SpanID: parent, Name: "GET /users-with-orders", Kind: 2,
+		StartTimeUnixNano: strconv.FormatInt(startNs, 10),
+		EndTimeUnixNano:   strconv.FormatInt(startNs+250_000_000, 10),
+	}}
+	cursor := startNs + 5_000_000
+	for i := 0; i < 5; i++ {
+		dur := int64(20_000_000)
+		spans = append(spans, tracing.OTLPSpan{
+			TraceID: traceID, SpanID: genID()[:16], ParentSpanID: parent,
+			Name: "db.query", Kind: 3,
+			StartTimeUnixNano: strconv.FormatInt(cursor, 10),
+			EndTimeUnixNano:   strconv.FormatInt(cursor+dur, 10),
+			Attributes: []tracing.KeyValue{
+				{Key: "service.name", Value: tracing.AnyValue{StringValue: "api"}},
+				{Key: "db.system", Value: tracing.AnyValue{StringValue: "postgres"}},
+				{Key: "db.statement", Value: tracing.AnyValue{StringValue: fmt.Sprintf("SELECT * FROM users WHERE id = %d", i+1)}},
+			},
+		})
+		cursor += dur
+	}
+	return wrapTrace("api", spans)
+}
+
+// buildSlowDBTrace creates a single 1.5s DB span — well above the 1s
+// SlowDBQuery threshold.
+func buildSlowDBTrace() tracing.ExportTraceRequest {
+	startNs := time.Now().UTC().Add(-4 * time.Minute).UnixNano()
+	traceID := genID() + genID()
+	parent := genID()[:16]
+	dbDur := int64(1_500_000_000)
+
+	spans := []tracing.OTLPSpan{
+		{
+			TraceID: traceID, SpanID: parent, Name: "GET /report", Kind: 2,
+			StartTimeUnixNano: strconv.FormatInt(startNs, 10),
+			EndTimeUnixNano:   strconv.FormatInt(startNs+dbDur+10_000_000, 10),
+		},
+		{
+			TraceID: traceID, SpanID: genID()[:16], ParentSpanID: parent,
+			Name: "db.query", Kind: 3,
+			StartTimeUnixNano: strconv.FormatInt(startNs+1_000_000, 10),
+			EndTimeUnixNano:   strconv.FormatInt(startNs+1_000_000+dbDur, 10),
+			Attributes: []tracing.KeyValue{
+				{Key: "service.name", Value: tracing.AnyValue{StringValue: "api"}},
+				{Key: "db.system", Value: tracing.AnyValue{StringValue: "postgres"}},
+				{Key: "db.statement", Value: tracing.AnyValue{StringValue: "SELECT * FROM events JOIN users ON events.user_id = users.id WHERE created_at > NOW() - INTERVAL '30 days'"}},
+			},
+		},
+	}
+	return wrapTrace("api", spans)
+}
+
+// buildConsecutiveDBTrace creates 3 serially-executed sibling DB spans
+// totalling >100ms — meets the ConsecutiveDB threshold without the same
+// fingerprint (so it doesn't double-fire as N+1).
+func buildConsecutiveDBTrace() tracing.ExportTraceRequest {
+	startNs := time.Now().UTC().Add(-3 * time.Minute).UnixNano()
+	traceID := genID() + genID()
+	parent := genID()[:16]
+
+	spans := []tracing.OTLPSpan{{
+		TraceID: traceID, SpanID: parent, Name: "GET /dashboard-load", Kind: 2,
+		StartTimeUnixNano: strconv.FormatInt(startNs, 10),
+		EndTimeUnixNano:   strconv.FormatInt(startNs+200_000_000, 10),
+	}}
+	statements := []string{
+		"SELECT * FROM users WHERE org_id = 42",
+		"SELECT * FROM orders WHERE org_id = 42",
+		"SELECT * FROM payments WHERE org_id = 42",
+	}
+	cursor := startNs + 5_000_000
+	for _, stmt := range statements {
+		dur := int64(50_000_000) // 50ms each → 150ms total > 100ms floor
+		spans = append(spans, tracing.OTLPSpan{
+			TraceID: traceID, SpanID: genID()[:16], ParentSpanID: parent,
+			Name: "db.query", Kind: 3,
+			StartTimeUnixNano: strconv.FormatInt(cursor, 10),
+			EndTimeUnixNano:   strconv.FormatInt(cursor+dur, 10),
+			Attributes: []tracing.KeyValue{
+				{Key: "service.name", Value: tracing.AnyValue{StringValue: "api"}},
+				{Key: "db.system", Value: tracing.AnyValue{StringValue: "postgres"}},
+				{Key: "db.statement", Value: tracing.AnyValue{StringValue: stmt}},
+			},
+		})
+		cursor += dur
+	}
+	return wrapTrace("api", spans)
+}
+
+// buildSlowHTTPTrace creates a single 5s outbound HTTP client span — above
+// the 3s SlowHTTPCall threshold.
+func buildSlowHTTPTrace() tracing.ExportTraceRequest {
+	startNs := time.Now().UTC().Add(-2 * time.Minute).UnixNano()
+	traceID := genID() + genID()
+	parent := genID()[:16]
+	dur := int64(5_000_000_000)
+
+	spans := []tracing.OTLPSpan{
+		{
+			TraceID: traceID, SpanID: parent, Name: "POST /webhook-fanout", Kind: 2,
+			StartTimeUnixNano: strconv.FormatInt(startNs, 10),
+			EndTimeUnixNano:   strconv.FormatInt(startNs+dur+10_000_000, 10),
+		},
+		{
+			TraceID: traceID, SpanID: genID()[:16], ParentSpanID: parent,
+			Name: "HTTP POST", Kind: 3,
+			StartTimeUnixNano: strconv.FormatInt(startNs+1_000_000, 10),
+			EndTimeUnixNano:   strconv.FormatInt(startNs+1_000_000+dur, 10),
+			Attributes: []tracing.KeyValue{
+				{Key: "service.name", Value: tracing.AnyValue{StringValue: "api"}},
+				{Key: "http.url", Value: tracing.AnyValue{StringValue: "https://hooks.example.com/notify"}},
+				{Key: "http.method", Value: tracing.AnyValue{StringValue: "POST"}},
+			},
+		},
+	}
+	return wrapTrace("api", spans)
+}
+
+func wrapTrace(rootService string, spans []tracing.OTLPSpan) tracing.ExportTraceRequest {
+	return tracing.ExportTraceRequest{
+		ResourceSpans: []tracing.ResourceSpans{{
+			Resource: tracing.Resource{
+				Attributes: []tracing.KeyValue{
+					{Key: "service.name", Value: tracing.AnyValue{StringValue: rootService}},
+				},
+			},
+			ScopeSpans: []tracing.ScopeSpans{{Spans: spans}},
+		}},
+	}
 }
 
 func seedReplays(ctx context.Context, db *nucleus.Client) error {
