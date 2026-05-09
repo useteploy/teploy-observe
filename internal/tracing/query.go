@@ -431,6 +431,101 @@ type TraceErrorHit struct {
 	IssueID    string    `json:"issue_id"`
 }
 
+// PerformanceIssue is a row from performance_issues for the UI.
+type PerformanceIssue struct {
+	IssueID      string `json:"issue_id" db:"issue_id"`
+	TraceID      string `json:"trace_id" db:"trace_id"`
+	DetectorName string `json:"detector_name" db:"detector_name"`
+	Fingerprint  string `json:"fingerprint" db:"fingerprint"`
+	Title        string `json:"title" db:"title"`
+	Description  string `json:"description" db:"description"`
+	Severity     string `json:"severity" db:"severity"`
+	Count        int64  `json:"count" db:"count"`
+	FirstSeen    int64  `json:"first_seen" db:"first_seen"`
+	LastSeen     int64  `json:"last_seen" db:"last_seen"`
+}
+
+// ListPerformanceIssues returns detector-emitted issues that touched the
+// given window, grouped by fingerprint (most-recent fire wins thanks to the
+// replacing-mergetree on last_seen).
+func (q *QueryService) ListPerformanceIssues(ctx context.Context, siteID string, fromMs, toMs int64) ([]PerformanceIssue, error) {
+	type row struct {
+		IssueID      string `db:"issue_id"`
+		TraceID      string `db:"trace_id"`
+		DetectorName string `db:"detector_name"`
+		Fingerprint  string `db:"fingerprint"`
+		Title        string `db:"title"`
+		Description  string `db:"description"`
+		Severity     string `db:"severity"`
+		Count        string `db:"count"`
+		FirstSeen    string `db:"first_seen"`
+		LastSeen     string `db:"last_seen"`
+	}
+	rows, err := nucleus.Query[row](ctx, q.db.SQL(),
+		`SELECT issue_id, trace_id, detector_name, fingerprint, title, description, severity,
+			CAST(count AS TEXT) AS count,
+			CAST(first_seen AS TEXT) AS first_seen,
+			CAST(last_seen AS TEXT) AS last_seen
+		 FROM performance_issues
+		 WHERE site_id = $1
+		   AND CAST(last_seen AS BIGINT) >= CAST($2 AS BIGINT)
+		   AND CAST(first_seen AS BIGINT) <= CAST($3 AS BIGINT)`,
+		siteID, dbutil.IntParam(fromMs), dbutil.IntParam(toMs),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Collapse to the latest row per fingerprint in Go — the
+	// replacing-mergetree dedupes at the storage layer but we still need
+	// to fold post-CAST in case multiple bucket fires landed in this
+	// window.
+	type acc struct {
+		row       row
+		count     int64
+		first     int64
+		last      int64
+	}
+	by := make(map[string]*acc)
+	for _, r := range rows {
+		fp := r.Fingerprint
+		c := parseInt(r.Count)
+		first := parseInt(r.FirstSeen)
+		last := parseInt(r.LastSeen)
+		a, ok := by[fp]
+		if !ok {
+			by[fp] = &acc{row: r, count: c, first: first, last: last}
+			continue
+		}
+		a.count += c
+		if first < a.first || a.first == 0 {
+			a.first = first
+		}
+		if last > a.last {
+			a.last = last
+			a.row = r // newest row wins for title/desc/severity
+		}
+	}
+
+	out := make([]PerformanceIssue, 0, len(by))
+	for _, a := range by {
+		out = append(out, PerformanceIssue{
+			IssueID:      a.row.IssueID,
+			TraceID:      a.row.TraceID,
+			DetectorName: a.row.DetectorName,
+			Fingerprint:  a.row.Fingerprint,
+			Title:        a.row.Title,
+			Description:  a.row.Description,
+			Severity:     a.row.Severity,
+			Count:        a.count,
+			FirstSeen:    a.first,
+			LastSeen:     a.last,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].LastSeen > out[j].LastSeen })
+	return out, nil
+}
+
 // TraceErrors returns error events correlated with a trace by timestamp overlap.
 func (q *QueryService) TraceErrors(ctx context.Context, traceID, siteID string) ([]TraceErrorHit, error) {
 	type bounds struct {

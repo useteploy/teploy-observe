@@ -829,6 +829,12 @@ func main() {
 	// --- Public share dashboard ---
 	r.HandleFunc("GET /share/{token}", shareViewHandler(shareSvc, uiSub))
 
+	// --- Performance issue detectors API ---
+	// Routes live in perf_handlers.go; only the registration call is here so
+	// merge-conflict surface with W4.A (heatmaps) and W4.B (replay→issue) is
+	// a single line addition rather than a scattered diff.
+	RegisterPerformanceRoutes(r.Group("/api/v1/performance", jwtMW), traceQuery)
+
 	// SPA catch-all: serve index.html for all non-API, non-asset GET requests.
 	// This must be registered last so API routes take precedence.
 	indexHTML, _ := fs.ReadFile(uiSub, "index.html")

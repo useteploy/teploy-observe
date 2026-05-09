@@ -12,6 +12,7 @@ import (
 	"github.com/neutron-dev/neutron-go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/tracing/detectors"
 )
 
 // bucketSizeMs is the rollup bucket width for service_stats / service_dependencies.
@@ -21,12 +22,13 @@ const bucketSizeMs int64 = 60_000
 
 // IngestService handles OTLP trace ingestion and RED metrics computation.
 type IngestService struct {
-	db     *nucleus.Client
-	logger *slog.Logger
+	db        *nucleus.Client
+	logger    *slog.Logger
+	detectors *detectors.Engine
 }
 
 func NewIngestService(db *nucleus.Client) *IngestService {
-	return &IngestService{db: db, logger: slog.Default()}
+	return &IngestService{db: db, logger: slog.Default(), detectors: detectors.New(db)}
 }
 
 // WithLogger lets callers thread their own logger (used by main + seed so
@@ -36,6 +38,9 @@ func (s *IngestService) WithLogger(logger *slog.Logger) *IngestService {
 		return s
 	}
 	s.logger = logger
+	if s.detectors != nil {
+		s.detectors = s.detectors.WithLogger(logger)
+	}
 	return s
 }
 
@@ -89,9 +94,13 @@ func (s *IngestService) ingest(ctx context.Context, siteID string, req ExportTra
 	}
 
 	services, deps := aggregateRollups(flat)
+	detSpans := flatToDetectorSpans(req, flat)
 
 	if syncRollup {
 		s.writeRollups(ctx, siteID, services, deps)
+		if s.detectors != nil {
+			s.detectors.Persist(ctx, siteID, detSpans)
+		}
 	} else {
 		// Detach from the request context so handler timeouts don't kill
 		// a half-finished rollup write. A 30s ceiling keeps a stuck DB
@@ -100,10 +109,47 @@ func (s *IngestService) ingest(ctx context.Context, siteID string, req ExportTra
 			bg, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			s.writeRollups(bg, siteID, services, deps)
+			if s.detectors != nil {
+				s.detectors.Persist(bg, siteID, detSpans)
+			}
 		}()
 	}
 
 	return IngestResponse{OK: true, Spans: total}, nil
+}
+
+// flatToDetectorSpans projects the internal flatSpan slice into the
+// detectors-package Span type. Attributes come from the original OTLP
+// request because flatSpan only stores the marshalled JSON.
+func flatToDetectorSpans(req ExportTraceRequest, flat []flatSpan) []detectors.Span {
+	// Build a span_id -> attributes map from the OTLP envelope so we can
+	// re-attach attributes without re-parsing the JSON we wrote to the DB.
+	attrsByID := make(map[string]map[string]string)
+	for _, rs := range req.ResourceSpans {
+		for _, ss := range rs.ScopeSpans {
+			for _, sp := range ss.Spans {
+				attrsByID[sp.SpanID] = AttrsToMap(sp.Attributes)
+			}
+		}
+	}
+
+	out := make([]detectors.Span, 0, len(flat))
+	for _, sp := range flat {
+		out = append(out, detectors.Span{
+			TraceID:       sp.TraceID,
+			SpanID:        sp.SpanID,
+			ParentSpanID:  sp.ParentSpanID,
+			ServiceName:   sp.ServiceName,
+			OperationName: sp.OperationName,
+			SpanKind:      sp.SpanKind,
+			StartMs:       sp.StartMs,
+			EndMs:         sp.EndMs,
+			DurationMs:    sp.DurationMs,
+			StatusCode:    sp.StatusCode,
+			Attributes:    attrsByID[sp.SpanID],
+		})
+	}
+	return out
 }
 
 // flatSpan is the per-span view used by both the spans INSERT loop and
