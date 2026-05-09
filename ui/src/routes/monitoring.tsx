@@ -8,14 +8,14 @@ import "../styles/monitoring.css";
 
 export const config = { mode: "app" };
 
-function formatDate(iso: string): string {
+function formatDate(iso: string | number): string {
   if (!iso) return "--";
   try {
     return new Date(iso).toLocaleString("en-US", {
       month: "short", day: "numeric",
       hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
     });
-  } catch { return iso; }
+  } catch { return String(iso); }
 }
 
 function formatInterval(seconds: string | number): string {
@@ -125,7 +125,7 @@ function UptimeTab() {
         url: formUrl.trim(),
         method: formMethod,
         expected_status: parseInt(formExpected) || 200,
-        interval_seconds: parseInt(formInterval) || 60,
+        interval_secs: parseInt(formInterval) || 60,
       });
       setShowCreate(false);
       setFormName(""); setFormUrl(""); setFormMethod("GET"); setFormExpected("200"); setFormInterval("60");
@@ -153,7 +153,7 @@ function UptimeTab() {
             { key: "name", label: "name" },
             { key: "url", label: "url" },
             { key: "method", label: "method" },
-            { key: "interval_seconds", label: "interval_sec" },
+            { key: "interval_secs", label: "interval_sec" },
             { key: "expected_status", label: "expected_status" },
             { key: "enabled", label: "enabled" },
           ]}
@@ -188,7 +188,7 @@ function UptimeTab() {
                       {m.uptimePct.toFixed(2)}% SLA
                     </span>
                   )}
-                  <span class="monitoring-row-interval">every {formatInterval(m.interval_seconds)}</span>
+                  <span class="monitoring-row-interval">every {formatInterval(m.interval_secs)}</span>
                 </div>
               </div>
               {selectedId === m.monitor_id && (
@@ -327,7 +327,7 @@ function CronTab() {
     try {
       await monitoringApi.cronCreate({
         site_id: siteId, name: formName.trim(), slug: formSlug.trim(),
-        schedule: formSchedule.trim(), grace_seconds: parseInt(formGrace) || 300,
+        schedule: formSchedule.trim(), grace_period: parseInt(formGrace) || 300,
       });
       setShowCreate(false);
       setFormName(""); setFormSlug(""); setFormSchedule(""); setFormGrace("300");
@@ -351,7 +351,7 @@ function CronTab() {
       ) : (
         <div class="monitoring-list">
           {monitors.map(m => (
-            <div key={m.monitor_id} class="monitoring-row">
+            <div key={m.cron_id} class="monitoring-row">
               <StatusBadge status={m.enabled ? "enabled" : "disabled"} size="sm" />
               <div class="monitoring-row-info">
                 <div class="monitoring-row-name">{m.name}</div>
@@ -359,7 +359,7 @@ function CronTab() {
               </div>
               <div class="monitoring-row-meta">
                 <span class="monitoring-cron-schedule">{m.schedule}</span>
-                <span class="monitoring-row-interval">grace: {formatInterval(m.grace_seconds)}</span>
+                <span class="monitoring-row-interval">grace: {formatInterval(m.grace_period)}</span>
               </div>
             </div>
           ))}
@@ -442,17 +442,17 @@ function InfraTab() {
     <div>
       <div class="monitoring-infra-grid">
         {hosts.map(h => (
-          <div key={h.host_id} class="monitoring-infra-card" onClick={() => handleHostClick(h.hostname)}
+          <div key={h.hostname} class="monitoring-infra-card" onClick={() => handleHostClick(h.hostname)}
             style={{ cursor: "pointer" }}>
             <div class="monitoring-infra-hostname">{h.hostname}</div>
             <div style={{ fontSize: "11px", color: "var(--obs-text-muted)", marginBottom: "12px" }}>
-              Last report: {formatDate(h.last_report)}
+              Last report: {formatDate(h.last_seen)}
             </div>
             <div class="monitoring-infra-metrics">
               {[
-                { label: "CPU", value: h.cpu_pct },
-                { label: "Memory", value: h.memory_pct },
-                { label: "Disk", value: h.disk_pct },
+                { label: "CPU", value: h.cpu_percent },
+                { label: "Memory", value: h.memory_percent },
+                { label: "Disk", value: h.disk_percent },
               ].map(m => (
                 <div key={m.label} class="monitoring-infra-metric">
                   <span class="monitoring-infra-metric-label">{m.label}</span>
@@ -482,14 +482,14 @@ function InfraTab() {
               {history.slice(0, 50).map((m, i) => (
                 <div key={i} class="monitoring-result-row">
                   <span class="monitoring-result-ts">{formatDate(m.timestamp)}</span>
-                  <span class="monitoring-result-response" style={{ color: metricColor(m.cpu_pct) }}>
-                    CPU {m.cpu_pct.toFixed(0)}%
+                  <span class="monitoring-result-response" style={{ color: metricColor(m.cpu_percent) }}>
+                    CPU {m.cpu_percent.toFixed(0)}%
                   </span>
-                  <span class="monitoring-result-response" style={{ color: metricColor(m.memory_pct) }}>
-                    Mem {m.memory_pct.toFixed(0)}%
+                  <span class="monitoring-result-response" style={{ color: metricColor(m.memory_percent) }}>
+                    Mem {m.memory_percent.toFixed(0)}%
                   </span>
-                  <span class="monitoring-result-response" style={{ color: metricColor(m.disk_pct) }}>
-                    Disk {m.disk_pct.toFixed(0)}%
+                  <span class="monitoring-result-response" style={{ color: metricColor(m.disk_percent) }}>
+                    Disk {m.disk_percent.toFixed(0)}%
                   </span>
                 </div>
               ))}

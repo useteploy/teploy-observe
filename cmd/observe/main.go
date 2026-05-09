@@ -1023,6 +1023,20 @@ func changePasswordHandler(authSvc *auth.AuthService) neutron.HandlerFunc[change
 	}
 }
 
+// emptyOnNil coerces a nil slice to an empty slice so list endpoints
+// always serialize as `[]` rather than `null`. The Go JSON encoder
+// renders a nil slice as null, which breaks TS clients that expect
+// `T[]`. See docs/api-shape-convention.md for the API contract.
+func emptyOnNil[T any](s []T, err error) ([]T, error) {
+	if err != nil {
+		return nil, err
+	}
+	if s == nil {
+		return []T{}, nil
+	}
+	return s, nil
+}
+
 // --- Site handlers ---
 
 func listSitesHandler(siteSvc *sites.SiteService) neutron.HandlerFunc[neutron.Empty, []sites.Site] {
@@ -1135,7 +1149,7 @@ func listAPIKeysHandler(authSvc *auth.AuthService) neutron.HandlerFunc[listAPIKe
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		return authSvc.ListAPIKeys(ctx, input.SiteID)
+		return emptyOnNil(authSvc.ListAPIKeys(ctx, input.SiteID))
 	}
 }
 
@@ -1415,7 +1429,7 @@ func llmStatsHandler(svc *llm.LLMService) neutron.HandlerFunc[llmStatsInput, llm
 func llmModelsHandler(svc *llm.LLMService) neutron.HandlerFunc[llmStatsInput, []llm.ModelStats] {
 	return func(ctx context.Context, input llmStatsInput) ([]llm.ModelStats, error) {
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.ModelBreakdown(ctx, input.SiteID, from, to)
+		return emptyOnNil(svc.ModelBreakdown(ctx, input.SiteID, from, to))
 	}
 }
 
@@ -1423,7 +1437,7 @@ type llmTracesInput struct { SiteID string `query:"site_id"`; Limit int `query:"
 
 func llmTracesHandler(svc *llm.LLMService) neutron.HandlerFunc[llmTracesInput, []llm.LLMTrace] {
 	return func(ctx context.Context, input llmTracesInput) ([]llm.LLMTrace, error) {
-		return svc.RecentTraces(ctx, input.SiteID, input.Limit)
+		return emptyOnNil(svc.RecentTraces(ctx, input.SiteID, input.Limit))
 	}
 }
 
@@ -1442,7 +1456,7 @@ type infraHostsInput struct { SiteID string `query:"site_id"` }
 
 func infraHostsHandler(svc *infra.InfraService) neutron.HandlerFunc[infraHostsInput, []infra.HostSummary] {
 	return func(ctx context.Context, input infraHostsInput) ([]infra.HostSummary, error) {
-		return svc.ListHosts(ctx, input.SiteID)
+		return emptyOnNil(svc.ListHosts(ctx, input.SiteID))
 	}
 }
 
@@ -1456,7 +1470,7 @@ type infraHistoryInput struct {
 func infraHistoryHandler(svc *infra.InfraService) neutron.HandlerFunc[infraHistoryInput, []infra.HostMetric] {
 	return func(ctx context.Context, input infraHistoryInput) ([]infra.HostMetric, error) {
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.HostHistory(ctx, input.SiteID, input.Hostname, from, to, 100)
+		return emptyOnNil(svc.HostHistory(ctx, input.SiteID, input.Hostname, from, to, 100))
 	}
 }
 
@@ -1466,7 +1480,7 @@ type listPipelinesInput struct { SiteID string `query:"site_id"` }
 
 func listPipelinesHandler(svc *logs.PipelineService) neutron.HandlerFunc[listPipelinesInput, []logs.Pipeline] {
 	return func(ctx context.Context, input listPipelinesInput) ([]logs.Pipeline, error) {
-		return svc.List(ctx, input.SiteID)
+		return emptyOnNil(svc.List(ctx, input.SiteID))
 	}
 }
 
@@ -1494,7 +1508,7 @@ type listGroupsInput struct{ SiteID string `query:"site_id"` }
 
 func listGroupsHandler(svc *groups.GroupService) neutron.HandlerFunc[listGroupsInput, []groups.Group] {
 	return func(ctx context.Context, input listGroupsInput) ([]groups.Group, error) {
-		return svc.List(ctx, input.SiteID)
+		return emptyOnNil(svc.List(ctx, input.SiteID))
 	}
 }
 
@@ -1543,7 +1557,7 @@ func correlationHandler(svc *query.StatsService) neutron.HandlerFunc[correlation
 		from, to := parseTimeRange(input.From, input.To)
 		target := input.Target
 		if target == "" { target = "signup" }
-		return svc.CorrelationAnalysis(ctx, input.SiteID, target, from, to)
+		return emptyOnNil(svc.CorrelationAnalysis(ctx, input.SiteID, target, from, to))
 	}
 }
 
@@ -1561,7 +1575,7 @@ type listSSOInput struct{}
 
 func listSSOHandler(svc *sso.SSOService) neutron.HandlerFunc[listSSOInput, []sso.SSOConfig] {
 	return func(ctx context.Context, _ listSSOInput) ([]sso.SSOConfig, error) {
-		return svc.List(ctx)
+		return emptyOnNil(svc.List(ctx))
 	}
 }
 
@@ -1855,7 +1869,7 @@ type listFlagsInput struct{ SiteID string `query:"site_id"` }
 
 func listFlagsHandler(svc *flags.FlagService) neutron.HandlerFunc[listFlagsInput, []flags.FeatureFlag] {
 	return func(ctx context.Context, input listFlagsInput) ([]flags.FeatureFlag, error) {
-		return svc.List(ctx, input.SiteID)
+		return emptyOnNil(svc.List(ctx, input.SiteID))
 	}
 }
 
@@ -1901,7 +1915,7 @@ func flagHistoryHandler(svc *flags.FlagService) neutron.HandlerFunc[flagHistoryI
 		if input.FlagID == "" {
 			return nil, neutron.ErrBadRequest("flag_id required")
 		}
-		return svc.History(ctx, input.FlagID)
+		return emptyOnNil(svc.History(ctx, input.FlagID))
 	}
 }
 
@@ -1927,7 +1941,7 @@ type listExperimentsInput struct{ SiteID string `query:"site_id"` }
 
 func listExperimentsHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[listExperimentsInput, []experiments.Experiment] {
 	return func(ctx context.Context, input listExperimentsInput) ([]experiments.Experiment, error) {
-		return svc.List(ctx, input.SiteID)
+		return emptyOnNil(svc.List(ctx, input.SiteID))
 	}
 }
 
@@ -1985,7 +1999,7 @@ type listSurveysInput struct{ SiteID string `query:"site_id"` }
 
 func listSurveysHandler(svc *surveys.SurveyService) neutron.HandlerFunc[listSurveysInput, []surveys.Survey] {
 	return func(ctx context.Context, input listSurveysInput) ([]surveys.Survey, error) {
-		return svc.List(ctx, input.SiteID)
+		return emptyOnNil(svc.List(ctx, input.SiteID))
 	}
 }
 
@@ -2024,7 +2038,7 @@ type surveyResponsesInput struct {
 
 func surveyResponsesHandler(svc *surveys.SurveyService) neutron.HandlerFunc[surveyResponsesInput, []surveys.SurveyResponse] {
 	return func(ctx context.Context, input surveyResponsesInput) ([]surveys.SurveyResponse, error) {
-		return svc.ListResponses(ctx, input.SurveyID, input.SiteID, input.Limit)
+		return emptyOnNil(svc.ListResponses(ctx, input.SurveyID, input.SiteID, input.Limit))
 	}
 }
 
@@ -2067,7 +2081,7 @@ type listReportsInput struct {
 
 func listReportsHandler(svc *reports.ReportService) neutron.HandlerFunc[listReportsInput, []reports.ReportSchedule] {
 	return func(ctx context.Context, input listReportsInput) ([]reports.ReportSchedule, error) {
-		return svc.List(ctx, input.SiteID)
+		return emptyOnNil(svc.List(ctx, input.SiteID))
 	}
 }
 
@@ -2109,7 +2123,7 @@ type listIntegrationsInput struct {
 
 func listIntegrationsHandler(svc *integrations.IntegrationService) neutron.HandlerFunc[listIntegrationsInput, []integrations.Integration] {
 	return func(ctx context.Context, input listIntegrationsInput) ([]integrations.Integration, error) {
-		return svc.List(ctx, input.SiteID)
+		return emptyOnNil(svc.List(ctx, input.SiteID))
 	}
 }
 
@@ -2230,7 +2244,7 @@ type listFeedbackInput struct {
 func listFeedbackHandler(svc *feedback.FeedbackService) neutron.HandlerFunc[listFeedbackInput, []feedback.FeedbackEntry] {
 	return func(ctx context.Context, input listFeedbackInput) ([]feedback.FeedbackEntry, error) {
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.List(ctx, input.SiteID, from, to, input.Limit)
+		return emptyOnNil(svc.List(ctx, input.SiteID, from, to, input.Limit))
 	}
 }
 
@@ -2242,7 +2256,7 @@ type listViewsInput struct {
 
 func listViewsHandler(svc *views.ViewService) neutron.HandlerFunc[listViewsInput, []views.SavedView] {
 	return func(ctx context.Context, input listViewsInput) ([]views.SavedView, error) {
-		return svc.List(ctx, input.SiteID)
+		return emptyOnNil(svc.List(ctx, input.SiteID))
 	}
 }
 
@@ -2286,7 +2300,7 @@ type releaseHealthInput struct {
 func releaseHealthHandler(svc *obserrors.IssueService) neutron.HandlerFunc[releaseHealthInput, []obserrors.ReleaseHealth] {
 	return func(ctx context.Context, input releaseHealthInput) ([]obserrors.ReleaseHealth, error) {
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.ReleaseHealthList(ctx, input.SiteID, from, to)
+		return emptyOnNil(svc.ReleaseHealthList(ctx, input.SiteID, from, to))
 	}
 }
 
@@ -2324,7 +2338,7 @@ type logSearchInput struct {
 func logSearchHandler(svc *logs.LogService) neutron.HandlerFunc[logSearchInput, []logs.Log] {
 	return func(ctx context.Context, input logSearchInput) ([]logs.Log, error) {
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.SearchLogs(ctx, input.SiteID, from, to, input.Level, input.Service, input.Query, input.Limit, input.Offset)
+		return emptyOnNil(svc.SearchLogs(ctx, input.SiteID, from, to, input.Level, input.Service, input.Query, input.Limit, input.Offset))
 	}
 }
 
@@ -2340,7 +2354,7 @@ func logStatsHandler(svc *logs.LogService) neutron.HandlerFunc[logStatsInput, []
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.LogStats(ctx, input.SiteID, from, to)
+		return emptyOnNil(svc.LogStats(ctx, input.SiteID, from, to))
 	}
 }
 
@@ -2357,7 +2371,7 @@ func logHistogramHandler(svc *logs.LogService) neutron.HandlerFunc[logHistogramI
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.Histogram(ctx, input.SiteID, from, to, input.BucketMs)
+		return emptyOnNil(svc.Histogram(ctx, input.SiteID, from, to, input.BucketMs))
 	}
 }
 
@@ -2428,7 +2442,7 @@ type listGoalsInput struct {
 func listGoalsHandler(svc *query.StatsService) neutron.HandlerFunc[listGoalsInput, []query.GoalConversion] {
 	return func(ctx context.Context, input listGoalsInput) ([]query.GoalConversion, error) {
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.GoalConversions(ctx, input.SiteID, from, to)
+		return emptyOnNil(svc.GoalConversions(ctx, input.SiteID, from, to))
 	}
 }
 
@@ -2460,7 +2474,7 @@ type listMonitorsInput struct {
 
 func listMonitorsHandler(svc *monitoring.UptimeService) neutron.HandlerFunc[listMonitorsInput, []monitoring.Monitor] {
 	return func(ctx context.Context, input listMonitorsInput) ([]monitoring.Monitor, error) {
-		return svc.ListMonitors(ctx, input.SiteID)
+		return emptyOnNil(svc.ListMonitors(ctx, input.SiteID))
 	}
 }
 
@@ -2497,7 +2511,7 @@ type monitorResultsInput struct {
 
 func monitorResultsHandler(svc *monitoring.UptimeService) neutron.HandlerFunc[monitorResultsInput, []monitoring.MonitorResult] {
 	return func(ctx context.Context, input monitorResultsInput) ([]monitoring.MonitorResult, error) {
-		return svc.ListResults(ctx, input.MonitorID, input.Limit)
+		return emptyOnNil(svc.ListResults(ctx, input.MonitorID, input.Limit))
 	}
 }
 
@@ -2509,7 +2523,7 @@ type listCronsInput struct {
 
 func listCronsHandler(svc *monitoring.CronService) neutron.HandlerFunc[listCronsInput, []monitoring.CronMonitor] {
 	return func(ctx context.Context, input listCronsInput) ([]monitoring.CronMonitor, error) {
-		return svc.ListCrons(ctx, input.SiteID)
+		return emptyOnNil(svc.ListCrons(ctx, input.SiteID))
 	}
 }
 
@@ -2561,7 +2575,7 @@ type listDashboardsInput struct {
 
 func listDashboardsHandler(svc *dashboards.DashboardService) neutron.HandlerFunc[listDashboardsInput, []dashboards.Dashboard] {
 	return func(ctx context.Context, input listDashboardsInput) ([]dashboards.Dashboard, error) {
-		return svc.List(ctx, input.SiteID)
+		return emptyOnNil(svc.List(ctx, input.SiteID))
 	}
 }
 
@@ -2732,7 +2746,7 @@ type listReplaysInput struct {
 func listReplaysHandler(svc *replays.ReplayService) neutron.HandlerFunc[listReplaysInput, []replays.ReplaySession] {
 	return func(ctx context.Context, input listReplaysInput) ([]replays.ReplaySession, error) {
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.ListReplays(ctx, input.SiteID, from, to, input.Limit, input.Offset)
+		return emptyOnNil(svc.ListReplays(ctx, input.SiteID, from, to, input.Limit, input.Offset))
 	}
 }
 
@@ -2742,7 +2756,7 @@ type getReplayInput struct {
 
 func getReplayHandler(svc *replays.ReplayService) neutron.HandlerFunc[getReplayInput, []replays.ReplayEvent] {
 	return func(ctx context.Context, input getReplayInput) ([]replays.ReplayEvent, error) {
-		return svc.GetReplayEvents(ctx, input.ReplayID)
+		return emptyOnNil(svc.GetReplayEvents(ctx, input.ReplayID))
 	}
 }
 
@@ -2754,7 +2768,7 @@ type listLinksInput struct {
 
 func listLinksHandler(svc *tracking.LinkService) neutron.HandlerFunc[listLinksInput, []tracking.TrackedLink] {
 	return func(ctx context.Context, input listLinksInput) ([]tracking.TrackedLink, error) {
-		return svc.ListLinks(ctx, "default", input.SiteID)
+		return emptyOnNil(svc.ListLinks(ctx, "default", input.SiteID))
 	}
 }
 
@@ -2868,7 +2882,7 @@ func listAlertRulesHandler(svc *platform.AlertService) neutron.HandlerFunc[listA
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		return svc.ListRules(ctx, input.SiteID)
+		return emptyOnNil(svc.ListRules(ctx, input.SiteID))
 	}
 }
 
@@ -2960,7 +2974,7 @@ func alertHistoryHandler(svc *platform.AlertService) neutron.HandlerFunc[alertHi
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		return svc.ListHistory(ctx, input.SiteID, input.Limit, input.Offset)
+		return emptyOnNil(svc.ListHistory(ctx, input.SiteID, input.Limit, input.Offset))
 	}
 }
 
@@ -2973,7 +2987,7 @@ func listWebhooksHandler(svc *platform.WebhookService) neutron.HandlerFunc[listW
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		return svc.List(ctx, input.SiteID)
+		return emptyOnNil(svc.List(ctx, input.SiteID))
 	}
 }
 
@@ -3033,7 +3047,7 @@ func listServicesHandler(svc *tracing.QueryService) neutron.HandlerFunc[listServ
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.ListServices(ctx, input.SiteID, from, to)
+		return emptyOnNil(svc.ListServices(ctx, input.SiteID, from, to))
 	}
 }
 
@@ -3050,7 +3064,7 @@ func listOperationsHandler(svc *tracing.QueryService) neutron.HandlerFunc[listOp
 			return nil, neutron.ErrBadRequest("site_id and service required")
 		}
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.ListOperations(ctx, input.SiteID, input.Service, from, to)
+		return emptyOnNil(svc.ListOperations(ctx, input.SiteID, input.Service, from, to))
 	}
 }
 
@@ -3073,7 +3087,7 @@ func searchTracesHandler(svc *tracing.QueryService) neutron.HandlerFunc[searchTr
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.SearchTraces(ctx, input.SiteID, from, to, input.Service, input.Operation, input.Status, input.MinDuration, input.MaxDuration, input.Limit, input.Offset)
+		return emptyOnNil(svc.SearchTraces(ctx, input.SiteID, from, to, input.Service, input.Operation, input.Status, input.MinDuration, input.MaxDuration, input.Limit, input.Offset))
 	}
 }
 
@@ -3087,7 +3101,7 @@ func getTraceHandler(svc *tracing.QueryService) neutron.HandlerFunc[getTraceInpu
 		if input.SiteID == "" || input.TraceID == "" {
 			return nil, neutron.ErrBadRequest("site_id and trace_id required")
 		}
-		return svc.GetTrace(ctx, input.TraceID, input.SiteID)
+		return emptyOnNil(svc.GetTrace(ctx, input.TraceID, input.SiteID))
 	}
 }
 
@@ -3124,7 +3138,7 @@ func serviceDepsHandler(svc *tracing.QueryService) neutron.HandlerFunc[serviceDe
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
 		from, to := parseTimeRange(input.From, input.To)
-		return svc.ServiceDependencies(ctx, input.SiteID, from, to)
+		return emptyOnNil(svc.ServiceDependencies(ctx, input.SiteID, from, to))
 	}
 }
 
@@ -3174,7 +3188,7 @@ func dailyErrorCountsHandler(svc *obserrors.IssueService) neutron.HandlerFunc[da
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		return svc.DailyCounts(ctx, input.SiteID, input.Days)
+		return emptyOnNil(svc.DailyCounts(ctx, input.SiteID, input.Days))
 	}
 }
 
