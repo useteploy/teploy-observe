@@ -129,6 +129,33 @@
         if (tag === 'a' || tag === 'button' || tag === 'input' || target.getAttribute('role') === 'button') {
           send('click', { selector: selector, text: text, href: href });
         }
+
+        // Dead click detection: click yielded no DOM mutation, no navigation,
+        // and no input focus change within 1.5s. Per-click temporary observer
+        // to avoid leaking listeners across many clicks.
+        if (typeof MutationObserver !== 'undefined') {
+          var deadClickX = (typeof e.clientX === 'number') ? e.clientX : 0;
+          var deadClickY = (typeof e.clientY === 'number') ? e.clientY : 0;
+          var startUrl = location.href;
+          var startActive = document.activeElement;
+          var mutated = false;
+          var mo = new MutationObserver(function() { mutated = true; });
+          mo.observe(document.documentElement, {
+            childList: true, subtree: true,
+            attributes: true, characterData: true,
+          });
+          setTimeout(function() {
+            mo.disconnect();
+            if (mutated) return;
+            if (location.href !== startUrl) return;
+            if (document.activeElement !== startActive) return;
+            send('dead_click', {
+              x: deadClickX, y: deadClickY,
+              target_selector: selector,
+              page_url: startUrl,
+            });
+          }, 1500);
+        }
       }, true);
 
       // Form submissions
