@@ -8,8 +8,8 @@
   "compression": {
     "enabled": true,
     "files": 59,
-    "gzipBytesSaved": 274484,
-    "brotliBytesSaved": 291653
+    "gzipBytesSaved": 279785,
+    "brotliBytesSaved": 297193
   },
-  "generatedAt": "2026-04-17T22:38:40.842Z"
+  "generatedAt": "2026-05-07T07:14:47.205Z"
 }
