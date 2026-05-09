@@ -6,14 +6,36 @@
 
   var origin = script.src ? new URL(script.src).origin : '';
   var endpoint = script.getAttribute('data-endpoint') || origin + '/api/v1/replays';
+  var errorsEndpoint = script.getAttribute('data-errors-endpoint') || origin + '/api/v1/errors';
   var siteId = script.getAttribute('data-site-id') || '';
   var maxEvents = parseInt(script.getAttribute('data-max-events') || '5000', 10);
   var flushInterval = parseInt(script.getAttribute('data-flush-interval') || '10000', 10);
+  // Rage click: N clicks on the same target within W ms.
+  var rageThreshold = parseInt(script.getAttribute('data-rage-threshold') || '4', 10);
+  var rageWindowMs = parseInt(script.getAttribute('data-rage-window') || '1000', 10);
 
   var events = [];
   var flushTimer = null;
   var sessionId = '';
   var hasError = false;
+
+  // Local replay id — generated client-side so observe-errors.js can attach
+  // it to errors captured before the first replay batch reaches the server.
+  function makeReplayId() {
+    var bytes = new Uint8Array(16);
+    var c = window.crypto || window.msCrypto;
+    if (c && c.getRandomValues) {
+      c.getRandomValues(bytes);
+    } else {
+      for (var i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+    }
+    var hex = '';
+    for (var j = 0; j < bytes.length; j++) {
+      hex += (bytes[j] < 16 ? '0' : '') + bytes[j].toString(16);
+    }
+    return hex;
+  }
+  var replayId = makeReplayId();
 
   // --- DOM Snapshot ---
 
@@ -75,13 +97,34 @@
       record('mouse', { x: e.clientX, y: e.clientY });
     }, { passive: true });
 
-    // Clicks
+    // Clicks (with rage-click detection: N clicks on same target within W ms).
+    var rageState = { selector: '', clicks: [], reported: false };
     document.addEventListener('click', function(e) {
       var target = e.target;
       var tag = target.tagName ? target.tagName.toLowerCase() : '';
       var id = target.id ? '#' + target.id : '';
       var cls = target.className ? '.' + String(target.className).split(' ')[0] : '';
-      record('click', { x: e.clientX, y: e.clientY, target: tag + id + cls });
+      var sel = tag + id + cls;
+      record('click', { x: e.clientX, y: e.clientY, target: sel });
+
+      var now = Date.now();
+      if (rageState.selector !== sel) {
+        rageState.selector = sel;
+        rageState.clicks = [now];
+        rageState.reported = false;
+        return;
+      }
+      // Drop clicks outside the rage window.
+      rageState.clicks.push(now);
+      var cutoff = now - rageWindowMs;
+      while (rageState.clicks.length && rageState.clicks[0] < cutoff) {
+        rageState.clicks.shift();
+      }
+      if (rageState.clicks.length >= rageThreshold && !rageState.reported) {
+        rageState.reported = true;
+        record('rage_click', { target: sel, count: rageState.clicks.length });
+        reportRageClick(sel, target, rageState.clicks.length);
+      }
     }, true);
 
     // Scrolls (throttled)
@@ -166,11 +209,13 @@
     var payload = {
       site_id: siteId,
       session_id: sessionId,
+      replay_id: replayId,
       url: location.href,
       browser: navigator.userAgent.substring(0, 128),
       os: '',
       device: '',
       has_error: hasError,
+      viewport_width: window.innerWidth || 0,
       events: batch
     };
 
@@ -185,6 +230,53 @@
     }
   }
 
+  // Build a breadcrumb-like ancestor path for a click target. Used as a
+  // pseudo-stack on auto-issued RageClicks (no JS stack exists otherwise).
+  function ancestorPath(node) {
+    var frames = [];
+    var n = node;
+    var depth = 0;
+    while (n && n.nodeType === 1 && depth < 10) {
+      var tag = n.tagName ? n.tagName.toLowerCase() : '';
+      var id = n.id ? '#' + n.id : '';
+      var cls = n.className ? '.' + String(n.className).split(' ').filter(Boolean).slice(0, 2).join('.') : '';
+      frames.push({ filename: location.pathname, function: tag + id + cls, in_app: true });
+      n = n.parentNode;
+      depth++;
+    }
+    return frames;
+  }
+
+  // POST a synthetic "RageClick" issue to the errors ingest endpoint.
+  function reportRageClick(selector, targetNode, count) {
+    var payload = {
+      site_id: siteId,
+      session_id: sessionId,
+      replay_id: replayId,
+      error_type: 'RageClick',
+      error_value: 'User clicked ' + count + ' times on ' + selector + ' without progress',
+      mechanism: 'rage_click',
+      handled: false,
+      level: 'warning',
+      url: location.href,
+      browser: (navigator.userAgent || '').substring(0, 256),
+      os: '',
+      device: '',
+      stack_trace: ancestorPath(targetNode),
+      breadcrumbs: [],
+      selector: selector
+    };
+    var body = JSON.stringify(payload);
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon(errorsEndpoint, new Blob([body], { type: 'application/json' }));
+    } else {
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', errorsEndpoint, true);
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.send(body);
+    }
+  }
+
   // --- Public API ---
   window.observeReplay = {
     start: init,
@@ -192,7 +284,8 @@
       if (flushTimer) clearInterval(flushTimer);
       flush();
     },
-    setSessionId: function(id) { sessionId = id; }
+    setSessionId: function(id) { sessionId = id; },
+    getReplayId: function() { return replayId; }
   };
 
   init();
