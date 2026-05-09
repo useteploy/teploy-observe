@@ -2963,6 +2963,35 @@ func getReplayHandler(svc *replays.ReplayService) neutron.HandlerFunc[getReplayI
 	}
 }
 
+// --- Heatmap handlers ---
+
+type queryHeatmapInput struct {
+	SiteID string `query:"site_id"`
+	URL    string `query:"url"`
+	From   string `query:"from"`
+	To     string `query:"to"`
+}
+
+func queryHeatmapHandler(svc *heatmaps.Service) neutron.HandlerFunc[queryHeatmapInput, []heatmaps.Click] {
+	return func(ctx context.Context, input queryHeatmapInput) ([]heatmaps.Click, error) {
+		if input.SiteID == "" {
+			return nil, neutron.ErrBadRequest("site_id required")
+		}
+		if input.URL == "" {
+			return nil, neutron.ErrBadRequest("url required")
+		}
+		from, to := parseTimeRange(input.From, input.To)
+		clicks, err := svc.Query(ctx, input.SiteID, input.URL, from.UnixMilli(), to.UnixMilli())
+		if err != nil {
+			return nil, err
+		}
+		if clicks == nil {
+			clicks = []heatmaps.Click{}
+		}
+		return clicks, nil
+	}
+}
+
 type replayIssuesInput struct {
 	ReplayID string `path:"replay_id"`
 	SiteID   string `query:"site_id"`

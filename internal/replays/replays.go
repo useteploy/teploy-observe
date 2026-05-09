@@ -6,20 +6,37 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/heatmaps"
 )
 
 type ReplayService struct {
-	db *nucleus.Client
+	db       *nucleus.Client
+	heatmaps *heatmaps.Service
+	logger   *slog.Logger
 }
 
 func NewReplayService(db *nucleus.Client) *ReplayService {
-	return &ReplayService{db: db}
+	return &ReplayService{
+		db:       db,
+		heatmaps: heatmaps.NewService(db),
+		logger:   slog.Default(),
+	}
+}
+
+// WithLogger threads a custom logger so heatmap-rollup write failures
+// surface under the same handler context as the replay ingest itself.
+func (s *ReplayService) WithLogger(logger *slog.Logger) *ReplayService {
+	if logger != nil {
+		s.logger = logger
+	}
+	return s
 }
 
 // ReplaySession is the domain type with typed fields.
@@ -47,19 +64,25 @@ type ReplayEvent struct {
 }
 
 // IngestInput is the JSON body from the replay SDK.
+//
+// ViewportWidth is optional; when set it seeds the heatmap aggregator with
+// a vw_bucket for clicks that occur before any `resize` event in the
+// batch. The replay SDK populates it from `window.innerWidth` at flush
+// time (see cmd/observe/tracker/observe-replay.js).
 type IngestInput struct {
 	SiteID    string `json:"site_id"`
 	SessionID string `json:"session_id"`
 	// ReplayID is generated client-side so observe-errors.js can attach
 	// errors to the same replay before the first batch reaches the server.
 	// Empty -> the server assigns a fresh id.
-	ReplayID string `json:"replay_id"`
-	URL      string `json:"url"`
-	Browser  string `json:"browser"`
-	OS       string `json:"os"`
-	Device   string `json:"device"`
-	HasError bool   `json:"has_error"`
-	Events   []struct {
+	ReplayID      string `json:"replay_id"`
+	URL           string `json:"url"`
+	Browser       string `json:"browser"`
+	OS            string `json:"os"`
+	Device        string `json:"device"`
+	HasError      bool   `json:"has_error"`
+	ViewportWidth int    `json:"viewport_width"`
+	Events        []struct {
 		Type      string `json:"type"`
 		Timestamp int64  `json:"timestamp"`
 		Data      any    `json:"data"`
@@ -121,6 +144,13 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 		}
 	}
 
+	// Track the most recent viewport width seen in this batch so click
+	// events can carry a vw_bucket without requiring the tracker to
+	// re-emit window size on every click. ViewportWidth defaults to the
+	// session's `viewport_width` field if the SDK supplied it, else 0.
+	currentVW := input.ViewportWidth
+	clickEvents := make([]heatmaps.RawEvent, 0)
+
 	for _, ev := range input.Events {
 		eventID := genID()
 		dataJSON := ""
@@ -137,9 +167,60 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 		if err != nil {
 			return replayID, fmt.Errorf("insert replay event: %w", err)
 		}
+
+		switch ev.Type {
+		case "resize":
+			if w, ok := readIntField(ev.Data, "w"); ok {
+				currentVW = w
+			}
+		case "click":
+			clickEvents = append(clickEvents, heatmaps.RawEvent{
+				Type:          ev.Type,
+				Data:          ev.Data,
+				ViewportWidth: currentVW,
+			})
+		}
+	}
+
+	// Write the per-bucket heatmap rollups. Best-effort: a heatmap write
+	// failure must not fail the underlying replay ingest because the raw
+	// event rows are already durable. Pattern matches tracing rollups
+	// (see internal/tracing/ingest.go).
+	if len(clickEvents) > 0 && input.URL != "" {
+		clicks := heatmaps.ExtractClicks(clickEvents)
+		if len(clicks) > 0 {
+			if err := s.heatmaps.Aggregate(ctx, input.SiteID, input.URL, clicks); err != nil {
+				s.logger.Warn("heatmaps: aggregate failed",
+					"site", input.SiteID, "url", input.URL, "err", err)
+			}
+		}
 	}
 
 	return replayID, nil
+}
+
+// readIntField is the same defensive numeric extractor used by the
+// heatmaps package, kept here so the resize-tracking shortcut doesn't
+// need to import a parser. Returns false on missing or non-numeric
+// values.
+func readIntField(data any, key string) (int, bool) {
+	m, ok := data.(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	v, ok := m[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	}
+	return 0, false
 }
 
 // ListReplays returns recent replay sessions for a site.
