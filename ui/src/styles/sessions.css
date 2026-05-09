@@ -255,6 +255,27 @@
   opacity: 0.9;
 }
 
+.replay-heatmap-toggle {
+  padding: 6px 12px;
+  background: transparent;
+  color: var(--obs-text);
+  border: 1px solid var(--obs-border);
+  border-radius: 6px;
+  font-weight: 500;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.replay-heatmap-toggle:hover {
+  background: var(--obs-bg-hover, rgba(255, 255, 255, 0.04));
+}
+
+.replay-heatmap-toggle--on {
+  background: rgba(255, 96, 64, 0.18);
+  color: #ff8a4c;
+  border-color: rgba(255, 96, 64, 0.4);
+}
+
 .replay-time {
   font-family: var(--obs-font-mono, monospace);
   font-size: 12px;

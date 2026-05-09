@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "preact/hooks";
 import type { ReplayEvent } from "../api/replays.js";
+import { heatmapsApi, type Click } from "../api/heatmaps.js";
+import HeatmapOverlay from "./HeatmapOverlay.js";
 
 type SerializedNode =
   | { type: "text"; value: string }
@@ -60,10 +62,16 @@ function snapshotToHTML(snap: Snapshot): string {
 interface PlayerProps {
   events: ReplayEvent[];
   onClose: () => void;
+  // Optional site/URL context so the heatmap toggle can fetch aggregated
+  // clicks for *this* page across *all* sessions, not just the current one.
+  // Falls back to local-session clicks if either is missing.
+  siteId?: string;
+  url?: string;
 }
 
-export default function ReplayPlayer({ events, onClose }: PlayerProps) {
+export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
   const cursorRef = useRef<HTMLDivElement>(null);
   const rippleRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef<number | null>(null);
@@ -73,6 +81,9 @@ export default function ReplayPlayer({ events, onClose }: PlayerProps) {
   const [speed, setSpeed] = useState(1);
   const [elapsed, setElapsed] = useState(0);
   const [snapshotReady, setSnapshotReady] = useState(false);
+  const [heatmapOn, setHeatmapOn] = useState(false);
+  const [heatmapClicks, setHeatmapClicks] = useState<Click[]>([]);
+  const [stageSize, setStageSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
 
   const startTs = parsed.length ? parsed[0].timestamp : 0;
   const endTs = parsed.length ? parsed[parsed.length - 1].timestamp : 0;
@@ -156,6 +167,86 @@ export default function ReplayPlayer({ events, onClose }: PlayerProps) {
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
   }, [playing, speed, duration]);
 
+  // Track replay-stage size so the heatmap canvas matches the iframe area
+  // exactly. Re-measures on layout changes (resize, modal open, etc.).
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const measure = () => {
+      const rect = stage.getBoundingClientRect();
+      setStageSize({ w: Math.max(0, rect.width), h: Math.max(0, rect.height) });
+    };
+    measure();
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(measure);
+      ro.observe(stage);
+      return () => ro.disconnect();
+    }
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, []);
+
+  // Lazy-load aggregated clicks the first time the user toggles the
+  // overlay on. Falls back to clicks visible in the local session if the
+  // server returns nothing — keeps the toggle useful on a fresh install
+  // before any cross-session aggregation has occurred.
+  useEffect(() => {
+    if (!heatmapOn) return;
+    if (heatmapClicks.length > 0) return;
+    let cancelled = false;
+    const run = async () => {
+      const localClicks: Click[] = [];
+      const counts = new Map<string, { x: number; y: number; n: number }>();
+      for (const ev of parsed) {
+        if (ev.type !== "click") continue;
+        const x = Number(ev.data?.x);
+        const y = Number(ev.data?.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+        // Same 10px buckets as the server so the local fallback looks the
+        // same as the cross-session view.
+        const bx = Math.floor(x / 10);
+        const by = Math.floor(y / 10);
+        const k = `${bx},${by}`;
+        const cur = counts.get(k);
+        if (cur) {
+          cur.n++;
+        } else {
+          counts.set(k, { x: bx * 10 + 5, y: by * 10 + 5, n: 1 });
+        }
+      }
+      counts.forEach((v) => localClicks.push({ x: v.x, y: v.y, count: v.n }));
+
+      if (siteId && url) {
+        try {
+          const now = new Date();
+          const from = new Date(now.getTime() - 30 * 86400000).toISOString();
+          const to = now.toISOString();
+          const remote = await heatmapsApi.query(siteId, url, from, to);
+          if (cancelled) return;
+          // Merge remote + local so the overlay always shows the current
+          // session's clicks even before they've been written to the
+          // rollup table (which is async / best-effort by design).
+          const merged = new Map<string, Click>();
+          const ingest = (c: Click) => {
+            const k = `${c.x},${c.y}`;
+            const cur = merged.get(k);
+            if (cur) cur.count += c.count;
+            else merged.set(k, { ...c });
+          };
+          for (const c of remote || []) ingest(c);
+          for (const c of localClicks) ingest(c);
+          setHeatmapClicks(Array.from(merged.values()));
+          return;
+        } catch {
+          // Fall through to local-only clicks.
+        }
+      }
+      if (!cancelled) setHeatmapClicks(localClicks);
+    };
+    run();
+    return () => { cancelled = true; };
+  }, [heatmapOn, siteId, url, parsed, heatmapClicks.length]);
+
   const onScrub = (e: Event) => {
     const target = e.target as HTMLInputElement;
     setElapsed(Number(target.value));
@@ -177,7 +268,7 @@ export default function ReplayPlayer({ events, onClose }: PlayerProps) {
           <button class="replay-close" onClick={onClose} aria-label="Close player">×</button>
         </div>
 
-        <div class="replay-stage">
+        <div class="replay-stage" ref={stageRef}>
           <iframe
             ref={iframeRef}
             class="replay-iframe"
@@ -186,6 +277,9 @@ export default function ReplayPlayer({ events, onClose }: PlayerProps) {
           />
           <div ref={cursorRef} class="replay-cursor" aria-hidden="true" />
           <div ref={rippleRef} class="replay-ripple" aria-hidden="true" />
+          {heatmapOn && (
+            <HeatmapOverlay clicks={heatmapClicks} width={stageSize.w} height={stageSize.h} />
+          )}
           {!parsed.length && (
             <div class="replay-empty">No replay events recorded.</div>
           )}
@@ -194,6 +288,15 @@ export default function ReplayPlayer({ events, onClose }: PlayerProps) {
         <div class="replay-controls">
           <button class="replay-play" onClick={() => setPlaying(!playing)} aria-label={playing ? "Pause" : "Play"}>
             {playing ? "Pause" : "Play"}
+          </button>
+          <button
+            class={`replay-heatmap-toggle${heatmapOn ? " replay-heatmap-toggle--on" : ""}`}
+            onClick={() => setHeatmapOn((v) => !v)}
+            aria-pressed={heatmapOn}
+            aria-label="Toggle click heatmap"
+            data-testid="heatmap-toggle"
+          >
+            {heatmapOn ? "Heatmap on" : "Heatmap"}
           </button>
           <span class="replay-time">{fmt(elapsed)} / {fmt(duration)}</span>
           <input
