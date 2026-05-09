@@ -227,7 +227,10 @@ func seedTraces(ctx context.Context, db *nucleus.Client) error {
 				ScopeSpans: []tracing.ScopeSpans{{Spans: spans}},
 			}},
 		}
-		if _, err := ingest.Ingest(ctx, defaultSiteID, req); err != nil {
+		// IngestSync (vs Ingest) blocks on the rollup write so a fresh
+		// install shows Services + ServiceMap data the moment the HTTP
+		// server is ready, instead of racing the background goroutine.
+		if _, err := ingest.IngestSync(ctx, defaultSiteID, req); err != nil {
 			return fmt.Errorf("ingest trace %d: %w", i, err)
 		}
 	}
