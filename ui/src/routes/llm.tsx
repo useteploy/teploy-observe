@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "preact/hooks";
 import { get } from "../api/helpers.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
+import ExportButton from "../components/shared/ExportButton.js";
 
 export const config = { mode: "app" };
 
@@ -76,12 +77,13 @@ export default function LLMPage() {
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<LLMTrace | null>(null);
 
-  const now = new Date();
-  const from = new Date(now.getTime() - 7 * 86400000).toISOString();
-  const to = now.toISOString();
-
   const fetch = useCallback(async () => {
     setLoading(true);
+    // Compute the window inside the callback so the ref stays stable across
+    // renders — otherwise from/to change every render and we infinite-loop.
+    const now = new Date();
+    const from = new Date(now.getTime() - 7 * 86400000).toISOString();
+    const to = now.toISOString();
     try {
       const [s, m, t] = await Promise.all([
         get<LLMStats>(`${BASE}/stats?site_id=${siteId}&from=${from}&to=${to}`).catch(() => null),
@@ -92,7 +94,7 @@ export default function LLMPage() {
       setModels(m || []);
       setTraces(t || []);
     } finally { setLoading(false); }
-  }, [siteId, from, to]);
+  }, [siteId]);
 
   useEffect(() => { fetch(); }, [fetch]);
 
@@ -227,7 +229,23 @@ export default function LLMPage() {
           {/* Recent traces */}
           {traces.length > 0 && (
             <div>
-              <h2 style={{ fontSize: "14px", fontWeight: 600, color: "var(--obs-text)", marginBottom: "8px" }}>Recent Calls</h2>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
+                <h2 style={{ fontSize: "14px", fontWeight: 600, color: "var(--obs-text)", margin: 0 }}>Recent Calls</h2>
+                <ExportButton
+                  filename={`llm-traces-${siteId}-${Date.now()}.csv`}
+                  rows={traces}
+                  columns={[
+                    { key: "model", label: "model" },
+                    { key: "provider", label: "provider" },
+                    { key: "operation", label: "operation" },
+                    { key: "total_tokens", label: "tokens" },
+                    { key: "cost_usd", label: "cost_usd" },
+                    { key: "latency_ms", label: "latency_ms" },
+                    { key: "status", label: "status" },
+                    { key: "timestamp", label: "timestamp_ms" },
+                  ]}
+                />
+              </div>
               <div style={{ background: "var(--obs-surface)", borderRadius: "var(--obs-radius-md)", overflow: "hidden" }}>
                 {traces.map((t) => (
                   <div key={t.trace_id} onClick={() => setSelected(t)}

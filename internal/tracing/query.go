@@ -195,7 +195,9 @@ func (q *QueryService) SearchTraces(ctx context.Context, siteID string, from, to
 		offset = 0
 	}
 
-	where := "site_id = $1 AND start_time >= CAST($2 AS BIGINT) AND start_time < CAST($3 AS BIGINT)"
+	// start_time is stored as TEXT (digit-string) and Nucleus doesn't coerce it
+	// to BIGINT for the comparison — both sides need an explicit cast.
+	where := "site_id = $1 AND CAST(start_time AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(start_time AS BIGINT) < CAST($3 AS BIGINT)"
 	params := []any{siteID, fromMs, toMs}
 	idx := 4
 
