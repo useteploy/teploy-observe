@@ -61,12 +61,13 @@ type Options struct {
 	LogFlushInterval time.Duration
 }
 
-// Client submits events, errors, and logs to Observe.
+// Client submits events, errors, logs, and traces to Observe.
 type Client struct {
 	opts   Options
 	http   *http.Client
 	mu     sync.Mutex
 	logs   []LogEntry
+	spans  []pendingSpan
 	closed chan struct{}
 	done   chan struct{}
 }
@@ -157,6 +158,10 @@ func (c *Client) Close() error {
 		close(c.closed)
 	}
 	<-c.done
+	if err := c.flushSpans(context.Background()); err != nil {
+		_ = c.flushLogs(context.Background())
+		return err
+	}
 	return c.flushLogs(context.Background())
 }
 
@@ -170,6 +175,7 @@ func (c *Client) loop() {
 			return
 		case <-t.C:
 			_ = c.flushLogs(context.Background())
+			_ = c.flushSpans(context.Background())
 		}
 	}
 }
@@ -254,16 +260,20 @@ func (c *Client) flushLogs(ctx context.Context) error {
 }
 
 func (c *Client) post(ctx context.Context, path string, body any) error {
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("observe: marshal: %w", err)
-	}
 	url := c.opts.Endpoint
 	for len(url) > 0 && url[len(url)-1] == '/' {
 		url = url[:len(url)-1]
 	}
 	url += path
+	return c.postRaw(ctx, url, body, nil)
+}
 
+// postRaw is the underlying HTTP call, used by post() and the OTLP trace path.
+func (c *Client) postRaw(ctx context.Context, url string, body any, extraHeaders map[string]string) error {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("observe: marshal: %w", err)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return fmt.Errorf("observe: new request: %w", err)
@@ -272,13 +282,16 @@ func (c *Client) post(ctx context.Context, path string, body any) error {
 	if c.opts.APIKey != "" {
 		req.Header.Set("X-API-Key", c.opts.APIKey)
 	}
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("observe: post: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("observe: %s returned %d", path, resp.StatusCode)
+		return fmt.Errorf("observe: %s returned %d", url, resp.StatusCode)
 	}
 	return nil
 }
