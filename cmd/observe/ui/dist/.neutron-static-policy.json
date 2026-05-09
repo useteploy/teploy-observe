@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-05-09T08:26:36.427Z",
+  "generatedAt": "2026-05-09T09:15:33.258Z",
   "headers": {
     "/assets/*": {
       "Cache-Control": "public, max-age=31536000, immutable"

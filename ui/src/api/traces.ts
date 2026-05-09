@@ -68,6 +68,19 @@ export interface TraceError {
   issue_id: string;
 }
 
+export interface PerformanceIssue {
+  issue_id: string;
+  trace_id: string;
+  detector_name: string;
+  fingerprint: string;
+  title: string;
+  description: string;
+  severity: string;
+  count: number;
+  first_seen: number;
+  last_seen: number;
+}
+
 export const tracesApi = {
   services: (siteId: string, from: string, to: string) =>
     get<Service[]>(`${BASE}/services?site_id=${siteId}&from=${from}&to=${to}`),
@@ -88,4 +101,6 @@ export const tracesApi = {
     get<TraceError[]>(`${BASE}/${traceId}/errors?site_id=${siteId}`),
   dependencies: (siteId: string, from: string, to: string) =>
     get<ServiceDependency[]>(`${BASE}/dependencies?site_id=${siteId}&from=${from}&to=${to}`),
+  performanceIssues: (siteId: string, from: string, to: string) =>
+    get<PerformanceIssue[]>(`/api/v1/performance/issues?site_id=${siteId}&from=${from}&to=${to}`),
 };

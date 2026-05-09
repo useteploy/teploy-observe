@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { tracesApi } from "../api/traces.js";
-import type { Service, Operation, Span, TraceSummary, TraceError, ServiceDependency } from "../api/traces.js";
+import type { Service, Operation, Span, TraceSummary, TraceError, ServiceDependency, PerformanceIssue } from "../api/traces.js";
 import SearchInput from "../components/shared/SearchInput.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
@@ -627,7 +627,82 @@ function DependencyGraph({ deps, loading }: { deps: ServiceDependency[]; loading
   );
 }
 
-type View = "services" | "operations" | "trace" | "search" | "deps" | "map";
+type View = "services" | "operations" | "trace" | "search" | "deps" | "map" | "performance";
+
+// PerformanceIssuesTable lists detector-emitted findings from
+// /api/v1/performance/issues. Clicking a row jumps into the trace waterfall
+// for the offending trace_id so users go from "what" to "where" in one click.
+function PerformanceIssuesTable({ siteId, from, to, onSelectTrace }: {
+  siteId: string;
+  from: string;
+  to: string;
+  onSelectTrace: (id: string) => void;
+}) {
+  const [issues, setIssues] = useState<PerformanceIssue[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    tracesApi.performanceIssues(siteId, from, to)
+      .then(d => setIssues(d || []))
+      .catch(() => setIssues([]))
+      .finally(() => setLoading(false));
+  }, [siteId, from, to]);
+
+  if (loading) return <ListSkeleton />;
+  if (issues.length === 0) {
+    return (
+      <EmptyState
+        title="No performance issues detected"
+        description="Detectors look for N+1 queries, slow DB calls, serial DB chains, and slow outbound HTTP. As traces stream in, anything that matches will surface here."
+        icon="layers"
+      />
+    );
+  }
+
+  return (
+    <table class="obs-table">
+      <thead>
+        <tr>
+          <th>Severity</th>
+          <th>Detector</th>
+          <th>Title</th>
+          <th>Description</th>
+          <th style={{ textAlign: "right" }}>Count</th>
+          <th>Last Seen</th>
+        </tr>
+      </thead>
+      <tbody>
+        {issues.map(iss => {
+          const sevColor = iss.severity === "error"
+            ? "var(--obs-danger)"
+            : iss.severity === "warning"
+              ? "var(--obs-warning)"
+              : "var(--obs-text-muted)";
+          return (
+            <tr key={iss.fingerprint} style={{ cursor: iss.trace_id ? "pointer" : "default" }}
+                onClick={() => iss.trace_id && onSelectTrace(iss.trace_id)}>
+              <td>
+                <span style={{
+                  display: "inline-block", padding: "2px 8px", borderRadius: "4px",
+                  background: sevColor, color: "white", fontSize: "11px",
+                  textTransform: "uppercase", fontWeight: 600,
+                }}>{iss.severity}</span>
+              </td>
+              <td><code style={{ fontSize: "12px" }}>{iss.detector_name}</code></td>
+              <td>{iss.title}</td>
+              <td style={{ color: "var(--obs-text-muted)", fontSize: "13px" }}>{iss.description}</td>
+              <td style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{iss.count}</td>
+              <td style={{ color: "var(--obs-text-muted)", fontSize: "12px" }}>
+                {iss.last_seen ? new Date(iss.last_seen).toLocaleString() : "—"}
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
 
 export default function TracesPage() {
   const siteId = typeof window !== "undefined"
@@ -704,7 +779,7 @@ export default function TracesPage() {
     } else if (view === "trace") {
       setView("services");
       setTraceId(null);
-    } else if (view === "search" || view === "map" || view === "deps") {
+    } else if (view === "search" || view === "map" || view === "deps" || view === "performance") {
       setView("services");
     }
   };
@@ -789,6 +864,11 @@ export default function TracesPage() {
             onClick={() => setView("deps")}>
             Dependencies
           </button>
+          <button class={`obs-btn ${view === "performance" ? "obs-btn--primary" : ""}`}
+            data-testid="traces-tab-performance"
+            onClick={() => setView("performance")}>
+            Performance
+          </button>
           <button class={`obs-btn ${view === "search" ? "obs-btn--primary" : ""}`}
             data-testid="traces-tab-search"
             onClick={() => setView("search")}>
@@ -857,6 +937,8 @@ export default function TracesPage() {
         )
       ) : view === "deps" ? (
         <DependencyGraph deps={deps} loading={depsLoading} />
+      ) : view === "performance" ? (
+        <PerformanceIssuesTable siteId={siteId} from={from} to={to} onSelectTrace={loadTrace} />
       ) : view === "search" ? (
         <SearchFilters siteId={siteId} from={from} to={to} services={services} onSelectTrace={loadTrace} />
       ) : loading ? (
