@@ -4,34 +4,30 @@ on:
   push:
     tags:
       - 'v*'
+      - 'sdk-browser-v*'
+      - 'sdk-sentry-shim-v*'
+      - 'sdk-python-v*'
 
 permissions:
   contents: write
   packages: write
 
+# UI dist is committed at cmd/observe/ui/dist/, so goreleaser packages it
+# directly — no pnpm or Neutron source needed at release time. Devs who
+# edit UI sources locally must run scripts/ui-sync.sh and commit the
+# regenerated dist before tagging.
+
 jobs:
   goreleaser:
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
           fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version: '1.24'
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Install pnpm deps
-        working-directory: tystack/typescript
-        run: pnpm install --frozen-lockfile
-      - name: Build UI for embedding
-        working-directory: teploy-observe
-        run: ./scripts/ui-sync.sh
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -43,14 +39,13 @@ jobs:
           distribution: goreleaser
           version: '~> v2'
           args: release --clean
-          workdir: teploy-observe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
 
   npm-browser:
-    runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/sdk-browser-')
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -58,19 +53,19 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
       - name: Build
-        working-directory: teploy-observe/sdk/browser
+        working-directory: sdk/browser
         run: |
           npm install
           npm run build
       - name: Publish
-        working-directory: teploy-observe/sdk/browser
+        working-directory: sdk/browser
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   npm-sentry-shim:
-    runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/sdk-sentry-shim-')
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -78,31 +73,31 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
       - name: Build
-        working-directory: teploy-observe/sdk/sentry-shim
+        working-directory: sdk/sentry-shim
         run: |
           npm install
           npm run build
       - name: Publish
-        working-directory: teploy-observe/sdk/sentry-shim
+        working-directory: sdk/sentry-shim
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   pypi:
-    runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/sdk-python-')
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Build
-        working-directory: teploy-observe/sdk/python
+        working-directory: sdk/python
         run: |
           python -m pip install --upgrade build twine
           python -m build
       - name: Publish to PyPI
-        working-directory: teploy-observe/sdk/python
+        working-directory: sdk/python
         run: twine upload dist/*
         env:
           TWINE_USERNAME: __token__
