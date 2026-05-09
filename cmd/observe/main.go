@@ -917,7 +917,9 @@ func main() {
 // ─── Subcommands ────────────────────────────────────────────────────────────
 
 func printHelp() {
-	fmt.Println(`Observe — self-hosted analytics, errors, logs, traces, replays.
+	// Write directly to stdout to avoid `go vet` parsing the `date +%F`
+	// example below as a printf directive.
+	os.Stdout.WriteString(`Observe — self-hosted analytics, errors, logs, traces, replays.
 
 Usage:
   observe              Start the HTTP server (default).
@@ -937,7 +939,8 @@ Env vars:
 
 Example backup:
   observe backup | zstd > observe-$(date +%F).tar.zst
-  zstdcat observe-2026-04-17.tar.zst | observe restore`)
+  zstdcat observe-2026-04-17.tar.zst | observe restore
+`)
 }
 
 func connectForCLI(cfg config.Config, logger *slog.Logger) *nucleus.Client {
