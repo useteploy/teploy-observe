@@ -94,6 +94,32 @@ func TestIssueCulprit(t *testing.T) {
 	}
 }
 
+func TestGroupHashRageClick_SameSelectorMerges(t *testing.T) {
+	// Two rage clicks on the same selector + same page must collapse into
+	// a single issue, even when the URL has different query strings.
+	h1 := GroupHashRageClick("https://app.example.com/checkout?ref=hero", "button#submit")
+	h2 := GroupHashRageClick("https://app.example.com/checkout?ref=email&utm=foo", "button#submit")
+	if h1 != h2 {
+		t.Errorf("rage clicks on same selector should merge, got %s vs %s", h1, h2)
+	}
+}
+
+func TestGroupHashRageClick_DifferentSelectorSplits(t *testing.T) {
+	h1 := GroupHashRageClick("https://app.example.com/checkout", "button#submit")
+	h2 := GroupHashRageClick("https://app.example.com/checkout", "button#cancel")
+	if h1 == h2 {
+		t.Errorf("rage clicks on different selectors must not merge: %s", h1)
+	}
+}
+
+func TestGroupHashRageClick_DifferentPageSplits(t *testing.T) {
+	h1 := GroupHashRageClick("https://app.example.com/checkout", "button#submit")
+	h2 := GroupHashRageClick("https://app.example.com/cart", "button#submit")
+	if h1 == h2 {
+		t.Errorf("rage clicks on different pages must not merge: %s", h1)
+	}
+}
+
 func TestIssueTitle(t *testing.T) {
 	title := IssueTitle("TypeError", "Cannot read property 'x' of null")
 	if title != "TypeError: Cannot read property 'x' of null" {
