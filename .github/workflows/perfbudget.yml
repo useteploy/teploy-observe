@@ -1,0 +1,211 @@
+name: Perf Budget
+
+# Roadmap T041: 10k events/sec sustained on 1vCPU/2GB over 10 minutes with
+# <50ms p95 ingest latency. Runs weekly so a regression shows up before the
+# next release tag, and on-demand via workflow_dispatch when investigating
+# a suspected slowdown.
+#
+# Not wired into CI on push/PR — a 10-minute soak is too slow for PR
+# feedback. Use the manual trigger with a shorter duration to smoke-test
+# changes locally before merging.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Bench duration (e.g. 60s, 600s)'
+        required: false
+        default: '600s'
+      concurrency:
+        description: 'Concurrent workers'
+        required: false
+        default: '128'
+      min_rps:
+        description: 'Minimum req/s to pass'
+        required: false
+        default: '10000'
+      max_p95_ms:
+        description: 'Maximum p95 latency in ms'
+        required: false
+        default: '50'
+      max_fail_pct:
+        description: 'Maximum failure %'
+        required: false
+        default: '1'
+  schedule:
+    # Sundays 04:00 UTC — quiet runner pool, doesn't collide with weekday CI.
+    - cron: '0 4 * * 0'
+
+jobs:
+  perfbudget:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BUDGET_DURATION:     ${{ github.event.inputs.duration     || '600s' }}
+      BUDGET_CONCURRENCY:  ${{ github.event.inputs.concurrency  || '128' }}
+      BUDGET_MIN_RPS:      ${{ github.event.inputs.min_rps      || '10000' }}
+      BUDGET_MAX_P95_MS:   ${{ github.event.inputs.max_p95_ms   || '50' }}
+      BUDGET_MAX_FAIL_PCT: ${{ github.event.inputs.max_fail_pct || '1' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Nucleus build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            Neutron/nucleus/target
+          key: nucleus-${{ runner.os }}-${{ hashFiles('Neutron/nucleus/Cargo.lock') }}
+          restore-keys: |
+            nucleus-${{ runner.os }}-
+
+      - name: Build Nucleus
+        working-directory: Neutron/nucleus
+        run: cargo build --release --features server --bin nucleus
+
+      - name: Build Observe
+        run: go build -o observe ./cmd/observe
+
+      - name: Build bench harness
+        working-directory: bench
+        run: go build -o observe-bench .
+
+      - name: Boot Nucleus + Observe
+        run: |
+          set -eu
+          mkdir -p /tmp/perfbudget/data
+          NUCLEUS_BIN="$PWD/Neutron/nucleus/target/release/nucleus"
+          OBSERVE_BIN="$PWD/observe"
+
+          "$NUCLEUS_BIN" start --port 5432 --data /tmp/perfbudget/data/nucleus \
+            >/tmp/perfbudget/nucleus.log 2>&1 &
+          echo $! > /tmp/perfbudget/nucleus.pid
+
+          for _ in $(seq 1 80); do
+            if (echo > /dev/tcp/127.0.0.1/5432) 2>/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+          (echo > /dev/tcp/127.0.0.1/5432) 2>/dev/null || {
+            echo "::error::nucleus failed to start"
+            cat /tmp/perfbudget/nucleus.log
+            exit 1
+          }
+
+          OBSERVE_NUCLEUS_URL="postgres://postgres@localhost:5432/postgres?sslmode=disable" \
+          OBSERVE_PORT=3000 \
+          OBSERVE_DATA_DIR=/tmp/perfbudget/data \
+          OBSERVE_JWT_SECRET="perfbudget-ci-secret-not-for-prod" \
+          "$OBSERVE_BIN" >/tmp/perfbudget/observe.log 2>&1 &
+          echo $! > /tmp/perfbudget/observe.pid
+
+          for _ in $(seq 1 80); do
+            if curl -fs http://localhost:3000/healthz >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.25
+          done
+          curl -fs http://localhost:3000/healthz >/dev/null 2>&1 || {
+            echo "::error::observe failed to start"
+            cat /tmp/perfbudget/observe.log
+            exit 1
+          }
+
+      - name: Provision API key + raise rate limit
+        id: provision
+        run: |
+          set -eu
+          TOKEN=$(curl -fs -X POST http://localhost:3000/api/v1/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"observe"}' | \
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+
+          # Raise per-site cap above the bench target so the rate limiter
+          # doesn't become the bottleneck under measurement.
+          CAP=$(( BUDGET_MIN_RPS * 5 ))
+          curl -fs -X PUT \
+            -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "{\"rate_per_second\":$CAP}" \
+            http://localhost:3000/api/v1/sites/default/ratelimit >/dev/null
+
+          KEY=$(curl -fs -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"perfbudget-ci"}' \
+            http://localhost:3000/api/v1/sites/default/keys | \
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["key"])')
+
+          echo "::add-mask::$KEY"
+          echo "api_key=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Run perf budget
+        env:
+          OBSERVE_URL: http://localhost:3000
+          OBSERVE_API_KEY: ${{ steps.provision.outputs.api_key }}
+          OBSERVE_SITE_ID: default
+        run: sh scripts/perfbudget.sh
+
+      - name: Stop services
+        if: always()
+        run: |
+          [ -f /tmp/perfbudget/observe.pid ] && kill -TERM "$(cat /tmp/perfbudget/observe.pid)" 2>/dev/null || true
+          [ -f /tmp/perfbudget/nucleus.pid ] && kill -TERM "$(cat /tmp/perfbudget/nucleus.pid)" 2>/dev/null || true
+
+      - name: Summarize results
+        if: always()
+        run: |
+          if [ ! -f bench_results.json ]; then
+            echo "no bench_results.json produced" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## Perf Budget"
+            echo
+            echo "| metric | value | budget |"
+            echo "| --- | --- | --- |"
+            python3 - <<'PY'
+          import json, os
+          with open("bench_results.json") as f:
+              r = json.load(f)[0]
+          total = r.get("total_requests", 0)
+          failed = r.get("failed_requests", 0)
+          fp = (failed / total * 100) if total else 0
+          rows = [
+              ("throughput (req/s)", f"{r.get('throughput_rps', 0):.0f}", f">= {os.environ['BUDGET_MIN_RPS']}"),
+              ("p50 latency (ms)",   f"{r.get('latency_p50_ms', 0):.2f}", "—"),
+              ("p95 latency (ms)",   f"{r.get('latency_p95_ms', 0):.2f}", f"<= {os.environ['BUDGET_MAX_P95_MS']}"),
+              ("p99 latency (ms)",   f"{r.get('latency_p99_ms', 0):.2f}", "—"),
+              ("failure rate (%)",   f"{fp:.2f}",                         f"<= {os.environ['BUDGET_MAX_FAIL_PCT']}"),
+              ("total requests",     str(total),                          "—"),
+              ("duration",           r.get("duration", "—"),              "—"),
+              ("concurrency",        str(r.get("concurrency", 0)),        "—"),
+          ]
+          for name, val, budget in rows:
+              print(f"| {name} | {val} | {budget} |")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload bench results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench_results
+          path: bench_results.json
+
+      - name: Upload service logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: service-logs
+          path: /tmp/perfbudget/*.log
