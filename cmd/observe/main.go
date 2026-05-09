@@ -9,7 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/signal"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"strings"
@@ -54,8 +54,13 @@ import (
 	"github.com/useteploy/teploy-observe/internal/surveys"
 	"github.com/useteploy/teploy-observe/internal/tracking"
 	"github.com/useteploy/teploy-observe/internal/tracing"
+	"github.com/useteploy/teploy-observe/internal/upgrade"
 	"github.com/useteploy/teploy-observe/internal/views"
 )
+
+// observeVersion is the version string printed by `observe version` and
+// reported to the in-process meta service. Bump it on each release.
+const observeVersion = "0.1.0"
 
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
@@ -77,7 +82,10 @@ func main() {
 			runRestore(cfg, logger)
 			return
 		case "version":
-			fmt.Println("observe 0.1.0")
+			fmt.Println("observe " + observeVersion)
+			return
+		case "upgrade":
+			runUpgrade(cfg, logger, os.Args[2:])
 			return
 		case "help", "-h", "--help":
 			printHelp()
@@ -238,7 +246,7 @@ func main() {
 	scheduler := jobs.NewScheduler(rollups, retention, logger)
 
 	// Self-observability service
-	metaSvc := meta.New(db, retention, "0.1.0")
+	metaSvc := meta.New(db, retention, observeVersion)
 
 	// Self-instrumentation: trace every HTTP request + ship panics to /errors,
 	// scoped to site_id=_meta. Off by default (adds ingest load to the same
@@ -288,7 +296,7 @@ func main() {
 		neutron.WithMiddleware(ingest.RequestInfoMiddleware),
 		neutron.WithMiddleware(config.DemoModeMiddleware(cfg.DemoMode)),
 		neutron.WithNucleusChecker(db),
-		neutron.WithOpenAPIInfo("Teploy Observe", "0.1.0"),
+		neutron.WithOpenAPIInfo("Teploy Observe", observeVersion),
 		// /docs is reserved for the in-product docs page; Swagger UI lives at /api/docs.
 		neutron.DisableDefaultDocs(),
 	)
@@ -831,10 +839,12 @@ func main() {
 		w.Write(indexHTML)
 	})
 
-	// Start background services directly (lifecycle hooks may not fire on all platforms)
-	buf.Start()
+	// buf + scheduler are started by the lifecycle hooks registered on
+	// the neutron app above. errorBuf has no lifecycle hook so we start
+	// it directly. (Calling .Start twice on scheduler creates a second
+	// goroutine set whose cancel-func gets overwritten, hanging Stop —
+	// learnt the hard way during T043.)
 	errorBuf.Start()
-	scheduler.Start()
 
 	// Alert check loop (every 60s)
 	go func() {
@@ -879,37 +889,45 @@ func main() {
 		}
 	}()
 
-	// Graceful shutdown
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigCh
-		logger.Info("shutting down gracefully...")
-
-		// Flush buffers
-		buf.Stop()
-		errorBuf.Stop()
-		scheduler.Stop()
-
-		// Flush self-monitoring queues so we don't lose the last batch
-		// of self-traces/logs/errors on graceful shutdown.
-		_ = self.Close()
-
-		// Close database
-		db.Close()
-
-		logger.Info("shutdown complete")
-		os.Exit(0)
-	}()
+	// PID file lets `observe upgrade` find this process and send SIGTERM.
+	// Env snapshot lets `observe upgrade` re-launch the new binary with
+	// the same OBSERVE_* configuration even when the upgrader was invoked
+	// from a different shell. Both are best-effort.
+	dataDir := os.Getenv("OBSERVE_DATA_DIR")
+	if dataDir != "" {
+		if err := upgrade.WritePID(dataDir); err != nil {
+			logger.Warn("could not write pid file", "err", err, "dir", dataDir)
+		} else {
+			logger.Info("pid file written", "path", upgrade.PIDFile(dataDir))
+		}
+		if err := upgrade.WriteEnv(dataDir); err != nil {
+			logger.Warn("could not write env snapshot", "err", err)
+		}
+	}
 
 	if os.Getenv("OBSERVE_LOG_ROUTES") == "1" {
 		r.PrintRoutes()
 	}
 
 	logger.Info("starting observe", "addr", cfg.Addr)
-	if err := app.Run(cfg.Addr); err != nil {
-		logger.Error("server error", "err", err)
+	// app.Run owns SIGTERM + http drain + lifecycle.stop (which Stops the
+	// ingest buffer + scheduler we registered as hooks). It blocks until
+	// shutdown completes.
+	runErr := app.Run(cfg.Addr)
+
+	// Supplemental shutdown for state Neutron's lifecycle doesn't manage:
+	// errorBuf flush, dogfood self-monitoring, db.Close, PID file.
+	logger.Info("running supplemental shutdown")
+	errorBuf.Stop()
+	_ = self.Close()
+	db.Close()
+	if dataDir != "" {
+		_ = upgrade.RemovePID(dataDir)
+	}
+	logger.Info("shutdown complete")
+
+	if runErr != nil {
+		logger.Error("server error", "err", runErr)
 		os.Exit(1)
 	}
 }
@@ -925,12 +943,18 @@ Usage:
   observe              Start the HTTP server (default).
   observe backup       Stream a tar archive of all tables to stdout.
   observe restore      Read a tar archive from stdin and insert into tables.
+  observe upgrade      Drain ingest, swap binary, resume — zero event loss.
   observe version      Print the observe version.
   observe help         Show this message.
+
+Upgrade flags:
+  --target <path>      Path to the new binary (default: ./observe-new)
+  --data-dir <path>    Override OBSERVE_DATA_DIR for PID lookup
 
 Env vars:
   OBSERVE_ADDR                 HTTP bind address (default :3000)
   OBSERVE_NUCLEUS_URL          Nucleus/Postgres DSN
+  OBSERVE_DATA_DIR             Data directory (PID file, WAL queue)
   OBSERVE_JWT_SECRET           JWT signing secret (required in prod)
   OBSERVE_ADMIN_USER           First-boot admin username (default: admin)
   OBSERVE_ADMIN_PASSWORD       First-boot admin password (default: observe)
@@ -940,6 +964,10 @@ Env vars:
 Example backup:
   observe backup | zstd > observe-$(date +%F).tar.zst
   zstdcat observe-2026-04-17.tar.zst | observe restore
+
+Example upgrade:
+  cp /tmp/observe-new ./observe-new
+  ./observe upgrade --target ./observe-new
 `)
 }
 
@@ -975,6 +1003,172 @@ func runRestore(cfg config.Config, logger *slog.Logger) {
 		os.Exit(1)
 	}
 	logger.Info("restore complete")
+}
+
+// runUpgrade orchestrates a zero-downtime binary swap. See
+// internal/upgrade for the building blocks. Flow:
+//   1. Parse --target and --data-dir flags.
+//   2. Pre-flight the target binary (exists, executable, version >= current).
+//   3. SIGTERM the running observe via PID file.
+//   4. Wait up to 30s for it to exit (graceful shutdown flushes ingest +
+//      WAL queue persists buffered events on disk).
+//   5. Atomic swap: rename current → .prev, rename target → current.
+//   6. Spawn the new binary detached with the same env.
+//   7. Wait up to 60s for /healthz to return 200.
+//   8. On any failure after the swap, restore the previous binary.
+func runUpgrade(cfg config.Config, logger *slog.Logger, args []string) {
+	target := "./observe-new"
+	dataDir := os.Getenv("OBSERVE_DATA_DIR")
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--target":
+			if i+1 >= len(args) {
+				logger.Error("upgrade: --target requires a value")
+				os.Exit(2)
+			}
+			target = args[i+1]
+			i++
+		case "--data-dir":
+			if i+1 >= len(args) {
+				logger.Error("upgrade: --data-dir requires a value")
+				os.Exit(2)
+			}
+			dataDir = args[i+1]
+			i++
+		case "-h", "--help":
+			fmt.Println("usage: observe upgrade [--target PATH] [--data-dir PATH]")
+			return
+		default:
+			logger.Error("upgrade: unknown argument", "arg", args[i])
+			os.Exit(2)
+		}
+	}
+	if dataDir == "" {
+		logger.Error("upgrade: OBSERVE_DATA_DIR or --data-dir required (need to find PID file)")
+		os.Exit(2)
+	}
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		logger.Error("upgrade: resolve target path", "err", err)
+		os.Exit(1)
+	}
+
+	// 1. Pre-flight the target.
+	logger.Info("upgrade: pre-flighting target", "target", absTarget)
+	currentVersionStr := "observe " + observeVersion
+	targetVersion, err := upgrade.PreflightTarget(absTarget, currentVersionStr)
+	if err != nil {
+		logger.Error("upgrade: pre-flight failed", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("upgrade: target ok", "target_version", fmt.Sprintf("%d.%d.%d", targetVersion.Major, targetVersion.Minor, targetVersion.Patch))
+
+	// 2. Locate current binary path and the running PID.
+	currentBinary, err := os.Executable()
+	if err != nil {
+		logger.Error("upgrade: cannot resolve current executable", "err", err)
+		os.Exit(1)
+	}
+	if resolved, err := filepath.EvalSymlinks(currentBinary); err == nil {
+		currentBinary = resolved
+	}
+	pid, err := upgrade.ReadPID(dataDir)
+	if err != nil {
+		logger.Error("upgrade: cannot read pid file (is observe running?)", "err", err, "path", upgrade.PIDFile(dataDir))
+		os.Exit(1)
+	}
+	logger.Info("upgrade: found running observe", "pid", pid, "binary", currentBinary)
+
+	// 3+4. SIGTERM and wait for exit.
+	if err := upgrade.SignalProcess(pid, syscall.SIGTERM); err != nil {
+		logger.Error("upgrade: send sigterm", "err", err, "pid", pid)
+		os.Exit(1)
+	}
+	logger.Info("upgrade: sent sigterm, waiting for exit (up to 30s)")
+	ctx := context.Background()
+	if err := upgrade.WaitForShutdown(ctx, pid, dataDir, 30*time.Second); err != nil {
+		logger.Error("upgrade: old process did not exit in time", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("upgrade: old process exited, ingest WAL queue is on disk")
+
+	// 5. Atomic swap (rename within the same directory is atomic on the
+	// same filesystem; cross-FS would error and we'd refuse below).
+	prevBackup, err := upgrade.SwapBinary(currentBinary, absTarget)
+	if err != nil {
+		logger.Error("upgrade: binary swap failed", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("upgrade: binary swapped", "current", currentBinary, "backup", prevBackup)
+
+	// 6. Spawn the new binary detached. Prefer the OBSERVE_* env snapshot
+	// the previous instance wrote (so the upgrader can be invoked from a
+	// different shell and the new binary still gets OBSERVE_NUCLEUS_URL
+	// etc.); fall back to the upgrader's own env when no snapshot exists.
+	spawnEnv := os.Environ()
+	if snap, err := upgrade.ReadEnv(dataDir); err == nil && len(snap) > 0 {
+		// Merge: start from non-OBSERVE_ vars in current env, then layer
+		// the snapshot on top so its OBSERVE_* values win.
+		merged := make([]string, 0, len(snap)+len(spawnEnv))
+		for _, kv := range spawnEnv {
+			if !strings.HasPrefix(kv, "OBSERVE_") {
+				merged = append(merged, kv)
+			}
+		}
+		merged = append(merged, snap...)
+		spawnEnv = merged
+		logger.Info("upgrade: spawning with env snapshot", "vars", len(snap))
+	}
+	cmd := exec.Command(currentBinary)
+	cmd.Env = spawnEnv
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Stdin = nil
+	cmd.SysProcAttr = newProcAttrDetached()
+	if err := cmd.Start(); err != nil {
+		logger.Error("upgrade: spawn new binary failed, rolling back", "err", err)
+		if rerr := upgrade.RestoreBinary(currentBinary, prevBackup); rerr != nil {
+			logger.Error("upgrade: ROLLBACK FAILED — manual intervention required", "err", rerr)
+		}
+		os.Exit(1)
+	}
+	if cmd.Process != nil {
+		_ = cmd.Process.Release()
+	}
+	logger.Info("upgrade: new binary spawned, waiting for healthz (up to 60s)")
+
+	// 7. Health check. Prefer the OBSERVE_ADDR from the env snapshot
+	// (what the running observe is actually listening on) over the
+	// upgrader's own cfg, which falls back to :3000 by default.
+	healthAddr := cfg.Addr
+	if snap, err := upgrade.ReadEnv(dataDir); err == nil {
+		for _, kv := range snap {
+			if strings.HasPrefix(kv, "OBSERVE_ADDR=") {
+				healthAddr = strings.TrimPrefix(kv, "OBSERVE_ADDR=")
+				break
+			}
+		}
+	}
+	healthURL := upgrade.HealthURL(healthAddr)
+	logger.Info("upgrade: probing healthz", "url", healthURL)
+	if err := upgrade.WaitForHealthz(ctx, healthURL, 60*time.Second); err != nil {
+		logger.Error("upgrade: new binary failed health check, rolling back", "err", err, "url", healthURL)
+		// Try to terminate the unhealthy new process so the rollback can boot.
+		if newPid, perr := upgrade.ReadPID(dataDir); perr == nil && newPid != pid {
+			_ = upgrade.SignalProcess(newPid, syscall.SIGTERM)
+			_ = upgrade.WaitForExit(ctx, newPid, 15*time.Second)
+		}
+		if rerr := upgrade.RestoreBinary(currentBinary, prevBackup); rerr != nil {
+			logger.Error("upgrade: ROLLBACK FAILED — manual intervention required", "err", rerr, "backup", prevBackup)
+			os.Exit(1)
+		}
+		logger.Info("upgrade: previous binary restored, you must restart observe manually")
+		os.Exit(1)
+	}
+
+	// 8. Success — clean up the backup.
+	_ = os.Remove(prevBackup)
+	logger.Info("upgrade: complete", "version", fmt.Sprintf("%d.%d.%d", targetVersion.Major, targetVersion.Minor, targetVersion.Patch))
 }
 
 // --- Auth handlers ---
@@ -3222,6 +3416,13 @@ func shareViewHandler(shareSvc *share.ShareService, uiFS fs.FS) http.HandlerFunc
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(html))
 	}
+}
+
+// newProcAttrDetached returns a SysProcAttr that detaches the spawned child
+// from the upgrader's process group so the new observe outlives the
+// `observe upgrade` command. On unix this means Setsid=true.
+func newProcAttrDetached() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{Setsid: true}
 }
 
 // selfMonitorEndpoint converts a bind address (":3000", "0.0.0.0:3000")
