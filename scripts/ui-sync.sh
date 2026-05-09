@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Canonical UI rebuild: edit in teploy-observe/ui/src/, build in tystack canonical,
+# Canonical UI rebuild: edit in teploy-observe/ui/src/, build in Neutron canonical,
 # embed dist back into cmd/observe/ui/dist/, rebuild Go binary.
 #
 # Idempotent: running against unchanged source produces byte-identical dist.
@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OBSERVE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OBSERVE_UI_SRC="$OBSERVE_ROOT/ui/src"
-CANONICAL_APP="$OBSERVE_ROOT/../../tystack/typescript/apps/observe"
+CANONICAL_APP="$OBSERVE_ROOT/../../Neutron/typescript/apps/observe"
 CANONICAL_SRC="$CANONICAL_APP/src"
 EMBED_DIST="$OBSERVE_ROOT/cmd/observe/ui/dist"
 BIN_OUT="${OBSERVE_BIN:-/tmp/obs-launch/observe}"

@@ -8,7 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OBSERVE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-NUCLEUS_BIN="${NUCLEUS_BIN:-$OBSERVE_ROOT/../../tystack/nucleus/target/release/nucleus}"
+NUCLEUS_BIN="${NUCLEUS_BIN:-$OBSERVE_ROOT/../../Neutron/nucleus/target/release/nucleus}"
 OBSERVE_BIN="${OBSERVE_BIN:-/tmp/obs-launch/observe}"
 NUCLEUS_PORT="${NUCLEUS_PORT:-5432}"
 OBSERVE_PORT="${OBSERVE_PORT:-3000}"
@@ -17,7 +17,7 @@ DATA_DIR="${OBSERVE_DATA_DIR:-/tmp/obs-launch/data}"
 log() { printf '\033[1;36m[dev]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[dev]\033[0m %s\n' "$*" >&2; exit 1; }
 
-[ -x "$NUCLEUS_BIN" ] || fail "nucleus binary missing: $NUCLEUS_BIN (run: cd tystack/nucleus && cargo build --release --features server --bin nucleus)"
+[ -x "$NUCLEUS_BIN" ] || fail "nucleus binary missing: $NUCLEUS_BIN (run: cd Neutron/nucleus && cargo build --release --features server --bin nucleus)"
 [ -x "$OBSERVE_BIN" ] || fail "observe binary missing: $OBSERVE_BIN (run: scripts/ui-sync.sh)"
 
 NUCLEUS_PID=""
