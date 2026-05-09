@@ -4,6 +4,7 @@ import type { FeatureFlag, FlagHistoryEntry } from "../api/flags.js";
 import Modal from "../components/shared/Modal.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
 import EmptyState from "../components/shared/EmptyState.js";
+import ExportButton from "../components/shared/ExportButton.js";
 import "../styles/flags.css";
 
 export const config = { mode: "app" };
@@ -343,6 +344,17 @@ export default function FlagsPage() {
       <div class="obs-page-header">
         <h1 class="obs-page-title">Feature Flags</h1>
         <div class="obs-page-actions">
+          <ExportButton
+            filename={`flags-${siteId}-${Date.now()}.csv`}
+            rows={flags}
+            columns={[
+              { key: "flag_key", label: "key" },
+              { key: "name", label: "name" },
+              { key: "flag_type", label: "type" },
+              { key: "rollout_pct", label: "rollout_%" },
+              { key: "enabled", label: "enabled" },
+            ]}
+          />
           <button class="obs-btn obs-btn--primary" onClick={() => setShowCreate(true)}>
             Create Flag
           </button>

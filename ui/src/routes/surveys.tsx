@@ -3,6 +3,7 @@ import { get, post } from "../api/helpers.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
+import ExportButton from "../components/shared/ExportButton.js";
 
 export const config = { mode: "app" };
 
@@ -193,6 +194,15 @@ export default function SurveysPage() {
       <div class="obs-page-header">
         <h1 class="obs-page-title">Surveys</h1>
         <div class="obs-page-actions">
+          <ExportButton
+            filename={`surveys-${siteId}-${Date.now()}.csv`}
+            rows={surveys}
+            columns={[
+              { key: "name", label: "name" },
+              { key: "status", label: "status" },
+              { key: "created_at", label: "created_at" },
+            ]}
+          />
           <button class="obs-btn obs-btn--primary" onClick={() => setShowCreate(true)}>New Survey</button>
         </div>
       </div>

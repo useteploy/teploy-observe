@@ -3,6 +3,7 @@ import { experimentsApi } from "../api/flags.js";
 import type { Experiment, ExperimentResults } from "../api/flags.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
+import ExportButton from "../components/shared/ExportButton.js";
 import "../styles/flags.css";
 
 export const config = { mode: "app" };
@@ -194,6 +195,17 @@ export default function ExperimentsPage() {
       <div class="obs-page-header">
         <h1 class="obs-page-title">Experiments</h1>
         <div class="obs-page-actions">
+          <ExportButton
+            filename={`experiments-${siteId}-${Date.now()}.csv`}
+            rows={experiments}
+            columns={[
+              { key: "name", label: "name" },
+              { key: "flag_key", label: "flag_key" },
+              { key: "goal_metric", label: "goal" },
+              { key: "status", label: "status" },
+              { key: "started_at", label: "started_at" },
+            ]}
+          />
           <button class="obs-btn obs-btn--primary" onClick={() => setShowCreate(true)}>
             Create Experiment
           </button>

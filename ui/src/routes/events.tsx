@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "preact/hooks";
 import { analyticsApi } from "../api/analytics.js";
 import type { CustomEventStat, PropertyStat, TimeSeriesPoint } from "../api/analytics.js";
 import SearchInput from "../components/shared/SearchInput.js";
+import ExportButton from "../components/shared/ExportButton.js";
 
 export const config = { mode: "app" };
 
@@ -50,8 +51,19 @@ export default function EventsPage() {
         <h1 class="obs-page-title">Events</h1>
       </div>
 
-      <div style={{ marginBottom: "16px" }}>
-        <SearchInput value={query} onInput={setQuery} placeholder="Search events..." />
+      <div style={{ marginBottom: "16px", display: "flex", gap: "8px", alignItems: "center" }}>
+        <div style={{ flex: 1 }}>
+          <SearchInput value={query} onInput={setQuery} placeholder="Search events..." />
+        </div>
+        <ExportButton
+          filename={`events-${siteId}-${Date.now()}.csv`}
+          rows={filtered}
+          columns={[
+            { key: "event_type", label: "event" },
+            { key: "count", label: "count" },
+            { key: "visitors", label: "visitors" },
+          ]}
+        />
       </div>
 
       {loading ? (

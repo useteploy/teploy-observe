@@ -6,6 +6,7 @@ import Modal from "../components/shared/Modal.js";
 import ConfirmDialog from "../components/shared/ConfirmDialog.js";
 import Pagination from "../components/shared/Pagination.js";
 import EmptyState from "../components/shared/EmptyState.js";
+import ExportButton from "../components/shared/ExportButton.js";
 import "../styles/settings.css";
 
 export const config = { mode: "app" };
@@ -122,6 +123,19 @@ function RulesTab({ siteId }: { siteId: string }) {
         <span style={{ fontSize: "13px", color: "var(--obs-text-secondary)" }}>
           {rules.length} rule{rules.length !== 1 ? "s" : ""}
         </span>
+        <ExportButton
+          filename={`alert-rules-${siteId}-${Date.now()}.csv`}
+          rows={rules}
+          columns={[
+            { key: "name", label: "name" },
+            { key: "metric", label: "metric" },
+            { key: "operator", label: "operator" },
+            { key: "threshold", label: "threshold" },
+            { key: "window_minutes", label: "window_min" },
+            { key: "cooldown", label: "cooldown_min" },
+            { key: "enabled", label: "enabled" },
+          ]}
+        />
         <button class="obs-btn obs-btn--primary" onClick={() => setShowCreate(true)}>Create Rule</button>
       </div>
 

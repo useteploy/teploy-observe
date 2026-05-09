@@ -6,6 +6,7 @@ import StatusBadge from "../components/shared/StatusBadge.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
 import Tabs from "../components/shared/Tabs.js";
 import EmptyState from "../components/shared/EmptyState.js";
+import ExportButton from "../components/shared/ExportButton.js";
 import "../styles/traces.css";
 
 export const config = { mode: "app" };
@@ -784,6 +785,19 @@ export default function TracesPage() {
           onInput={setSearchId}
           placeholder="Jump to trace ID..."
           onSubmit={handleSearchTrace}
+        />
+        <ExportButton
+          filename={`services-${siteId}-${Date.now()}.csv`}
+          rows={services}
+          columns={[
+            { key: "service_name", label: "service" },
+            { key: "request_count", label: "requests" },
+            { key: "error_count", label: "errors" },
+            { key: "avg_duration_ms", label: "avg_ms" },
+            { key: "p50_ms", label: "p50_ms" },
+            { key: "p95_ms", label: "p95_ms" },
+            { key: "p99_ms", label: "p99_ms" },
+          ]}
         />
       </div>
 

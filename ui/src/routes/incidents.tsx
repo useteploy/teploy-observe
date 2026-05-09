@@ -1,4 +1,5 @@
 import { useState, useEffect } from "preact/hooks";
+import ExportButton from "../components/shared/ExportButton.js";
 
 export const config = { mode: "app" };
 
@@ -95,9 +96,23 @@ export default function IncidentsPage() {
     <div>
       <div class="obs-page-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <h1 class="obs-page-title">Incidents</h1>
-        <button class="obs-btn obs-btn--primary" onClick={() => setShowCreate(true)}>
-          Declare incident
-        </button>
+        <div style={{ display: "flex", gap: "8px" }}>
+          <ExportButton
+            filename={`incidents-${Date.now()}.csv`}
+            rows={[...active, ...resolved]}
+            columns={[
+              { key: "title", label: "title" },
+              { key: "severity", label: "severity" },
+              { key: "source", label: "source" },
+              { key: "started_at", label: "started_at" },
+              { key: "ended_at", label: "ended_at" },
+              { key: "description", label: "description" },
+            ]}
+          />
+          <button class="obs-btn obs-btn--primary" onClick={() => setShowCreate(true)}>
+            Declare incident
+          </button>
+        </div>
       </div>
 
       {loading ? (

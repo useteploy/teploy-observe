@@ -3,6 +3,7 @@ import { monitoringApi } from "../api/monitoring.js";
 import type { UptimeMonitor, UptimeResult, CronMonitor, InfraHost, InfraMetric } from "../api/monitoring.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
+import ExportButton from "../components/shared/ExportButton.js";
 import "../styles/monitoring.css";
 
 export const config = { mode: "app" };
@@ -145,6 +146,18 @@ function UptimeTab() {
         <span style={{ fontSize: "13px", color: "var(--obs-text-secondary)" }}>
           {monitors.length} monitor{monitors.length !== 1 ? "s" : ""}
         </span>
+        <ExportButton
+          filename={`uptime-monitors-${siteId}-${Date.now()}.csv`}
+          rows={monitors}
+          columns={[
+            { key: "name", label: "name" },
+            { key: "url", label: "url" },
+            { key: "method", label: "method" },
+            { key: "interval_seconds", label: "interval_sec" },
+            { key: "expected_status", label: "expected_status" },
+            { key: "enabled", label: "enabled" },
+          ]}
+        />
         <button class="obs-btn obs-btn--primary" onClick={() => setShowCreate(true)}>
           Add Monitor
         </button>
