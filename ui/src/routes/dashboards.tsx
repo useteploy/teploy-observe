@@ -204,8 +204,8 @@ interface Panel {
   position_x: string; position_y: string; width: string; height: string;
 }
 
-interface DashboardDetail {
-  dashboard: Dashboard; panels: Panel[];
+interface DashboardDetail extends Dashboard {
+  panels: Panel[];
 }
 
 const PANEL_TYPES = [
@@ -234,6 +234,10 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
   const [panelValues, setPanelValues] = useState<Record<string, string>>({});
   const [panelSparklines, setPanelSparklines] = useState<Record<string, number[]>>({});
   const [chartLabels, setChartLabels] = useState<string[]>([]);
+  const [dragSrcId, setDragSrcId] = useState<string | null>(null);
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
+  const [resize, setResize] = useState<{ panelId: string; startX: number; startWidth: number; previewWidth: number } | null>(null);
+  const gridRef = useRef<HTMLDivElement>(null);
 
   const fetchDetail = useCallback(async () => {
     setLoading(true);
@@ -288,6 +292,50 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
 
   useEffect(() => { fetchDetail(); }, [fetchDetail]);
 
+  // Track resize drag globally so the user can drag past the panel edge.
+  useEffect(() => {
+    if (!resize) return;
+    const grid = gridRef.current;
+    const colWidth = grid ? (grid.offsetWidth + 12) / 12 : 80;
+    const onMove = (e: MouseEvent) => {
+      const dx = e.clientX - resize.startX;
+      const cols = Math.max(2, Math.min(12, Math.round(resize.startWidth + dx / colWidth)));
+      setResize((prev) => prev && cols !== prev.previewWidth ? { ...prev, previewWidth: cols } : prev);
+    };
+    const onUp = async () => {
+      const r = resize;
+      setResize(null);
+      if (r && r.previewWidth !== r.startWidth) {
+        try {
+          await post(`${BASE}/${dashboardId}/panels/${r.panelId}/layout`, { width: String(r.previewWidth) });
+          fetchDetail();
+        } catch (err) { console.error("resize save failed:", err); }
+      }
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [resize, dashboardId, fetchDetail]);
+
+  const swapPanelOrder = async (srcId: string, dstId: string) => {
+    if (!detail || srcId === dstId) return;
+    const src = detail.panels.find((p) => p.panel_id === srcId);
+    const dst = detail.panels.find((p) => p.panel_id === dstId);
+    if (!src || !dst) return;
+    const srcY = parseInt(src.position_y) || detail.panels.indexOf(src);
+    const dstY = parseInt(dst.position_y) || detail.panels.indexOf(dst);
+    try {
+      await Promise.all([
+        post(`${BASE}/${dashboardId}/panels/${srcId}/layout`, { position_y: String(dstY) }),
+        post(`${BASE}/${dashboardId}/panels/${dstId}/layout`, { position_y: String(srcY) }),
+      ]);
+      fetchDetail();
+    } catch (err) { console.error("reorder failed:", err); }
+  };
+
   const handleAddPanel = async () => {
     if (!panelTitle.trim()) return;
     setAdding(true);
@@ -321,11 +369,11 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
       <div class="dashboard-toolbar">
         <div>
           <h2 style={{ fontSize: "16px", fontWeight: 600, color: "var(--obs-text)", margin: 0 }}>
-            {detail.dashboard.name}
+            {detail.name}
           </h2>
-          {detail.dashboard.description && (
+          {detail.description && (
             <p style={{ fontSize: "12px", color: "var(--obs-text-secondary)", margin: "4px 0 0" }}>
-              {detail.dashboard.description}
+              {detail.description}
             </p>
           )}
         </div>
@@ -344,46 +392,75 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
           ]}
         />
       ) : (
-        <div class="dashboard-panels">
+        <div class="dashboard-panels" ref={gridRef}>
           {detail.panels.filter(p => p.title).map((panel, idx, all) => {
-            const w = parseInt(panel.width) || 6;
+            const savedW = parseInt(panel.width) || 6;
+            const w = resize?.panelId === panel.panel_id ? resize.previewWidth : savedW;
             const series = panelSparklines[panel.panel_id];
             const isTimeSeries = panel.panel_type === "timeseries";
-            const updateLayout = async (patch: { width?: string; position_y?: string }) => {
-              await post(`${BASE}/${dashboardId}/panels/${panel.panel_id}/layout`, patch);
+            const setWidth = async (next: number) => {
+              await post(`${BASE}/${dashboardId}/panels/${panel.panel_id}/layout`, { width: String(next) });
               fetchDetail();
             };
-            const setWidth = (next: number) => updateLayout({ width: String(next) });
-            const move = (dir: -1 | 1) => {
-              const otherIdx = idx + dir;
-              if (otherIdx < 0 || otherIdx >= all.length) return;
-              const other = all[otherIdx];
-              const myY = parseInt(panel.position_y) || idx;
-              const otherY = parseInt(other.position_y) || otherIdx;
-              // swap position_y values
-              Promise.all([
-                post(`${BASE}/${dashboardId}/panels/${panel.panel_id}/layout`, { position_y: String(otherY) }),
-                post(`${BASE}/${dashboardId}/panels/${other.panel_id}/layout`, { position_y: String(myY) }),
-              ]).then(fetchDetail);
-            };
+            const isDragSrc = dragSrcId === panel.panel_id;
+            const isDragOver = dragOverId === panel.panel_id && dragSrcId && dragSrcId !== panel.panel_id;
+            const isResizing = resize?.panelId === panel.panel_id;
             return (
-              <div key={panel.panel_id} class={`dashboard-panel ${isTimeSeries ? "dashboard-panel--chart" : ""}`}
-                style={{ gridColumn: `span ${Math.min(w, 12)}` }}>
+              <div key={panel.panel_id}
+                class={`dashboard-panel ${isTimeSeries ? "dashboard-panel--chart" : ""} ${isDragSrc ? "dashboard-panel--dragging" : ""} ${isDragOver ? "dashboard-panel--drop-target" : ""} ${isResizing ? "dashboard-panel--resizing" : ""}`}
+                style={{ gridColumn: `span ${Math.min(w, 12)}` }}
+                draggable={!resize}
+                onDragStart={(e) => {
+                  setDragSrcId(panel.panel_id);
+                  if (e.dataTransfer) {
+                    e.dataTransfer.effectAllowed = "move";
+                    e.dataTransfer.setData("text/plain", panel.panel_id);
+                  }
+                }}
+                onDragOver={(e) => {
+                  if (!dragSrcId || dragSrcId === panel.panel_id) return;
+                  e.preventDefault();
+                  if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+                  if (dragOverId !== panel.panel_id) setDragOverId(panel.panel_id);
+                }}
+                onDragLeave={() => {
+                  if (dragOverId === panel.panel_id) setDragOverId(null);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  if (dragSrcId && dragSrcId !== panel.panel_id) {
+                    swapPanelOrder(dragSrcId, panel.panel_id);
+                  }
+                  setDragSrcId(null);
+                  setDragOverId(null);
+                }}
+                onDragEnd={() => {
+                  setDragSrcId(null);
+                  setDragOverId(null);
+                }}
+              >
                 <div class="dashboard-panel-head">
-                  <div class="dashboard-panel-title">{panel.title}</div>
+                  <div class="dashboard-panel-title" style={{ cursor: "grab" }} title="Drag to reorder">{panel.title}</div>
                   <div class="dashboard-panel-controls">
-                    <button class="dashboard-panel-ctrl" aria-label="Move up" disabled={idx === 0} onClick={() => move(-1)}>↑</button>
-                    <button class="dashboard-panel-ctrl" aria-label="Move down" disabled={idx === all.length - 1} onClick={() => move(1)}>↓</button>
-                    <span class="dashboard-panel-ctrl-sep" />
                     {[4, 6, 8, 12].map((n) => (
                       <button key={n}
-                        class={`dashboard-panel-ctrl ${w === n ? "dashboard-panel-ctrl--active" : ""}`}
+                        class={`dashboard-panel-ctrl ${savedW === n ? "dashboard-panel-ctrl--active" : ""}`}
                         aria-label={`Set width ${n}/12`}
                         onClick={() => setWidth(n)}
                       >{n}</button>
                     ))}
                   </div>
                 </div>
+                <div
+                  class="dashboard-panel-resize"
+                  aria-label="Drag to resize"
+                  title="Drag to resize"
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setResize({ panelId: panel.panel_id, startX: e.clientX, startWidth: savedW, previewWidth: savedW });
+                  }}
+                />
                 {isTimeSeries ? (
                   series && series.length > 1
                     ? <PanelTimeSeries data={series} labels={chartLabels} label={panel.query_type} />

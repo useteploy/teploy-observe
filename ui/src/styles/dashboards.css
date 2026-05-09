@@ -22,6 +22,35 @@
   background: var(--obs-surface); border-radius: var(--obs-radius-md);
   border: 1px solid var(--obs-border-subtle); padding: 16px;
   min-height: 120px; display: flex; flex-direction: column;
+  position: relative;
+  transition: border-color var(--obs-transition), box-shadow var(--obs-transition);
+}
+.dashboard-panel--dragging {
+  opacity: 0.4;
+}
+.dashboard-panel--drop-target {
+  border-color: var(--obs-accent, #6366f1);
+  box-shadow: 0 0 0 2px var(--obs-accent, #6366f1);
+}
+.dashboard-panel--resizing {
+  border-color: var(--obs-accent, #6366f1);
+  user-select: none;
+}
+.dashboard-panel-resize {
+  position: absolute;
+  top: 0; right: -3px; bottom: 0;
+  width: 6px;
+  cursor: ew-resize;
+  z-index: 1;
+  background: transparent;
+  transition: background var(--obs-transition);
+}
+.dashboard-panel:hover .dashboard-panel-resize {
+  background: var(--obs-border);
+}
+.dashboard-panel-resize:hover,
+.dashboard-panel--resizing .dashboard-panel-resize {
+  background: var(--obs-accent, #6366f1);
 }
 .dashboard-panel-title {
   font-size: 12px; font-weight: 600; color: var(--obs-text-secondary);
