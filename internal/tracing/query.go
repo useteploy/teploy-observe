@@ -3,6 +3,7 @@ package tracing
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -354,23 +355,71 @@ type Dependency struct {
 }
 
 // ServiceDependencies returns the dependency graph for all services.
+//
+// Aggregation is done in Go (not SQL) because Nucleus rejects nested
+// aggregates like `CASE WHEN SUM(x) > 0 THEN SUM(y*z)/SUM(z) END` with
+// "aggregate function SUM outside of aggregate context". Pull the
+// per-bucket rows and fold them in-process.
 func (q *QueryService) ServiceDependencies(ctx context.Context, siteID string, from, to time.Time) ([]Dependency, error) {
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
-	return nucleus.Query[Dependency](ctx, q.db.SQL(),
-		`SELECT src_service, dst_service,
-			CAST(SUM(CAST(call_count AS BIGINT)) AS TEXT) AS call_count,
-			CAST(SUM(CAST(error_count AS BIGINT)) AS TEXT) AS error_count,
-			CAST(CASE WHEN SUM(CAST(call_count AS BIGINT)) > 0
-				THEN SUM(CAST(avg_duration AS BIGINT) * CAST(call_count AS BIGINT)) / SUM(CAST(call_count AS BIGINT))
-				ELSE 0 END AS TEXT) AS avg_duration
+	type rawDep struct {
+		Src         string `db:"src_service"`
+		Dst         string `db:"dst_service"`
+		CallCount   string `db:"call_count"`
+		ErrorCount  string `db:"error_count"`
+		AvgDuration string `db:"avg_duration"`
+	}
+	rows, err := nucleus.Query[rawDep](ctx, q.db.SQL(),
+		`SELECT src_service, dst_service, call_count, error_count, avg_duration
 		 FROM service_dependencies
-		 WHERE site_id = $1 AND CAST(ts_bucket AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(ts_bucket AS BIGINT) < CAST($3 AS BIGINT)
-		 GROUP BY src_service, dst_service
-		 ORDER BY call_count DESC`,
+		 WHERE site_id = $1
+		   AND CAST(ts_bucket AS BIGINT) >= CAST($2 AS BIGINT)
+		   AND CAST(ts_bucket AS BIGINT) < CAST($3 AS BIGINT)`,
 		siteID, fromMs, toMs,
 	)
+	if err != nil {
+		return nil, err
+	}
+
+	type edgeKey struct{ src, dst string }
+	type edgeAcc struct {
+		calls, errors, durSumWeighted int64
+	}
+	m := make(map[edgeKey]*edgeAcc)
+	for _, r := range rows {
+		k := edgeKey{r.Src, r.Dst}
+		acc, ok := m[k]
+		if !ok {
+			acc = &edgeAcc{}
+			m[k] = acc
+		}
+		calls := parseInt(r.CallCount)
+		acc.calls += calls
+		acc.errors += parseInt(r.ErrorCount)
+		// Reconstruct duration_sum from per-bucket avg * count so the
+		// re-averaged result is call-weighted, not bucket-weighted.
+		acc.durSumWeighted += parseInt(r.AvgDuration) * calls
+	}
+
+	out := make([]Dependency, 0, len(m))
+	for k, acc := range m {
+		avg := int64(0)
+		if acc.calls > 0 {
+			avg = acc.durSumWeighted / acc.calls
+		}
+		out = append(out, Dependency{
+			SrcService:  k.src,
+			DstService:  k.dst,
+			CallCount:   acc.calls,
+			ErrorCount:  acc.errors,
+			AvgDuration: avg,
+		})
+	}
+	// Sort by CallCount desc to keep parity with the previous SQL ORDER BY.
+	sort.Slice(out, func(i, j int) bool { return out[i].CallCount > out[j].CallCount })
+	return out, nil
 }
 
 // TraceErrorHit is an error event correlated with a trace.
