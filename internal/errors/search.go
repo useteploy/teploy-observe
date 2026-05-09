@@ -95,7 +95,9 @@ func (s *SearchService) SearchErrors(ctx context.Context, siteID, query string, 
 	var events []ErrorEvent
 	for _, hit := range hits {
 		rows, err := nucleus.Query[ErrorEvent](ctx, s.db.SQL(),
-			`SELECT error_id, tenant_id, site_id, session_id, issue_id, group_hash,
+			`SELECT error_id, tenant_id, site_id, session_id,
+				COALESCE(replay_id, '') AS replay_id,
+				issue_id, group_hash,
 				CAST(timestamp AS TEXT) AS timestamp,
 				error_type, error_value, mechanism,
 				COALESCE(handled, 'true') AS handled, level, release_tag, environment, url,

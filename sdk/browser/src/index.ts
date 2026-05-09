@@ -50,6 +50,8 @@ export interface ErrorPayload {
   url?: string;
   breadcrumbs?: unknown[];
   level?: "error" | "warning" | "info";
+  /** Active session-replay id, if observe-replay.js is loaded on the page. */
+  replay_id?: string;
 }
 
 export interface LogPayload {
@@ -190,7 +192,25 @@ export function captureException(err: Error, ctx?: { mechanism?: string; release
     level: "error",
     stack_trace: parseStack(err.stack),
   };
+  // If observe-replay.js is on the page, attach the active replay id so the
+  // Errors UI can cross-jump to the session replay.
+  const replayId = activeReplayId();
+  if (replayId) payload.replay_id = replayId;
   return post("/api/v1/errors", payload, client.opts.apiKey);
+}
+
+function activeReplayId(): string | null {
+  if (typeof window === "undefined") return null;
+  const r: any = (window as any).observeReplay;
+  if (r && typeof r.getReplayId === "function") {
+    try {
+      const id = r.getReplayId();
+      return typeof id === "string" && id ? id : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 /** Submit a log entry. */

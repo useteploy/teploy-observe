@@ -43,6 +43,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/infra"
 	"github.com/useteploy/teploy-observe/internal/llm"
 	"github.com/useteploy/teploy-observe/internal/groups"
+	"github.com/useteploy/teploy-observe/internal/heatmaps"
 	"github.com/useteploy/teploy-observe/internal/integrations"
 	"github.com/useteploy/teploy-observe/internal/logs"
 	"github.com/useteploy/teploy-observe/internal/monitoring"
@@ -210,7 +211,8 @@ func main() {
 	cronSvc := monitoring.NewCronService(db, logger)
 	linkSvc := tracking.NewLinkService(db)
 	dashSvc := dashboards.NewDashboardService(db)
-	replaySvc := replays.NewReplayService(db)
+	replaySvc := replays.NewReplayService(db).WithLogger(logger)
+	heatmapsSvc := heatmaps.NewService(db)
 	aiSvc := aiquery.NewService(db, logger)
 	aiSchema := aiquery.NewSchemaCard(db)
 	scheduledExportSvc := jobs.NewExportService(db, explorerSvc, logger)
@@ -779,6 +781,13 @@ func main() {
 		neutron.WithTags("replays"), neutron.WithSummary("List session replays"))
 	neutron.Get(replayGroup, "/{replay_id}", getReplayHandler(replaySvc),
 		neutron.WithTags("replays"), neutron.WithSummary("Get replay events"))
+	neutron.Get(replayGroup, "/{replay_id}/issues", replayIssuesHandler(issueSvc),
+		neutron.WithTags("replays"), neutron.WithSummary("List issues with events linked to this replay"))
+
+	// --- Click heatmaps (JWT auth) ---
+	heatmapGroup := r.Group("/api/v1/heatmaps", jwtMW)
+	neutron.Get(heatmapGroup, "", queryHeatmapHandler(heatmapsSvc),
+		neutron.WithTags("heatmaps"), neutron.WithSummary("Aggregated click heatmap for a URL"))
 
 	// --- Tracked links ---
 	linkGroup := r.Group("/api/v1/links", jwtMW)
@@ -2951,6 +2960,20 @@ type getReplayInput struct {
 func getReplayHandler(svc *replays.ReplayService) neutron.HandlerFunc[getReplayInput, []replays.ReplayEvent] {
 	return func(ctx context.Context, input getReplayInput) ([]replays.ReplayEvent, error) {
 		return emptyOnNil(svc.GetReplayEvents(ctx, input.ReplayID))
+	}
+}
+
+type replayIssuesInput struct {
+	ReplayID string `path:"replay_id"`
+	SiteID   string `query:"site_id"`
+}
+
+func replayIssuesHandler(svc *obserrors.IssueService) neutron.HandlerFunc[replayIssuesInput, []obserrors.Issue] {
+	return func(ctx context.Context, input replayIssuesInput) ([]obserrors.Issue, error) {
+		if input.SiteID == "" {
+			input.SiteID = "default"
+		}
+		return emptyOnNil(svc.IssuesByReplay(ctx, input.SiteID, input.ReplayID))
 	}
 }
 

@@ -173,9 +173,16 @@
     setTimeout(function() { delete reportedHashes[key]; }, 5000);
 
     var ua = navigator.userAgent || '';
+    var replayId = '';
+    try {
+      if (window.observeReplay && typeof window.observeReplay.getReplayId === 'function') {
+        replayId = window.observeReplay.getReplayId() || '';
+      }
+    } catch (e) { /* ignore */ }
     var payload = {
       site_id: siteId,
       session_id: '',
+      replay_id: replayId,
       error_type: type || 'Error',
       error_value: (value || '').substring(0, 2048),
       mechanism: mechanism || 'onerror',

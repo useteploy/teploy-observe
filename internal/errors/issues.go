@@ -199,6 +199,7 @@ type ErrorEvent struct {
 	ErrorID     string    `json:"error_id"`
 	SiteID      string    `json:"site_id"`
 	SessionID   string    `json:"session_id"`
+	ReplayID    string    `json:"replay_id"`
 	IssueID     string    `json:"issue_id"`
 	GroupHash   string    `json:"group_hash"`
 	Timestamp   time.Time `json:"timestamp"`
@@ -225,7 +226,9 @@ func (s *IssueService) LatestEvents(ctx context.Context, issueID, siteID string,
 		limit = 10
 	}
 	return nucleus.Query[ErrorEvent](ctx, s.db.SQL(),
-		fmt.Sprintf(`SELECT error_id, tenant_id, site_id, session_id, issue_id, group_hash,
+		fmt.Sprintf(`SELECT error_id, tenant_id, site_id, session_id,
+			COALESCE(replay_id, '') AS replay_id,
+			issue_id, group_hash,
 			CAST(timestamp AS TEXT) AS timestamp,
 			error_type, error_value, mechanism,
 			COALESCE(handled, 'true') AS handled, level, release_tag, environment, url,
@@ -240,6 +243,40 @@ func (s *IssueService) LatestEvents(ctx context.Context, issueID, siteID string,
 		 LIMIT %d`, limit),
 		issueID, siteID,
 	)
+}
+
+// IssuesByReplay returns issues that have at least one error event linked
+// to the given replay_id. Used by the sessions UI to show a "View errors
+// in this session" cross-jump.
+func (s *IssueService) IssuesByReplay(ctx context.Context, siteID, replayID string) ([]Issue, error) {
+	if replayID == "" {
+		return nil, nil
+	}
+	type idRow struct {
+		IssueID string `db:"issue_id"`
+	}
+	rows, err := nucleus.Query[idRow](ctx, s.db.SQL(),
+		`SELECT DISTINCT issue_id FROM error_events
+		 WHERE site_id = $1 AND replay_id = $2`,
+		siteID, replayID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	out := make([]Issue, 0, len(rows))
+	for _, r := range rows {
+		if r.IssueID == "" {
+			continue
+		}
+		issue, err := s.GetIssue(ctx, r.IssueID, siteID)
+		if err == nil && issue != nil {
+			out = append(out, *issue)
+		}
+	}
+	return out, nil
 }
 
 // DailyCount represents error volume for a single day (UTC).

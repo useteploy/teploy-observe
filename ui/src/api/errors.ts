@@ -23,6 +23,7 @@ export interface ErrorEvent {
   error_id: string;
   site_id: string;
   session_id: string;
+  replay_id: string;
   issue_id: string;
   group_hash: string;
   timestamp: string;

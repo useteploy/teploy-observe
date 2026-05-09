@@ -227,6 +227,17 @@ function IssueDetail({ issue, siteId, onBack }: { issue: Issue; siteId: string; 
             {loadingSession ? "Loading..." : "View Session"}
           </button>
         </div>
+        {selectedEvent?.replay_id && (
+          <div class="errors-detail-stat">
+            <a
+              class="obs-btn obs-btn--sm"
+              data-testid="view-replay"
+              href={`/sessions?site_id=${siteId}&replay_id=${selectedEvent.replay_id}`}
+            >
+              View replay
+            </a>
+          </div>
+        )}
       </div>
 
       {/* Selected event environment info */}

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { replaysApi } from "../api/replays.js";
 import type { ReplaySession, ReplayEvent } from "../api/replays.js";
+import type { Issue } from "../api/errors.js";
 import ReplayPlayer from "../components/ReplayPlayer.js";
 import ExportButton from "../components/shared/ExportButton.js";
 import EmptyState from "../components/shared/EmptyState.js";
@@ -67,6 +68,7 @@ function SessionsSkeleton() {
 function SessionDetail({ session, onBack }: { session: ReplaySession; onBack: () => void }) {
   const [events, setEvents] = useState<ReplayEvent[]>([]);
   const [pageviews, setPageviews] = useState<SessionEvent[]>([]);
+  const [issues, setIssues] = useState<Issue[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [showPlayer, setShowPlayer] = useState(false);
@@ -76,9 +78,11 @@ function SessionDetail({ session, onBack }: { session: ReplaySession; onBack: ()
     Promise.all([
       replaysApi.events(session.replay_id).catch(() => []),
       get<SessionEvent[]>(`/api/v1/stats/sessions/${session.session_id}?site_id=${session.site_id}`).catch(() => []),
-    ]).then(([replayEvents, sessionEvents]) => {
+      replaysApi.issues(session.replay_id, session.site_id).catch(() => []),
+    ]).then(([replayEvents, sessionEvents, replayIssues]) => {
       setEvents(replayEvents || []);
       setPageviews(sessionEvents || []);
+      setIssues(replayIssues || []);
     }).finally(() => setLoading(false));
   }, [session.replay_id, session.session_id, session.site_id]);
 
@@ -136,7 +140,32 @@ function SessionDetail({ session, onBack }: { session: ReplaySession; onBack: ()
       </div>
 
       {showPlayer && (
-        <ReplayPlayer events={events} onClose={() => setShowPlayer(false)} />
+        <ReplayPlayer
+          events={events}
+          onClose={() => setShowPlayer(false)}
+          siteId={session.site_id}
+          url={session.url}
+        />
+      )}
+
+      {issues.length > 0 && (
+        <div class="sessions-issues-banner" style={{
+          padding: "10px 14px", marginBottom: "16px",
+          background: "var(--obs-card)", border: "1px solid var(--obs-border)",
+          borderRadius: "var(--obs-radius-md)", display: "flex",
+          alignItems: "center", gap: "12px", fontSize: "12px"
+        }}>
+          <span style={{ color: "var(--obs-danger)", fontWeight: 600 }}>
+            {issues.length} error{issues.length === 1 ? "" : "s"} in this session
+          </span>
+          <a
+            class="obs-btn obs-btn--sm"
+            data-testid="view-session-errors"
+            href={`/errors?site_id=${session.site_id}&issue_id=${issues[0].issue_id}`}
+          >
+            View errors in this session ({issues.length})
+          </a>
+        </div>
       )}
 
       {loading ? (
@@ -214,9 +243,11 @@ function SessionDetail({ session, onBack }: { session: ReplaySession; onBack: ()
 // ─── Main Page ───
 
 export default function SessionsPage() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const params = typeof window !== "undefined"
+    ? new URLSearchParams(window.location.search)
+    : new URLSearchParams();
+  const siteId = params.get("site_id") || "default";
+  const deepReplayId = params.get("replay_id") || "";
 
   const PAGE_SIZE = 20;
   const [sessions, setSessions] = useState<ReplaySession[]>([]);
@@ -224,6 +255,27 @@ export default function SessionsPage() {
   const [page, setPage] = useState(1);
   const [errorOnly, setErrorOnly] = useState(false);
   const [selected, setSelected] = useState<ReplaySession | null>(null);
+
+  // Deep-link: ?replay_id=X jumps directly into the session detail. We
+  // synthesize a minimal ReplaySession so the user lands on the right page
+  // even before the list query has hydrated.
+  useEffect(() => {
+    if (deepReplayId && !selected) {
+      setSelected({
+        replay_id: deepReplayId,
+        site_id: siteId,
+        session_id: "",
+        start_time: new Date().toISOString(),
+        duration_ms: 0,
+        page_count: 0,
+        url: "",
+        browser: "",
+        os: "",
+        device: "",
+        has_error: false,
+      });
+    }
+  }, [deepReplayId, siteId]);
 
   const now = new Date();
   const from = new Date(now.getTime() - 86400000).toISOString();

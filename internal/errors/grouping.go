@@ -67,6 +67,25 @@ func hashTypeAndMessage(errorType, message string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// GroupHashRageClick groups rage-click auto-issues on (type + URL path + selector)
+// so repeated rage clicks on the same target collapse into a single issue.
+// The query string and fragment are stripped from the URL to avoid splitting
+// the same logical page across many issues.
+func GroupHashRageClick(rawURL, selector string) string {
+	page := stripURL(rawURL)
+	h := md5.New()
+	fmt.Fprintf(h, "RageClick|%s|%s", page, selector)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// stripURL returns the URL with query string and fragment removed.
+func stripURL(u string) string {
+	if i := strings.IndexAny(u, "?#"); i != -1 {
+		return u[:i]
+	}
+	return u
+}
+
 // Parameterization patterns — replace volatile values with placeholders
 // so that identical errors with different runtime values group together.
 var paramPatterns = []struct {

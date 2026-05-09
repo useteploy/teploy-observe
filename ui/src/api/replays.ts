@@ -1,6 +1,7 @@
 // Session replay API — list sessions, view events.
 
 import { get } from "./helpers.js";
+import type { Issue } from "./errors.js";
 
 const BASE = "/api/v1/replays";
 
@@ -35,4 +36,6 @@ export const replaysApi = {
   },
   events: (replayId: string) =>
     get<ReplayEvent[]>(`${BASE}/${replayId}`),
+  issues: (replayId: string, siteId: string) =>
+    get<Issue[]>(`${BASE}/${replayId}/issues?site_id=${siteId}`),
 };

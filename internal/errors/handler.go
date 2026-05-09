@@ -18,6 +18,7 @@ import (
 type ErrorInput struct {
 	SiteID      string       `json:"site_id"`
 	SessionID   string       `json:"session_id"`
+	ReplayID    string       `json:"replay_id"`
 	ErrorType   string       `json:"error_type"`
 	ErrorValue  string       `json:"error_value"`
 	Mechanism   string       `json:"mechanism"`
@@ -34,6 +35,10 @@ type ErrorInput struct {
 	Contexts    any          `json:"contexts"`
 	Extra       any          `json:"extra"`
 	Fingerprint []string     `json:"fingerprint"`
+	// Selector identifies the synthetic source of the error (e.g. the DOM
+	// selector for a RageClick auto-issue). Used by grouping for non-stack
+	// errors so multiple rage clicks on the same target collapse together.
+	Selector string `json:"selector"`
 }
 
 // Breadcrumb is a user action that preceded the error.
@@ -80,6 +85,10 @@ func (h *ErrorHandler) Handle(ctx context.Context, input ErrorInput) (ErrorRespo
 	var groupHash string
 	if len(input.Fingerprint) > 0 {
 		groupHash = customFingerprint(input.Fingerprint)
+	} else if input.ErrorType == "RageClick" {
+		// Rage clicks have no stack trace — group by (type + URL + selector)
+		// so repeated rage clicks on the same element merge into one issue.
+		groupHash = GroupHashRageClick(input.URL, input.Selector)
 	} else {
 		groupHash = GroupHash(input.ErrorType, input.ErrorValue, input.StackTrace)
 	}
@@ -116,12 +125,12 @@ func (h *ErrorHandler) Handle(ctx context.Context, input ErrorInput) (ErrorRespo
 	// Insert error event
 	_, err = h.db.SQL().Exec(ctx,
 		`INSERT INTO error_events (
-			error_id, tenant_id, site_id, session_id, issue_id, group_hash,
+			error_id, tenant_id, site_id, session_id, replay_id, issue_id, group_hash,
 			timestamp, error_type, error_value, mechanism, handled, level,
 			release_tag, environment, url, browser, os, device,
 			stack_trace, breadcrumbs, contexts, extra
-		) VALUES ($1,'default',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
-		errorID, input.SiteID, input.SessionID, issueID, groupHash,
+		) VALUES ($1,'default',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+		errorID, input.SiteID, input.SessionID, input.ReplayID, issueID, groupHash,
 		now.UnixMilli(), input.ErrorType, input.ErrorValue, input.Mechanism, handled, input.Level,
 		input.ReleaseTag, input.Environment, input.URL, input.Browser, input.OS, input.Device,
 		stackJSON, breadcrumbsJSON, contextsJSON, extraJSON,
