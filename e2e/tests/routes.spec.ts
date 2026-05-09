@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { login } from "./auth.spec.js";
+import { login } from "./helpers.js";
 
 test.describe("every route renders without a console error", () => {
   const ROUTES = [
