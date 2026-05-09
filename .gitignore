@@ -5,6 +5,8 @@
 
 # Compiled bench binary (rebuilt with `go build` in ./bench)
 bench/observe-bench
+# Bench output — volatile per run; shouldn't track changes
+bench_results.json
 
 # Nucleus data
 nucleus_data/
