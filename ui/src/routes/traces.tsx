@@ -821,17 +821,24 @@ export default function TracesPage() {
 
       {/* RED summary cards */}
       {services.length > 0 && view === "services" && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "12px", marginBottom: "16px" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "12px", marginBottom: "16px" }}>
           {(() => {
             const totalReqs = services.reduce((s, svc) => s + svc.request_count, 0);
             const totalErrs = services.reduce((s, svc) => s + svc.error_count, 0);
             const avgDur = services.length > 0
               ? services.reduce((s, svc) => s + svc.avg_duration_ms * svc.request_count, 0) / Math.max(totalReqs, 1) : 0;
             const errRate = totalReqs > 0 ? (totalErrs / totalReqs * 100) : 0;
+            // Request-weighted Apdex across services. Services with no
+            // traffic contribute 0 to both numerator and denominator.
+            const apdex = totalReqs > 0
+              ? services.reduce((s, svc) => s + (svc.apdex_score || 0) * svc.request_count, 0) / totalReqs
+              : 0;
+            const apdexColor = apdex >= 0.94 ? "var(--obs-success)" : apdex >= 0.85 ? "var(--obs-warning)" : "var(--obs-danger)";
             return [
               { label: "Total Requests", value: totalReqs.toLocaleString(), color: "var(--obs-accent)" },
               { label: "Error Rate", value: `${errRate.toFixed(2)}%`, color: errRate > 5 ? "var(--obs-danger)" : errRate > 1 ? "var(--obs-warning)" : "var(--obs-success)" },
               { label: "Avg Duration", value: `${Math.round(avgDur)}ms`, color: "var(--obs-text)" },
+              { label: "Apdex", value: apdex.toFixed(2), color: apdexColor },
             ].map((card, i) => (
               <div key={i} style={{ background: "var(--obs-surface)", borderRadius: "var(--obs-radius-md)", padding: "16px", borderLeft: `3px solid ${card.color}` }}>
                 <div style={{ fontSize: "11px", color: "var(--obs-text-muted)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: "4px" }}>{card.label}</div>

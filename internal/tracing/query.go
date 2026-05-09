@@ -22,13 +22,40 @@ func NewQueryService(db *nucleus.Client) *QueryService {
 
 // ServiceSummary is a service with its RED metrics.
 type ServiceSummary struct {
-	ServiceName  string `json:"service_name"`
-	RequestCount int64  `json:"request_count"`
-	ErrorCount   int64  `json:"error_count"`
-	AvgDuration  int64  `json:"avg_duration_ms"`
-	P50          int64  `json:"p50_ms"`
-	P95          int64  `json:"p95_ms"`
-	P99          int64  `json:"p99_ms"`
+	ServiceName  string  `json:"service_name"`
+	RequestCount int64   `json:"request_count"`
+	ErrorCount   int64   `json:"error_count"`
+	AvgDuration  int64   `json:"avg_duration_ms"`
+	P50          int64   `json:"p50_ms"`
+	P95          int64   `json:"p95_ms"`
+	P99          int64   `json:"p99_ms"`
+	ApdexScore   float64 `json:"apdex_score"`
+}
+
+// apdexThresholdMs is the default satisfied-threshold T for Apdex calculation.
+// Frustrated > 4T; tolerated > T && <= 4T; satisfied <= T. SigNoz parity.
+const apdexThresholdMs int64 = 500
+
+// apdex computes the Apdex score (0..1) for a slice of durations.
+//   satisfied = duration <= t
+//   tolerated = t < duration <= 4t
+//   frustrated = duration > 4t
+//   score = (satisfied + tolerated/2) / total
+// Returns 0 for an empty input.
+func apdex(durations []int64, t int64) float64 {
+	if len(durations) == 0 || t <= 0 {
+		return 0
+	}
+	tol := 4 * t
+	var satisfied, tolerated int64
+	for _, d := range durations {
+		if d <= t {
+			satisfied++
+		} else if d <= tol {
+			tolerated++
+		}
+	}
+	return (float64(satisfied) + float64(tolerated)/2.0) / float64(len(durations))
 }
 
 // ListServices returns services with aggregated RED metrics for a time range.
@@ -81,6 +108,15 @@ func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to
 		}
 	}
 
+	// Compute Apdex per service from raw span durations in the same window.
+	// service_stats only stores aggregates, so the apdex buckets need a
+	// second pass against spans.
+	apdexByService, err := q.serviceApdex(ctx, siteID, from, to, apdexThresholdMs)
+	if err != nil {
+		// Non-fatal — Apdex is best-effort, RED metrics still ship.
+		apdexByService = map[string]float64{}
+	}
+
 	result := make([]ServiceSummary, 0, len(m))
 	for name, a := range m {
 		avg := int64(0)
@@ -90,9 +126,42 @@ func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to
 		result = append(result, ServiceSummary{
 			ServiceName: name, RequestCount: a.reqs, ErrorCount: a.errs,
 			AvgDuration: avg, P50: a.p50, P95: a.p95, P99: a.p99,
+			ApdexScore: apdexByService[name],
 		})
 	}
 	return result, nil
+}
+
+// serviceApdex computes per-service Apdex from raw span durations in [from, to).
+func (q *QueryService) serviceApdex(ctx context.Context, siteID string, from, to time.Time, t int64) (map[string]float64, error) {
+	fromMs := dbutil.IntParam(from.UnixMilli())
+	toMs := dbutil.IntParam(to.UnixMilli())
+
+	type row struct {
+		ServiceName string `db:"service_name"`
+		DurationMs  string `db:"duration_ms"`
+	}
+	rows, err := nucleus.Query[row](ctx, q.db.SQL(),
+		`SELECT service_name, CAST(duration_ms AS TEXT) AS duration_ms
+		 FROM spans
+		 WHERE site_id = $1 AND parent_span_id = ''
+		   AND CAST(start_time AS BIGINT) >= CAST($2 AS BIGINT)
+		   AND CAST(start_time AS BIGINT) < CAST($3 AS BIGINT)`,
+		siteID, fromMs, toMs,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	byService := make(map[string][]int64)
+	for _, r := range rows {
+		byService[r.ServiceName] = append(byService[r.ServiceName], parseInt(r.DurationMs))
+	}
+	out := make(map[string]float64, len(byService))
+	for name, durs := range byService {
+		out[name] = apdex(durs, t)
+	}
+	return out, nil
 }
 
 // OperationSummary is an operation within a service with RED metrics.

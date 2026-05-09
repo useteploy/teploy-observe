@@ -12,6 +12,7 @@ export interface Service {
   p50_ms: number;
   p95_ms: number;
   p99_ms: number;
+  apdex_score: number;
 }
 
 export interface Operation {
