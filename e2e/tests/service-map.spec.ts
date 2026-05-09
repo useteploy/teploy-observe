@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, request as pwRequest } from "@playwright/test";
 import { login } from "./helpers.js";
 
 test.describe("traces — service map", () => {
@@ -38,5 +38,42 @@ test.describe("traces — service map", () => {
     }
 
     expect(errors, `console errors: ${errors.join(" | ")}`).toHaveLength(0);
+  });
+
+  // Regression for dogfood finding #11: rollup tables (service_stats,
+  // service_dependencies) used to never get written. After the
+  // ingest-time rollup fix the seed-loaded stack must surface at
+  // least one service in /api/v1/traces/services and a dependency
+  // edge from the seeded cross-service traces.
+  test("seeded stack populates service_stats + service_dependencies", async ({
+    page,
+    baseURL,
+  }) => {
+    const ctx = await pwRequest.newContext({ baseURL, storageState: await page.context().storageState() });
+    const to = new Date();
+    const from = new Date(to.getTime() - 24 * 60 * 60 * 1000);
+    const range = `site_id=default&from=${from.toISOString()}&to=${to.toISOString()}`;
+
+    const services = await ctx.get(`/api/v1/traces/services?${range}`);
+    expect(services.ok(), "GET /api/v1/traces/services").toBeTruthy();
+    const servicesBody = await services.json();
+    expect(Array.isArray(servicesBody)).toBeTruthy();
+    expect(
+      servicesBody.length,
+      `seed should populate >=1 service, got ${JSON.stringify(servicesBody)}`,
+    ).toBeGreaterThanOrEqual(1);
+
+    const deps = await ctx.get(`/api/v1/traces/dependencies?${range}`);
+    expect(deps.ok(), "GET /api/v1/traces/dependencies").toBeTruthy();
+    const depsBody = await deps.json();
+    expect(Array.isArray(depsBody)).toBeTruthy();
+    // The seed has at least one cross-service trace (web -> api,
+    // api -> worker), so at least one edge should exist.
+    expect(
+      depsBody.length,
+      `seed should populate >=1 dependency edge, got ${JSON.stringify(depsBody)}`,
+    ).toBeGreaterThanOrEqual(1);
+
+    await ctx.dispose();
   });
 });
