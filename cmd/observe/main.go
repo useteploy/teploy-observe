@@ -21,6 +21,7 @@ import (
 
 	"github.com/useteploy/teploy-observe/internal/auth"
 	"github.com/useteploy/teploy-observe/internal/config"
+	"github.com/useteploy/teploy-observe/internal/dogfood"
 	obserrors "github.com/useteploy/teploy-observe/internal/errors"
 	"github.com/useteploy/teploy-observe/internal/export"
 	"github.com/useteploy/teploy-observe/internal/backup"
@@ -239,9 +240,28 @@ func main() {
 	// Self-observability service
 	metaSvc := meta.New(db, retention, "0.1.0")
 
+	// Self-instrumentation: trace every HTTP request + ship panics to /errors,
+	// scoped to site_id=_meta. Off by default (adds ingest load to the same
+	// process) — opt in with OBSERVE_DOGFOOD=true. Failures are non-fatal.
+	var self *dogfood.Self
+	if os.Getenv("OBSERVE_DOGFOOD") == "true" {
+		selfEndpoint := selfMonitorEndpoint(cfg.Addr)
+		s, err := dogfood.Setup(ctx, db, authSvc, selfEndpoint, logger.Handler())
+		if err != nil {
+			logger.Warn("dogfood self-monitoring disabled", "err", err)
+			self = &dogfood.Self{}
+		} else {
+			self = s
+			logger.Info("dogfood self-monitoring enabled", "endpoint", selfEndpoint, "site_id", dogfood.MetaSiteID)
+		}
+	} else {
+		self = &dogfood.Self{}
+	}
+
 	// Build app
 	app := neutron.New(
 		neutron.WithLogger(logger),
+		neutron.WithMiddleware(self.RecoverMiddleware, self.TraceMiddleware),
 		neutron.WithLifecycle(db.LifecycleHook()),
 		neutron.WithLifecycle(neutron.LifecycleHook{
 			Name: "ingest-buffer",
@@ -492,6 +512,10 @@ func main() {
 		neutron.WithTags("integrations"), neutron.WithSummary("Create integration"))
 	neutron.Post(intAdmin, "/{integration_id}/test", testIntegrationHandler(integrationSvc),
 		neutron.WithTags("integrations"), neutron.WithSummary("Deliver a test payload"))
+	neutron.Get(intGroup, "/{integration_id}/deliveries", listDeliveriesHandler(integrationSvc),
+		neutron.WithTags("integrations"), neutron.WithSummary("List recent delivery attempts"))
+	neutron.Post(intAdmin, "/deliveries/{delivery_id}/replay", replayDeliveryHandler(integrationSvc),
+		neutron.WithTags("integrations"), neutron.WithSummary("Replay a prior delivery"))
 	neutron.Delete(intAdmin, "/{integration_id}", deleteIntegrationHandler(integrationSvc),
 		neutron.WithTags("integrations"), neutron.WithSummary("Delete integration"))
 
@@ -867,6 +891,10 @@ func main() {
 		buf.Stop()
 		errorBuf.Stop()
 		scheduler.Stop()
+
+		// Flush self-monitoring queues so we don't lose the last batch
+		// of self-traces/logs/errors on graceful shutdown.
+		_ = self.Close()
 
 		// Close database
 		db.Close()
@@ -2132,6 +2160,43 @@ func testIntegrationHandler(svc *integrations.IntegrationService) neutron.Handle
 	}
 }
 
+type listDeliveriesInput struct {
+	IntegrationID string `path:"integration_id"`
+	Limit         int    `query:"limit"`
+}
+
+func listDeliveriesHandler(svc *integrations.IntegrationService) neutron.HandlerFunc[listDeliveriesInput, []integrations.Delivery] {
+	return func(ctx context.Context, input listDeliveriesInput) ([]integrations.Delivery, error) {
+		if input.IntegrationID == "" {
+			return nil, neutron.ErrBadRequest("integration_id required")
+		}
+		rows, err := svc.ListDeliveries(ctx, input.IntegrationID, input.Limit)
+		if err != nil {
+			return nil, err
+		}
+		if rows == nil {
+			rows = []integrations.Delivery{}
+		}
+		return rows, nil
+	}
+}
+
+type replayDeliveryInput struct {
+	DeliveryID string `path:"delivery_id"`
+}
+
+func replayDeliveryHandler(svc *integrations.IntegrationService) neutron.HandlerFunc[replayDeliveryInput, testIntegrationResponse] {
+	return func(ctx context.Context, input replayDeliveryInput) (testIntegrationResponse, error) {
+		if input.DeliveryID == "" {
+			return testIntegrationResponse{}, neutron.ErrBadRequest("delivery_id required")
+		}
+		if err := svc.Replay(ctx, input.DeliveryID); err != nil {
+			return testIntegrationResponse{OK: false, Message: err.Error()}, nil
+		}
+		return testIntegrationResponse{OK: true, Message: "Replay delivered"}, nil
+	}
+}
+
 // --- Feedback handlers ---
 
 func feedbackSubmitHandler(svc *feedback.FeedbackService) http.HandlerFunc {
@@ -3140,4 +3205,22 @@ func shareViewHandler(shareSvc *share.ShareService, uiFS fs.FS) http.HandlerFunc
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(html))
 	}
+}
+
+// selfMonitorEndpoint converts a bind address (":3000", "0.0.0.0:3000")
+// into a base URL the in-process SDK can call back into.
+func selfMonitorEndpoint(addr string) string {
+	if env := os.Getenv("OBSERVE_SELF_URL"); env != "" {
+		return env
+	}
+	if addr == "" {
+		return "http://127.0.0.1:3000"
+	}
+	if addr[0] == ':' {
+		return "http://127.0.0.1" + addr
+	}
+	if !strings.HasPrefix(addr, "http://") && !strings.HasPrefix(addr, "https://") {
+		return "http://" + addr
+	}
+	return addr
 }

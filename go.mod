@@ -34,4 +34,8 @@ require (
 	golang.org/x/text v0.32.0 // indirect
 )
 
-replace github.com/neutron-dev/neutron-go => ../../tystack/go
+replace github.com/neutron-dev/neutron-go => ../../Neutron/go
+
+replace github.com/useteploy/teploy-observe/sdk/go => ./sdk/go
+
+require github.com/useteploy/teploy-observe/sdk/go v0.0.0

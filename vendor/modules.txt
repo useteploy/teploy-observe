@@ -132,11 +132,14 @@ github.com/jackc/puddle/v2/internal/genstack
 ## explicit; go 1.18
 github.com/leodido/go-urn
 github.com/leodido/go-urn/scim/schema
-# github.com/neutron-dev/neutron-go v0.0.0 => ../../tystack/go
+# github.com/neutron-dev/neutron-go v0.0.0 => ../../Neutron/go
 ## explicit; go 1.24.0
 github.com/neutron-dev/neutron-go/neutron
 github.com/neutron-dev/neutron-go/neutronauth
 github.com/neutron-dev/neutron-go/nucleus
+# github.com/useteploy/teploy-observe/sdk/go v0.0.0 => ./sdk/go
+## explicit; go 1.22
+github.com/useteploy/teploy-observe/sdk/go
 # golang.org/x/crypto v0.46.0
 ## explicit; go 1.24.0
 golang.org/x/crypto/bcrypt
@@ -164,4 +167,5 @@ golang.org/x/text/transform
 golang.org/x/text/unicode/bidi
 golang.org/x/text/unicode/norm
 golang.org/x/text/width
-# github.com/neutron-dev/neutron-go => ../../tystack/go
+# github.com/neutron-dev/neutron-go => ../../Neutron/go
+# github.com/useteploy/teploy-observe/sdk/go => ./sdk/go
