@@ -1,7 +1,7 @@
 {
   "name": "@observe/sentry-shim",
   "version": "0.1.0",
-  "description": "Drop-in Sentry SDK shim backed by Observe. Swap @sentry/browser for this and existing calls keep working.",
+  "description": "Drop-in @sentry/node replacement that ships events to a self-hosted Observe deployment.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -11,16 +11,38 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "README.md"],
+  "files": ["dist", "README.md", "LICENSE"],
   "scripts": {
     "build": "tsc",
-    "test": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit && node --test --import tsx tests/*.test.ts",
+    "test:integration": "node --test --import tsx tests/integration.test.ts"
   },
-  "dependencies": {
-    "@observe/browser": "^0.1.0"
+  "keywords": [
+    "sentry",
+    "shim",
+    "observability",
+    "errors",
+    "self-hosted",
+    "observe"
+  ],
+  "author": "Observe",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/useteploy/teploy-observe",
+    "directory": "sdk/sentry-shim"
+  },
+  "homepage": "https://github.com/useteploy/teploy-observe",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "devDependencies": {
+    "tsx": "^4.19.2",
     "typescript": "^5.4.5"
   },
-  "license": "MIT"
+  "sideEffects": false
 }
