@@ -42,8 +42,17 @@ test.describe("dashboard grid drag/resize", () => {
     const titleText = await page.locator(".dashboard-panel-title").first().evaluate((el) => el.textContent || "");
     const panel = page.locator(".dashboard-panel").filter({ has: page.locator(`.dashboard-panel-title:text-is("${titleText}")`) });
     await panel.first().hover();
+    // Wait for the layout PATCH to complete before asserting — the click
+    // returns immediately, but fetchDetail() runs after which is what
+    // updates the gridColumn style. Without this wait, fast machines
+    // race past the re-render window.
+    const layoutResponse = page.waitForResponse(
+      (r) => /\/panels\/[^/]+\/layout$/.test(r.url()) && r.status() < 400,
+      { timeout: 5_000 },
+    );
     await panel.first().locator('.dashboard-panel-ctrl[aria-label="Set width 12/12"]').click();
-    await expect(panel.first()).toHaveAttribute("style", /span 12/, { timeout: 3_000 });
+    await layoutResponse;
+    await expect(panel.first()).toHaveAttribute("style", /span 12/, { timeout: 5_000 });
 
     // Detail view is state-based, not URL-based — reload returns to the list,
     // so we click back in to verify persistence.
