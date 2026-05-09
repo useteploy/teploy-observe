@@ -566,3 +566,69 @@
 .traces-flame-tooltip-err span:last-child {
   color: #ef4444;
 }
+
+/* ─── Service Map ─── */
+.service-map {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--obs-surface);
+  border: 1px solid var(--obs-border);
+  border-radius: var(--obs-radius-md);
+  padding: 12px;
+}
+
+.service-map-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 28px;
+}
+
+.service-map-meta {
+  font-size: 12px;
+  color: var(--obs-text-muted);
+}
+
+.service-map-stage {
+  width: 100%;
+  background: var(--obs-bg-card, rgba(0, 0, 0, 0.02));
+  border-radius: var(--obs-radius-sm);
+  overflow: hidden;
+}
+
+.service-map-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+  user-select: none;
+}
+
+.service-map-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding-top: 6px;
+  border-top: 1px solid var(--obs-border);
+  font-size: 11px;
+  color: var(--obs-text-secondary);
+}
+
+.service-map-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.service-map-legend-hint {
+  margin-left: auto;
+  color: var(--obs-text-muted);
+}
+
+.service-map-swatch {
+  width: 18px;
+  height: 4px;
+  border-radius: 2px;
+  display: inline-block;
+}

@@ -7,6 +7,7 @@ import CodeBlock from "../components/shared/CodeBlock.js";
 import Tabs from "../components/shared/Tabs.js";
 import EmptyState from "../components/shared/EmptyState.js";
 import ExportButton from "../components/shared/ExportButton.js";
+import ServiceMap from "../components/ServiceMap.js";
 import "../styles/traces.css";
 
 export const config = { mode: "app" };
@@ -560,18 +561,7 @@ function SearchFilters({ siteId, from, to, services, onSelectTrace }: {
 
 // ─── Dependency Graph ───
 
-function DependencyGraph({ siteId, from, to }: { siteId: string; from: string; to: string }) {
-  const [deps, setDeps] = useState<ServiceDependency[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    setLoading(true);
-    tracesApi.dependencies(siteId, from, to)
-      .then(d => setDeps(d || []))
-      .catch(() => setDeps([]))
-      .finally(() => setLoading(false));
-  }, [siteId, from, to]);
-
+function DependencyGraph({ deps, loading }: { deps: ServiceDependency[]; loading: boolean }) {
   if (loading) return <ListSkeleton />;
   if (!deps.length) return <div class="obs-empty-state">No service dependencies found</div>;
 
@@ -637,7 +627,7 @@ function DependencyGraph({ siteId, from, to }: { siteId: string; from: string; t
   );
 }
 
-type View = "services" | "operations" | "trace" | "search" | "deps";
+type View = "services" | "operations" | "trace" | "search" | "deps" | "map";
 
 export default function TracesPage() {
   const siteId = typeof window !== "undefined"
@@ -653,6 +643,9 @@ export default function TracesPage() {
   const [loadingTrace, setLoadingTrace] = useState(false);
   const [traceView, setTraceView] = useState<"waterfall" | "flame">("waterfall");
   const [searchId, setSearchId] = useState("");
+  const [deps, setDeps] = useState<ServiceDependency[]>([]);
+  const [depsLoading, setDepsLoading] = useState(false);
+  const [depsLoaded, setDepsLoaded] = useState(false);
 
   const now = new Date();
   const from = new Date(now.getTime() - 86400000).toISOString();
@@ -677,6 +670,19 @@ export default function TracesPage() {
     }
   }, []);
 
+  // Lazy-load dependencies the first time the user opens deps or map.
+  useEffect(() => {
+    if ((view !== "deps" && view !== "map") || depsLoaded) return;
+    setDepsLoading(true);
+    tracesApi.dependencies(siteId, from, to)
+      .then(d => setDeps(d || []))
+      .catch(() => setDeps([]))
+      .finally(() => {
+        setDepsLoading(false);
+        setDepsLoaded(true);
+      });
+  }, [view, depsLoaded, siteId]);
+
   const loadTrace = async (id: string) => {
     setLoadingTrace(true);
     setTraceId(id);
@@ -698,7 +704,7 @@ export default function TracesPage() {
     } else if (view === "trace") {
       setView("services");
       setTraceId(null);
-    } else if (view === "search") {
+    } else if (view === "search" || view === "map" || view === "deps") {
       setView("services");
     }
   };
@@ -768,13 +774,25 @@ export default function TracesPage() {
       <div class="obs-page-header">
         <h1 class="obs-page-title">Traces</h1>
         <div class="obs-page-actions" style={{ display: "flex", gap: "8px" }}>
+          <button class={`obs-btn ${view === "services" ? "obs-btn--primary" : ""}`}
+            data-testid="traces-tab-services"
+            onClick={() => setView("services")}>
+            Services
+          </button>
+          <button class={`obs-btn ${view === "map" ? "obs-btn--primary" : ""}`}
+            data-testid="traces-tab-map"
+            onClick={() => setView("map")}>
+            Map
+          </button>
           <button class={`obs-btn ${view === "deps" ? "obs-btn--primary" : ""}`}
-            onClick={() => setView(view === "deps" ? "services" : "deps")}>
-            {view === "deps" ? "Show Services" : "Dependencies"}
+            data-testid="traces-tab-deps"
+            onClick={() => setView("deps")}>
+            Dependencies
           </button>
           <button class={`obs-btn ${view === "search" ? "obs-btn--primary" : ""}`}
-            onClick={() => setView(view === "search" ? "services" : "search")}>
-            {view === "search" ? "Show Services" : "Search Traces"}
+            data-testid="traces-tab-search"
+            onClick={() => setView("search")}>
+            Search Traces
           </button>
         </div>
       </div>
@@ -824,8 +842,14 @@ export default function TracesPage() {
         </div>
       )}
 
-      {view === "deps" ? (
-        <DependencyGraph siteId={siteId} from={from} to={to} />
+      {view === "map" ? (
+        depsLoading ? (
+          <ListSkeleton />
+        ) : (
+          <ServiceMap dependencies={deps} services={services} />
+        )
+      ) : view === "deps" ? (
+        <DependencyGraph deps={deps} loading={depsLoading} />
       ) : view === "search" ? (
         <SearchFilters siteId={siteId} from={from} to={to} services={services} onSelectTrace={loadTrace} />
       ) : loading ? (
