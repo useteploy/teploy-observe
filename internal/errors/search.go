@@ -313,7 +313,7 @@ func (s *SearchService) ErrorCount(ctx context.Context, siteID string, fromMs, t
 	}
 	rows, err := nucleus.Query[countResult](ctx, s.db.SQL(),
 		`SELECT COUNT(*) AS count FROM error_events
-		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`,
+		 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)`,
 		siteID, strconv.FormatInt(fromMs, 10), strconv.FormatInt(toMs, 10),
 	)
 	if err != nil || len(rows) == 0 {

@@ -268,7 +268,7 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 		type r struct{ Count string `db:"count"` }
 		rows, err := nucleus.Query[r](ctx, sql,
 			`SELECT CAST(COUNT(*) AS TEXT) AS count FROM events
-			 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT) AND event_type = 'pageview'`,
+			 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT) AND event_type = 'pageview'`,
 			siteID, from, to)
 		if err != nil || len(rows) == 0 { return map[string]string{"value": "0"}, nil }
 		return map[string]string{"value": rows[0].Count}, nil
@@ -277,7 +277,7 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 		type r struct{ Count string `db:"count"` }
 		rows, err := nucleus.Query[r](ctx, sql,
 			`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count FROM events
-			 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`,
+			 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)`,
 			siteID, from, to)
 		if err != nil || len(rows) == 0 { return map[string]string{"value": "0"}, nil }
 		return map[string]string{"value": rows[0].Count}, nil
@@ -286,7 +286,7 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 		type r struct{ Count string `db:"count"` }
 		rows, err := nucleus.Query[r](ctx, sql,
 			`SELECT CAST(COUNT(*) AS TEXT) AS count FROM error_events
-			 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`,
+			 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)`,
 			siteID, from, to)
 		if err != nil || len(rows) == 0 { return map[string]string{"value": "0"}, nil }
 		return map[string]string{"value": rows[0].Count}, nil

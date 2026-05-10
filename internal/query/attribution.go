@@ -106,8 +106,8 @@ func (s *AttributionService) AttributionByModel(ctx context.Context, siteID, mod
 		`SELECT session_id, COALESCE(utm_source, '') AS utm_source, timestamp
 		   FROM events
 		  WHERE site_id = $1
-		    AND timestamp >= CAST($2 AS BIGINT)
-		    AND timestamp <  CAST($3 AS BIGINT)
+		    AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT)
+		    AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
 		  ORDER BY session_id, timestamp ASC`,
 		siteID, from, to,
 	)

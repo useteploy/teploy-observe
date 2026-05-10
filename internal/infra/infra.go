@@ -108,7 +108,7 @@ func (s *InfraService) HostHistory(ctx context.Context, siteID, hostname string,
 			cpu_percent, memory_percent, memory_used_mb, memory_total_mb,
 			disk_percent, disk_used_gb, disk_total_gb,
 			net_rx_bytes, net_tx_bytes, load_1m, load_5m, load_15m
-		 FROM host_metrics WHERE site_id = $1 AND hostname = $2 AND timestamp >= CAST($3 AS BIGINT) AND timestamp < CAST($4 AS BIGINT)
+		 FROM host_metrics WHERE site_id = $1 AND hostname = $2 AND CAST(timestamp AS BIGINT) >= CAST($3 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($4 AS BIGINT)
 		 ORDER BY timestamp DESC LIMIT %d`, limit),
 		siteID, hostname, fromMs, toMs,
 	)

@@ -371,7 +371,7 @@ func (s *CronService) CheckMissed(ctx context.Context) ([]CronMonitor, error) {
 		}
 		rows, err := nucleus.Query[countRow](ctx, s.db.SQL(),
 			`SELECT CAST(COUNT(*) AS TEXT) AS count FROM cron_checkins
-			 WHERE cron_id = $1 AND timestamp >= CAST($2 AS BIGINT)`,
+			 WHERE cron_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT)`,
 			c.CronID, cutoff)
 		if err != nil {
 			s.logger.Error("monitoring: check missed count failed", "cron", c.CronID, "err", err)

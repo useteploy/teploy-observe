@@ -41,7 +41,7 @@ func (s *StatsService) Retention(ctx context.Context, siteID string, from, to ti
 	rows, err := nucleus.Query[sessionFirstLast](ctx, s.db.SQL(),
 		`SELECT session_id, first_ts
 		 FROM sessions
-		 WHERE site_id = $1 AND first_ts >= CAST($2 AS BIGINT) AND first_ts < CAST($3 AS BIGINT)`,
+		 WHERE site_id = $1 AND CAST(first_ts AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(first_ts AS BIGINT) < CAST($3 AS BIGINT)`,
 		siteID, fromMs, toMs,
 	)
 	if err != nil {
@@ -61,7 +61,7 @@ func (s *StatsService) Retention(ctx context.Context, siteID string, from, to ti
 	events, err := nucleus.Query[eventRow](ctx, s.db.SQL(),
 		`SELECT session_id, CAST(timestamp AS TEXT) AS timestamp
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT)
+		 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT)
 		 ORDER BY session_id, timestamp ASC`,
 		siteID, fromMs,
 	)

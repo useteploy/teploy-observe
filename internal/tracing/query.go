@@ -547,7 +547,7 @@ func (q *QueryService) TraceErrors(ctx context.Context, traceID, siteID string) 
 			CAST(timestamp AS TEXT) AS timestamp,
 			issue_id
 		 FROM error_events
-		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp <= CAST($3 AS BIGINT)
+		 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) <= CAST($3 AS BIGINT)
 		 ORDER BY timestamp ASC`,
 		siteID, b[0].MinT, b[0].MaxT,
 	)

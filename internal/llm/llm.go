@@ -158,7 +158,7 @@ func (s *LLMService) Stats(ctx context.Context, siteID string, from, to time.Tim
 			COALESCE(SUM(CAST(cost_usd AS DOUBLE)), 0) AS cost,
 			COALESCE(AVG(CAST(latency_ms AS BIGINT)), 0) AS latency,
 			COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) AS errors
-		 FROM llm_traces WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`,
+		 FROM llm_traces WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)`,
 		siteID, fromMs, toMs,
 	)
 	if err != nil {
@@ -205,7 +205,7 @@ func (s *LLMService) ModelBreakdown(ctx context.Context, siteID string, from, to
 			COALESCE(SUM(CAST(total_tokens AS BIGINT)), 0) AS total_tokens,
 			COALESCE(SUM(CAST(cost_usd AS DOUBLE)), 0) AS total_cost_usd,
 			COALESCE(AVG(CAST(latency_ms AS BIGINT)), 0) AS avg_latency_ms
-		 FROM llm_traces WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
+		 FROM llm_traces WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
 		 GROUP BY model, provider
 		 ORDER BY call_count DESC`,
 		siteID, fromMs, toMs,
