@@ -6,6 +6,7 @@ import CodeBlock from "../components/shared/CodeBlock.js";
 import EmptyState from "../components/shared/EmptyState.js";
 import ExportButton from "../components/shared/ExportButton.js";
 import "../styles/flags.css";
+import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
 
@@ -273,9 +274,7 @@ function FlagDetail({ flag }: { flag: FeatureFlag }) {
 // ─── Main Page ───
 
 export default function FlagsPage() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const [flags, setFlags] = useState<FeatureFlag[]>([]);
   const [loading, setLoading] = useState(true);

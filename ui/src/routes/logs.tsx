@@ -8,6 +8,7 @@ import Pagination from "../components/shared/Pagination.js";
 import ExportButton from "../components/shared/ExportButton.js";
 import EmptyState from "../components/shared/EmptyState.js";
 import "../styles/logs.css";
+import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
 
@@ -205,10 +206,7 @@ function LogHistogram({ data }: { data: LogHistogramBucket[] }) {
 }
 
 export default function LogsPage() {
-  const siteId =
-    typeof window !== "undefined"
-      ? new URLSearchParams(window.location.search).get("site_id") || "default"
-      : "default";
+  const { state: { siteId } } = useFilters();
 
   const PAGE_SIZE = 50;
   const [logs, setLogs] = useState<LogEntry[]>([]);

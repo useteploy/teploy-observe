@@ -4,6 +4,7 @@ import type { FunnelStep, FunnelResult, RetentionCohort, JourneyResult, GoalConv
 import Modal from "../components/shared/Modal.js";
 import Tabs from "../components/shared/Tabs.js";
 import "../styles/insights.css";
+import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
 
@@ -532,9 +533,7 @@ function CorrelationsPanel({ siteId, from, to }: { siteId: string; from: string;
 // ─── Main Page ───
 
 export default function InsightsPage() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const now = new Date();
   const from = new Date(now.getTime() - 30 * 86400000).toISOString();

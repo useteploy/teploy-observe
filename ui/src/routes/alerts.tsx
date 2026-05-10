@@ -8,6 +8,7 @@ import Pagination from "../components/shared/Pagination.js";
 import EmptyState from "../components/shared/EmptyState.js";
 import ExportButton from "../components/shared/ExportButton.js";
 import "../styles/settings.css";
+import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
 
@@ -309,9 +310,7 @@ function HistoryTab({ siteId }: { siteId: string }) {
 }
 
 export default function AlertsPage() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const [activeTab, setActiveTab] = useState("rules");
 

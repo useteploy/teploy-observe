@@ -3,6 +3,7 @@ import { analyticsApi } from "../api/analytics.js";
 import type { CustomEventStat, PropertyStat, TimeSeriesPoint } from "../api/analytics.js";
 import SearchInput from "../components/shared/SearchInput.js";
 import ExportButton from "../components/shared/ExportButton.js";
+import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
 
@@ -11,9 +12,7 @@ function formatNumber(n: number): string {
 }
 
 export default function EventsPage() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const [events, setEvents] = useState<CustomEventStat[]>([]);
   const [loading, setLoading] = useState(true);

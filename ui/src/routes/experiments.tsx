@@ -5,6 +5,7 @@ import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
 import ExportButton from "../components/shared/ExportButton.js";
 import "../styles/flags.css";
+import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
 
@@ -124,9 +125,7 @@ function ResultsPanel({ experimentId }: { experimentId: string }) {
 }
 
 export default function ExperimentsPage() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [loading, setLoading] = useState(true);

@@ -1,5 +1,6 @@
 import { useState, useEffect } from "preact/hooks";
 import { get, post } from "../api/helpers.js";
+import { useFilters } from "../hooks/useFilters.js";
 import "../styles/explorer.css";
 
 export const config = { mode: "app" };
@@ -12,6 +13,7 @@ interface QueryResult {
 }
 
 export default function ExplorerPage() {
+  const { state: { siteId } } = useFilters();
   const [sql, setSql] = useState("SELECT * FROM events LIMIT 20");
   const [tables, setTables] = useState<string[]>([]);
   const [result, setResult] = useState<QueryResult | null>(null);
@@ -59,7 +61,7 @@ export default function ExplorerPage() {
     try {
       const data = await post<{ sql: string; model?: string; error?: string }>(
         "/api/v1/ai/query",
-        { question: question.trim(), site_id: "default" }
+        { question: question.trim(), site_id: siteId }
       );
       if (data.error) {
         setAskError(data.error);

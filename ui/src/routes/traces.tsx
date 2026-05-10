@@ -9,6 +9,7 @@ import EmptyState from "../components/shared/EmptyState.js";
 import ExportButton from "../components/shared/ExportButton.js";
 import ServiceMap from "../components/ServiceMap.js";
 import "../styles/traces.css";
+import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
 
@@ -900,9 +901,7 @@ function PerformanceIssuesTable({ siteId, from, to, onSelectTrace }: {
 }
 
 export default function TracesPage() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const [services, setServices] = useState<Service[]>([]);
   const [loading, setLoading] = useState(true);

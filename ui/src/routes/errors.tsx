@@ -9,6 +9,7 @@ import Pagination from "../components/shared/Pagination.js";
 import ExportButton from "../components/shared/ExportButton.js";
 import EmptyState from "../components/shared/EmptyState.js";
 import "../styles/errors.css";
+import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
 
@@ -384,9 +385,7 @@ function DailyChart({ siteId }: { siteId: string }) {
 // ─── Main Page ───
 
 export default function ErrorsPage() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const PAGE_SIZE = 20;
   const [issues, setIssues] = useState<Issue[]>([]);

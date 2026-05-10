@@ -5,6 +5,7 @@ import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
 import ExportButton from "../components/shared/ExportButton.js";
 import "../styles/monitoring.css";
+import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
 
@@ -57,9 +58,7 @@ interface MonitorWithStatus extends UptimeMonitor {
 }
 
 function UptimeTab() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const [monitors, setMonitors] = useState<MonitorWithStatus[]>([]);
   const [loading, setLoading] = useState(true);
@@ -299,9 +298,7 @@ function UptimeTab() {
 // ─── Cron Tab ───
 
 function CronTab() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const [monitors, setMonitors] = useState<CronMonitor[]>([]);
   const [loading, setLoading] = useState(true);
@@ -404,9 +401,7 @@ function CronTab() {
 // ─── Infra Tab ───
 
 function InfraTab() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const [hosts, setHosts] = useState<InfraHost[]>([]);
   const [loading, setLoading] = useState(true);

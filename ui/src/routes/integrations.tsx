@@ -5,6 +5,7 @@ import Modal from "../components/shared/Modal.js";
 import ConfirmDialog from "../components/shared/ConfirmDialog.js";
 import EmptyState from "../components/shared/EmptyState.js";
 import "../styles/settings.css";
+import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
 
@@ -37,9 +38,7 @@ const TYPES = [
 ];
 
 export default function IntegrationsPage() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const [items, setItems] = useState<Integration[]>([]);
   const [loading, setLoading] = useState(true);

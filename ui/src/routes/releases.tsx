@@ -8,6 +8,7 @@ import type {
 import ExportButton from "../components/shared/ExportButton.js";
 import EmptyState from "../components/shared/EmptyState.js";
 import "../styles/errors.css";
+import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
 
@@ -75,9 +76,7 @@ function Sparkline({ points }: { points: ReleaseSparklinePoint[] }) {
 }
 
 export default function ReleasesPage() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const [releases, setReleases] = useState<ReleaseHealth[]>([]);
   const [loading, setLoading] = useState(true);

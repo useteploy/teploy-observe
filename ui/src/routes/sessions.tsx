@@ -9,6 +9,7 @@ import { get } from "../api/helpers.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
 import Pagination from "../components/shared/Pagination.js";
+import { useFilters } from "../hooks/useFilters.js";
 import "../styles/sessions.css";
 
 interface SessionEvent {
@@ -243,10 +244,10 @@ function SessionDetail({ session, onBack }: { session: ReplaySession; onBack: ()
 // ─── Main Page ───
 
 export default function SessionsPage() {
+  const { state: { siteId } } = useFilters();
   const params = typeof window !== "undefined"
     ? new URLSearchParams(window.location.search)
     : new URLSearchParams();
-  const siteId = params.get("site_id") || "default";
   const deepReplayId = params.get("replay_id") || "";
 
   const PAGE_SIZE = 20;

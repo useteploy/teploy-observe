@@ -1,5 +1,6 @@
 import { useState, useEffect } from "preact/hooks";
 import ExportButton from "../components/shared/ExportButton.js";
+import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
 
@@ -44,6 +45,7 @@ function formatDuration(start: number, end: number): string {
 }
 
 export default function IncidentsPage() {
+  const { state: { siteId } } = useFilters();
   const [active, setActive] = useState<Incident[]>([]);
   const [recent, setRecent] = useState<Incident[]>([]);
   const [loading, setLoading] = useState(true);
@@ -55,9 +57,10 @@ export default function IncidentsPage() {
     try {
       const now = Date.now();
       const from = now - 7 * 24 * 3600 * 1000;
+      const enc = encodeURIComponent(siteId);
       const [activeList, rangeList] = await Promise.all([
-        api<Incident[]>("/api/v1/incidents?site_id=default"),
-        api<Incident[]>(`/api/v1/incidents?site_id=default&from=${from}&to=${now}`),
+        api<Incident[]>(`/api/v1/incidents?site_id=${enc}`),
+        api<Incident[]>(`/api/v1/incidents?site_id=${enc}&from=${from}&to=${now}`),
       ]);
       setActive(activeList || []);
       setRecent((rangeList || []).filter(i => i.ended_at !== 0));
@@ -66,14 +69,14 @@ export default function IncidentsPage() {
     }
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, [siteId]);
 
   const create = async () => {
     try {
       await api("/api/v1/incidents", {
         method: "POST",
         body: JSON.stringify({
-          site_id: "default",
+          site_id: siteId,
           title: form.title,
           description: form.description,
           severity: form.severity,

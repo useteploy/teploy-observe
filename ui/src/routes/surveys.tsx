@@ -4,6 +4,7 @@ import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
 import ExportButton from "../components/shared/ExportButton.js";
+import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
 
@@ -116,9 +117,7 @@ function ResponsesView({ survey, onBack }: { survey: Survey; onBack: () => void 
 }
 
 export default function SurveysPage() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const [surveys, setSurveys] = useState<Survey[]>([]);
   const [loading, setLoading] = useState(true);

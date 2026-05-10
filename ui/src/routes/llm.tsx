@@ -3,6 +3,7 @@ import { get } from "../api/helpers.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
 import ExportButton from "../components/shared/ExportButton.js";
+import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
 
@@ -67,9 +68,7 @@ function formatTime(ts: number): string {
 }
 
 export default function LLMPage() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const [stats, setStats] = useState<LLMStats | null>(null);
   const [models, setModels] = useState<ModelStats[]>([]);

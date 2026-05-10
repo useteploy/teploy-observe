@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { analyticsApi } from "../api/analytics.js";
 import type { UTMStat, AttributionRow, AttributionModel } from "../api/analytics.js";
+import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
 
@@ -220,9 +221,7 @@ function AttributionTab({ siteId, from, to }: AttributionTabProps) {
 }
 
 export default function CampaignsPage() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const [tab, setTab] = useState<TabId>("overview");
   const [sources, setSources] = useState<UTMStat[]>([]);

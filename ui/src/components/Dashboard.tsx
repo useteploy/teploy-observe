@@ -1,4 +1,4 @@
-import { FilterProvider, useFilters } from "../hooks/useFilters.js";
+import { useFilters } from "../hooks/useFilters.js";
 import { api } from "../api.js";
 import StatsCards from "./StatsCards.js";
 import TimeSeriesChart from "./TimeSeriesChart.js";
@@ -105,15 +105,12 @@ function DashboardInner() {
 }
 
 interface Props {
-  siteId: string;
+  /** Optional override; default is to read from the surrounding RouteFilterProvider. */
+  siteId?: string;
 }
 
-function Dashboard({ siteId }: Props) {
-  return (
-    <FilterProvider siteId={siteId}>
-      <DashboardInner />
-    </FilterProvider>
-  );
+function Dashboard(_props: Props) {
+  return <DashboardInner />;
 }
 
 Dashboard.displayName = "Dashboard";

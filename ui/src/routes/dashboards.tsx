@@ -6,6 +6,7 @@ import Modal from "../components/shared/Modal.js";
 import ConfirmDialog from "../components/shared/ConfirmDialog.js";
 import EmptyState from "../components/shared/EmptyState.js";
 import "../styles/dashboards.css";
+import { useFilters } from "../hooks/useFilters.js";
 
 function MiniSparkline({ data, color = "var(--obs-accent)" }: { data: number[]; color?: string }) {
   const ref = useRef<HTMLCanvasElement>(null);
@@ -519,9 +520,7 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
 // ─── Main Page ───
 
 export default function DashboardsPage() {
-  const siteId = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search).get("site_id") || "default"
-    : "default";
+  const { state: { siteId } } = useFilters();
 
   const [dashboards, setDashboards] = useState<Dashboard[]>([]);
   const [loading, setLoading] = useState(true);
