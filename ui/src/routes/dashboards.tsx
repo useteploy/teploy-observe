@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useRef } from "preact/hooks";
 import { get, post, del } from "../api/helpers.js";
 import { analyticsApi } from "../api/analytics.js";
 import type { TimeSeriesPoint } from "../api/analytics.js";
+import { metricsApi } from "../api/metrics.js";
+import type { MetricInfo, MetricSeries, Aggregation, StepDuration } from "../api/metrics.js";
 import Modal from "../components/shared/Modal.js";
 import ConfirmDialog from "../components/shared/ConfirmDialog.js";
 import EmptyState from "../components/shared/EmptyState.js";
@@ -214,6 +216,7 @@ const PANEL_TYPES = [
   { value: "timeseries", label: "Time Series" },
   { value: "table", label: "Table" },
   { value: "bar", label: "Bar Chart" },
+  { value: "metric_series", label: "Metric series (OTLP)" },
 ];
 
 const QUERY_TYPES = [
@@ -221,6 +224,73 @@ const QUERY_TYPES = [
   { value: "visitors", label: "Visitors" },
   { value: "errors", label: "Error Count" },
 ];
+
+const METRIC_AGGS: Aggregation[] = ["last", "avg", "sum", "min", "max", "rate", "p50", "p95", "p99"];
+const METRIC_STEPS: StepDuration[] = ["15s", "30s", "60s", "5m", "1h", "1d"];
+
+const METRIC_PANEL_COLORS = [
+  "#6366f1", "#10b981", "#f59e0b", "#ef4444",
+  "#8b5cf6", "#06b6d4", "#ec4899", "#84cc16",
+];
+
+function metricLabelKey(labels: Record<string, string>): string {
+  const keys = Object.keys(labels).sort();
+  if (keys.length === 0) return "(all)";
+  return keys.map(k => `${k}=${labels[k]}`).join(" ");
+}
+
+// Inline SVG renderer reused for dashboard panels of type metric_series.
+// Kept self-contained so the dashboards route doesn't import the metrics
+// route file (avoids preact-signals coupling and Vite chunk bloat).
+function MetricSeriesChart({ series }: { series: MetricSeries[] }) {
+  const all = series.flatMap(s => s.points);
+  if (all.length === 0) {
+    return <div class="dashboard-panel-empty">No data points in selected window.</div>;
+  }
+  const w = 540, h = 180;
+  const pad = { top: 12, right: 16, bottom: 24, left: 40 };
+  const innerW = w - pad.left - pad.right;
+  const innerH = h - pad.top - pad.bottom;
+  const xs = all.map(p => p.ts_ms);
+  const ys = all.map(p => p.value);
+  const xMin = Math.min(...xs);
+  const xMax = Math.max(...xs);
+  const yMin = Math.min(...ys, 0);
+  const yMax = Math.max(...ys, 1);
+  const xRange = Math.max(1, xMax - xMin);
+  const yRange = Math.max(0.0001, yMax - yMin);
+  const sx = (x: number) => pad.left + ((x - xMin) / xRange) * innerW;
+  const sy = (y: number) => pad.top + innerH - ((y - yMin) / yRange) * innerH;
+
+  return (
+    <div>
+      <svg width={w} height={h} role="img" aria-label="Metric series chart" data-testid="metric-series-panel-chart">
+        <line x1={pad.left} x2={w - pad.right} y1={pad.top} y2={pad.top} stroke="var(--obs-border)" stroke-dasharray="2,2" />
+        <line x1={pad.left} x2={w - pad.right} y1={pad.top + innerH / 2} y2={pad.top + innerH / 2} stroke="var(--obs-border)" stroke-dasharray="2,2" />
+        <line x1={pad.left} x2={w - pad.right} y1={pad.top + innerH} y2={pad.top + innerH} stroke="var(--obs-border)" stroke-dasharray="2,2" />
+        <text x={pad.left - 6} y={pad.top + 4} text-anchor="end" font-size="10" fill="var(--obs-text-secondary)">{yMax.toFixed(1)}</text>
+        <text x={pad.left - 6} y={pad.top + innerH + 4} text-anchor="end" font-size="10" fill="var(--obs-text-secondary)">{yMin.toFixed(1)}</text>
+
+        {series.map((s, idx) => {
+          if (s.points.length === 0) return null;
+          const color = METRIC_PANEL_COLORS[idx % METRIC_PANEL_COLORS.length];
+          const linePath = s.points
+            .map((p, i) => `${i === 0 ? "M" : "L"} ${sx(p.ts_ms).toFixed(1)} ${sy(p.value).toFixed(1)}`)
+            .join(" ");
+          return <path key={idx} d={linePath} fill="none" stroke={color} stroke-width="2" />;
+        })}
+      </svg>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "4px" }}>
+        {series.map((s, idx) => (
+          <div key={idx} style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "10px", color: "var(--obs-text-secondary)" }}>
+            <span style={{ width: "8px", height: "8px", borderRadius: "2px", background: METRIC_PANEL_COLORS[idx % METRIC_PANEL_COLORS.length], display: "inline-block" }} />
+            {metricLabelKey(s.labels)}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 // ─── Dashboard Detail ───
 
@@ -235,6 +305,14 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
   const [panelValues, setPanelValues] = useState<Record<string, string>>({});
   const [panelSparklines, setPanelSparklines] = useState<Record<string, number[]>>({});
   const [chartLabels, setChartLabels] = useState<string[]>([]);
+  const [metricSeriesByPanel, setMetricSeriesByPanel] = useState<Record<string, MetricSeries[]>>({});
+  // Add Panel modal — metric_series specific state
+  const [availableMetrics, setAvailableMetrics] = useState<MetricInfo[]>([]);
+  const [metricName, setMetricName] = useState("");
+  const [metricAgg, setMetricAgg] = useState<Aggregation>("last");
+  const [metricStep, setMetricStep] = useState<StepDuration>("60s");
+  const [metricLabelRows, setMetricLabelRows] = useState<{ k: string; v: string }[]>([]);
+  const [metricGroupBy, setMetricGroupBy] = useState("");
   const [dragSrcId, setDragSrcId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [resize, setResize] = useState<{ panelId: string; startX: number; startWidth: number; previewWidth: number } | null>(null);
@@ -250,13 +328,30 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
         const from = new Date(now.getTime() - 7 * 86400000).toISOString();
         const to = now.toISOString();
 
+        // metric_series panels return Series[]; standard panels return
+        // {value}. We split the fan-out so the renderer below can look at
+        // either map and pick the right shape.
+        const fromMs = String(now.getTime() - 7 * 86400000);
+        const toMs = String(now.getTime());
+
+        const metricPromises = data.panels
+          .filter(p => p.title && (p.panel_type === "metric_series" || p.query_type === "metric_series"))
+          .map(async (p) => {
+            try {
+              const s = await post<MetricSeries[]>(`${BASE}/${dashboardId}/panels/${p.panel_id}/execute`, { site_id: siteId, from: fromMs, to: toMs });
+              return { id: p.panel_id, series: Array.isArray(s) ? s : [] };
+            } catch { return { id: p.panel_id, series: [] as MetricSeries[] }; }
+          });
+
         // Fetch panel values + sparkline data in parallel
-        const valPromises = data.panels.filter(p => p.title).map(async (p) => {
-          try {
-            const r = await post<{ value: string }>(`${BASE}/${dashboardId}/panels/${p.panel_id}/execute`, { site_id: siteId, from, to });
-            return { id: p.panel_id, value: r?.value || "0" };
-          } catch { return { id: p.panel_id, value: "--" }; }
-        });
+        const valPromises = data.panels
+          .filter(p => p.title && p.panel_type !== "metric_series" && p.query_type !== "metric_series")
+          .map(async (p) => {
+            try {
+              const r = await post<{ value: string }>(`${BASE}/${dashboardId}/panels/${p.panel_id}/execute`, { site_id: siteId, from, to });
+              return { id: p.panel_id, value: r?.value || "0" };
+            } catch { return { id: p.panel_id, value: "--" }; }
+          });
 
         // Fetch timeseries for sparklines
         let tsData: TimeSeriesPoint[] = [];
@@ -264,10 +359,15 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
           tsData = await analyticsApi.timeseries(siteId, from, to, "day") || [];
         } catch {}
 
-        const results = await Promise.all(valPromises);
+        const [results, metricResults] = await Promise.all([
+          Promise.all(valPromises),
+          Promise.all(metricPromises),
+        ]);
         const vals: Record<string, string> = {};
         const sparks: Record<string, number[]> = {};
+        const metricMap: Record<string, MetricSeries[]> = {};
         for (const r of results) { vals[r.id] = r.value; }
+        for (const m of metricResults) { metricMap[m.id] = m.series; }
 
         // Map sparkline data to each panel based on query type
         for (const p of data.panels) {
@@ -286,10 +386,17 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
         setPanelValues(vals);
         setPanelSparklines(sparks);
         setChartLabels(labels);
+        setMetricSeriesByPanel(metricMap);
       }
     } catch { setDetail(null); }
     finally { setLoading(false); }
   }, [dashboardId, siteId]);
+
+  // Lazy-load the metric autocomplete list when the modal opens.
+  useEffect(() => {
+    if (!showAddPanel || availableMetrics.length > 0) return;
+    metricsApi.list(siteId).then((m) => setAvailableMetrics(m || [])).catch(() => {});
+  }, [showAddPanel, siteId]);
 
   useEffect(() => { fetchDetail(); }, [fetchDetail]);
 
@@ -341,15 +448,40 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
     if (!panelTitle.trim()) return;
     setAdding(true);
     try {
+      let queryConfig = "";
+      let resolvedQueryType = queryType;
+      if (panelType === "metric_series") {
+        if (!metricName.trim()) {
+          setAdding(false);
+          return;
+        }
+        const labels: Record<string, string> = {};
+        for (const row of metricLabelRows) {
+          const k = row.k.trim(), v = row.v.trim();
+          if (k && v) labels[k] = v;
+        }
+        queryConfig = JSON.stringify({
+          metric: metricName.trim(),
+          labels,
+          agg: metricAgg,
+          step: metricStep,
+          group_by: metricGroupBy.trim(),
+        });
+        resolvedQueryType = "metric_series";
+      }
       await post<Panel>(`${BASE}/${dashboardId}/panels`, {
         panel_type: panelType,
         title: panelTitle.trim(),
-        query_type: queryType,
+        query_type: resolvedQueryType,
+        query_config: queryConfig,
         width: "6",
         height: "4",
       });
       setShowAddPanel(false);
       setPanelTitle("");
+      setMetricName("");
+      setMetricLabelRows([]);
+      setMetricGroupBy("");
       fetchDetail();
     } catch (err) { console.error("Failed to add panel:", err); }
     finally { setAdding(false); }
@@ -399,6 +531,8 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
             const w = resize?.panelId === panel.panel_id ? resize.previewWidth : savedW;
             const series = panelSparklines[panel.panel_id];
             const isTimeSeries = panel.panel_type === "timeseries";
+            const isMetricSeries = panel.panel_type === "metric_series" || panel.query_type === "metric_series";
+            const metricSeries = metricSeriesByPanel[panel.panel_id];
             const setWidth = async (next: number) => {
               await post(`${BASE}/${dashboardId}/panels/${panel.panel_id}/layout`, { width: String(next) });
               fetchDetail();
@@ -408,7 +542,8 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
             const isResizing = resize?.panelId === panel.panel_id;
             return (
               <div key={panel.panel_id}
-                class={`dashboard-panel ${isTimeSeries ? "dashboard-panel--chart" : ""} ${isDragSrc ? "dashboard-panel--dragging" : ""} ${isDragOver ? "dashboard-panel--drop-target" : ""} ${isResizing ? "dashboard-panel--resizing" : ""}`}
+                data-testid={`dashboard-panel-${panel.panel_id}`}
+                class={`dashboard-panel ${isTimeSeries || isMetricSeries ? "dashboard-panel--chart" : ""} ${isDragSrc ? "dashboard-panel--dragging" : ""} ${isDragOver ? "dashboard-panel--drop-target" : ""} ${isResizing ? "dashboard-panel--resizing" : ""}`}
                 style={{ gridColumn: `span ${Math.min(w, 12)}` }}
                 draggable={!resize}
                 onDragStart={(e) => {
@@ -462,7 +597,11 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
                     setResize({ panelId: panel.panel_id, startX: e.clientX, startWidth: savedW, previewWidth: savedW });
                   }}
                 />
-                {isTimeSeries ? (
+                {isMetricSeries ? (
+                  metricSeries && metricSeries.length > 0
+                    ? <MetricSeriesChart series={metricSeries} />
+                    : <div class="dashboard-panel-empty">No metric data yet.</div>
+                ) : isTimeSeries ? (
                   series && series.length > 1
                     ? <PanelTimeSeries data={series} labels={chartLabels} label={panel.query_type} />
                     : <div class="dashboard-panel-empty">Not enough data yet.</div>
@@ -487,27 +626,90 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
         <div class="add-panel-form">
           <div class="obs-form-group">
             <label class="obs-label">Title</label>
-            <input class="obs-input" placeholder="Total Pageviews" value={panelTitle}
+            <input class="obs-input" data-testid="add-panel-title" placeholder="Total Pageviews" value={panelTitle}
               onInput={(e) => setPanelTitle((e.target as HTMLInputElement).value)} />
           </div>
           <div class="obs-form-group">
             <label class="obs-label">Panel Type</label>
-            <select class="obs-select" value={panelType}
+            <select class="obs-select" data-testid="add-panel-type" value={panelType}
               onChange={(e) => setPanelType((e.target as HTMLSelectElement).value)}>
               {PANEL_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
             </select>
           </div>
-          <div class="obs-form-group">
-            <label class="obs-label">Metric</label>
-            <select class="obs-select" value={queryType}
-              onChange={(e) => setQueryType((e.target as HTMLSelectElement).value)}>
-              {QUERY_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
-            </select>
-          </div>
+
+          {panelType === "metric_series" ? (
+            <>
+              <div class="obs-form-group">
+                <label class="obs-label">Metric name</label>
+                <input
+                  class="obs-input"
+                  data-testid="add-panel-metric-name"
+                  list="metric-name-options"
+                  placeholder="http_requests_total"
+                  value={metricName}
+                  onInput={(e) => setMetricName((e.target as HTMLInputElement).value)}
+                />
+                <datalist id="metric-name-options">
+                  {availableMetrics.map(m => <option key={m.name} value={m.name}>{m.kind}</option>)}
+                </datalist>
+              </div>
+              <div class="obs-form-group">
+                <label class="obs-label">Aggregation</label>
+                <select class="obs-select" data-testid="add-panel-metric-agg" value={metricAgg}
+                  onChange={(e) => setMetricAgg((e.target as HTMLSelectElement).value as Aggregation)}>
+                  {METRIC_AGGS.map(a => <option key={a} value={a}>{a}</option>)}
+                </select>
+              </div>
+              <div class="obs-form-group">
+                <label class="obs-label">Step</label>
+                <select class="obs-select" data-testid="add-panel-metric-step" value={metricStep}
+                  onChange={(e) => setMetricStep((e.target as HTMLSelectElement).value as StepDuration)}>
+                  {METRIC_STEPS.map(s => <option key={s} value={s}>{s}</option>)}
+                </select>
+              </div>
+              <div class="obs-form-group">
+                <label class="obs-label">Group by (comma-separated label keys)</label>
+                <input class="obs-input" data-testid="add-panel-metric-groupby" placeholder="region,instance" value={metricGroupBy}
+                  onInput={(e) => setMetricGroupBy((e.target as HTMLInputElement).value)} />
+              </div>
+              <div class="obs-form-group">
+                <label class="obs-label">Label filters</label>
+                {metricLabelRows.map((row, i) => (
+                  <div key={i} style={{ display: "flex", gap: "6px", marginBottom: "4px" }}>
+                    <input class="obs-input" placeholder="key" value={row.k} style={{ flex: 1 }}
+                      onInput={(e) => {
+                        const next = [...metricLabelRows];
+                        next[i] = { ...next[i], k: (e.target as HTMLInputElement).value };
+                        setMetricLabelRows(next);
+                      }} />
+                    <input class="obs-input" placeholder="value" value={row.v} style={{ flex: 1 }}
+                      onInput={(e) => {
+                        const next = [...metricLabelRows];
+                        next[i] = { ...next[i], v: (e.target as HTMLInputElement).value };
+                        setMetricLabelRows(next);
+                      }} />
+                    <button class="obs-btn obs-btn--sm" onClick={() => setMetricLabelRows(metricLabelRows.filter((_, j) => j !== i))}>×</button>
+                  </div>
+                ))}
+                <button class="obs-btn obs-btn--sm" onClick={() => setMetricLabelRows([...metricLabelRows, { k: "", v: "" }])}>
+                  + Add filter
+                </button>
+              </div>
+            </>
+          ) : (
+            <div class="obs-form-group">
+              <label class="obs-label">Metric</label>
+              <select class="obs-select" value={queryType}
+                onChange={(e) => setQueryType((e.target as HTMLSelectElement).value)}>
+                {QUERY_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+              </select>
+            </div>
+          )}
+
           <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
             <button class="obs-btn" onClick={() => setShowAddPanel(false)}>Cancel</button>
-            <button class="obs-btn obs-btn--primary" onClick={handleAddPanel}
-              disabled={adding || !panelTitle.trim()}>
+            <button class="obs-btn obs-btn--primary" data-testid="add-panel-submit" onClick={handleAddPanel}
+              disabled={adding || !panelTitle.trim() || (panelType === "metric_series" && !metricName.trim())}>
               {adding ? "Adding..." : "Add Panel"}
             </button>
           </div>

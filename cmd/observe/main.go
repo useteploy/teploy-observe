@@ -221,7 +221,7 @@ func main() {
 	uptimeSvc := monitoring.NewUptimeService(db, logger)
 	cronSvc := monitoring.NewCronService(db, logger)
 	linkSvc := tracking.NewLinkService(db)
-	dashSvc := dashboards.NewDashboardService(db)
+	dashSvc := dashboards.NewDashboardService(db).WithMetrics(metricsSvc)
 	replaySvc := replays.NewReplayService(db).
 		WithLogger(logger).
 		WithPrivacy(siteSvc.PrivacyConfig, cfg.SessionSalt)

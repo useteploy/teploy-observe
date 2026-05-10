@@ -10,14 +10,27 @@ import (
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/metrics"
 )
 
 type DashboardService struct {
-	db *nucleus.Client
+	db         *nucleus.Client
+	metricsSvc *metrics.Service
 }
 
 func NewDashboardService(db *nucleus.Client) *DashboardService {
 	return &DashboardService{db: db}
+}
+
+// WithMetrics wires the metrics service so panels of type "metric_series"
+// can be executed via this dashboard service. Wired from main.go where
+// both services are constructed; kept optional so unit tests that don't
+// touch metric panels can still build a service without dragging in the
+// metrics package.
+func (s *DashboardService) WithMetrics(svc *metrics.Service) *DashboardService {
+	s.metricsSvc = svc
+	return s
 }
 
 type Dashboard struct {
@@ -47,12 +60,19 @@ type Panel struct {
 }
 
 // PanelConfig is the structured query configuration for a panel.
+//
+// metric_series panels (Phase 2) reuse Metric for the metric name, Filters
+// as the AND-joined label map, plus three new fields (Agg, Step, GroupBy)
+// that map 1:1 onto metrics.QueryOptions.
 type PanelConfig struct {
-	Metric   string `json:"metric,omitempty"`   // for metric panels
-	GroupBy  string `json:"group_by,omitempty"` // for table/bar panels
-	Filters  map[string]string `json:"filters,omitempty"`
-	Interval string `json:"interval,omitempty"` // for timeseries
-	SQL      string `json:"sql,omitempty"`      // for custom SQL
+	Metric   string            `json:"metric,omitempty"`    // for metric / metric_series panels
+	GroupBy  string            `json:"group_by,omitempty"`  // table/bar panels = single key; metric_series = comma-separated
+	Filters  map[string]string `json:"filters,omitempty"`   // metric_series = label filter map; also used as `labels`
+	Labels   map[string]string `json:"labels,omitempty"`    // metric_series alias of Filters (Filters wins if both set)
+	Interval string            `json:"interval,omitempty"`  // timeseries
+	SQL      string            `json:"sql,omitempty"`       // custom SQL
+	Agg      string            `json:"agg,omitempty"`       // metric_series — last|avg|sum|min|max|rate|p50|p95|p99
+	Step     string            `json:"step,omitempty"`      // metric_series — bucket size, e.g. "60s"
 }
 
 func (s *DashboardService) Create(ctx context.Context, siteID, name, description, createdBy string) (*Dashboard, error) {
@@ -97,9 +117,46 @@ func (s *DashboardService) Delete(ctx context.Context, dashboardID string) error
 	return err
 }
 
+// IsValidPanelType reports whether t is a panel type we know how to render.
+// Validated on AddPanel so a typo doesn't quietly land an unrenderable
+// panel in the DB.
+func IsValidPanelType(t string) bool {
+	switch t {
+	case "metric", "timeseries", "table", "bar", "metric_series":
+		return true
+	}
+	return false
+}
+
 func (s *DashboardService) AddPanel(ctx context.Context, dashboardID string, panel Panel) (*Panel, error) {
 	panel.PanelID = genID()
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+
+	if panel.PanelType != "" && !IsValidPanelType(panel.PanelType) {
+		return nil, fmt.Errorf("dashboards: unsupported panel_type %q", panel.PanelType)
+	}
+	// metric_series stores its query in query_config — ensure it parses
+	// before the row lands so the dashboard view doesn't crash later.
+	if panel.PanelType == "metric_series" {
+		var cfg PanelConfig
+		if panel.QueryConfig != "" {
+			if err := json.Unmarshal([]byte(panel.QueryConfig), &cfg); err != nil {
+				return nil, fmt.Errorf("dashboards: query_config invalid JSON: %w", err)
+			}
+		}
+		if cfg.Metric == "" {
+			return nil, fmt.Errorf("dashboards: metric_series panels require query_config.metric")
+		}
+		if cfg.Agg != "" && !metrics.IsValidAggregation(cfg.Agg) {
+			return nil, fmt.Errorf("dashboards: unsupported agg %q", cfg.Agg)
+		}
+		if _, err := metrics.ParseStep(cfg.Step); err != nil {
+			return nil, err
+		}
+		if panel.QueryType == "" {
+			panel.QueryType = "metric_series"
+		}
+	}
 
 	if panel.Width == "" { panel.Width = "6" }
 	if panel.Height == "" { panel.Height = "4" }
@@ -162,6 +219,46 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 	var config PanelConfig
 	if panel.QueryConfig != "" {
 		json.Unmarshal([]byte(panel.QueryConfig), &config)
+	}
+
+	// metric_series panels run their query against the metrics service
+	// instead of the analytics tables.
+	if panel.PanelType == "metric_series" || panel.QueryType == "metric_series" {
+		if s.metricsSvc == nil {
+			return nil, fmt.Errorf("dashboards: metrics service not wired")
+		}
+		labels := config.Filters
+		if labels == nil {
+			labels = config.Labels
+		}
+		stepMs, err := metrics.ParseStep(config.Step)
+		if err != nil {
+			return nil, err
+		}
+		fromMs, _ := strconv.ParseInt(from, 10, 64)
+		toMs, _ := strconv.ParseInt(to, 10, 64)
+		if toMs == 0 {
+			toMs = time.Now().UTC().UnixMilli()
+		}
+		if fromMs == 0 {
+			fromMs = toMs - 60*60*1000
+		}
+		var groupBy []string
+		if config.GroupBy != "" {
+			groupBy = metrics.ParseGroupBy(config.GroupBy)
+		}
+		series, err := s.metricsSvc.QuerySeries(ctx, siteID, config.Metric, labels, fromMs, toMs, metrics.QueryOptions{
+			Agg:     config.Agg,
+			StepMs:  stepMs,
+			GroupBy: groupBy,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if series == nil {
+			series = []metrics.Series{}
+		}
+		return series, nil
 	}
 
 	sql := s.db.SQL()
