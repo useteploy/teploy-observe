@@ -110,6 +110,8 @@ export interface ErrorEnvelope {
   url?: string;
   mechanism?: string;
   handled?: boolean;
+  /** Identifier set via setUser({id}). Server hashes with site session_salt. */
+  distinct_id?: string;
 }
 
 export interface LogEnvelope {
@@ -118,6 +120,8 @@ export interface LogEnvelope {
   message: string;
   service_name?: string;
   attributes?: Record<string, unknown>;
+  /** Identifier set via setUser({id}). Server hashes with site session_salt. */
+  distinct_id?: string;
 }
 
 interface ResolvedConfig {
@@ -158,6 +162,12 @@ class Scope {
     if (this.level) env.level = this.level;
     if (this.user) {
       env.contexts = { ...(env.contexts ?? {}), user: this.user };
+      // Map Sentry-style setUser({id}) to Observe's identify() contract.
+      // The server hashes the value with the per-site session_salt before
+      // storage, so the raw id never persists by default.
+      if (this.user.id !== undefined && this.user.id !== null) {
+        env.distinct_id = String(this.user.id);
+      }
     }
     if (Object.keys(this.tags).length > 0) {
       env.contexts = { ...(env.contexts ?? {}), tags: this.tags };
@@ -366,6 +376,9 @@ export function captureMessage(
       ...(config.environment ? { environment: config.environment } : {}),
     },
   };
+  if (scope.user && scope.user.id !== undefined && scope.user.id !== null) {
+    log.distinct_id = String(scope.user.id);
+  }
   const id = randomId();
   void postJSON("/api/v1/logs", log);
   return id;
