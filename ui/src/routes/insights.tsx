@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { analyticsApi } from "../api/analytics.js";
 import type { FunnelStep, FunnelResult, RetentionCohort, JourneyResult, GoalConversion, Correlation } from "../api/analytics.js";
+import { cohortsApi } from "../api/persons.js";
+import type { Cohort } from "../api/persons.js";
 import Modal from "../components/shared/Modal.js";
 import Tabs from "../components/shared/Tabs.js";
 import "../styles/insights.css";
@@ -530,6 +532,95 @@ function CorrelationsPanel({ siteId, from, to }: { siteId: string; from: string;
   );
 }
 
+// ─── Cohort filter chip ───
+//
+// C2: every analytics route can opt in to a cohort filter via
+// ?cohort_id=X. The chip lives in the page header so the user can see
+// which cohort is active and switch / clear without leaving the page.
+// The chip writes to URL state so deep links round-trip.
+
+function CohortFilterChip({ siteId }: { siteId: string }) {
+  const [cohorts, setCohorts] = useState<Cohort[]>([]);
+  const [active, setActive] = useState<string>(() => {
+    if (typeof window === "undefined") return "";
+    return new URLSearchParams(window.location.search).get("cohort_id") || "";
+  });
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    cohortsApi.list(siteId).then(d => setCohorts(d || [])).catch(() => setCohorts([]));
+  }, [siteId]);
+
+  const apply = (id: string) => {
+    setActive(id);
+    setOpen(false);
+    const url = new URL(window.location.href);
+    if (id) {
+      url.searchParams.set("cohort_id", id);
+    } else {
+      url.searchParams.delete("cohort_id");
+    }
+    window.history.pushState(null, "", url.toString());
+    // Some panels read filter state from URL on mount only — soft
+    // navigate so they re-fetch.
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  };
+
+  const activeCohort = cohorts.find(c => c.cohort_id === active);
+
+  return (
+    <div style={{ position: "relative" }}>
+      <button class="obs-btn obs-btn--sm" onClick={() => setOpen(!open)}
+        data-testid="cohort-filter-chip"
+        style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5z" />
+        </svg>
+        {activeCohort ? activeCohort.name : "Filter by cohort"}
+        {active && (
+          <span onClick={(e) => { e.stopPropagation(); apply(""); }}
+            style={{ marginLeft: "4px", color: "var(--obs-text-muted)", cursor: "pointer" }}
+            title="Clear cohort filter">×</span>
+        )}
+      </button>
+
+      {open && (
+        <div style={{ position: "absolute", top: "100%", right: 0, marginTop: "4px",
+          minWidth: "240px", background: "var(--obs-card)",
+          border: "1px solid var(--obs-border)", borderRadius: "var(--obs-radius-md)",
+          boxShadow: "var(--obs-shadow-md, 0 4px 12px rgba(0,0,0,.15))",
+          zIndex: 100, maxHeight: "320px", overflow: "auto" }}>
+          {cohorts.length === 0 ? (
+            <div style={{ padding: "12px", fontSize: "12px", color: "var(--obs-text-muted)" }}>
+              No cohorts yet — <a href="/cohorts" style={{ color: "var(--obs-accent)" }}>create one</a>.
+            </div>
+          ) : (
+            cohorts.map(c => (
+              <div key={c.cohort_id} onClick={() => apply(c.cohort_id)}
+                data-testid="cohort-filter-option"
+                style={{ padding: "8px 12px", cursor: "pointer", fontSize: "13px",
+                  borderBottom: "1px solid var(--obs-border)",
+                  background: c.cohort_id === active ? "var(--obs-bg)" : "transparent" }}>
+                <div>{c.name}</div>
+                <div style={{ fontSize: "11px", color: "var(--obs-text-muted)", marginTop: "2px" }}>
+                  {c.member_count.toLocaleString()} members
+                </div>
+              </div>
+            ))
+          )}
+          {active && (
+            <div onClick={() => apply("")}
+              style={{ padding: "8px 12px", cursor: "pointer", fontSize: "12px",
+                color: "var(--obs-text-muted)", textAlign: "center" }}>
+              Clear filter
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Main Page ───
 
 export default function InsightsPage() {
@@ -541,8 +632,11 @@ export default function InsightsPage() {
 
   return (
     <div>
-      <div class="obs-page-header">
+      <div class="obs-page-header" style={{ display: "flex", alignItems: "center", gap: "12px" }}>
         <h1 class="obs-page-title">Insights</h1>
+        <div style={{ marginLeft: "auto" }}>
+          <CohortFilterChip siteId={siteId} />
+        </div>
       </div>
 
       <Tabs tabs={[

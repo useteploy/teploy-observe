@@ -2,6 +2,15 @@
 
 const enc = encodeURIComponent;
 
+// activeCohortID reads ?cohort_id= from the page URL so every analytics
+// query auto-includes the active cohort filter without each call site
+// having to plumb it. C2 (Wave 4): the chip on /insights writes the
+// param; the panels read here. Returns "" when not set.
+function activeCohortID(): string {
+  if (typeof window === "undefined") return "";
+  return new URLSearchParams(window.location.search).get("cohort_id") || "";
+}
+
 export function qs(siteId: string, from: string, to: string, opts?: {
   limit?: number;
   compare?: string;
@@ -18,6 +27,12 @@ export function qs(siteId: string, from: string, to: string, opts?: {
     for (const [k, v] of Object.entries(opts.filters)) {
       if (v) q += `&${enc(k)}=${enc(v)}`;
     }
+  }
+  // Cohort filter — auto-include from URL unless the caller already
+  // provided one in filters (filters wins on explicit override).
+  if (!opts?.filters?.cohort_id) {
+    const cohort = activeCohortID();
+    if (cohort) q += `&cohort_id=${enc(cohort)}`;
   }
   return q;
 }

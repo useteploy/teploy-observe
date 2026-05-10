@@ -72,6 +72,19 @@ function initialSiteId(): string {
   return "default";
 }
 
+/**
+ * Read `?cohort_id=` from the URL on first mount so deep links from
+ * /cohorts → /insights round-trip the active cohort filter without an
+ * extra click. The cohort lives in the regular `filters` map alongside
+ * pathname / browser / etc. so every existing query helper picks it up
+ * via the qs() helper without further wiring.
+ */
+function initialFilters(): Record<string, string> {
+  if (typeof window === "undefined") return {};
+  const cohortID = new URLSearchParams(window.location.search).get("cohort_id");
+  return cohortID ? { cohort_id: cohortID } : {};
+}
+
 export function FilterProvider({ siteId, children }: { siteId: string; children: ComponentChildren }) {
   const now = new Date();
   const yesterday = new Date(now.getTime() - 86400000);
@@ -107,7 +120,7 @@ export function RouteFilterProvider({ children }: { children: ComponentChildren 
     to: now.toISOString(),
     rangeLabel: "Last 24 hours",
     compare: null,
-    filters: {},
+    filters: initialFilters(),
     interval: "hour",
   });
 
