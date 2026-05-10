@@ -100,7 +100,7 @@ func (s *LinkService) CreateLink(ctx context.Context, tenantID, siteID, name, de
 	}
 
 	_, err = s.DB.SQL().Exec(ctx,
-		`INSERT INTO links (link_id, tenant_id, site_id, name, destination, slug, click_count, created_at, version)
+		`INSERT INTO tracked_links (link_id, tenant_id, site_id, name, destination, slug, click_count, created_at, version)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		link.LinkID, link.TenantID, link.SiteID, link.Name, link.Destination,
 		link.Slug, link.ClickCount, link.CreatedAt, link.Version,
@@ -116,7 +116,7 @@ func (s *LinkService) CreateLink(ctx context.Context, tenantID, siteID, name, de
 func (s *LinkService) ListLinks(ctx context.Context, tenantID, siteID string) ([]TrackedLink, error) {
 	links, err := nucleus.Query[TrackedLink](ctx, s.DB.SQL(),
 		`SELECT link_id, tenant_id, site_id, name, destination, slug, click_count, created_at, version
-		 FROM links WHERE tenant_id = $1 AND site_id = $2 ORDER BY created_at DESC`,
+		 FROM tracked_links WHERE tenant_id = $1 AND site_id = $2 ORDER BY created_at DESC`,
 		tenantID, siteID,
 	)
 	if err != nil {
@@ -129,7 +129,7 @@ func (s *LinkService) ListLinks(ctx context.Context, tenantID, siteID string) ([
 func (s *LinkService) GetLinkBySlug(ctx context.Context, slug string) (TrackedLink, error) {
 	link, err := nucleus.QueryOne[TrackedLink](ctx, s.DB.SQL(),
 		`SELECT link_id, tenant_id, site_id, name, destination, slug, click_count, created_at, version
-		 FROM links WHERE slug = $1`,
+		 FROM tracked_links WHERE slug = $1`,
 		slug,
 	)
 	if err != nil {
@@ -169,7 +169,7 @@ func (s *LinkService) RecordClick(ctx context.Context, slug, referrer, country, 
 	newVersion := fmt.Sprintf("%d", parseInt(link.Version)+1)
 
 	_, err = s.DB.SQL().Exec(ctx,
-		`INSERT INTO links (link_id, tenant_id, site_id, name, destination, slug, click_count, created_at, version)
+		`INSERT INTO tracked_links (link_id, tenant_id, site_id, name, destination, slug, click_count, created_at, version)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		link.LinkID, link.TenantID, link.SiteID, link.Name, link.Destination,
 		link.Slug, newCount, link.CreatedAt, newVersion,
