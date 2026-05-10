@@ -57,20 +57,48 @@ type ErrorResponse struct {
 	IssueID string `json:"issue_id,omitempty"`
 }
 
-// ErrorHandler processes incoming error events.
-type ErrorHandler struct {
+// Service is the canonical entry point for inserting error events.
+//
+// Every code path that records an error (live HTTP ingest via ErrorBuffer,
+// the demo seed, ops tooling) MUST call IngestErrorEvent. Direct INSERTs
+// into error_events are forbidden because they bypass:
+//   - issue resolve/create (so /api/v1/issues misses the row),
+//   - FTS indexing (so /api/v1/issues/search returns 500 on "no docs"),
+//   - source-map resolution.
+//
+// Pre-refactor, the seed inserted directly and search broke on fresh installs.
+// Funneling through one method makes the bug class structurally impossible.
+type Service struct {
 	db        *nucleus.Client
 	issueSvc  *IssueService
 	searchSvc *SearchService
 	srcmapSvc *sourcemaps.SourceMapService
 }
 
-func NewErrorHandler(db *nucleus.Client, issueSvc *IssueService, searchSvc *SearchService, srcmapSvc *sourcemaps.SourceMapService) *ErrorHandler {
-	return &ErrorHandler{db: db, issueSvc: issueSvc, searchSvc: searchSvc, srcmapSvc: srcmapSvc}
+// ErrorHandler is the legacy alias retained for callers that still reference
+// the old name (HTTP ingest, error buffer). New code should use *Service.
+type ErrorHandler = Service
+
+// NewService constructs the canonical ingest service.
+func NewService(db *nucleus.Client, issueSvc *IssueService, searchSvc *SearchService, srcmapSvc *sourcemaps.SourceMapService) *Service {
+	return &Service{db: db, issueSvc: issueSvc, searchSvc: searchSvc, srcmapSvc: srcmapSvc}
 }
 
-// Handle processes a single error event: compute grouphash, resolve issue, store event.
-func (h *ErrorHandler) Handle(ctx context.Context, input ErrorInput) (ErrorResponse, error) {
+// NewErrorHandler is the legacy constructor, kept so existing callers
+// don't need to be touched in the same commit. Forwards to NewService.
+func NewErrorHandler(db *nucleus.Client, issueSvc *IssueService, searchSvc *SearchService, srcmapSvc *sourcemaps.SourceMapService) *Service {
+	return NewService(db, issueSvc, searchSvc, srcmapSvc)
+}
+
+// IngestErrorEvent inserts an error event end-to-end:
+//   1. compute grouphash (custom fingerprint, rage-click special-case, or stack-based),
+//   2. resolve or create the parent issue,
+//   3. (optionally) resolve a minified stack via source maps,
+//   4. INSERT into error_events,
+//   5. index the error message in FTS for BM25 search.
+//
+// Returns the issue_id so callers can present a link to the user.
+func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (string, error) {
 	now := time.Now().UTC()
 
 	if input.ErrorType == "" && input.ErrorValue == "" {
@@ -97,17 +125,17 @@ func (h *ErrorHandler) Handle(ctx context.Context, input ErrorInput) (ErrorRespo
 	culprit := IssueCulprit(input.StackTrace)
 
 	// Resolve or create issue
-	issueID, err := h.issueSvc.ResolveIssue(ctx, input.SiteID, groupHash, title, culprit, input.Level, input.ReleaseTag, now.UnixMilli())
+	issueID, err := s.issueSvc.ResolveIssue(ctx, input.SiteID, groupHash, title, culprit, input.Level, input.ReleaseTag, now.UnixMilli())
 	if err != nil {
-		return ErrorResponse{}, fmt.Errorf("resolve issue: %w", err)
+		return "", fmt.Errorf("resolve issue: %w", err)
 	}
 
 	// Serialize JSONB fields
 	stackJSON := jsonOrEmpty(input.StackTrace)
 
 	// Resolve minified stack trace via source maps (if available)
-	if input.ReleaseTag != "" && h.srcmapSvc != nil {
-		if resolved, err := h.srcmapSvc.ResolveStackTrace(ctx, input.SiteID, input.ReleaseTag, stackJSON); err == nil {
+	if input.ReleaseTag != "" && s.srcmapSvc != nil {
+		if resolved, err := s.srcmapSvc.ResolveStackTrace(ctx, input.SiteID, input.ReleaseTag, stackJSON); err == nil {
 			stackJSON = resolved
 		}
 	}
@@ -123,7 +151,7 @@ func (h *ErrorHandler) Handle(ctx context.Context, input ErrorInput) (ErrorRespo
 	}
 
 	// Insert error event
-	_, err = h.db.SQL().Exec(ctx,
+	_, err = s.db.SQL().Exec(ctx,
 		`INSERT INTO error_events (
 			error_id, tenant_id, site_id, session_id, replay_id, issue_id, group_hash,
 			timestamp, error_type, error_value, mechanism, handled, level,
@@ -136,17 +164,28 @@ func (h *ErrorHandler) Handle(ctx context.Context, input ErrorInput) (ErrorRespo
 		stackJSON, breadcrumbsJSON, contextsJSON, extraJSON,
 	)
 	if err != nil {
-		return ErrorResponse{}, fmt.Errorf("insert error event: %w", err)
+		return "", fmt.Errorf("insert error event: %w", err)
 	}
 
-	// Index in FTS for BM25 search (non-fatal)
-	if h.searchSvc != nil {
-		if err := h.searchSvc.IndexError(ctx, errorID, input.ErrorType, input.ErrorValue); err != nil {
-			// Log but don't fail the ingestion
+	// Index in FTS for BM25 search (non-fatal — search degrades gracefully).
+	if s.searchSvc != nil {
+		if err := s.searchSvc.IndexError(ctx, errorID, input.ErrorType, input.ErrorValue); err != nil {
+			// Log but don't fail the ingestion. Operators can rebuild via
+			// `observe reindex` if FTS files are corrupted or missing.
 			_ = err
 		}
 	}
 
+	return issueID, nil
+}
+
+// Handle is the legacy HTTP-shape wrapper around IngestErrorEvent. Returns
+// the SDK-facing ErrorResponse envelope.
+func (s *Service) Handle(ctx context.Context, input ErrorInput) (ErrorResponse, error) {
+	issueID, err := s.IngestErrorEvent(ctx, input)
+	if err != nil {
+		return ErrorResponse{}, err
+	}
 	return ErrorResponse{OK: true, IssueID: issueID}, nil
 }
 
