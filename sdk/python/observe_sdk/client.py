@@ -41,12 +41,40 @@ class Client:
         self._lock = threading.Lock()
         self._buffer: List[Dict[str, Any]] = []
         self._stop = threading.Event()
+        # Set by identify(); included verbatim in subsequent payloads.
+        # The server hashes it with the per-site session_salt before
+        # storage, so the raw value never persists by default.
+        self._distinct_id: Optional[str] = None
         self._thread = threading.Thread(
             target=self._loop, name="observe-flush", daemon=True
         )
         self._thread.start()
 
     # ── public API ────────────────────────────────────────────────────────
+
+    def identify(self, user_id: str, traits: Optional[Dict[str, Any]] = None) -> None:
+        """Associate subsequent events / errors / logs with a user identifier.
+
+        The server hashes ``user_id`` with the per-site ``session_salt`` so
+        the raw value never lands in storage (unless the site has the
+        ``raw_distinct_id`` opt-in flag set).
+
+        ``traits`` are optional and reserved for the future persons UI; for
+        now they're attached to the one-shot ``$identify`` log line.
+        """
+        if not user_id:
+            return
+        self._distinct_id = str(user_id)
+        # Emit a one-shot log line so the server has an explicit identify
+        # marker, mirroring the browser SDK's $identify event.
+        attrs: Dict[str, Any] = {"user_id": self._distinct_id}
+        if traits:
+            attrs.update(traits)
+        self.log("info", "$identify", **attrs)
+
+    def reset(self) -> None:
+        """Clear the active distinct_id (e.g. on logout)."""
+        self._distinct_id = None
 
     def capture_exception(self, exc: BaseException, *, release: Optional[str] = None) -> None:
         """Submit a single exception with stack trace. Sends immediately."""
@@ -59,6 +87,8 @@ class Client:
             "level": "error",
             "stack_trace": _stack_frames(exc),
         }
+        if self._distinct_id:
+            payload["distinct_id"] = self._distinct_id
         self._post("/api/v1/errors", payload)
 
     def log(self, level: str, message: str, **fields: Any) -> None:
@@ -69,6 +99,8 @@ class Client:
             "service_name": self.opts.service_name or "",
             "attributes": fields,
         }
+        if self._distinct_id:
+            entry["distinct_id"] = self._distinct_id
         with self._lock:
             self._buffer.append(entry)
             full = len(self._buffer) >= self.opts.log_batch_size
@@ -156,6 +188,14 @@ def close() -> None:
 
 def flush() -> None:
     _require().flush()
+
+
+def identify(user_id: str, traits: Optional[Dict[str, Any]] = None) -> None:
+    _require().identify(user_id, traits)
+
+
+def reset() -> None:
+    _require().reset()
 
 
 def capture_exception(exc: BaseException, *, release: Optional[str] = None) -> None:
