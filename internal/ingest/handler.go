@@ -31,6 +31,11 @@ type IngestInput struct {
 	// session_salt before storage (unless the site has raw_distinct_id
 	// opt-in set). Default '' for anonymous events.
 	DistinctID string `json:"distinct_id,omitempty"`
+	// Release is the application release tag (e.g. git SHA or semver)
+	// the SDK was initialized with. Used by the session rollup to
+	// stamp release_tag on the resulting sessions row, which feeds
+	// crash-free-session computation per release.
+	Release string `json:"release,omitempty"`
 }
 
 // IngestResponse is returned to the tracker.
@@ -162,6 +167,7 @@ func Handler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.Handl
 			UTMContent:     utmContent,
 			Properties:     input.Properties,
 			DistinctID:     distinctID,
+			ReleaseTag:     input.Release,
 		}
 
 		if !buf.Push(e) {

@@ -28,6 +28,10 @@ export interface InitOptions {
   batchSize?: number;
   /** Flush cadence in ms when the buffer isn't full. Default: 2000. */
   flushIntervalMs?: number;
+  /** Application release tag (git SHA, semver, etc.). Stamped on every
+   * event and error so the /releases UI can surface crash-free %, error
+   * rate, and adoption per release. */
+  release?: string;
 }
 
 export interface EventPayload {
@@ -39,6 +43,8 @@ export interface EventPayload {
   title?: string;
   /** Hashed user identifier set by identify(). Empty for anonymous events. */
   distinct_id?: string;
+  /** Application release tag from init({ release }). Empty if not set. */
+  release?: string;
   [key: string]: unknown;
 }
 
@@ -69,7 +75,7 @@ export interface LogPayload {
 }
 
 interface Client {
-  opts: Required<Omit<InitOptions, "apiKey">> & { apiKey?: string };
+  opts: Required<Omit<InitOptions, "apiKey" | "release">> & { apiKey?: string; release?: string };
   buffer: EventPayload[];
   timer: number | null;
   userId: string | null;
@@ -113,6 +119,7 @@ export function init(options: InitOptions): void {
       disableAutoPageview: options.disableAutoPageview ?? false,
       batchSize: options.batchSize ?? 50,
       flushIntervalMs: options.flushIntervalMs ?? 2000,
+      release: options.release,
     },
     buffer: [],
     timer: null,
@@ -166,6 +173,7 @@ export function track(eventType: string, props: Record<string, unknown> = {}): v
     ...props,
   };
   if (client.userId) payload.distinct_id = client.userId;
+  if (client.opts.release) payload.release = client.opts.release;
   client.buffer.push(payload);
   if (client.buffer.length >= client.opts.batchSize) flush();
 }
@@ -201,7 +209,7 @@ export function captureException(err: Error, ctx?: { mechanism?: string; release
     site_id: client.opts.siteId,
     error_type: err.name || "Error",
     error_value: err.message || String(err),
-    release_tag: ctx?.release,
+    release_tag: ctx?.release ?? client.opts.release,
     environment: "production",
     url: typeof location !== "undefined" ? location.href : "",
     level: "error",

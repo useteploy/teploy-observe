@@ -220,6 +220,7 @@ type sessionEvent struct {
 	UTMSource    string `db:"utm_source"`
 	UTMMedium    string `db:"utm_medium"`
 	UTMCampaign  string `db:"utm_campaign"`
+	ReleaseTag   string `db:"release_tag"`
 }
 
 // RunSessionRollup aggregates events into session summaries.
@@ -249,7 +250,8 @@ func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 			COALESCE(screen_height, 0) AS screen_height,
 			COALESCE(utm_source, '') AS utm_source,
 			COALESCE(utm_medium, '') AS utm_medium,
-			COALESCE(utm_campaign, '') AS utm_campaign
+			COALESCE(utm_campaign, '') AS utm_campaign,
+			COALESCE(release_tag, '') AS release_tag
 		 FROM events
 		 WHERE timestamp >= CAST($1 AS BIGINT)
 		 ORDER BY session_id, timestamp`,
@@ -279,8 +281,8 @@ func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 		referrer, browser, os, device, country, language,
 		screen_width, screen_height,
 		utm_source, utm_medium, utm_campaign,
-		is_bounce, version
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`
+		is_bounce, version, release_tag
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`
 
 	inserted := 0
 	for _, events := range grouped {
@@ -293,6 +295,17 @@ func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 		if len(events) <= 1 {
 			isBounce = "true"
 		}
+		// Pick the first non-empty release_tag in the session — the SDK
+		// includes it on every event but we only need one.
+		releaseTag := first.ReleaseTag
+		if releaseTag == "" {
+			for _, e := range events {
+				if e.ReleaseTag != "" {
+					releaseTag = e.ReleaseTag
+					break
+				}
+			}
+		}
 
 		_, err := sql.Exec(ctx, insertSQL,
 			first.TenantID, first.SiteID, first.SessionID,
@@ -303,7 +316,7 @@ func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 			first.Country, first.Language,
 			first.ScreenWidth, first.ScreenHeight,
 			first.UTMSource, first.UTMMedium, first.UTMCampaign,
-			isBounce, version,
+			isBounce, version, releaseTag,
 		)
 		if err != nil {
 			return fmt.Errorf("session rollup insert: %w", err)

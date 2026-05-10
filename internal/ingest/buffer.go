@@ -49,6 +49,10 @@ type Event struct {
 	// ingest handler before the event reaches this buffer; callers should
 	// never put a raw user ID here.
 	DistinctID string `json:"distinct_id,omitempty"`
+	// ReleaseTag is the application release the SDK was initialized
+	// with (git sha, semver, etc.). Empty means the SDK didn't supply
+	// one. Used by the session rollup to stamp sessions.release_tag.
+	ReleaseTag string `json:"release_tag,omitempty"`
 }
 
 // Buffer is a ring buffer that accumulates events and batch-inserts them
@@ -207,7 +211,7 @@ func (b *Buffer) Len() int {
 }
 
 const (
-	eventsCols       = 30 // keep in sync with eventsColList / eventRow args
+	eventsCols       = 31 // keep in sync with eventsColList / eventRow args
 	eventsRecentCols = 12 // keep in sync with eventsRecentColList / eventsRecentRow args
 )
 
@@ -217,7 +221,7 @@ const eventsColList = `event_id, tenant_id, site_id, session_id, visit_id, event
 	browser, browser_version, os, os_version, device,
 	screen_width, screen_height,
 	utm_source, utm_medium, utm_campaign, utm_term, utm_content,
-	properties, distinct_id`
+	properties, distinct_id, release_tag`
 
 const eventsRecentColList = `event_id, tenant_id, site_id, session_id, event_type,
 	timestamp, pathname, referrer, browser, os, country, properties`
@@ -258,7 +262,7 @@ func propertiesJSON(p map[string]any) string {
 	return string(raw)
 }
 
-// eventArgs appends the 30 parameter values for one event row (in column order).
+// eventArgs appends the 31 parameter values for one event row (in column order).
 func eventArgs(dst []any, e *Event) []any {
 	return append(dst,
 		e.EventID, e.TenantID, e.SiteID, e.SessionID, e.VisitID, e.EventType,
@@ -269,6 +273,7 @@ func eventArgs(dst []any, e *Event) []any {
 		e.UTMSource, e.UTMMedium, e.UTMCampaign, e.UTMTerm, e.UTMContent,
 		propertiesJSON(e.Properties),
 		e.DistinctID,
+		e.ReleaseTag,
 	)
 }
 
