@@ -132,31 +132,56 @@ func (s *LLMService) Stats(ctx context.Context, siteID string, from, to time.Tim
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
+	// Scan as native ints/floats and stringify in Go.
+	//
+	// Nucleus (per dogfood findings #6, #23, #24) currently:
+	//   - returns ZERO rows for `SELECT CAST(COUNT(*) AS TEXT)` against
+	//     an empty filtered result set (should be one row, value 0),
+	//   - emits the empty string when stringifying any BIGINT aggregate.
+	//
+	// COALESCE alone doesn't help — the cast-to-text layer is what's
+	// broken. So we scan into native types (which Nucleus serializes
+	// correctly via the binary protocol), then format on the way out.
+	// Empty result sets fall through to the zero-value LLMStats below
+	// with explicit "0" strings.
 	type rawRow struct {
-		Calls    string `db:"calls"`
-		Tokens   string `db:"tokens"`
-		Cost     string `db:"cost"`
-		Latency  string `db:"latency"`
-		Errors   string `db:"errors"`
+		Calls   int64   `db:"calls"`
+		Tokens  int64   `db:"tokens"`
+		Cost    float64 `db:"cost"`
+		Latency float64 `db:"latency"`
+		Errors  int64   `db:"errors"`
 	}
 
 	rows, err := nucleus.Query[rawRow](ctx, s.db.SQL(),
-		`SELECT CAST(COUNT(*) AS TEXT) AS calls,
-			CAST(SUM(CAST(total_tokens AS BIGINT)) AS TEXT) AS tokens,
-			CAST(SUM(CAST(cost_usd AS BIGINT)) AS TEXT) AS cost,
-			CAST(AVG(CAST(latency_ms AS BIGINT)) AS TEXT) AS latency,
-			CAST(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS TEXT) AS errors
+		`SELECT COUNT(*) AS calls,
+			COALESCE(SUM(CAST(total_tokens AS BIGINT)), 0) AS tokens,
+			COALESCE(SUM(CAST(cost_usd AS DOUBLE)), 0) AS cost,
+			COALESCE(AVG(CAST(latency_ms AS BIGINT)), 0) AS latency,
+			COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) AS errors
 		 FROM llm_traces WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`,
 		siteID, fromMs, toMs,
 	)
-	if err != nil || len(rows) == 0 {
+	if err != nil {
 		return &LLMStats{}, err
 	}
 
+	// Empty filter result: dogfood #24 means Nucleus may return zero rows
+	// even though COUNT(*) is a scalar aggregate. Synthesize the zeros so
+	// the UI renders "0" not blanks.
+	if len(rows) == 0 {
+		return &LLMStats{
+			TotalCalls: "0", TotalTokens: "0",
+			TotalCostUSD: "0", AvgLatencyMs: "0", ErrorCount: "0",
+		}, nil
+	}
+
+	r := rows[0]
 	return &LLMStats{
-		TotalCalls: rows[0].Calls, TotalTokens: rows[0].Tokens,
-		TotalCostUSD: rows[0].Cost, AvgLatencyMs: rows[0].Latency,
-		ErrorCount: rows[0].Errors,
+		TotalCalls:   strconv.FormatInt(r.Calls, 10),
+		TotalTokens:  strconv.FormatInt(r.Tokens, 10),
+		TotalCostUSD: strconv.FormatFloat(r.Cost, 'f', -1, 64),
+		AvgLatencyMs: strconv.FormatFloat(r.Latency, 'f', -1, 64),
+		ErrorCount:   strconv.FormatInt(r.Errors, 10),
 	}, nil
 }
 
@@ -164,17 +189,42 @@ func (s *LLMService) ModelBreakdown(ctx context.Context, siteID string, from, to
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
-	return nucleus.Query[ModelStats](ctx, s.db.SQL(),
+	// Scan natively for the same dogfood reason as Stats() — CAST(... AS
+	// TEXT) over an aggregate returns the empty string from Nucleus.
+	type rawRow struct {
+		Model        string  `db:"model"`
+		Provider     string  `db:"provider"`
+		CallCount    int64   `db:"call_count"`
+		TotalTokens  int64   `db:"total_tokens"`
+		TotalCostUSD float64 `db:"total_cost_usd"`
+		AvgLatencyMs float64 `db:"avg_latency_ms"`
+	}
+	rows, err := nucleus.Query[rawRow](ctx, s.db.SQL(),
 		`SELECT model, provider,
-			CAST(COUNT(*) AS TEXT) AS call_count,
-			CAST(SUM(CAST(total_tokens AS BIGINT)) AS TEXT) AS total_tokens,
-			CAST(SUM(CAST(cost_usd AS BIGINT)) AS TEXT) AS total_cost_usd,
-			CAST(AVG(CAST(latency_ms AS BIGINT)) AS TEXT) AS avg_latency_ms
+			COUNT(*) AS call_count,
+			COALESCE(SUM(CAST(total_tokens AS BIGINT)), 0) AS total_tokens,
+			COALESCE(SUM(CAST(cost_usd AS DOUBLE)), 0) AS total_cost_usd,
+			COALESCE(AVG(CAST(latency_ms AS BIGINT)), 0) AS avg_latency_ms
 		 FROM llm_traces WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
 		 GROUP BY model, provider
 		 ORDER BY call_count DESC`,
 		siteID, fromMs, toMs,
 	)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ModelStats, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, ModelStats{
+			Model:        r.Model,
+			Provider:     r.Provider,
+			CallCount:    strconv.FormatInt(r.CallCount, 10),
+			TotalTokens:  strconv.FormatInt(r.TotalTokens, 10),
+			TotalCostUSD: strconv.FormatFloat(r.TotalCostUSD, 'f', -1, 64),
+			AvgLatencyMs: strconv.FormatFloat(r.AvgLatencyMs, 'f', -1, 64),
+		})
+	}
+	return out, nil
 }
 
 func (s *LLMService) RecentTraces(ctx context.Context, siteID string, limit int) ([]LLMTrace, error) {
