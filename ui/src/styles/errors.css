@@ -396,6 +396,53 @@
 }
 
 /* ─── Releases page ─── */
+
+/* B2 phase 1: per-release health card grid above the existing list. */
+.release-health-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.release-health-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  background: var(--obs-surface);
+  border: 1px solid var(--obs-border);
+  border-radius: 8px;
+}
+
+.release-health-tag {
+  font-weight: 600;
+  font-size: 14px;
+  margin-bottom: 4px;
+  color: var(--obs-text);
+}
+
+.release-health-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+}
+
+.release-health-label {
+  color: var(--obs-text-secondary);
+}
+
+.release-health-value {
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+}
+
+.release-sparkline {
+  margin-top: 4px;
+  display: block;
+}
+
 .releases-list {
   display: flex;
   flex-direction: column;

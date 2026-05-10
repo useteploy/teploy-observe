@@ -52,6 +52,27 @@ export interface ReleaseHealth {
   last_seen: string;
 }
 
+// B2 phase 1: per-release crash-free %, adoption %, error rate. Powers
+// the stat-card grid + 14-day sparkline at the top of /releases.
+export interface ReleaseStat {
+  release_tag: string;
+  sessions: number;
+  crashed_sessions: number;
+  crash_free_session_pct: number;
+  adoption_pct: number;
+  errors: number;
+  error_rate: number;
+  first_seen_ms: number;
+  last_seen_ms: number;
+}
+
+export interface ReleaseSparklinePoint {
+  day_ms: number;
+  sessions: number;
+  crashed_sessions: number;
+  crash_free_session_pct: number;
+}
+
 export interface DailyCount {
   day: string;
   count: number;
@@ -77,6 +98,10 @@ export const errorsApi = {
     get<Issue[]>(`${BASE}/issues/search?site_id=${siteId}&q=${encodeURIComponent(query)}`),
   releases: (siteId: string) =>
     get<ReleaseHealth[]>(`${BASE}/releases?site_id=${siteId}`),
+  releaseHealth: (siteId: string, fromIso: string, toIso: string) =>
+    get<ReleaseStat[]>(`${BASE}/releases/health?site_id=${siteId}&from=${fromIso}&to=${toIso}`),
+  releaseSparkline: (siteId: string, release: string, days = 14) =>
+    get<ReleaseSparklinePoint[]>(`${BASE}/releases/sparkline?site_id=${siteId}&release=${encodeURIComponent(release)}&days=${days}`),
   daily: (siteId: string, days = 14) =>
     get<DailyCount[]>(`${BASE}/issues/daily?site_id=${siteId}&days=${days}`),
 };
