@@ -52,6 +52,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/reports"
 	"github.com/useteploy/teploy-observe/internal/replays"
 	"github.com/useteploy/teploy-observe/internal/sourcemaps"
+	"github.com/useteploy/teploy-observe/internal/metrics"
 	"github.com/useteploy/teploy-observe/internal/sso"
 	"github.com/useteploy/teploy-observe/internal/surveys"
 	"github.com/useteploy/teploy-observe/internal/tracking"
@@ -192,6 +193,9 @@ func main() {
 	// Tracing services
 	traceIngest := tracing.NewIngestService(db)
 	traceQuery := tracing.NewQueryService(db)
+
+	// Metrics service (W3.A Phase 1 — OTLP metrics ingest + query)
+	metricsSvc := metrics.NewService(db).WithLogger(logger)
 
 	// Platform services
 	userSvc := platform.NewUserService(db)
@@ -877,6 +881,14 @@ func main() {
 	// convention as RegisterPerformanceRoutes / RegisterAttributionRoutes
 	// above to keep this section diff-stable across waves.
 	RegisterFunnelRoutes(r.Group("/api/v1/tracing/funnel", jwtMW), traceQuery, viewSvc, requireEditor)
+
+	// --- Metrics API ---
+	// W3.A Phase 1: OTLP metrics ingest at /v1/metrics + list/query at
+	// /api/v1/metrics/*. Routes live in metrics_handlers.go to keep the
+	// main.go diff to a single line (matches the boards / attribution /
+	// funnels convention above). Placed at the END of route registrations
+	// to minimize merge conflict surface with parallel waves.
+	RegisterMetricsRoutes(r, jwtMW, metricsSvc)
 
 	// SPA catch-all: serve index.html for all non-API, non-asset GET requests.
 	// This must be registered last so API routes take precedence.
