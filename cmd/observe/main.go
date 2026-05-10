@@ -693,8 +693,14 @@ func main() {
 	r.HandleFunc("POST /api/v1/surveys/respond", surveyRespondHandler(surveySvc))
 
 	// --- Release health (JWT auth) ---
-	neutron.Get(r.Group("/api/v1/releases", jwtMW), "", releaseHealthHandler(issueSvc),
-		neutron.WithTags("releases"), neutron.WithSummary("Release health metrics"))
+	releaseHealthSvc := obserrors.NewReleaseHealthService(db)
+	releaseGroup := r.Group("/api/v1/releases", jwtMW)
+	neutron.Get(releaseGroup, "", releaseHealthHandler(issueSvc),
+		neutron.WithTags("releases"), neutron.WithSummary("Release error counts"))
+	neutron.Get(releaseGroup, "/health", releaseHealthV2Handler(releaseHealthSvc),
+		neutron.WithTags("releases"), neutron.WithSummary("Crash-free + adoption + error rate per release"))
+	neutron.Get(releaseGroup, "/sparkline", releaseSparklineHandler(releaseHealthSvc),
+		neutron.WithTags("releases"), neutron.WithSummary("Daily crash-free % series for one release"))
 
 	// --- Log ingestion (API key auth) ---
 	neutron.Post(ingestGroup, "/logs", logIngestHandler(logSvc),
@@ -2598,6 +2604,55 @@ func releaseHealthHandler(svc *obserrors.IssueService) neutron.HandlerFunc[relea
 	return func(ctx context.Context, input releaseHealthInput) ([]obserrors.ReleaseHealth, error) {
 		from, to := parseTimeRange(input.From, input.To)
 		return emptyOnNil(svc.ReleaseHealthList(ctx, input.SiteID, from, to))
+	}
+}
+
+// releaseHealthV2Handler is the new per-release crash-free + adoption +
+// error-rate endpoint introduced in Wave 1 (B2 phase 1). It complements
+// the legacy ReleaseHealthList (counts only) without removing it.
+func releaseHealthV2Handler(svc *obserrors.ReleaseHealthService) neutron.HandlerFunc[releaseHealthInput, []obserrors.ReleaseStat] {
+	return func(ctx context.Context, input releaseHealthInput) ([]obserrors.ReleaseStat, error) {
+		if input.SiteID == "" {
+			input.SiteID = "default"
+		}
+		from, to := parseTimeRange(input.From, input.To)
+		stats, err := svc.Health(ctx, input.SiteID, from.UnixMilli(), to.UnixMilli())
+		if err != nil {
+			return nil, err
+		}
+		if stats == nil {
+			stats = []obserrors.ReleaseStat{}
+		}
+		return stats, nil
+	}
+}
+
+type releaseSparklineInput struct {
+	SiteID  string `query:"site_id"`
+	Release string `query:"release"`
+	Days    int    `query:"days"`
+}
+
+func releaseSparklineHandler(svc *obserrors.ReleaseHealthService) neutron.HandlerFunc[releaseSparklineInput, []obserrors.ReleaseSparklinePoint] {
+	return func(ctx context.Context, input releaseSparklineInput) ([]obserrors.ReleaseSparklinePoint, error) {
+		if input.SiteID == "" {
+			input.SiteID = "default"
+		}
+		if input.Release == "" {
+			return []obserrors.ReleaseSparklinePoint{}, neutron.ErrBadRequest("release required")
+		}
+		days := input.Days
+		if days <= 0 {
+			days = 14
+		}
+		points, err := svc.Sparkline(ctx, input.SiteID, input.Release, days)
+		if err != nil {
+			return nil, err
+		}
+		if points == nil {
+			points = []obserrors.ReleaseSparklinePoint{}
+		}
+		return points, nil
 	}
 }
 
