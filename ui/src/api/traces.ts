@@ -1,6 +1,6 @@
 // Distributed tracing API — services, operations, waterfall, dependencies.
 
-import { get } from "./helpers.js";
+import { get, post, del } from "./helpers.js";
 
 const BASE = "/api/v1/traces";
 
@@ -81,6 +81,28 @@ export interface PerformanceIssue {
   last_seen: number;
 }
 
+export interface FunnelStep {
+  operation: string;
+  count: number;
+  conversion_pct: number;
+  median_gap_ms: number;
+  p95_gap_ms: number;
+}
+
+export interface FunnelResult {
+  steps: FunnelStep[];
+  total_traces: number;
+}
+
+export interface SavedFunnel {
+  view_id: string;
+  site_id: string;
+  name: string;
+  ops: string[];
+  created_by: string;
+  created_at: string;
+}
+
 export const tracesApi = {
   services: (siteId: string, from: string, to: string) =>
     get<Service[]>(`${BASE}/services?site_id=${siteId}&from=${from}&to=${to}`),
@@ -103,4 +125,12 @@ export const tracesApi = {
     get<ServiceDependency[]>(`${BASE}/dependencies?site_id=${siteId}&from=${from}&to=${to}`),
   performanceIssues: (siteId: string, from: string, to: string) =>
     get<PerformanceIssue[]>(`/api/v1/performance/issues?site_id=${siteId}&from=${from}&to=${to}`),
+  funnelPreview: (siteId: string, ops: string[], fromMs: number, toMs: number) =>
+    post<FunnelResult>(`/api/v1/tracing/funnel/preview`, { site_id: siteId, ops, from: fromMs, to: toMs }),
+  savedFunnels: (siteId: string) =>
+    get<SavedFunnel[]>(`/api/v1/tracing/funnel/saved?site_id=${encodeURIComponent(siteId)}`),
+  saveFunnel: (siteId: string, name: string, ops: string[]) =>
+    post<SavedFunnel>(`/api/v1/tracing/funnel/saved`, { site_id: siteId, name, ops }),
+  deleteSavedFunnel: (viewId: string) =>
+    del(`/api/v1/tracing/funnel/saved/${encodeURIComponent(viewId)}`),
 };

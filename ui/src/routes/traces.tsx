@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { tracesApi } from "../api/traces.js";
-import type { Service, Operation, Span, TraceSummary, TraceError, ServiceDependency, PerformanceIssue } from "../api/traces.js";
+import type { Service, Operation, Span, TraceSummary, TraceError, ServiceDependency, PerformanceIssue, FunnelStep, FunnelResult, SavedFunnel } from "../api/traces.js";
 import SearchInput from "../components/shared/SearchInput.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
@@ -627,7 +627,202 @@ function DependencyGraph({ deps, loading }: { deps: ServiceDependency[]; loading
   );
 }
 
-type View = "services" | "operations" | "trace" | "search" | "deps" | "map" | "performance";
+type View = "services" | "operations" | "trace" | "search" | "deps" | "map" | "performance" | "funnels";
+
+// FunnelBuilder is the UI for the trace-funnel tab. Users add ordered
+// operation names (with autocomplete from the loaded services) and run a
+// preview against the current site + time window. Results render as a
+// vertical step list with count + conversion %. Saved funnels live in
+// saved_views with view_config.type='trace_funnel' so reload restores them.
+function FunnelBuilder({ siteId, services, fromMs, toMs }: {
+  siteId: string;
+  services: Service[];
+  fromMs: number;
+  toMs: number;
+}) {
+  const [ops, setOps] = useState<string[]>(["", ""]);
+  const [result, setResult] = useState<FunnelResult | null>(null);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState<string>("");
+  const [saved, setSaved] = useState<SavedFunnel[]>([]);
+  const [opSuggestions, setOpSuggestions] = useState<string[]>([]);
+
+  // Pull the union of operations across all services so the autocomplete
+  // datalist covers everything the user might type. Falls through silently
+  // on empty service lists — the operation field is still a free-text input.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const all = new Set<string>();
+      for (const svc of services) {
+        try {
+          const fromISO = new Date(fromMs).toISOString();
+          const toISO = new Date(toMs).toISOString();
+          const ops = await tracesApi.operations(siteId, svc.service_name, fromISO, toISO);
+          for (const op of ops) all.add(op.operation_name);
+        } catch { /* skip per-service errors */ }
+      }
+      if (!cancelled) setOpSuggestions(Array.from(all).sort());
+    })();
+    return () => { cancelled = true; };
+  }, [siteId, services, fromMs, toMs]);
+
+  const reloadSaved = useCallback(async () => {
+    try {
+      const list = await tracesApi.savedFunnels(siteId);
+      setSaved(list || []);
+    } catch { setSaved([]); }
+  }, [siteId]);
+  useEffect(() => { reloadSaved(); }, [reloadSaved]);
+
+  const setOp = (idx: number, val: string) => {
+    const next = [...ops];
+    next[idx] = val;
+    setOps(next);
+  };
+  const addStep = () => setOps([...ops, ""]);
+  const removeStep = (idx: number) => {
+    if (ops.length <= 2) return;
+    setOps(ops.filter((_, i) => i !== idx));
+  };
+
+  const run = async () => {
+    setError("");
+    const cleaned = ops.map(o => o.trim()).filter(Boolean);
+    if (cleaned.length < 2) { setError("Add at least 2 ordered operations."); return; }
+    setRunning(true);
+    try {
+      const res = await tracesApi.funnelPreview(siteId, cleaned, fromMs, toMs);
+      setResult(res);
+    } catch (e: any) {
+      setError(e?.message || "preview failed");
+      setResult(null);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const save = async () => {
+    const cleaned = ops.map(o => o.trim()).filter(Boolean);
+    if (cleaned.length < 2) { setError("Add at least 2 ordered operations."); return; }
+    const name = window.prompt("Funnel name?");
+    if (!name) return;
+    try {
+      await tracesApi.saveFunnel(siteId, name.trim(), cleaned);
+      reloadSaved();
+    } catch (e: any) {
+      setError(e?.message || "save failed");
+    }
+  };
+
+  const load = (f: SavedFunnel) => {
+    setOps(f.ops.length >= 2 ? f.ops : [...f.ops, ""]);
+    setResult(null);
+  };
+
+  const remove = async (id: string) => {
+    if (!window.confirm("Delete this saved funnel?")) return;
+    try {
+      await tracesApi.deleteSavedFunnel(id);
+      reloadSaved();
+    } catch { /* swallow — list refreshes will surface */ }
+  };
+
+  return (
+    <div data-testid="trace-funnel-builder" style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+      {saved.length > 0 && (
+        <div style={{ background: "var(--obs-surface)", borderRadius: "var(--obs-radius-md)", padding: "12px" }}>
+          <div style={{ fontSize: "11px", color: "var(--obs-text-muted)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: "8px" }}>Saved funnels</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
+            {saved.map(f => (
+              <div key={f.view_id} style={{ display: "flex", alignItems: "center", gap: "6px", background: "var(--obs-bg)", padding: "6px 10px", borderRadius: "999px", fontSize: "12px" }}>
+                <button class="obs-btn" style={{ padding: "0", background: "transparent", border: "none", color: "var(--obs-accent)", fontSize: "12px", cursor: "pointer" }} onClick={() => load(f)}>{f.name}</button>
+                <span style={{ color: "var(--obs-text-muted)" }}>{f.ops.length} steps</span>
+                <button class="obs-btn" style={{ padding: "0", background: "transparent", border: "none", color: "var(--obs-text-muted)", fontSize: "14px", cursor: "pointer" }} onClick={() => remove(f.view_id)} title="Delete">×</button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div style={{ background: "var(--obs-surface)", borderRadius: "var(--obs-radius-md)", padding: "16px" }}>
+        <div style={{ fontSize: "13px", fontWeight: 600, marginBottom: "10px" }}>Ordered operations</div>
+        <datalist id="trace-funnel-op-suggestions">
+          {opSuggestions.map(s => <option key={s} value={s} />)}
+        </datalist>
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          {ops.map((op, i) => (
+            <div key={i} style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+              <span style={{ fontSize: "12px", color: "var(--obs-text-muted)", width: "24px", textAlign: "right" }}>{i + 1}.</span>
+              <input
+                type="text"
+                value={op}
+                placeholder="operation name (e.g. GET /users/:id)"
+                list="trace-funnel-op-suggestions"
+                data-testid={`trace-funnel-op-${i}`}
+                onInput={(e) => setOp(i, (e.target as HTMLInputElement).value)}
+                style={{ flex: 1, padding: "6px 10px", borderRadius: "var(--obs-radius-sm)", border: "1px solid var(--obs-border)", background: "var(--obs-bg)", color: "var(--obs-text)", fontSize: "13px" }}
+              />
+              {ops.length > 2 && (
+                <button class="obs-btn" onClick={() => removeStep(i)} title="Remove step" style={{ padding: "4px 8px" }}>×</button>
+              )}
+            </div>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: "8px", marginTop: "12px" }}>
+          <button class="obs-btn" onClick={addStep}>+ Add step</button>
+          <button class="obs-btn obs-btn--primary" onClick={run} disabled={running} data-testid="trace-funnel-run">
+            {running ? "Running..." : "Run"}
+          </button>
+          <button class="obs-btn" onClick={save}>Save funnel</button>
+        </div>
+        {error && <div style={{ color: "var(--obs-danger)", fontSize: "12px", marginTop: "8px" }}>{error}</div>}
+      </div>
+
+      {result && (
+        <div data-testid="trace-funnel-result" style={{ background: "var(--obs-surface)", borderRadius: "var(--obs-radius-md)", padding: "16px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "12px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 600 }}>Results</div>
+            <div style={{ fontSize: "12px", color: "var(--obs-text-muted)" }}>{result.total_traces.toLocaleString()} traces analyzed</div>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+            {result.steps.map((step: FunnelStep, i: number) => {
+              const widthPct = result.steps[0].count > 0
+                ? Math.max(2, (step.count / result.steps[0].count) * 100)
+                : 2;
+              const convColor = i === 0
+                ? "var(--obs-text-muted)"
+                : step.conversion_pct >= 80
+                  ? "var(--obs-success)"
+                  : step.conversion_pct >= 40
+                    ? "var(--obs-warning)"
+                    : "var(--obs-danger)";
+              return (
+                <div key={i} style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px" }}>
+                    <span><strong>{i + 1}.</strong> <code style={{ fontSize: "12px" }}>{step.operation}</code></span>
+                    <span style={{ display: "flex", gap: "16px", alignItems: "center" }}>
+                      {i > 0 && step.median_gap_ms > 0 && (
+                        <span style={{ color: "var(--obs-text-muted)" }} title="median gap from previous step">
+                          {formatDuration(step.median_gap_ms)} median, {formatDuration(step.p95_gap_ms)} p95
+                        </span>
+                      )}
+                      <span style={{ color: convColor, fontWeight: 600 }}>{step.conversion_pct.toFixed(1)}%</span>
+                      <span style={{ fontVariantNumeric: "tabular-nums", minWidth: "60px", textAlign: "right" }}>{step.count.toLocaleString()}</span>
+                    </span>
+                  </div>
+                  <div style={{ height: "8px", background: "var(--obs-bg)", borderRadius: "4px", overflow: "hidden" }}>
+                    <div style={{ height: "100%", width: `${widthPct}%`, background: "var(--obs-accent)", transition: "width 0.3s" }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 // PerformanceIssuesTable lists detector-emitted findings from
 // /api/v1/performance/issues. Clicking a row jumps into the trace waterfall
@@ -779,7 +974,7 @@ export default function TracesPage() {
     } else if (view === "trace") {
       setView("services");
       setTraceId(null);
-    } else if (view === "search" || view === "map" || view === "deps" || view === "performance") {
+    } else if (view === "search" || view === "map" || view === "deps" || view === "performance" || view === "funnels") {
       setView("services");
     }
   };
@@ -874,6 +1069,11 @@ export default function TracesPage() {
             onClick={() => setView("search")}>
             Search Traces
           </button>
+          <button class={`obs-btn ${view === "funnels" ? "obs-btn--primary" : ""}`}
+            data-testid="traces-tab-funnels"
+            onClick={() => setView("funnels")}>
+            Funnels
+          </button>
         </div>
       </div>
 
@@ -941,6 +1141,8 @@ export default function TracesPage() {
         <PerformanceIssuesTable siteId={siteId} from={from} to={to} onSelectTrace={loadTrace} />
       ) : view === "search" ? (
         <SearchFilters siteId={siteId} from={from} to={to} services={services} onSelectTrace={loadTrace} />
+      ) : view === "funnels" ? (
+        <FunnelBuilder siteId={siteId} services={services} fromMs={new Date(from).getTime()} toMs={new Date(to).getTime()} />
       ) : loading ? (
         <ServicesSkeleton />
       ) : services.length === 0 ? (
