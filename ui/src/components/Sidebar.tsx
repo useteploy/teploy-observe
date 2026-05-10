@@ -11,6 +11,7 @@ const NAV_ITEMS = [
   { key: "releases", label: "Releases", icon: "M7 14l5-5 5 5z", href: "/releases" },
   { key: "traces", label: "Traces", icon: "M3 4h18v2H3V4zm0 7h18v2H3v-2zm0 7h18v2H3v-2z", href: "/traces" },
   { key: "logs", label: "Logs", icon: "M3 3h18v18H3V3zm2 2v14h14V5H5zm2 2h10v2H7V7zm0 4h10v2H7v-2zm0 4h7v2H7v-2z", href: "/logs" },
+  { key: "metrics", label: "Metrics", icon: "M3 3h2v18H3V3zm4 12h2v6H7v-6zm4-8h2v14h-2V7zm4 4h2v10h-2V11zm4-6h2v16h-2V5z", href: "/metrics" },
   { key: "flags", label: "Flags", icon: "M14.4 6L14 4H5v17h2v-7h5.6l.4 2h7V6h-5.6z", href: "/flags" },
   { key: "experiments", label: "Experiments", icon: "M7 2v2h1v14c0 1.1.9 2 2 2h4c1.1 0 2-.9 2-2V4h1V2H7zm4 14h-1V4h1v12zm2 0h-1V4h1v12z", href: "/experiments" },
   { key: "sessions", label: "Sessions", icon: "M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z", href: "/sessions" },
