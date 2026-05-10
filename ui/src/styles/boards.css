@@ -1,0 +1,243 @@
+/* Boards (W2.B) — multi-site aggregate dashboards. Page-scoped styles
+ * follow the same pattern as dashboards.css / insights.css: a single
+ * .boards-* prefix to avoid bleeding into other routes.
+ */
+
+.boards-page {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.boards-page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.boards-page-header h1 {
+  margin: 0 0 4px;
+  font-size: 24px;
+}
+
+.boards-muted {
+  color: var(--obs-text-muted);
+  margin: 0;
+}
+
+.boards-error {
+  color: var(--obs-danger, #c53030);
+  margin: 4px 0 0;
+  font-size: 13px;
+}
+
+/* Card grid (saved boards list) */
+
+.boards-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.boards-card {
+  background: var(--obs-card-bg, #1a1a1a);
+  border: 1px solid var(--obs-border, #2a2a2a);
+  border-radius: 8px;
+  padding: 16px;
+  cursor: pointer;
+  transition: border-color 120ms ease, transform 80ms ease;
+}
+
+.boards-card:hover {
+  border-color: var(--obs-accent, #6366f1);
+}
+
+.boards-card h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.boards-card-meta {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: var(--obs-text-muted);
+}
+
+.boards-card-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* Open board (grid table) */
+
+.boards-open {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.boards-open-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.boards-open-header h2 {
+  margin: 0;
+  font-size: 20px;
+  flex: 1;
+}
+
+.boards-open-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.boards-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--obs-card-bg, #1a1a1a);
+  border: 1px solid var(--obs-border, #2a2a2a);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.boards-table th,
+.boards-table td {
+  padding: 10px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--obs-border, #2a2a2a);
+}
+
+.boards-table thead th {
+  background: var(--obs-bg-subtle, #141414);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--obs-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.boards-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.boards-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.boards-warn {
+  color: var(--obs-warn, #d97706);
+}
+
+.boards-row {
+  cursor: pointer;
+  transition: background 80ms ease;
+}
+
+.boards-row:hover {
+  background: var(--obs-bg-subtle, #141414);
+}
+
+.boards-site-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.boards-site-cell small {
+  font-size: 11px;
+  color: var(--obs-text-muted);
+}
+
+.boards-loading {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.boards-skeleton-row {
+  height: 44px;
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--obs-bg-subtle, #141414) 25%, var(--obs-card-bg, #1a1a1a) 50%, var(--obs-bg-subtle, #141414) 75%);
+  background-size: 200% 100%;
+  animation: boards-shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes boards-shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Builder modal */
+
+.boards-builder {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 360px;
+}
+
+.boards-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.boards-field > span {
+  font-weight: 600;
+  color: var(--obs-text-muted);
+}
+
+.boards-builder-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.boards-builder-toolbar {
+  display: flex;
+  gap: 6px;
+}
+
+.boards-site-list {
+  max-height: 280px;
+  overflow-y: auto;
+  border: 1px solid var(--obs-border, #2a2a2a);
+  border-radius: 6px;
+  padding: 4px;
+}
+
+.boards-site-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.boards-site-row:hover {
+  background: var(--obs-bg-subtle, #141414);
+}
+
+.boards-site-name {
+  flex: 1;
+}
+
+.boards-site-domain {
+  font-size: 12px;
+  color: var(--obs-text-muted);
+}
+
+.boards-builder-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--obs-border, #2a2a2a);
+}
