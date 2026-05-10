@@ -24,6 +24,12 @@
   var flushTimer = null;
   var FLUSH_INTERVAL = 500;
   var currentUrl = null;
+  // Set by window.observe.identify(userId). Persisted across page loads
+  // via localStorage so SPA navigations and reloads don't lose it.
+  var distinctId = null;
+  try {
+    distinctId = localStorage.getItem('observe_distinct_id') || null;
+  } catch (e) { /* localStorage may be disabled */ }
 
   function send(eventType, props) {
     var payload = {
@@ -36,6 +42,7 @@
       screen: screen.width + 'x' + screen.height
     };
     if (props) payload.properties = props;
+    if (distinctId) payload.distinct_id = distinctId;
 
     queue.push(payload);
 
@@ -236,6 +243,26 @@
       p.amount = amount;
       p.currency = currency || 'USD';
       send('revenue', p);
+    },
+    /**
+     * Associate subsequent events with a user identifier. The server
+     * hashes the value with the per-site session_salt before storage —
+     * raw IDs never persist by default. Pass null to clear.
+     */
+    identify: function(userId, traits) {
+      if (userId === null || userId === undefined || userId === '') {
+        distinctId = null;
+        try { localStorage.removeItem('observe_distinct_id'); } catch (e) {}
+        return;
+      }
+      distinctId = String(userId);
+      try { localStorage.setItem('observe_distinct_id', distinctId); } catch (e) {}
+      var props = traits ? Object.assign({ user_id: distinctId }, traits) : { user_id: distinctId };
+      send('$identify', props);
+    },
+    reset: function() {
+      distinctId = null;
+      try { localStorage.removeItem('observe_distinct_id'); } catch (e) {}
     },
     trackVitals: trackWebVitals
   };

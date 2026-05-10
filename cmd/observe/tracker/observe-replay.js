@@ -218,6 +218,8 @@
       viewport_width: window.innerWidth || 0,
       events: batch
     };
+    var distinctId = readDistinctID();
+    if (distinctId) payload.distinct_id = distinctId;
 
     var body = JSON.stringify(payload);
     if (navigator.sendBeacon) {
@@ -228,6 +230,14 @@
       xhr.setRequestHeader('Content-Type', 'application/json');
       xhr.send(body);
     }
+  }
+
+  // Read the distinct_id set by observe.js's identify(). Lives in
+  // localStorage under 'observe_distinct_id'. Empty when no identify
+  // has been called.
+  function readDistinctID() {
+    try { return localStorage.getItem('observe_distinct_id') || ''; }
+    catch (e) { return ''; }
   }
 
   // Build a breadcrumb-like ancestor path for a click target. Used as a
@@ -266,6 +276,8 @@
       breadcrumbs: [],
       selector: selector
     };
+    var distinctId = readDistinctID();
+    if (distinctId) payload.distinct_id = distinctId;
     var body = JSON.stringify(payload);
     if (navigator.sendBeacon) {
       navigator.sendBeacon(errorsEndpoint, new Blob([body], { type: 'application/json' }));

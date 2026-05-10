@@ -37,6 +37,8 @@ export interface EventPayload {
   url?: string;
   referrer?: string;
   title?: string;
+  /** Hashed user identifier set by identify(). Empty for anonymous events. */
+  distinct_id?: string;
   [key: string]: unknown;
 }
 
@@ -52,6 +54,8 @@ export interface ErrorPayload {
   level?: "error" | "warning" | "info";
   /** Active session-replay id, if observe-replay.js is loaded on the page. */
   replay_id?: string;
+  /** User identifier set by identify(). Hashed server-side with site salt. */
+  distinct_id?: string;
 }
 
 export interface LogPayload {
@@ -153,7 +157,7 @@ export function pageview(pathname?: string): void {
   });
 }
 
-/** Record a custom event. */
+/** Record a custom event. Includes distinct_id when identify() has been called. */
 export function track(eventType: string, props: Record<string, unknown> = {}): void {
   if (!client) return;
   const payload: EventPayload = {
@@ -161,15 +165,26 @@ export function track(eventType: string, props: Record<string, unknown> = {}): v
     event_type: eventType,
     ...props,
   };
+  if (client.userId) payload.distinct_id = client.userId;
   client.buffer.push(payload);
   if (client.buffer.length >= client.opts.batchSize) flush();
 }
 
-/** Associate subsequent events with a user id (and optional traits). */
+/**
+ * Associate subsequent events with a user id (and optional traits).
+ *
+ * Stores the userId locally and emits a one-shot `$identify` event so the
+ * server can record the identification in the events stream. Every
+ * subsequent track()/captureException() call includes `distinct_id` in the
+ * payload — the server hashes it with the per-site `session_salt` before
+ * storage, matching the existing session-id privacy pattern.
+ */
 export function identify(userId: string, traits?: Record<string, unknown>): void {
   if (!client) return;
   client.userId = userId;
-  if (traits) track("identify", { user_id: userId, ...traits });
+  // Always emit the identify event so the server sees the link, even if
+  // the caller doesn't supply traits.
+  track("$identify", traits ? { user_id: userId, ...traits } : { user_id: userId });
 }
 
 /** Clear the current user — call on logout. */
@@ -196,6 +211,7 @@ export function captureException(err: Error, ctx?: { mechanism?: string; release
   // Errors UI can cross-jump to the session replay.
   const replayId = activeReplayId();
   if (replayId) payload.replay_id = replayId;
+  if (client.userId) payload.distinct_id = client.userId;
   return post("/api/v1/errors", payload, client.opts.apiKey);
 }
 

@@ -197,6 +197,12 @@
       stack_trace: frames,
       breadcrumbs: breadcrumbs.slice()
     };
+    // Pull the user identifier set by observe.js's identify(). Server
+    // hashes it with site session_salt before storage.
+    try {
+      var distinctId = localStorage.getItem('observe_distinct_id') || '';
+      if (distinctId) payload.distinct_id = distinctId;
+    } catch (e) { /* localStorage may be disabled */ }
 
     var body = JSON.stringify(payload);
     if (navigator.sendBeacon) {
