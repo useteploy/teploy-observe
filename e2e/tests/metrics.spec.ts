@@ -146,4 +146,57 @@ test.describe("Metrics (W3.A Phase 1)", () => {
     await login(page);
     await expect(page.locator(".obs-sidebar-link", { hasText: "Metrics" })).toBeVisible();
   });
+
+  test("UI agg dropdown switches between reducers and chart re-renders", async ({ page }) => {
+    // Phase 2: agg is a dropdown that exposes last/avg/sum/min/max/rate/p50/p95/p99.
+    // Confirm that switching the value triggers a re-fetch and the chart stays
+    // visible — we assert via the data-testid attached to the SVG container.
+    const api = await request.newContext();
+    const uiMetric = `e2e_agg_metric_${Date.now()}`;
+    const baseNs = (Date.now() - 30_000) * 1_000_000;
+    const envelope = {
+      resourceMetrics: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: "agg-svc" } }] },
+        scopeMetrics: [{
+          scope: { name: "playwright-agg", version: "1.0" },
+          metrics: [{
+            name: uiMetric,
+            sum: {
+              isMonotonic: true,
+              aggregationTemporality: 2,
+              dataPoints: [
+                { timeUnixNano: String(baseNs), asDouble: 0, attributes: [] },
+                { timeUnixNano: String(baseNs + 1_000_000_000), asDouble: 5, attributes: [] },
+                { timeUnixNano: String(baseNs + 2_000_000_000), asDouble: 15, attributes: [] },
+              ],
+            },
+          }],
+        }],
+      }],
+    };
+    const r = await api.post(`${OBSERVE_URL}/v1/metrics?site_id=default`, {
+      data: envelope, headers: { "Content-Type": "application/json" },
+    });
+    expect(r.ok()).toBeTruthy();
+    await api.dispose();
+
+    await login(page);
+    await page.goto("/metrics");
+    await page.waitForLoadState("networkidle");
+
+    const item = page.getByTestId(`metric-item-${uiMetric}`);
+    await expect(item).toBeVisible({ timeout: 10_000 });
+    await item.click();
+
+    const aggSelect = page.getByTestId("metric-agg-select");
+    await expect(aggSelect).toBeVisible();
+
+    // Switch agg through several reducers — the chart-container testid
+    // must remain present (i.e. no crash) for each.
+    for (const a of ["avg", "sum", "rate", "p95"]) {
+      await aggSelect.selectOption(a);
+      await page.waitForTimeout(200);
+      await expect(page.getByTestId("metric-chart")).toBeVisible();
+    }
+  });
 });
