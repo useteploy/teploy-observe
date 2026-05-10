@@ -227,6 +227,17 @@ func main() {
 	scheduledExportSvc := jobs.NewExportService(db, explorerSvc, logger)
 	incidentSvc := incidents.NewService(db)
 
+	// W2.B: cross-site board summary. SiteLookup adapts the SiteService
+	// (Get returns Site) to the BoardService's small SiteMeta tuple so
+	// internal/query doesn't have to import internal/sites.
+	boardSvc := query.NewBoardService(db, func(ctx context.Context, id string) (query.SiteMeta, bool) {
+		s, err := siteSvc.Get(ctx, id)
+		if err != nil || s.SiteID == "" {
+			return query.SiteMeta{}, false
+		}
+		return query.SiteMeta{SiteID: s.SiteID, Name: s.Name, Domain: s.Domain}, true
+	})
+
 	// Auto-declare an incident whenever an alert rule fires. Dedup in
 	// the incident service by keying on rule_id + open state — a
 	// repeatedly-firing rule should open one incident and stay open.
@@ -849,6 +860,23 @@ func main() {
 	// merge-conflict surface with W4.A (heatmaps) and W4.B (replay→issue) is
 	// a single line addition rather than a scattered diff.
 	RegisterPerformanceRoutes(r.Group("/api/v1/performance", jwtMW), traceQuery)
+
+	// --- Boards API ---
+	// Multi-site aggregate dashboards (W2.B). Routes + handlers live in
+	// boards_handlers.go to keep merge-conflict surface with W2.A (funnels)
+	// and W2.C (attribution) at zero.
+	RegisterBoardsRoutes(r, jwtMW, requireEditor, boardSvc)
+
+	// --- Attribution API ---
+	// Routes live in attribution_handlers.go (W2.C). Single-line wiring keeps
+	// the merge surface minimal against W2.A (funnels) and W2.B (boards).
+	RegisterAttributionRoutes(r.Group("", jwtMW), query.NewAttributionService(db))
+
+	// --- Trace funnels API ---
+	// Routes live in funnel_handlers.go (W2.A). Same single-line wiring
+	// convention as RegisterPerformanceRoutes / RegisterAttributionRoutes
+	// above to keep this section diff-stable across waves.
+	RegisterFunnelRoutes(r.Group("/api/v1/tracing/funnel", jwtMW), traceQuery, viewSvc, requireEditor)
 
 	// SPA catch-all: serve index.html for all non-API, non-asset GET requests.
 	// This must be registered last so API routes take precedence.
