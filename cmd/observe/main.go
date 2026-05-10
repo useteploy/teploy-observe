@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"strings"
 	"time"
@@ -88,6 +89,9 @@ func main() {
 		case "upgrade":
 			runUpgrade(cfg, logger, os.Args[2:])
 			return
+		case "reindex":
+			runReindex(cfg, logger, os.Args[2:])
+			return
 		case "help", "-h", "--help":
 			printHelp()
 			return
@@ -143,9 +147,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Error tracking services — declared before seed so the demo path can
+	// use the canonical IngestErrorEvent wrapper (INSERT + issue resolve +
+	// FTS index in one shot).
+	srcmapSvc := sourcemaps.NewSourceMapService(db)
+	issueSvc := obserrors.NewIssueService(db)
+	searchSvc := obserrors.NewSearchService(db)
+	errorHandler := obserrors.NewErrorHandler(db, issueSvc, searchSvc, srcmapSvc)
+
 	// Seed demo data for empty tables unless disabled.
 	if os.Getenv("OBSERVE_SEED_DEMO") != "false" {
-		seed.Run(ctx, db, logger)
+		seed.Run(ctx, db, errorHandler, logger)
 	}
 
 	// Ingestion buffer with WAL-backed durability. The queue directory
@@ -175,12 +187,6 @@ func main() {
 
 	// Export service
 	exportSvc := export.NewExportService(db)
-
-	// Error tracking services
-	srcmapSvc := sourcemaps.NewSourceMapService(db)
-	issueSvc := obserrors.NewIssueService(db)
-	searchSvc := obserrors.NewSearchService(db)
-	errorHandler := obserrors.NewErrorHandler(db, issueSvc, searchSvc, srcmapSvc)
 
 	// Tracing services
 	traceIngest := tracing.NewIngestService(db)
@@ -959,12 +965,18 @@ Usage:
   observe backup       Stream a tar archive of all tables to stdout.
   observe restore      Read a tar archive from stdin and insert into tables.
   observe upgrade      Drain ingest, swap binary, resume — zero event loss.
+  observe reindex      Rebuild the FTS index from error_events.
   observe version      Print the observe version.
   observe help         Show this message.
 
 Upgrade flags:
   --target <path>      Path to the new binary (default: ./observe-new)
   --data-dir <path>    Override OBSERVE_DATA_DIR for PID lookup
+
+Reindex flags:
+  --site <id>          Only reindex one site (default: all sites)
+  --batch <n>          Rows per scan batch (default: 1000)
+  --dry-run            Scan but do not write to FTS (verifies source rows)
 
 Env vars:
   OBSERVE_ADDR                 HTTP bind address (default :3000)
@@ -1184,6 +1196,79 @@ func runUpgrade(cfg config.Config, logger *slog.Logger, args []string) {
 	// 8. Success — clean up the backup.
 	_ = os.Remove(prevBackup)
 	logger.Info("upgrade: complete", "version", fmt.Sprintf("%d.%d.%d", targetVersion.Major, targetVersion.Minor, targetVersion.Patch))
+}
+
+// runReindex rebuilds the FTS index from rows in error_events. Useful when
+// FTS files have been wiped or when a schema change has invalidated the
+// existing index. The same code path lives in the IngestErrorEvent wrapper,
+// so re-running this is identical to having ingested every row through the
+// live HTTP path.
+//
+// Idempotent: re-indexing the same row writes a new mapping that supersedes
+// the previous one. For a fully clean rebuild, drop the FTS files first.
+func runReindex(cfg config.Config, logger *slog.Logger, args []string) {
+	siteID := ""
+	batch := 1000
+	dryRun := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--site":
+			if i+1 >= len(args) {
+				logger.Error("reindex: --site requires a value")
+				os.Exit(2)
+			}
+			siteID = args[i+1]
+			i++
+		case "--batch":
+			if i+1 >= len(args) {
+				logger.Error("reindex: --batch requires a value")
+				os.Exit(2)
+			}
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil || n <= 0 {
+				logger.Error("reindex: --batch must be a positive integer", "got", args[i+1])
+				os.Exit(2)
+			}
+			batch = n
+			i++
+		case "--dry-run":
+			dryRun = true
+		case "-h", "--help":
+			fmt.Println("Usage: observe reindex [--site <id>] [--batch <n>] [--dry-run]")
+			return
+		default:
+			logger.Error("reindex: unknown flag", "arg", args[i])
+			os.Exit(2)
+		}
+	}
+
+	db := connectForCLI(cfg, logger)
+	defer db.Close()
+
+	searchSvc := obserrors.NewSearchService(db)
+
+	logger.Info("reindex: start",
+		"site", orAll(siteID), "batch", batch, "dry_run", dryRun)
+
+	ctx := context.Background()
+	progress, err := searchSvc.ReindexAll(ctx, siteID, batch, dryRun, int64(batch),
+		func(p obserrors.ReindexProgress) {
+			logger.Info("reindex: progress", "scanned", p.Scanned, "indexed", p.Indexed)
+		})
+	if err != nil {
+		logger.Error("reindex: failed",
+			"err", err, "scanned", progress.Scanned, "indexed", progress.Indexed)
+		os.Exit(1)
+	}
+	logger.Info("reindex: complete",
+		"scanned", progress.Scanned, "indexed", progress.Indexed, "dry_run", dryRun)
+}
+
+func orAll(s string) string {
+	if s == "" {
+		return "<all>"
+	}
+	return s
 }
 
 // --- Auth handlers ---

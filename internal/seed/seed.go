@@ -13,6 +13,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
+	obserrors "github.com/useteploy/teploy-observe/internal/errors"
 	"github.com/useteploy/teploy-observe/internal/logs"
 	"github.com/useteploy/teploy-observe/internal/replays"
 	"github.com/useteploy/teploy-observe/internal/tracing"
@@ -22,14 +23,27 @@ const defaultSiteID = "default"
 
 // Run populates demo data for any empty tables tied to the default site.
 // Safe to call on every boot — each seeding step is a no-op if data exists.
-func Run(ctx context.Context, db *nucleus.Client, logger *slog.Logger) {
-	steps := []struct {
+//
+// errSvc is the canonical error ingest service. The errors seed step routes
+// every demo error through it so the resulting rows are also written to FTS;
+// pre-refactor, /api/v1/issues/search returned 500 on a fresh install.
+func Run(ctx context.Context, db *nucleus.Client, errSvc *obserrors.Service, logger *slog.Logger) {
+	type step struct {
 		name string
 		fn   func(context.Context, *nucleus.Client) error
-	}{
+	}
+	steps := []step{
 		{"logs", seedLogs},
 		{"traces", seedTraces},
 		{"replays", seedReplays},
+		// Errors go through the wrapper instead of touching error_events
+		// directly — the wrapper owns issue-resolve + FTS indexing.
+		{"error_events", func(ctx context.Context, db *nucleus.Client) error {
+			if errSvc == nil {
+				return fmt.Errorf("error service not provided")
+			}
+			return seedErrors(ctx, db, errSvc)
+		}},
 	}
 
 	for _, s := range steps {
@@ -61,6 +75,8 @@ func countRows(ctx context.Context, db *nucleus.Client, table string) (int64, er
 		query = `SELECT COUNT(*) AS count FROM spans WHERE site_id = $1`
 	case "replays":
 		query = `SELECT COUNT(*) AS count FROM replay_sessions WHERE site_id = $1`
+	case "error_events":
+		query = `SELECT COUNT(*) AS count FROM error_events WHERE site_id = $1`
 	default:
 		return 0, fmt.Errorf("unknown table: %s", table)
 	}
@@ -438,6 +454,49 @@ func seedReplays(ctx context.Context, db *nucleus.Client) error {
 		}
 		if _, err := svc.Ingest(ctx, input); err != nil {
 			return fmt.Errorf("ingest replay %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// seedErrors plants a small, varied set of demo error events so a fresh
+// install renders something on /errors and so /api/v1/issues/search has
+// indexable rows. Every event flows through obserrors.Service.IngestErrorEvent
+// — the same code path live ingest uses — so issue resolution and FTS
+// indexing happen automatically.
+func seedErrors(ctx context.Context, _ *nucleus.Client, svc *obserrors.Service) error {
+	frames := []obserrors.StackFrame{
+		{Filename: "app.js", Function: "checkout", Lineno: 42, Colno: 12, InApp: true},
+		{Filename: "vendor.js", Function: "fetchJSON", Lineno: 187, Colno: 5, InApp: false},
+	}
+
+	demos := []obserrors.ErrorInput{
+		{
+			SiteID: defaultSiteID, ErrorType: "TypeError",
+			ErrorValue: "Cannot read properties of undefined (reading 'id')",
+			Mechanism:  "onerror", Handled: false, Level: "error",
+			URL: "https://demo.local/checkout", Browser: "Chrome", OS: "macOS", Device: "desktop",
+			StackTrace: frames,
+		},
+		{
+			SiteID: defaultSiteID, ErrorType: "NetworkError",
+			ErrorValue: "Connection timed out after 30s",
+			Mechanism:  "fetch", Handled: false, Level: "error",
+			URL: "https://demo.local/api/orders", Browser: "Firefox", OS: "Linux", Device: "desktop",
+			StackTrace: frames,
+		},
+		{
+			SiteID: defaultSiteID, ErrorType: "ValidationError",
+			ErrorValue: "Email field is required",
+			Mechanism:  "captured", Handled: true, Level: "warning",
+			URL: "https://demo.local/signup", Browser: "Safari", OS: "iOS", Device: "mobile",
+			StackTrace: frames,
+		},
+	}
+
+	for i := range demos {
+		if _, err := svc.IngestErrorEvent(ctx, demos[i]); err != nil {
+			return fmt.Errorf("ingest demo error %d: %w", i, err)
 		}
 	}
 	return nil
