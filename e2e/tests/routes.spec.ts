@@ -6,6 +6,8 @@ test.describe("every route renders without a console error", () => {
     "/",
     "/errors",
     "/sessions",
+    "/persons",
+    "/cohorts",
     "/logs",
     "/traces",
     "/alerts",
