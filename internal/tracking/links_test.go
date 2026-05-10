@@ -23,7 +23,8 @@ import (
 func TestListLinks_EmptySiteReturns200(t *testing.T) {
 	base := os.Getenv("OBSERVE_URL")
 	if base == "" {
-		base = "http://localhost:3000"
+		// Pin to IPv4 so we don't accidentally hit a co-tenant on ::1.
+		base = "http://127.0.0.1:3000"
 	}
 
 	if !stackUp(t, base) {
