@@ -54,6 +54,16 @@ export interface PropertyStat {
   key: string; value: string; count: number; visitors: number;
 }
 
+// Multi-touch attribution row. Sessions/Conversions are floats because
+// the linear model splits credit fractionally (1/N per unique source).
+export type AttributionModel = "first" | "last" | "linear";
+export interface AttributionRow {
+  source: string;
+  sessions: number;
+  conversions: number;
+  conversion_pct: number;
+}
+
 export const analyticsApi = {
   realtime: (siteId: string, minutes = 5) =>
     get<RealtimeResult>(`${BASE}/realtime?site_id=${siteId}&minutes=${minutes}`),
@@ -112,4 +122,7 @@ export const analyticsApi = {
     post<Goal>(`/api/v1/goals`, data),
   correlations: (siteId: string, from: string, to: string, target?: string) =>
     get<Correlation[]>(`${BASE}/correlations?${qs(siteId, from, to)}${target ? `&target=${encodeURIComponent(target)}` : ""}`),
+  // Attribution endpoint lives outside /stats — it's at /api/v1/attribution.
+  attribution: (siteId: string, from: string, to: string, model: AttributionModel) =>
+    get<AttributionRow[]>(`/api/v1/attribution?${qs(siteId, from, to)}&model=${encodeURIComponent(model)}`),
 };
