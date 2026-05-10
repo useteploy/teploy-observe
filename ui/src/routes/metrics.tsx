@@ -1,12 +1,20 @@
 import { useState, useEffect, useMemo } from "preact/hooks";
 import { metricsApi } from "../api/metrics.js";
-import type { MetricInfo, MetricPoint, Aggregation } from "../api/metrics.js";
+import type { MetricInfo, MetricSeries, Aggregation, StepDuration } from "../api/metrics.js";
 import { useFilters } from "../hooks/useFilters.js";
 import EmptyState from "../components/shared/EmptyState.js";
 
 export const config = { mode: "app" };
 
-const AGGREGATIONS: Aggregation[] = ["last", "avg", "sum", "min", "max"];
+const AGGREGATIONS: Aggregation[] = ["last", "avg", "sum", "min", "max", "rate", "p50", "p95", "p99"];
+const STEPS: StepDuration[] = ["15s", "30s", "60s", "5m", "1h", "1d"];
+
+// Tableau-style 8-colour rotation. Stable across re-renders so the same
+// label fingerprint always maps to the same colour in a session.
+const COLORS = [
+  "#6366f1", "#10b981", "#f59e0b", "#ef4444",
+  "#8b5cf6", "#06b6d4", "#ec4899", "#84cc16",
+];
 
 function formatValue(v: number): string {
   if (!isFinite(v)) return "-";
@@ -27,17 +35,25 @@ function formatTime(ts: number): string {
   }
 }
 
-interface ChartProps {
-  points: MetricPoint[];
-  width: number;
-  height: number;
+function labelKey(labels: Record<string, string>): string {
+  const keys = Object.keys(labels).sort();
+  if (keys.length === 0) return "(all)";
+  return keys.map(k => `${k}=${labels[k]}`).join(" ");
 }
 
-// Inline SVG line chart. Kept self-contained so this route doesn't
-// depend on the canvas-based TimeSeriesChart component (which is wired
-// to the analytics-only timeseries API).
-function LineChart({ points, width, height }: ChartProps) {
-  if (points.length === 0) {
+interface ChartProps {
+  series: MetricSeries[];
+  width: number;
+  height: number;
+  highlight: number | null;
+}
+
+// Inline SVG multi-line chart. Each series gets a stable colour based on
+// its array index — the legend mirrors the colour swatches so hover-
+// highlight is unambiguous.
+function MultiLineChart({ series, width, height, highlight }: ChartProps) {
+  const allPoints = series.flatMap(s => s.points);
+  if (allPoints.length === 0) {
     return (
       <div style={{ height: `${height}px`, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--obs-text-secondary)" }}>
         No data points in selected window
@@ -49,8 +65,8 @@ function LineChart({ points, width, height }: ChartProps) {
   const innerW = width - padding.left - padding.right;
   const innerH = height - padding.top - padding.bottom;
 
-  const xs = points.map(p => p.ts_ms);
-  const ys = points.map(p => p.value);
+  const xs = allPoints.map(p => p.ts_ms);
+  const ys = allPoints.map(p => p.value);
   const xMin = Math.min(...xs);
   const xMax = Math.max(...xs);
   const yMin = Math.min(...ys, 0);
@@ -61,27 +77,15 @@ function LineChart({ points, width, height }: ChartProps) {
   const scaleX = (x: number) => padding.left + ((x - xMin) / xRange) * innerW;
   const scaleY = (y: number) => padding.top + innerH - ((y - yMin) / yRange) * innerH;
 
-  const linePath = points
-    .map((p, i) => `${i === 0 ? "M" : "L"} ${scaleX(p.ts_ms).toFixed(1)} ${scaleY(p.value).toFixed(1)}`)
-    .join(" ");
-
-  const areaPath = `${linePath} L ${scaleX(xs[xs.length - 1]).toFixed(1)} ${(padding.top + innerH).toFixed(1)} L ${scaleX(xs[0]).toFixed(1)} ${(padding.top + innerH).toFixed(1)} Z`;
-
-  // Y-axis ticks (4 horizontal lines)
   const yTicks = [0, 0.25, 0.5, 0.75, 1].map(t => yMin + t * yRange);
-  // X-axis ticks (5 evenly spaced labels)
-  const xTickCount = Math.min(5, points.length);
-  const xTicks = Array.from({ length: xTickCount }, (_, i) => xMin + (i * xRange) / Math.max(1, xTickCount - 1));
+  const xTickCount = Math.min(5, allPoints.length);
+  const xTicks = Array.from(
+    { length: xTickCount },
+    (_, i) => xMin + (i * xRange) / Math.max(1, xTickCount - 1),
+  );
 
   return (
     <svg width={width} height={height} role="img" aria-label="Metric line chart">
-      <defs>
-        <linearGradient id="metric-area" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="#6366f1" stop-opacity="0.3" />
-          <stop offset="100%" stop-color="#6366f1" stop-opacity="0.0" />
-        </linearGradient>
-      </defs>
-
       {yTicks.map((t, i) => (
         <g key={`y-${i}`}>
           <line
@@ -105,14 +109,24 @@ function LineChart({ points, width, height }: ChartProps) {
         </text>
       ))}
 
-      <path d={areaPath} fill="url(#metric-area)" />
-      <path d={linePath} fill="none" stroke="#6366f1" stroke-width="2" />
-
-      {points.map((p, i) => (
-        <circle key={i} cx={scaleX(p.ts_ms)} cy={scaleY(p.value)} r="2.5" fill="#6366f1">
-          <title>{`${formatTime(p.ts_ms)}: ${formatValue(p.value)}`}</title>
-        </circle>
-      ))}
+      {series.map((s, idx) => {
+        if (s.points.length === 0) return null;
+        const color = COLORS[idx % COLORS.length];
+        const dim = highlight !== null && highlight !== idx ? 0.18 : 1;
+        const linePath = s.points
+          .map((p, i) => `${i === 0 ? "M" : "L"} ${scaleX(p.ts_ms).toFixed(1)} ${scaleY(p.value).toFixed(1)}`)
+          .join(" ");
+        return (
+          <g key={idx} opacity={dim}>
+            <path d={linePath} fill="none" stroke={color} stroke-width="2" />
+            {s.points.map((p, i) => (
+              <circle key={i} cx={scaleX(p.ts_ms)} cy={scaleY(p.value)} r="2.5" fill={color}>
+                <title>{`${labelKey(s.labels)} • ${formatTime(p.ts_ms)}: ${formatValue(p.value)}`}</title>
+              </circle>
+            ))}
+          </g>
+        );
+      })}
     </svg>
   );
 }
@@ -143,9 +157,12 @@ export default function MetricsRoute() {
   const [listLoading, setListLoading] = useState(true);
   const [selected, setSelected] = useState<string | null>(null);
   const [agg, setAgg] = useState<Aggregation>("last");
-  const [points, setPoints] = useState<MetricPoint[]>([]);
+  const [step, setStep] = useState<StepDuration>("60s");
+  const [groupByRaw, setGroupByRaw] = useState<string>("");
+  const [series, setSeries] = useState<MetricSeries[]>([]);
   const [pointsLoading, setPointsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [highlight, setHighlight] = useState<number | null>(null);
 
   // Load metric names whenever the active site changes.
   useEffect(() => {
@@ -163,27 +180,33 @@ export default function MetricsRoute() {
       .finally(() => setListLoading(false));
   }, [siteId]);
 
-  // Load points whenever the metric or aggregation or range changes.
+  const groupBy = useMemo(() => {
+    return groupByRaw.split(",").map(s => s.trim()).filter(Boolean);
+  }, [groupByRaw]);
+
+  // Load series whenever any of the query inputs change.
   useEffect(() => {
     if (!siteId || !selected) {
-      setPoints([]);
+      setSeries([]);
       return;
     }
     const fromMs = new Date(from).getTime();
     const toMs = new Date(to).getTime();
     setPointsLoading(true);
-    metricsApi.query(siteId, selected, fromMs, toMs, agg)
-      .then((p) => setPoints(p || []))
+    metricsApi.series(siteId, selected, fromMs, toMs, agg, { step, groupBy })
+      .then((s) => setSeries(s || []))
       .catch((e) => {
         setError(String(e));
-        setPoints([]);
+        setSeries([]);
       })
       .finally(() => setPointsLoading(false));
-  }, [siteId, selected, agg, from, to]);
+  }, [siteId, selected, agg, step, from, to, groupByRaw]);
 
   const selectedKind = useMemo(() => {
     return list.find(m => m.name === selected)?.kind ?? "";
   }, [list, selected]);
+
+  const totalPoints = useMemo(() => series.reduce((acc, s) => acc + s.points.length, 0), [series]);
 
   if (!listLoading && list.length === 0) {
     return (
@@ -199,7 +222,7 @@ export default function MetricsRoute() {
       <div>
         <h1 style={{ fontSize: "24px", margin: 0 }}>Metrics</h1>
         <p style={{ color: "var(--obs-text-secondary)", margin: "4px 0 0", fontSize: "13px" }}>
-          OTLP gauges, sums (counters), and histograms — Phase 1 viewer.
+          OTLP gauges, sums (counters), and histograms. Use group_by to fan series out by label.
         </p>
       </div>
 
@@ -252,29 +275,66 @@ export default function MetricsRoute() {
                 <div>
                   <h2 style={{ margin: 0, fontSize: "16px" }} data-testid="metric-selected-name">{selected}</h2>
                   <div style={{ fontSize: "12px", color: "var(--obs-text-secondary)", marginTop: "2px" }}>
-                    {selectedKind} • {points.length} bucket{points.length === 1 ? "" : "s"}
+                    {selectedKind} • {series.length} series • {totalPoints} point{totalPoints === 1 ? "" : "s"}
                   </div>
                 </div>
-                <div style={{ display: "flex", gap: "6px" }}>
-                  {AGGREGATIONS.map(a => (
-                    <button
-                      key={a}
-                      onClick={() => setAgg(a)}
-                      data-testid={`metric-agg-${a}`}
+                <div style={{ display: "flex", gap: "12px", alignItems: "center", flexWrap: "wrap" }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px", color: "var(--obs-text-secondary)" }}>
+                    group_by
+                    <input
+                      data-testid="metric-groupby"
+                      placeholder="region,instance"
+                      value={groupByRaw}
+                      onInput={(e) => setGroupByRaw((e.target as HTMLInputElement).value)}
                       style={{
-                        padding: "4px 10px",
+                        padding: "4px 8px",
                         border: "1px solid var(--obs-border)",
                         borderRadius: "4px",
-                        background: a === agg ? "var(--obs-accent)" : "transparent",
-                        color: a === agg ? "#fff" : "var(--obs-text)",
-                        cursor: "pointer",
+                        background: "var(--obs-bg)",
+                        color: "var(--obs-text)",
+                        fontSize: "12px",
+                        fontFamily: "inherit",
+                        width: "140px",
+                      }}
+                    />
+                  </label>
+                  <label style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px", color: "var(--obs-text-secondary)" }}>
+                    step
+                    <select
+                      data-testid="metric-step"
+                      value={step}
+                      onChange={(e) => setStep((e.target as HTMLSelectElement).value as StepDuration)}
+                      style={{
+                        padding: "4px 8px",
+                        border: "1px solid var(--obs-border)",
+                        borderRadius: "4px",
+                        background: "var(--obs-bg)",
+                        color: "var(--obs-text)",
                         fontSize: "12px",
                         fontFamily: "inherit",
                       }}
                     >
-                      {a}
-                    </button>
-                  ))}
+                      {STEPS.map(s => <option key={s} value={s}>{s}</option>)}
+                    </select>
+                  </label>
+                  <select
+                    data-testid="metric-agg-select"
+                    value={agg}
+                    onChange={(e) => setAgg((e.target as HTMLSelectElement).value as Aggregation)}
+                    style={{
+                      padding: "4px 8px",
+                      border: "1px solid var(--obs-border)",
+                      borderRadius: "4px",
+                      background: "var(--obs-bg)",
+                      color: "var(--obs-text)",
+                      fontSize: "12px",
+                      fontFamily: "inherit",
+                    }}
+                  >
+                    {AGGREGATIONS.map(a => (
+                      <option key={a} value={a} data-testid={`metric-agg-${a}`}>{a}</option>
+                    ))}
+                  </select>
                 </div>
               </div>
 
@@ -284,9 +344,37 @@ export default function MetricsRoute() {
                     Loading…
                   </div>
                 ) : (
-                  <LineChart points={points} width={760} height={320} />
+                  <MultiLineChart series={series} width={760} height={320} highlight={highlight} />
                 )}
               </div>
+
+              {series.length > 0 && (
+                <div data-testid="metric-legend" style={{ display: "flex", flexWrap: "wrap", gap: "8px", maxHeight: "120px", overflowY: "auto", paddingTop: "8px", borderTop: "1px solid var(--obs-border)" }}>
+                  {series.map((s, idx) => (
+                    <div
+                      key={idx}
+                      data-testid={`metric-legend-item-${idx}`}
+                      onMouseEnter={() => setHighlight(idx)}
+                      onMouseLeave={() => setHighlight(null)}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "6px",
+                        padding: "4px 8px",
+                        border: "1px solid var(--obs-border)",
+                        borderRadius: "4px",
+                        background: highlight === idx ? "var(--obs-bg-secondary)" : "transparent",
+                        cursor: "default",
+                        fontSize: "12px",
+                        color: "var(--obs-text)",
+                      }}
+                    >
+                      <span style={{ width: "10px", height: "10px", borderRadius: "2px", background: COLORS[idx % COLORS.length], display: "inline-block" }} />
+                      <span>{labelKey(s.labels)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </>
           ) : (
             <div style={{ padding: "32px", color: "var(--obs-text-secondary)", textAlign: "center" }}>
