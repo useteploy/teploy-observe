@@ -1,4 +1,5 @@
 import { useState, useEffect } from "preact/hooks";
+import SiteSwitcher from "./SiteSwitcher.js";
 
 const NAV_ITEMS = [
   { key: "analytics", label: "Dashboard", icon: "M3 13h4v8H3v-8zm7-4h4v12h-4V9zm7-6h4v18h-4V3z", href: "/" },
@@ -78,6 +79,8 @@ export default function Sidebar() {
           </svg>
         </button>
       </div>
+
+      <SiteSwitcher collapsed={collapsed} />
 
       <ul class="obs-sidebar-nav">
         {NAV_ITEMS.map(item => (
