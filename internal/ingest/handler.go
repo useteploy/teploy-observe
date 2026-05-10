@@ -11,7 +11,9 @@ import (
 	"github.com/neutron-dev/neutron-go/neutron"
 
 	"github.com/useteploy/teploy-observe/internal/geo"
+	"github.com/useteploy/teploy-observe/internal/identity"
 	"github.com/useteploy/teploy-observe/internal/session"
+	"github.com/useteploy/teploy-observe/internal/sites"
 )
 
 // IngestInput is the JSON body for POST /api/v1/events.
@@ -24,6 +26,11 @@ type IngestInput struct {
 	Language   string         `json:"language"`
 	Screen     string         `json:"screen"`
 	Properties map[string]any `json:"properties,omitempty"`
+	// DistinctID, when present, is the user identifier the SDK passed
+	// via identify(userId). The server hashes it with the site's
+	// session_salt before storage (unless the site has raw_distinct_id
+	// opt-in set). Default '' for anonymous events.
+	DistinctID string `json:"distinct_id,omitempty"`
 }
 
 // IngestResponse is returned to the tracker.
@@ -32,7 +39,11 @@ type IngestResponse struct {
 }
 
 // Handler returns the typed Neutron handler for event ingestion.
-func Handler(buf *Buffer, salt string) neutron.HandlerFunc[IngestInput, IngestResponse] {
+//
+// `siteSvc` is used to look up per-site privacy config for hashing
+// distinct_id. Pass nil to fall back to the global salt for hashing —
+// useful in tests.
+func Handler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.HandlerFunc[IngestInput, IngestResponse] {
 	return func(ctx context.Context, input IngestInput) (IngestResponse, error) {
 		now := time.Now().UTC()
 		ip := ClientIPFromContext(ctx)
@@ -71,6 +82,22 @@ func Handler(buf *Buffer, salt string) neutron.HandlerFunc[IngestInput, IngestRe
 		eventID := generateID()
 		parsed := ParseUA(ua)
 		country := geo.Lookup(ip)
+
+		// Hash the user-supplied distinct_id (if any) with the per-site
+		// session_salt — falls back to the global salt if the site is
+		// unknown or the SiteService isn't wired (tests).
+		distinctID := ""
+		if input.DistinctID != "" {
+			privSalt := salt
+			rawOptIn := false
+			if siteSvc != nil {
+				if s, raw, ok := siteSvc.PrivacyConfig(ctx, siteID); ok {
+					privSalt = s
+					rawOptIn = raw
+				}
+			}
+			distinctID = identity.MaybeHashDistinctID(input.DistinctID, privSalt, rawOptIn)
+		}
 
 		eventType := input.EventType
 		if eventType == "" {
@@ -134,6 +161,7 @@ func Handler(buf *Buffer, salt string) neutron.HandlerFunc[IngestInput, IngestRe
 			UTMTerm:        utmTerm,
 			UTMContent:     utmContent,
 			Properties:     input.Properties,
+			DistinctID:     distinctID,
 		}
 
 		if !buf.Push(e) {
@@ -179,8 +207,8 @@ type BatchInput struct {
 // BatchHandler processes multiple events in a single request.
 // This is the preferred ingestion path — the tracker sends all queued
 // events as one POST instead of one request per event.
-func BatchHandler(buf *Buffer, salt string) neutron.HandlerFunc[BatchInput, IngestResponse] {
-	singleHandler := Handler(buf, salt)
+func BatchHandler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.HandlerFunc[BatchInput, IngestResponse] {
+	singleHandler := Handler(buf, salt, siteSvc)
 	return func(ctx context.Context, input BatchInput) (IngestResponse, error) {
 		if len(input.Events) > 100 {
 			return IngestResponse{}, neutron.ErrBadRequest("batch too large (max 100 events)")

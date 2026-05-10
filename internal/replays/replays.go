@@ -14,12 +14,26 @@ import (
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 	"github.com/useteploy/teploy-observe/internal/heatmaps"
+	"github.com/useteploy/teploy-observe/internal/identity"
 )
+
+// hashDistinctID is a local alias so the call site reads cleanly. The
+// real impl lives in internal/identity.
+func hashDistinctID(raw, salt string, rawOptIn bool) string {
+	return identity.MaybeHashDistinctID(raw, salt, rawOptIn)
+}
+
+// PrivacyLookup mirrors errors.PrivacyLookup — see that doc for shape.
+// Duplicated here to avoid a replays -> errors import cycle (errors
+// already depends on sourcemaps; both packages need the same lookup).
+type PrivacyLookup func(ctx context.Context, siteID string) (salt string, rawOptIn bool, ok bool)
 
 type ReplayService struct {
 	db       *nucleus.Client
 	heatmaps *heatmaps.Service
 	logger   *slog.Logger
+	privacy  PrivacyLookup
+	salt     string
 }
 
 func NewReplayService(db *nucleus.Client) *ReplayService {
@@ -28,6 +42,14 @@ func NewReplayService(db *nucleus.Client) *ReplayService {
 		heatmaps: heatmaps.NewService(db),
 		logger:   slog.Default(),
 	}
+}
+
+// WithPrivacy installs the per-site distinct_id hashing lookup and a
+// fallback global salt for sites the lookup doesn't know about.
+func (s *ReplayService) WithPrivacy(lookup PrivacyLookup, fallbackSalt string) *ReplayService {
+	s.privacy = lookup
+	s.salt = fallbackSalt
+	return s
 }
 
 // WithLogger threads a custom logger so heatmap-rollup write failures
@@ -82,6 +104,10 @@ type IngestInput struct {
 	Device        string `json:"device"`
 	HasError      bool   `json:"has_error"`
 	ViewportWidth int    `json:"viewport_width"`
+	// DistinctID, when present, is the user identifier the SDK passed
+	// via identify(userId). Hashed with the per-site session_salt
+	// before storage.
+	DistinctID    string `json:"distinct_id,omitempty"`
 	Events        []struct {
 		Type      string `json:"type"`
 		Timestamp int64  `json:"timestamp"`
@@ -130,14 +156,32 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 		}
 	}
 
+	// Resolve and hash the user-supplied distinct_id (if any).
+	distinctID := ""
+	if input.DistinctID != "" {
+		salt := s.salt
+		rawOptIn := false
+		if s.privacy != nil {
+			if siteSalt, raw, ok := s.privacy(ctx, input.SiteID); ok {
+				salt = siteSalt
+				rawOptIn = raw
+			}
+		}
+		if salt == "" && !rawOptIn {
+			distinctID = input.DistinctID
+		} else {
+			distinctID = hashDistinctID(input.DistinctID, salt, rawOptIn)
+		}
+	}
+
 	if insertSession {
 		_, err := sql.Exec(ctx,
 			`INSERT INTO replay_sessions (replay_id, tenant_id, site_id, session_id, start_time,
-				duration_ms, page_count, url, browser, os, device, has_error)
-			 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+				duration_ms, page_count, url, browser, os, device, has_error, distinct_id)
+			 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 			replayID, input.SiteID, input.SessionID, startTime,
 			strconv.FormatInt(duration, 10), strconv.Itoa(len(input.Events)),
-			input.URL, input.Browser, input.OS, input.Device, hasError,
+			input.URL, input.Browser, input.OS, input.Device, hasError, distinctID,
 		)
 		if err != nil {
 			return "", fmt.Errorf("insert replay session: %w", err)

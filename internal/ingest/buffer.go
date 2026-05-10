@@ -44,6 +44,11 @@ type Event struct {
 	UTMTerm        string         `json:"utm_term"`
 	UTMContent     string         `json:"utm_content"`
 	Properties     map[string]any `json:"properties,omitempty"`
+	// DistinctID is the hashed user identifier (per identify() SDK call).
+	// Empty string means an anonymous event. The hashing happens in the
+	// ingest handler before the event reaches this buffer; callers should
+	// never put a raw user ID here.
+	DistinctID string `json:"distinct_id,omitempty"`
 }
 
 // Buffer is a ring buffer that accumulates events and batch-inserts them
@@ -202,7 +207,7 @@ func (b *Buffer) Len() int {
 }
 
 const (
-	eventsCols       = 29 // keep in sync with eventsColList / eventRow args
+	eventsCols       = 30 // keep in sync with eventsColList / eventRow args
 	eventsRecentCols = 12 // keep in sync with eventsRecentColList / eventsRecentRow args
 )
 
@@ -212,7 +217,7 @@ const eventsColList = `event_id, tenant_id, site_id, session_id, visit_id, event
 	browser, browser_version, os, os_version, device,
 	screen_width, screen_height,
 	utm_source, utm_medium, utm_campaign, utm_term, utm_content,
-	properties`
+	properties, distinct_id`
 
 const eventsRecentColList = `event_id, tenant_id, site_id, session_id, event_type,
 	timestamp, pathname, referrer, browser, os, country, properties`
@@ -253,7 +258,7 @@ func propertiesJSON(p map[string]any) string {
 	return string(raw)
 }
 
-// eventArgs appends the 29 parameter values for one event row (in column order).
+// eventArgs appends the 30 parameter values for one event row (in column order).
 func eventArgs(dst []any, e *Event) []any {
 	return append(dst,
 		e.EventID, e.TenantID, e.SiteID, e.SessionID, e.VisitID, e.EventType,
@@ -263,6 +268,7 @@ func eventArgs(dst []any, e *Event) []any {
 		dbutil.IntParam(int64(e.ScreenWidth)), dbutil.IntParam(int64(e.ScreenHeight)),
 		e.UTMSource, e.UTMMedium, e.UTMCampaign, e.UTMTerm, e.UTMContent,
 		propertiesJSON(e.Properties),
+		e.DistinctID,
 	)
 }
 

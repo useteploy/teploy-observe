@@ -149,11 +149,12 @@ func main() {
 
 	// Error tracking services — declared before seed so the demo path can
 	// use the canonical IngestErrorEvent wrapper (INSERT + issue resolve +
-	// FTS index in one shot).
+	// FTS index + distinct_id hashing in one shot).
 	srcmapSvc := sourcemaps.NewSourceMapService(db)
 	issueSvc := obserrors.NewIssueService(db)
 	searchSvc := obserrors.NewSearchService(db)
-	errorHandler := obserrors.NewErrorHandler(db, issueSvc, searchSvc, srcmapSvc)
+	errorHandler := obserrors.NewErrorHandler(db, issueSvc, searchSvc, srcmapSvc).
+		WithPrivacy(siteSvc.PrivacyConfig, cfg.SessionSalt)
 
 	// Seed demo data for empty tables unless disabled.
 	if os.Getenv("OBSERVE_SEED_DEMO") != "false" {
@@ -217,7 +218,9 @@ func main() {
 	cronSvc := monitoring.NewCronService(db, logger)
 	linkSvc := tracking.NewLinkService(db)
 	dashSvc := dashboards.NewDashboardService(db)
-	replaySvc := replays.NewReplayService(db).WithLogger(logger)
+	replaySvc := replays.NewReplayService(db).
+		WithLogger(logger).
+		WithPrivacy(siteSvc.PrivacyConfig, cfg.SessionSalt)
 	heatmapsSvc := heatmaps.NewService(db)
 	aiSvc := aiquery.NewService(db, logger)
 	aiSchema := aiquery.NewSchemaCard(db)
@@ -341,11 +344,11 @@ func main() {
 	})
 	// Auth runs before the limiter so the limiter can key on site_id.
 	ingestGroup := r.Group("/api/v1", ingestCORS, auth.APIKeyAuthMiddleware(authSvc, cfg.SiteID), rateLimiter.Middleware)
-	neutron.Post(ingestGroup, "/events", ingest.Handler(buf, cfg.SessionSalt),
+	neutron.Post(ingestGroup, "/events", ingest.Handler(buf, cfg.SessionSalt, siteSvc),
 		neutron.WithTags("ingest"),
 		neutron.WithSummary("Ingest analytics event"),
 	)
-	neutron.Post(ingestGroup, "/events/batch", ingest.BatchHandler(buf, cfg.SessionSalt),
+	neutron.Post(ingestGroup, "/events/batch", ingest.BatchHandler(buf, cfg.SessionSalt, siteSvc),
 		neutron.WithTags("ingest"),
 		neutron.WithSummary("Ingest batch of analytics events"),
 	)

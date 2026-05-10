@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -20,23 +21,67 @@ type Site struct {
 	Name        string `json:"name" db:"name"`
 	CreatedAt   int64  `json:"created_at" db:"created_at"`
 	SessionSalt string `json:"-" db:"session_salt"`
+	// RawDistinctID, when true, opts the site OUT of the default
+	// HMAC hashing of distinct_id values. Useful for operators that
+	// need server-side identity resolution (e.g. CRM joins by email).
+	RawDistinctID bool `json:"raw_distinct_id" db:"raw_distinct_id"`
 }
 
 // SiteService provides CRUD operations for the sites table.
 type SiteService struct {
 	db *nucleus.Client
+	// Small in-memory cache so the ingest hot path can call PrivacyConfig
+	// without a DB round-trip per event. Populated on first miss; the
+	// Cache size is naturally bounded by the number of sites.
+	mu    sync.RWMutex
+	cache map[string]Site
 }
 
 // NewSiteService creates a new SiteService.
 func NewSiteService(db *nucleus.Client) *SiteService {
-	return &SiteService{db: db}
+	return &SiteService{db: db, cache: map[string]Site{}}
+}
+
+// PrivacyConfig returns the (session_salt, raw_distinct_id_optin) pair
+// for a site. Used by ingest handlers to hash distinct_id consistently
+// per site. Cached in-process. Returns ("", false) if the site is
+// unknown — callers should treat that as "do not hash" or apply the
+// global salt as a fallback.
+func (s *SiteService) PrivacyConfig(ctx context.Context, siteID string) (salt string, rawOptIn bool, ok bool) {
+	if siteID == "" {
+		return "", false, false
+	}
+	s.mu.RLock()
+	if site, hit := s.cache[siteID]; hit {
+		s.mu.RUnlock()
+		return site.SessionSalt, site.RawDistinctID, true
+	}
+	s.mu.RUnlock()
+
+	site, err := s.Get(ctx, siteID)
+	if err != nil || site.SiteID == "" {
+		return "", false, false
+	}
+	s.mu.Lock()
+	s.cache[siteID] = site
+	s.mu.Unlock()
+	return site.SessionSalt, site.RawDistinctID, true
+}
+
+// InvalidatePrivacyConfig drops the cached entry for a site. Call after
+// flipping raw_distinct_id or rotating session_salt so the next ingest
+// picks up the new value.
+func (s *SiteService) InvalidatePrivacyConfig(siteID string) {
+	s.mu.Lock()
+	delete(s.cache, siteID)
+	s.mu.Unlock()
 }
 
 // List returns all sites.
 func (s *SiteService) List(ctx context.Context) ([]Site, error) {
 	sql := s.db.SQL()
 	rows, err := nucleus.Query[Site](ctx, sql,
-		"SELECT site_id, tenant_id, domain, name, created_at, session_salt FROM sites",
+		"SELECT site_id, tenant_id, domain, name, created_at, session_salt, raw_distinct_id FROM sites",
 	)
 	if err != nil {
 		return nil, fmt.Errorf("sites: list: %w", err)

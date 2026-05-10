@@ -11,6 +11,7 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
+	"github.com/useteploy/teploy-observe/internal/identity"
 	"github.com/useteploy/teploy-observe/internal/sourcemaps"
 )
 
@@ -19,6 +20,9 @@ type ErrorInput struct {
 	SiteID      string       `json:"site_id"`
 	SessionID   string       `json:"session_id"`
 	ReplayID    string       `json:"replay_id"`
+	// DistinctID, when present, is the user identifier from identify().
+	// The server hashes it with the site's session_salt before storage.
+	DistinctID  string       `json:"distinct_id,omitempty"`
 	ErrorType   string       `json:"error_type"`
 	ErrorValue  string       `json:"error_value"`
 	Mechanism   string       `json:"mechanism"`
@@ -57,6 +61,12 @@ type ErrorResponse struct {
 	IssueID string `json:"issue_id,omitempty"`
 }
 
+// PrivacyLookup resolves the per-site distinct-id hashing config without
+// the errors package needing to import internal/sites (which would create
+// an import cycle in tests). Returned (salt, rawOptIn, ok); ok=false
+// means "site unknown — caller should not hash".
+type PrivacyLookup func(ctx context.Context, siteID string) (salt string, rawOptIn bool, ok bool)
+
 // Service is the canonical entry point for inserting error events.
 //
 // Every code path that records an error (live HTTP ingest via ErrorBuffer,
@@ -64,7 +74,9 @@ type ErrorResponse struct {
 // into error_events are forbidden because they bypass:
 //   - issue resolve/create (so /api/v1/issues misses the row),
 //   - FTS indexing (so /api/v1/issues/search returns 500 on "no docs"),
-//   - source-map resolution.
+//   - source-map resolution,
+//   - distinct_id hashing (so raw user IDs would land in error_events
+//     verbatim — privacy regression).
 //
 // Pre-refactor, the seed inserted directly and search broke on fresh installs.
 // Funneling through one method makes the bug class structurally impossible.
@@ -73,6 +85,20 @@ type Service struct {
 	issueSvc  *IssueService
 	searchSvc *SearchService
 	srcmapSvc *sourcemaps.SourceMapService
+	// privacy is optional. If nil, distinct_id is stored as-is. cmd/observe
+	// wires this from sites.SiteService.PrivacyConfig at boot.
+	privacy PrivacyLookup
+	// fallbackSalt is the global session salt used when a per-site lookup
+	// returns ok=false. Empty means "do not hash" — leave distinct_id raw.
+	fallbackSalt string
+}
+
+// WithPrivacy installs the per-site distinct_id hashing lookup and
+// fallback salt. Called once at boot from cmd/observe.
+func (s *Service) WithPrivacy(lookup PrivacyLookup, fallbackSalt string) *Service {
+	s.privacy = lookup
+	s.fallbackSalt = fallbackSalt
+	return s
 }
 
 // ErrorHandler is the legacy alias retained for callers that still reference
@@ -150,18 +176,40 @@ func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (strin
 		handled = "false"
 	}
 
+	// Resolve distinct_id: hash with the per-site salt if a privacy
+	// lookup is wired and the site is known; otherwise fall back to the
+	// global salt; otherwise leave raw (test/dev fallback only).
+	distinctID := ""
+	if input.DistinctID != "" {
+		salt := s.fallbackSalt
+		rawOptIn := false
+		if s.privacy != nil {
+			if siteSalt, raw, ok := s.privacy(ctx, input.SiteID); ok {
+				salt = siteSalt
+				rawOptIn = raw
+			}
+		}
+		if salt == "" && !rawOptIn {
+			// No salt anywhere — store as-is rather than hash with empty
+			// key (which would give every site the same digest).
+			distinctID = input.DistinctID
+		} else {
+			distinctID = identity.MaybeHashDistinctID(input.DistinctID, salt, rawOptIn)
+		}
+	}
+
 	// Insert error event
 	_, err = s.db.SQL().Exec(ctx,
 		`INSERT INTO error_events (
 			error_id, tenant_id, site_id, session_id, replay_id, issue_id, group_hash,
 			timestamp, error_type, error_value, mechanism, handled, level,
 			release_tag, environment, url, browser, os, device,
-			stack_trace, breadcrumbs, contexts, extra
-		) VALUES ($1,'default',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+			stack_trace, breadcrumbs, contexts, extra, distinct_id
+		) VALUES ($1,'default',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
 		errorID, input.SiteID, input.SessionID, input.ReplayID, issueID, groupHash,
 		now.UnixMilli(), input.ErrorType, input.ErrorValue, input.Mechanism, handled, input.Level,
 		input.ReleaseTag, input.Environment, input.URL, input.Browser, input.OS, input.Device,
-		stackJSON, breadcrumbsJSON, contextsJSON, extraJSON,
+		stackJSON, breadcrumbsJSON, contextsJSON, extraJSON, distinctID,
 	)
 	if err != nil {
 		return "", fmt.Errorf("insert error event: %w", err)
