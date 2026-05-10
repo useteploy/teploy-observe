@@ -177,6 +177,135 @@ func unmarshalJSON(data string, v any) error {
 	return json.Unmarshal([]byte(data), v)
 }
 
+// ReindexProgress reports how much of the reindex pass has run.
+type ReindexProgress struct {
+	Scanned int64 // rows read from error_events
+	Indexed int64 // rows submitted to FTS (always == Scanned in non-dry-run mode)
+}
+
+// ReindexAll rebuilds the FTS index from error_events, in batches of `batch`
+// rows ordered by (site_id, timestamp). If `siteID` is empty, every site is
+// scanned. If `dryRun` is true, the function reads but does NOT call
+// IndexError — useful for verifying that the source rows look sane before
+// reindexing in earnest.
+//
+// The progress callback fires every `reportEvery` rows so callers can log
+// without re-tailing the error_events table.
+//
+// Idempotent: IndexError uses Incr-derived doc IDs, so re-running creates
+// new FTS rows that supersede earlier ones (the lookup map points to the
+// latest mapping). For a clean rebuild, drop the FTS files first.
+func (s *SearchService) ReindexAll(
+	ctx context.Context,
+	siteID string,
+	batch int,
+	dryRun bool,
+	reportEvery int64,
+	progress func(p ReindexProgress),
+) (ReindexProgress, error) {
+	if batch <= 0 {
+		batch = 1000
+	}
+	if reportEvery <= 0 {
+		reportEvery = int64(batch)
+	}
+
+	type row struct {
+		ErrorID    string `db:"error_id"`
+		ErrorType  string `db:"error_type"`
+		ErrorValue string `db:"error_value"`
+		SiteID     string `db:"site_id"`
+		Timestamp  int64  `db:"timestamp"`
+	}
+
+	var p ReindexProgress
+	var lastTS int64 = -1
+	var lastID string = ""
+
+	for {
+		var rows []row
+		var err error
+		// Use (timestamp, error_id) as a keyset cursor so we don't paginate
+		// with OFFSET (which costs more on every page in Nucleus). Empty
+		// cursor on first iteration.
+		if siteID == "" {
+			if lastTS < 0 {
+				rows, err = nucleus.Query[row](ctx, s.db.SQL(),
+					fmt.Sprintf(`SELECT error_id, error_type, error_value, site_id,
+						CAST(timestamp AS BIGINT) AS timestamp
+						FROM error_events
+						ORDER BY timestamp ASC, error_id ASC
+						LIMIT %d`, batch))
+			} else {
+				rows, err = nucleus.Query[row](ctx, s.db.SQL(),
+					fmt.Sprintf(`SELECT error_id, error_type, error_value, site_id,
+						CAST(timestamp AS BIGINT) AS timestamp
+						FROM error_events
+						WHERE (CAST(timestamp AS BIGINT) > $1)
+						   OR (CAST(timestamp AS BIGINT) = $1 AND error_id > $2)
+						ORDER BY timestamp ASC, error_id ASC
+						LIMIT %d`, batch),
+					strconv.FormatInt(lastTS, 10), lastID)
+			}
+		} else {
+			if lastTS < 0 {
+				rows, err = nucleus.Query[row](ctx, s.db.SQL(),
+					fmt.Sprintf(`SELECT error_id, error_type, error_value, site_id,
+						CAST(timestamp AS BIGINT) AS timestamp
+						FROM error_events
+						WHERE site_id = $1
+						ORDER BY timestamp ASC, error_id ASC
+						LIMIT %d`, batch),
+					siteID)
+			} else {
+				rows, err = nucleus.Query[row](ctx, s.db.SQL(),
+					fmt.Sprintf(`SELECT error_id, error_type, error_value, site_id,
+						CAST(timestamp AS BIGINT) AS timestamp
+						FROM error_events
+						WHERE site_id = $1
+						  AND ((CAST(timestamp AS BIGINT) > $2)
+						       OR (CAST(timestamp AS BIGINT) = $2 AND error_id > $3))
+						ORDER BY timestamp ASC, error_id ASC
+						LIMIT %d`, batch),
+					siteID, strconv.FormatInt(lastTS, 10), lastID)
+			}
+		}
+		if err != nil {
+			return p, fmt.Errorf("reindex: scan: %w", err)
+		}
+		if len(rows) == 0 {
+			break
+		}
+
+		for _, r := range rows {
+			p.Scanned++
+			if !dryRun {
+				if err := s.IndexError(ctx, r.ErrorID, r.ErrorType, r.ErrorValue); err != nil {
+					return p, fmt.Errorf("reindex: index error_id=%s: %w", r.ErrorID, err)
+				}
+				p.Indexed++
+			}
+			if progress != nil && p.Scanned%reportEvery == 0 {
+				progress(p)
+			}
+		}
+
+		last := rows[len(rows)-1]
+		lastTS = last.Timestamp
+		lastID = last.ErrorID
+
+		// Short batch means we drained the cursor.
+		if len(rows) < batch {
+			break
+		}
+	}
+
+	if progress != nil && p.Scanned%reportEvery != 0 {
+		progress(p)
+	}
+	return p, nil
+}
+
 // ErrorCount returns the total number of error events for a site in a time range.
 func (s *SearchService) ErrorCount(ctx context.Context, siteID string, fromMs, toMs int64) (int64, error) {
 	type countResult struct {
