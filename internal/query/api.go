@@ -26,6 +26,11 @@ type StatsInput struct {
 	UTMSource   string `query:"utm_source"`
 	UTMMedium   string `query:"utm_medium"`
 	UTMCampaign string `query:"utm_campaign"`
+	// CohortID is the C2 cohort filter. When non-empty, the API layer
+	// resolves it to a distinct_id IN (...) clause before issuing the
+	// query. Backwards-compat: every existing chart keeps working with
+	// no changes when cohort_id is absent.
+	CohortID string `query:"cohort_id"`
 }
 
 func (i StatsInput) TimeRange() (time.Time, time.Time) {
@@ -54,6 +59,38 @@ func (i StatsInput) Filters() *FilterBuilder {
 	fb.Add("utm_source", i.UTMSource)
 	fb.Add("utm_medium", i.UTMMedium)
 	fb.Add("utm_campaign", i.UTMCampaign)
+	return fb
+}
+
+// resolveFilters builds the FilterBuilder and, if CohortID is set and
+// the StatsService has a cohort resolver wired, expands the cohort
+// into a distinct_id IN (...) clause. Used by every analytics route
+// handler so cohort filtering is uniform across pages, sessions,
+// channels, etc.
+//
+// A cohort with zero members short-circuits to a "1 = 0" clause via
+// FilterBuilder.AddIn, so the chart returns empty rather than the
+// (mistaken) full unfiltered result.
+func (i StatsInput) resolveFilters(ctx context.Context, svc *StatsService) *FilterBuilder {
+	fb := i.Filters()
+	if i.CohortID == "" || svc == nil {
+		return fb
+	}
+	ids, err := svc.ResolveCohort(ctx, i.SiteID, i.CohortID)
+	if err != nil {
+		// Resolver failure is non-fatal: log and fall back to no
+		// cohort filter so the chart degrades gracefully (matches the
+		// "channels query failed" pattern below).
+		slog.Warn("cohort resolve failed; falling back to unfiltered", "err", err, "site", i.SiteID, "cohort", i.CohortID)
+		return fb
+	}
+	if ids == nil {
+		// Resolver wired but cohort_id wasn't found / returned nil.
+		// Treat as zero-members so the chart shows nothing (truthful
+		// rather than "your cohort doesn't exist; here's all data").
+		ids = []string{}
+	}
+	fb.AddIn("distinct_id", ids)
 	return fb
 }
 
@@ -217,7 +254,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 
 	neutron.Get(api, "/overview", func(ctx context.Context, input StatsInput) (any, error) {
 		from, to := input.TimeRange()
-		filters := input.Filters()
+		filters := input.resolveFilters(ctx, svc)
 		if input.Compare != "" {
 			result, err := svc.OverviewWithComparison(ctx, input.SiteID, from, to, input.Compare, filters)
 			if err != nil {
@@ -234,7 +271,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 
 	neutron.Get(api, "/timeseries", func(ctx context.Context, input StatsInput) ([]TimeSeriesPoint, error) {
 		from, to := input.TimeRange()
-		result, err := svc.PageviewTimeSeries(ctx, input.SiteID, from, to, input.Interval, input.Filters())
+		result, err := svc.PageviewTimeSeries(ctx, input.SiteID, from, to, input.Interval, input.resolveFilters(ctx, svc))
 		if err != nil {
 			slog.Error("timeseries query failed", "err", err, "site", input.SiteID, "from", from, "to", to)
 		}
@@ -243,7 +280,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 
 	neutron.Get(api, "/pages", func(ctx context.Context, input StatsInput) ([]TopPage, error) {
 		from, to := input.TimeRange()
-		result, err := svc.TopPages(ctx, input.SiteID, from, to, input.Limit, input.Filters())
+		result, err := svc.TopPages(ctx, input.SiteID, from, to, input.Limit, input.resolveFilters(ctx, svc))
 		if err != nil {
 			slog.Error("pages query failed", "err", err, "site", input.SiteID, "from", from, "to", to)
 		}
@@ -252,7 +289,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 
 	neutron.Get(api, "/referrers", func(ctx context.Context, input StatsInput) ([]TopReferrer, error) {
 		from, to := input.TimeRange()
-		result, err := svc.TopReferrers(ctx, input.SiteID, from, to, input.Limit, input.Filters())
+		result, err := svc.TopReferrers(ctx, input.SiteID, from, to, input.Limit, input.resolveFilters(ctx, svc))
 		if err != nil {
 			slog.Error("referrers query failed", "err", err, "site", input.SiteID, "from", from, "to", to)
 		}
@@ -261,7 +298,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 
 	neutron.Get(api, "/browsers", func(ctx context.Context, input StatsInput) ([]BrowserStat, error) {
 		from, to := input.TimeRange()
-		result, err := svc.TopBrowsers(ctx, input.SiteID, from, to, input.Limit, input.Filters())
+		result, err := svc.TopBrowsers(ctx, input.SiteID, from, to, input.Limit, input.resolveFilters(ctx, svc))
 		if err != nil {
 			slog.Error("browsers query failed", "err", err, "site", input.SiteID, "from", from, "to", to)
 		}
@@ -270,7 +307,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 
 	neutron.Get(api, "/countries", func(ctx context.Context, input StatsInput) ([]CountryStat, error) {
 		from, to := input.TimeRange()
-		result, err := svc.TopCountries(ctx, input.SiteID, from, to, input.Limit, input.Filters())
+		result, err := svc.TopCountries(ctx, input.SiteID, from, to, input.Limit, input.resolveFilters(ctx, svc))
 		if err != nil {
 			slog.Error("countries query failed", "err", err, "site", input.SiteID, "from", from, "to", to)
 		}
@@ -279,7 +316,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 
 	neutron.Get(api, "/os", func(ctx context.Context, input StatsInput) ([]OSStat, error) {
 		from, to := input.TimeRange()
-		result, err := svc.TopOS(ctx, input.SiteID, from, to, input.Limit, input.Filters())
+		result, err := svc.TopOS(ctx, input.SiteID, from, to, input.Limit, input.resolveFilters(ctx, svc))
 		if err != nil {
 			slog.Error("os query failed", "err", err, "site", input.SiteID, "from", from, "to", to)
 		}
@@ -288,7 +325,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 
 	neutron.Get(api, "/devices", func(ctx context.Context, input StatsInput) ([]DeviceStat, error) {
 		from, to := input.TimeRange()
-		result, err := svc.TopDevices(ctx, input.SiteID, from, to, input.Limit, input.Filters())
+		result, err := svc.TopDevices(ctx, input.SiteID, from, to, input.Limit, input.resolveFilters(ctx, svc))
 		if err != nil {
 			slog.Error("devices query failed", "err", err, "site", input.SiteID, "from", from, "to", to)
 		}
@@ -297,7 +334,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 
 	neutron.Get(api, "/channels", func(ctx context.Context, input StatsInput) ([]ChannelStat, error) {
 		from, to := input.TimeRange()
-		result, err := svc.TopChannels(ctx, input.SiteID, from, to, input.Filters())
+		result, err := svc.TopChannels(ctx, input.SiteID, from, to, input.resolveFilters(ctx, svc))
 		if err != nil {
 			slog.Error("channels query failed", "err", err, "site", input.SiteID, "from", from, "to", to)
 		}
@@ -306,7 +343,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 
 	neutron.Get(api, "/languages", func(ctx context.Context, input StatsInput) ([]LanguageStat, error) {
 		from, to := input.TimeRange()
-		result, err := svc.TopLanguages(ctx, input.SiteID, from, to, input.Limit, input.Filters())
+		result, err := svc.TopLanguages(ctx, input.SiteID, from, to, input.Limit, input.resolveFilters(ctx, svc))
 		if err != nil {
 			slog.Error("languages query failed", "err", err, "site", input.SiteID, "from", from, "to", to)
 		}
@@ -315,7 +352,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 
 	neutron.Get(api, "/screens", func(ctx context.Context, input StatsInput) ([]ScreenStat, error) {
 		from, to := input.TimeRange()
-		result, err := svc.TopScreens(ctx, input.SiteID, from, to, input.Limit, input.Filters())
+		result, err := svc.TopScreens(ctx, input.SiteID, from, to, input.Limit, input.resolveFilters(ctx, svc))
 		if err != nil {
 			slog.Error("screens query failed", "err", err, "site", input.SiteID, "from", from, "to", to)
 		}
@@ -328,7 +365,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 		if utmType == "" {
 			utmType = "source"
 		}
-		result, err := svc.TopUTM(ctx, input.SiteID, from, to, utmType, input.Limit, input.Filters())
+		result, err := svc.TopUTM(ctx, input.SiteID, from, to, utmType, input.Limit, input.resolveFilters(ctx, svc))
 		if err != nil {
 			slog.Error("utm query failed", "err", err, "site", input.SiteID, "type", utmType, "from", from, "to", to)
 		}
@@ -337,7 +374,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 
 	neutron.Get(api, "/entry-pages", func(ctx context.Context, input StatsInput) ([]EntryPageStat, error) {
 		from, to := input.TimeRange()
-		result, err := svc.TopEntryPages(ctx, input.SiteID, from, to, input.Limit, input.Filters())
+		result, err := svc.TopEntryPages(ctx, input.SiteID, from, to, input.Limit, input.resolveFilters(ctx, svc))
 		if err != nil {
 			slog.Error("entry-pages query failed", "err", err, "site", input.SiteID, "from", from, "to", to)
 		}
@@ -346,7 +383,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 
 	neutron.Get(api, "/exit-pages", func(ctx context.Context, input StatsInput) ([]ExitPageStat, error) {
 		from, to := input.TimeRange()
-		result, err := svc.TopExitPages(ctx, input.SiteID, from, to, input.Limit, input.Filters())
+		result, err := svc.TopExitPages(ctx, input.SiteID, from, to, input.Limit, input.resolveFilters(ctx, svc))
 		if err != nil {
 			slog.Error("exit-pages query failed", "err", err, "site", input.SiteID, "from", from, "to", to)
 		}
@@ -355,7 +392,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 
 	neutron.Get(api, "/events", func(ctx context.Context, input StatsInput) ([]CustomEventStat, error) {
 		from, to := input.TimeRange()
-		result, err := svc.CustomEvents(ctx, input.SiteID, from, to, input.Limit, input.Filters())
+		result, err := svc.CustomEvents(ctx, input.SiteID, from, to, input.Limit, input.resolveFilters(ctx, svc))
 		if err != nil {
 			slog.Error("custom events query failed", "err", err, "site", input.SiteID, "from", from, "to", to)
 		}

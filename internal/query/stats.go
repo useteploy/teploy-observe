@@ -13,13 +13,37 @@ import (
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
+// CohortResolver returns the list of distinct_ids for a cohort. It's
+// optional: if not wired (nil), cohort_id filters are silently dropped.
+// The handler layer typically supplies cohorts.Service.MembersForFilter.
+type CohortResolver func(ctx context.Context, siteID, cohortID string) ([]string, error)
+
 // StatsService provides analytics query methods for the dashboard.
 type StatsService struct {
-	db *nucleus.Client
+	db             *nucleus.Client
+	cohortResolver CohortResolver
 }
 
 func NewStatsService(db *nucleus.Client) *StatsService {
 	return &StatsService{db: db}
+}
+
+// WithCohortResolver attaches a cohort lookup so the api layer can apply
+// `?cohort_id=X` to any analytics route via StatsInput.ResolveCohort.
+// Returns the receiver for fluent setup at boot.
+func (s *StatsService) WithCohortResolver(r CohortResolver) *StatsService {
+	s.cohortResolver = r
+	return s
+}
+
+// ResolveCohort returns the distinct_ids for a cohort, or nil if no
+// resolver is wired. Used by the API layer to expand cohort_id into
+// a FilterBuilder.AddIn before issuing the analytics query.
+func (s *StatsService) ResolveCohort(ctx context.Context, siteID, cohortID string) ([]string, error) {
+	if s.cohortResolver == nil || cohortID == "" {
+		return nil, nil
+	}
+	return s.cohortResolver(ctx, siteID, cohortID)
 }
 
 // tableFor picks the optimal source table based on query time range.

@@ -52,7 +52,9 @@ import (
 	"github.com/useteploy/teploy-observe/internal/reports"
 	"github.com/useteploy/teploy-observe/internal/replays"
 	"github.com/useteploy/teploy-observe/internal/sourcemaps"
+	"github.com/useteploy/teploy-observe/internal/cohorts"
 	"github.com/useteploy/teploy-observe/internal/metrics"
+	"github.com/useteploy/teploy-observe/internal/persons"
 	"github.com/useteploy/teploy-observe/internal/sso"
 	"github.com/useteploy/teploy-observe/internal/surveys"
 	"github.com/useteploy/teploy-observe/internal/tracking"
@@ -196,6 +198,14 @@ func main() {
 
 	// Metrics service (W3.A Phase 1 — OTLP metrics ingest + query)
 	metricsSvc := metrics.NewService(db).WithLogger(logger)
+
+	// C2 (Wave 4) — persons + cohorts. Persons is read-only (aggregate
+	// over events.distinct_id). Cohorts owns its own table (migration
+	// 023) and exposes MembersForFilter to the stats service so any
+	// analytics chart can opt in to a cohort filter via ?cohort_id=X.
+	personsSvc := persons.NewService(db)
+	cohortsSvc := cohorts.NewService(db)
+	statsSvc.WithCohortResolver(cohortsSvc.MembersForFilter)
 
 	// Platform services
 	userSvc := platform.NewUserService(db)
@@ -889,6 +899,18 @@ func main() {
 	// funnels convention above). Placed at the END of route registrations
 	// to minimize merge conflict surface with parallel waves.
 	RegisterMetricsRoutes(r, jwtMW, metricsSvc)
+
+	// --- Persons API ---
+	// C2 Wave 4: aggregate over events.distinct_id. Read-only; no editor
+	// gating needed. Single-line wiring matches the metrics / boards
+	// convention above.
+	RegisterPersonsRoutes(r, jwtMW, personsSvc)
+
+	// --- Cohorts API ---
+	// C2 Wave 4: behavioural grouping. Owns its own table (migration 023)
+	// and exposes MembersForFilter to the stats service for ?cohort_id=
+	// filtering across every analytics chart.
+	RegisterCohortsRoutes(r, jwtMW, requireEditor, cohortsSvc)
 
 	// SPA catch-all: serve index.html for all non-API, non-asset GET requests.
 	// This must be registered last so API routes take precedence.
