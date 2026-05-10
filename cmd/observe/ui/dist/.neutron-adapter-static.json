@@ -1,15 +1,15 @@
 {
   "adapter": "static",
   "routes": {
-    "total": 27,
+    "total": 29,
     "static": 0,
-    "app": 27
+    "app": 29
   },
   "compression": {
     "enabled": true,
-    "files": 63,
-    "gzipBytesSaved": 315906,
-    "brotliBytesSaved": 335188
+    "files": 67,
+    "gzipBytesSaved": 336658,
+    "brotliBytesSaved": 357163
   },
-  "generatedAt": "2026-05-10T20:03:22.688Z"
+  "generatedAt": "2026-05-10T20:43:54.972Z"
 }
