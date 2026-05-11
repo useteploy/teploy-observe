@@ -12,9 +12,9 @@ import (
 
 // RetentionPolicy defines the TTL (in days) for a table + the SQL column to compare against.
 type RetentionPolicy struct {
-	Table       string
-	Column      string // BIGINT-as-text column, typically "timestamp", "start_time", or "ts_bucket"
-	Days        int
+	Table  string
+	Column string // BIGINT-as-text column, typically "timestamp", "start_time", or "ts_bucket"
+	Days   int
 }
 
 // RetentionService cleans up old data according to configured retention periods.
@@ -73,7 +73,7 @@ func (r *RetentionService) RunCleanup(ctx context.Context) error {
 		// Parameter is cast to BIGINT; column is also cast so text-typed BIGINT
 		// columns in Nucleus compare numerically rather than lexicographically.
 		query := fmt.Sprintf(
-			`DELETE FROM %s WHERE CAST(%s AS BIGINT) < CAST($1 AS BIGINT)`,
+			`DELETE FROM %s WHERE CAST(%s AS BIGINT) < $1`,
 			p.Table, p.Column,
 		)
 		affected, err := sql.Exec(ctx, query, strconv.FormatInt(cutoff, 10))

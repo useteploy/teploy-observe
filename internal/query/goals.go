@@ -78,7 +78,7 @@ func (s *StatsService) GoalConversions(ctx context.Context, siteID string, from,
 	}
 	totalRows, err := nucleus.Query[countRow](ctx, s.db.SQL(),
 		`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count
-		 FROM events WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)`,
+		 FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
 		siteID, fromMs, toMs,
 	)
 	totalVisitors := int64(0)
@@ -92,11 +92,11 @@ func (s *StatsService) GoalConversions(ctx context.Context, siteID string, from,
 		switch g.GoalType {
 		case "page":
 			q = `SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count
-				 FROM events WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
+				 FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 				   AND event_type = 'pageview' AND pathname = $4`
 		case "event":
 			q = `SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count
-				 FROM events WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
+				 FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 				   AND event_type = $4`
 		default:
 			continue

@@ -58,7 +58,7 @@ func (r *RollupService) RunHourlyRollup(ctx context.Context) error {
 			0 AS total_duration,
 			$3 AS version
 		FROM events
-		WHERE CAST(timestamp AS BIGINT) >= CAST($1 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($2 AS BIGINT)
+		WHERE timestamp >= $1 AND timestamp < $2
 		GROUP BY tenant_id, site_id, (CAST(timestamp AS BIGINT) / 3600000) * 3600000, pathname, event_type`),
 		startMs, endMs, version,
 	)
@@ -81,7 +81,7 @@ func (r *RollupService) RunHourlyRollup(ctx context.Context) error {
 // Runs once per day. ReplacingMergeTree deduplicates by key on merge.
 func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 	now := time.Now().UTC()
-	windowStart := now.Truncate(24*time.Hour).Add(-48 * time.Hour)
+	windowStart := now.Truncate(24 * time.Hour).Add(-48 * time.Hour)
 	windowEnd := now.Truncate(24 * time.Hour).Add(24 * time.Hour)
 
 	startMs := windowStart.UnixMilli()
@@ -119,7 +119,7 @@ func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 			0 AS total_duration,
 			$3 AS version
 		FROM events
-		WHERE CAST(timestamp AS BIGINT) >= CAST($1 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($2 AS BIGINT)
+		WHERE timestamp >= $1 AND timestamp < $2
 		GROUP BY tenant_id, site_id, (CAST(timestamp AS BIGINT) / 86400000) * 86400000, pathname, event_type,
 		         referrer, browser, os, country, device,
 		         utm_source, utm_medium, utm_campaign`),
@@ -154,7 +154,7 @@ func (r *RollupService) updateHLL(ctx context.Context, startMs, endMs int64, buc
 		fmt.Sprintf(`SELECT site_id, session_id,
 			(CAST(timestamp AS BIGINT) / %d) * %d AS bucket
 		 FROM events
-		 WHERE CAST(timestamp AS BIGINT) >= CAST($1 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($2 AS BIGINT)`,
+		 WHERE timestamp >= $1 AND timestamp < $2`,
 			bucketMs, bucketMs),
 		startMs, endMs,
 	)
@@ -253,7 +253,7 @@ func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 			COALESCE(utm_campaign, '') AS utm_campaign,
 			COALESCE(release_tag, '') AS release_tag
 		 FROM events
-		 WHERE CAST(timestamp AS BIGINT) >= CAST($1 AS BIGINT)
+		 WHERE timestamp >= $1
 		 ORDER BY session_id, timestamp`,
 		cutoff,
 	)

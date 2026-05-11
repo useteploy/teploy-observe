@@ -170,8 +170,8 @@ func (s *BoardService) summarizeSite(ctx context.Context, siteID string, fromMs,
 			MAX(CAST(timestamp AS BIGINT)) AS last_ts
 		 FROM events
 		 WHERE site_id = $1
-		   AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT)
-		   AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
+		   AND timestamp >= $2
+		   AND timestamp < $3
 		   AND event_type = 'pageview'`,
 		siteID, from, to,
 	); err == nil && len(r) > 0 {
@@ -191,8 +191,8 @@ func (s *BoardService) summarizeSite(ctx context.Context, siteID string, fromMs,
 		`SELECT COUNT(*) AS errors
 		 FROM error_events
 		 WHERE site_id = $1
-		   AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT)
-		   AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)`,
+		   AND timestamp >= $2
+		   AND timestamp < $3`,
 		siteID, from, to,
 	); err == nil && len(r) > 0 {
 		row.Errors = r[0].Errors
@@ -206,8 +206,8 @@ func (s *BoardService) summarizeSite(ctx context.Context, siteID string, fromMs,
 		`SELECT COUNT(*) AS replay_count
 		 FROM replay_sessions
 		 WHERE site_id = $1
-		   AND CAST(start_time AS BIGINT) >= CAST($2 AS BIGINT)
-		   AND CAST(start_time AS BIGINT) < CAST($3 AS BIGINT)`,
+		   AND start_time >= $2
+		   AND start_time < $3`,
 		siteID, from, to,
 	); err == nil && len(r) > 0 {
 		row.ReplayCount = r[0].ReplayCount
@@ -227,8 +227,8 @@ func (s *BoardService) summarizeSite(ctx context.Context, siteID string, fromMs,
 			SUM(CASE WHEN is_up = 'true' THEN 1 ELSE 0 END) AS up_count
 		 FROM uptime_results
 		 WHERE site_id = $1
-		   AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT)
-		   AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)`,
+		   AND timestamp >= $2
+		   AND timestamp < $3`,
 		siteID, from, to,
 	); err == nil && len(r) > 0 && r[0].Total > 0 {
 		row.UptimePct = float64(r[0].Up) * 100.0 / float64(r[0].Total)
@@ -246,8 +246,8 @@ func (s *BoardService) summarizeSite(ctx context.Context, siteID string, fromMs,
 			`SELECT MAX(CAST(start_time AS BIGINT)) AS last_ts
 			 FROM replay_sessions
 			 WHERE site_id = $1
-			   AND CAST(start_time AS BIGINT) >= CAST($2 AS BIGINT)
-			   AND CAST(start_time AS BIGINT) < CAST($3 AS BIGINT)`,
+			   AND start_time >= $2
+			   AND start_time < $3`,
 			siteID, from, to,
 		); err == nil && len(r) > 0 {
 			row.LastActivityMs = r[0].LastTS

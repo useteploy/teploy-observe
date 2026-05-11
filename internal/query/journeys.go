@@ -48,7 +48,7 @@ func (s *StatsService) Journeys(ctx context.Context, siteID string, from, to tim
 	rows, err := nucleus.Query[journeyEvent](ctx, s.db.SQL(),
 		`SELECT session_id, COALESCE(pathname, '/') AS pathname, timestamp
 		 FROM events
-		 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
+		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		   AND event_type = 'pageview' AND pathname != ''
 		 ORDER BY session_id, timestamp ASC`,
 		siteID, fromMs, toMs,

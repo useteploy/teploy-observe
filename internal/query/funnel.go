@@ -47,7 +47,7 @@ func (s *StatsService) Funnel(ctx context.Context, siteID string, from, to time.
 	rows, err := nucleus.Query[funnelEvent](ctx, s.db.SQL(),
 		`SELECT session_id, event_type, COALESCE(pathname, '') AS pathname, timestamp
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
+		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		 ORDER BY session_id, timestamp ASC`,
 		siteID, fromMs, toMs,
 	)
@@ -131,7 +131,7 @@ func (s *StatsService) FunnelByBreakdown(ctx context.Context, siteID string, fro
 	rows, err := nucleus.Query[breakdownRow](ctx, s.db.SQL(),
 		fmt.Sprintf(`SELECT session_id, event_type, COALESCE(pathname, '') AS pathname, timestamp, %s AS breakdown
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
+		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		 ORDER BY session_id, timestamp ASC`, col),
 		siteID, fromMs, toMs,
 	)

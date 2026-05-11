@@ -221,7 +221,7 @@ func (s *AlertService) CheckRules(ctx context.Context) error {
 			}
 			crows, err := nucleus.Query[countRow](ctx, s.db.SQL(),
 				`SELECT COUNT(*) AS count FROM alert_history
-				 WHERE rule_id = $1 AND triggered_at >= CAST($2 AS BIGINT)`,
+				 WHERE rule_id = $1 AND triggered_at >= $2`,
 				rule.RuleID, cooldownFrom)
 			if err == nil && len(crows) > 0 && crows[0].Count > 0 {
 				continue
@@ -268,13 +268,13 @@ func (s *AlertService) queryMetric(ctx context.Context, siteID, metric, fromMs, 
 	var q string
 	switch metric {
 	case "pageviews":
-		q = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM events WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT) AND event_type = 'pageview'`
+		q = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3 AND event_type = 'pageview'`
 	case "visitors":
-		q = `SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS value FROM events WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)`
+		q = `SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS value FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`
 	case "error_count":
-		q = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM error_events WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)`
+		q = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM error_events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`
 	case "error_rate":
-		q = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM error_events WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)`
+		q = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM error_events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`
 	default:
 		return 0, fmt.Errorf("unknown metric: %s", metric)
 	}

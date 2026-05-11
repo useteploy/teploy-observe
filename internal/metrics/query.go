@@ -216,8 +216,8 @@ func (s *Service) QuerySeries(ctx context.Context, siteID, name string, labels m
 		`SELECT ts_ns, value, histogram, metric_kind, attributes
 		 FROM metric_points
 		 WHERE site_id = $1 AND metric_name = $2
-		   AND CAST(ts_ns AS BIGINT) >= CAST($3 AS BIGINT)
-		   AND CAST(ts_ns AS BIGINT) < CAST($4 AS BIGINT)
+		   AND ts_ns >= $3
+		   AND ts_ns < $4
 		 ORDER BY ts_ns ASC`,
 		siteID, name,
 		dbutil.IntParam(fromNs),
@@ -365,9 +365,9 @@ func rateReduce(rows []pointRow, stepMs int64) []Point {
 		return []Point{}
 	}
 	type acc struct {
-		sum   float64
-		n     int
-		tsMs  int64
+		sum  float64
+		n    int
+		tsMs int64
 	}
 	buckets := map[int64]*acc{}
 	keys := []int64{}

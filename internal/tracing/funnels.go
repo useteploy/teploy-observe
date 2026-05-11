@@ -30,8 +30,8 @@ type FunnelStep struct {
 
 // FunnelResult is the funnel computation result returned to clients.
 type FunnelResult struct {
-	Steps      []FunnelStep `json:"steps"`
-	TotalTraces int64       `json:"total_traces"`
+	Steps       []FunnelStep `json:"steps"`
+	TotalTraces int64        `json:"total_traces"`
 }
 
 // funnelSpan is the minimal projection of a span needed for funnel
@@ -77,8 +77,8 @@ func (q *QueryService) FunnelByOps(ctx context.Context, siteID string, ops []str
 		`SELECT trace_id, operation_name, CAST(start_time AS TEXT) AS start_time
 		 FROM spans
 		 WHERE site_id = $1
-		   AND CAST(start_time AS BIGINT) >= CAST($2 AS BIGINT)
-		   AND CAST(start_time AS BIGINT) < CAST($3 AS BIGINT)
+		   AND start_time >= $2
+		   AND start_time < $3
 		   AND operation_name IN (%s)`,
 		strings.Join(placeholders, ","),
 	)
@@ -102,8 +102,8 @@ func computeFunnel(rows []funnelSpan, ops []string) FunnelResult {
 
 	// Bucket by trace_id, keep (op, startMs) pairs.
 	type spanRef struct {
-		op  string
-		ts  int64
+		op string
+		ts int64
 	}
 	byTrace := make(map[string][]spanRef)
 	for _, r := range rows {

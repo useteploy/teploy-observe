@@ -14,12 +14,12 @@ import (
 
 // Snapshot is the wire shape of GET /api/v1/meta.
 type Snapshot struct {
-	GeneratedAt  time.Time     `json:"generated_at"`
-	Version      string        `json:"version"`
-	Uptime       string        `json:"uptime"`
-	IngestRate   IngestMetrics `json:"ingest"`
-	Tables       []TableSize   `json:"tables"`
-	Retention    []Policy      `json:"retention"`
+	GeneratedAt time.Time     `json:"generated_at"`
+	Version     string        `json:"version"`
+	Uptime      string        `json:"uptime"`
+	IngestRate  IngestMetrics `json:"ingest"`
+	Tables      []TableSize   `json:"tables"`
+	Retention   []Policy      `json:"retention"`
 }
 
 // IngestMetrics measures what's coming in over the last minute.
@@ -104,7 +104,7 @@ type countRow struct {
 
 func (s *Service) countSince(ctx context.Context, table, col string, since time.Time) int64 {
 	query := fmt.Sprintf(
-		`SELECT COUNT(*) AS count FROM %s WHERE CAST(%s AS BIGINT) >= CAST($1 AS BIGINT)`,
+		`SELECT COUNT(*) AS count FROM %s WHERE CAST(%s AS BIGINT) >= $1`,
 		table, col,
 	)
 	rows, err := nucleus.Query[countRow](ctx, s.db.SQL(), query, since.UnixMilli())

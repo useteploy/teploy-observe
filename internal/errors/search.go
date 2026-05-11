@@ -241,8 +241,8 @@ func (s *SearchService) ReindexAll(
 					fmt.Sprintf(`SELECT error_id, error_type, error_value, site_id,
 						CAST(timestamp AS BIGINT) AS timestamp
 						FROM error_events
-						WHERE (CAST(timestamp AS BIGINT) > $1)
-						   OR (CAST(timestamp AS BIGINT) = $1 AND error_id > $2)
+						WHERE (timestamp > $1)
+						   OR (timestamp = $1 AND error_id > $2)
 						ORDER BY timestamp ASC, error_id ASC
 						LIMIT %d`, batch),
 					strconv.FormatInt(lastTS, 10), lastID)
@@ -263,8 +263,8 @@ func (s *SearchService) ReindexAll(
 						CAST(timestamp AS BIGINT) AS timestamp
 						FROM error_events
 						WHERE site_id = $1
-						  AND ((CAST(timestamp AS BIGINT) > $2)
-						       OR (CAST(timestamp AS BIGINT) = $2 AND error_id > $3))
+						  AND ((timestamp > $2)
+						       OR (timestamp = $2 AND error_id > $3))
 						ORDER BY timestamp ASC, error_id ASC
 						LIMIT %d`, batch),
 					siteID, strconv.FormatInt(lastTS, 10), lastID)
@@ -313,7 +313,7 @@ func (s *SearchService) ErrorCount(ctx context.Context, siteID string, fromMs, t
 	}
 	rows, err := nucleus.Query[countResult](ctx, s.db.SQL(),
 		`SELECT COUNT(*) AS count FROM error_events
-		 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)`,
+		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
 		siteID, strconv.FormatInt(fromMs, 10), strconv.FormatInt(toMs, 10),
 	)
 	if err != nil || len(rows) == 0 {

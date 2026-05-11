@@ -48,7 +48,7 @@ type Panel struct {
 	PanelID     string `json:"panel_id" db:"panel_id"`
 	TenantID    string `json:"-" db:"tenant_id"`
 	DashboardID string `json:"dashboard_id" db:"dashboard_id"`
-	PanelType   string `json:"panel_type" db:"panel_type"`     // metric, timeseries, table, bar
+	PanelType   string `json:"panel_type" db:"panel_type"` // metric, timeseries, table, bar
 	Title       string `json:"title" db:"title"`
 	QueryType   string `json:"query_type" db:"query_type"`     // pageviews, visitors, errors, custom_sql
 	QueryConfig string `json:"query_config" db:"query_config"` // JSONB
@@ -65,14 +65,14 @@ type Panel struct {
 // as the AND-joined label map, plus three new fields (Agg, Step, GroupBy)
 // that map 1:1 onto metrics.QueryOptions.
 type PanelConfig struct {
-	Metric   string            `json:"metric,omitempty"`    // for metric / metric_series panels
-	GroupBy  string            `json:"group_by,omitempty"`  // table/bar panels = single key; metric_series = comma-separated
-	Filters  map[string]string `json:"filters,omitempty"`   // metric_series = label filter map; also used as `labels`
-	Labels   map[string]string `json:"labels,omitempty"`    // metric_series alias of Filters (Filters wins if both set)
-	Interval string            `json:"interval,omitempty"`  // timeseries
-	SQL      string            `json:"sql,omitempty"`       // custom SQL
-	Agg      string            `json:"agg,omitempty"`       // metric_series — last|avg|sum|min|max|rate|p50|p95|p99
-	Step     string            `json:"step,omitempty"`      // metric_series — bucket size, e.g. "60s"
+	Metric   string            `json:"metric,omitempty"`   // for metric / metric_series panels
+	GroupBy  string            `json:"group_by,omitempty"` // table/bar panels = single key; metric_series = comma-separated
+	Filters  map[string]string `json:"filters,omitempty"`  // metric_series = label filter map; also used as `labels`
+	Labels   map[string]string `json:"labels,omitempty"`   // metric_series alias of Filters (Filters wins if both set)
+	Interval string            `json:"interval,omitempty"` // timeseries
+	SQL      string            `json:"sql,omitempty"`      // custom SQL
+	Agg      string            `json:"agg,omitempty"`      // metric_series — last|avg|sum|min|max|rate|p50|p95|p99
+	Step     string            `json:"step,omitempty"`     // metric_series — bucket size, e.g. "60s"
 }
 
 func (s *DashboardService) Create(ctx context.Context, siteID, name, description, createdBy string) (*Dashboard, error) {
@@ -158,10 +158,18 @@ func (s *DashboardService) AddPanel(ctx context.Context, dashboardID string, pan
 		}
 	}
 
-	if panel.Width == "" { panel.Width = "6" }
-	if panel.Height == "" { panel.Height = "4" }
-	if panel.PositionX == "" { panel.PositionX = "0" }
-	if panel.PositionY == "" { panel.PositionY = "0" }
+	if panel.Width == "" {
+		panel.Width = "6"
+	}
+	if panel.Height == "" {
+		panel.Height = "4"
+	}
+	if panel.PositionX == "" {
+		panel.PositionX = "0"
+	}
+	if panel.PositionY == "" {
+		panel.PositionY = "0"
+	}
 
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO dashboard_panels (panel_id, tenant_id, dashboard_id, panel_type, title, query_type, query_config, position_x, position_y, width, height, version)
@@ -265,30 +273,42 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 
 	switch panel.QueryType {
 	case "pageviews":
-		type r struct{ Count string `db:"count"` }
+		type r struct {
+			Count string `db:"count"`
+		}
 		rows, err := nucleus.Query[r](ctx, sql,
 			`SELECT CAST(COUNT(*) AS TEXT) AS count FROM events
-			 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT) AND event_type = 'pageview'`,
+			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3 AND event_type = 'pageview'`,
 			siteID, from, to)
-		if err != nil || len(rows) == 0 { return map[string]string{"value": "0"}, nil }
+		if err != nil || len(rows) == 0 {
+			return map[string]string{"value": "0"}, nil
+		}
 		return map[string]string{"value": rows[0].Count}, nil
 
 	case "visitors":
-		type r struct{ Count string `db:"count"` }
+		type r struct {
+			Count string `db:"count"`
+		}
 		rows, err := nucleus.Query[r](ctx, sql,
 			`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count FROM events
-			 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)`,
+			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
 			siteID, from, to)
-		if err != nil || len(rows) == 0 { return map[string]string{"value": "0"}, nil }
+		if err != nil || len(rows) == 0 {
+			return map[string]string{"value": "0"}, nil
+		}
 		return map[string]string{"value": rows[0].Count}, nil
 
 	case "errors":
-		type r struct{ Count string `db:"count"` }
+		type r struct {
+			Count string `db:"count"`
+		}
 		rows, err := nucleus.Query[r](ctx, sql,
 			`SELECT CAST(COUNT(*) AS TEXT) AS count FROM error_events
-			 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)`,
+			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
 			siteID, from, to)
-		if err != nil || len(rows) == 0 { return map[string]string{"value": "0"}, nil }
+		if err != nil || len(rows) == 0 {
+			return map[string]string{"value": "0"}, nil
+		}
 		return map[string]string{"value": rows[0].Count}, nil
 
 	default:

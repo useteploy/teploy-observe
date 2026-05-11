@@ -35,8 +35,8 @@ func (s *IssueService) ReleaseHealthList(ctx context.Context, siteID string, fro
 			MAX(CAST(timestamp AS BIGINT)) AS last_seen
 		 FROM error_events
 		 WHERE site_id = $1
-		   AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT)
-		   AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
+		   AND timestamp >= $2
+		   AND timestamp < $3
 		   AND release_tag != ''
 		 GROUP BY release_tag
 		 ORDER BY last_seen DESC
@@ -58,15 +58,15 @@ func (s *IssueService) ReleaseHealthList(ctx context.Context, siteID string, fro
 // error and one session has rate 1.0; a release with zero errors and
 // 1000 sessions has rate 0.0.
 type ReleaseStat struct {
-	ReleaseTag         string  `json:"release_tag"`
-	Sessions           int64   `json:"sessions"`
-	CrashedSessions    int64   `json:"crashed_sessions"`
+	ReleaseTag          string  `json:"release_tag"`
+	Sessions            int64   `json:"sessions"`
+	CrashedSessions     int64   `json:"crashed_sessions"`
 	CrashFreeSessionPct float64 `json:"crash_free_session_pct"`
-	AdoptionPct        float64 `json:"adoption_pct"`
-	Errors             int64   `json:"errors"`
-	ErrorRate          float64 `json:"error_rate"`
-	FirstSeen          int64   `json:"first_seen_ms"`
-	LastSeen           int64   `json:"last_seen_ms"`
+	AdoptionPct         float64 `json:"adoption_pct"`
+	Errors              int64   `json:"errors"`
+	ErrorRate           float64 `json:"error_rate"`
+	FirstSeen           int64   `json:"first_seen_ms"`
+	LastSeen            int64   `json:"last_seen_ms"`
 }
 
 // ReleaseHealthService computes per-release health from sessions +
@@ -101,8 +101,8 @@ func (s *ReleaseHealthService) Health(ctx context.Context, siteID string, fromMs
 			MAX(CAST(last_ts AS BIGINT)) AS last_seen
 		 FROM sessions
 		 WHERE site_id = $1
-		   AND CAST(first_ts AS BIGINT) >= CAST($2 AS BIGINT)
-		   AND CAST(first_ts AS BIGINT) < CAST($3 AS BIGINT)
+		   AND first_ts >= $2
+		   AND first_ts < $3
 		 GROUP BY release_tag`,
 		siteID, strconv.FormatInt(fromMs, 10), strconv.FormatInt(toMs, 10),
 	)
@@ -123,8 +123,8 @@ func (s *ReleaseHealthService) Health(ctx context.Context, siteID string, fromMs
 			COUNT(DISTINCT session_id) AS crashed_sessions
 		 FROM error_events
 		 WHERE site_id = $1
-		   AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT)
-		   AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
+		   AND timestamp >= $2
+		   AND timestamp < $3
 		   AND level IN ('error', 'fatal')
 		   AND session_id != ''
 		 GROUP BY release_tag`,
@@ -210,8 +210,8 @@ func (s *ReleaseHealthService) Sparkline(ctx context.Context, siteID, releaseTag
 		 FROM sessions
 		 WHERE site_id = $1
 		   AND release_tag = $2
-		   AND CAST(first_ts AS BIGINT) >= CAST($3 AS BIGINT)
-		   AND CAST(first_ts AS BIGINT) < CAST($4 AS BIGINT)
+		   AND first_ts >= $3
+		   AND first_ts < $4
 		 GROUP BY (CAST(first_ts AS BIGINT) / 86400000) * 86400000`,
 		siteID, releaseTag, fromMs, toMs,
 	)
@@ -231,8 +231,8 @@ func (s *ReleaseHealthService) Sparkline(ctx context.Context, siteID, releaseTag
 		   AND release_tag = $2
 		   AND level IN ('error', 'fatal')
 		   AND session_id != ''
-		   AND CAST(timestamp AS BIGINT) >= CAST($3 AS BIGINT)
-		   AND CAST(timestamp AS BIGINT) < CAST($4 AS BIGINT)
+		   AND timestamp >= $3
+		   AND timestamp < $4
 		 GROUP BY (CAST(timestamp AS BIGINT) / 86400000) * 86400000`,
 		siteID, releaseTag, fromMs, toMs,
 	)

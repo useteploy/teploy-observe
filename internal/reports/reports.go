@@ -73,14 +73,14 @@ func (s *ReportService) Delete(ctx context.Context, scheduleID string) error {
 
 // ReportData holds the metrics for a report email.
 type ReportData struct {
-	SiteID     string
-	SiteName   string
-	Period     string
-	Pageviews  string
-	Visitors   string
-	Sessions   string
-	Errors     string
-	TopPages   []string
+	SiteID    string
+	SiteName  string
+	Period    string
+	Pageviews string
+	Visitors  string
+	Sessions  string
+	Errors    string
+	TopPages  []string
 }
 
 // RunScheduled checks all enabled schedules and sends reports that are due.
@@ -159,7 +159,7 @@ func (s *ReportService) gatherData(ctx context.Context, sched ReportSchedule) Re
 
 	// Pageviews
 	rows, _ := nucleus.Query[countRow](ctx, s.db.SQL(),
-		`SELECT CAST(COUNT(*) AS TEXT) AS count FROM events WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT) AND event_type = 'pageview'`,
+		`SELECT CAST(COUNT(*) AS TEXT) AS count FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3 AND event_type = 'pageview'`,
 		sched.SiteID, fromMs, toMs)
 	if len(rows) > 0 {
 		data.Pageviews = rows[0].Count
@@ -167,7 +167,7 @@ func (s *ReportService) gatherData(ctx context.Context, sched ReportSchedule) Re
 
 	// Visitors
 	rows, _ = nucleus.Query[countRow](ctx, s.db.SQL(),
-		`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count FROM events WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`,
+		`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
 		sched.SiteID, fromMs, toMs)
 	if len(rows) > 0 {
 		data.Visitors = rows[0].Count
@@ -175,7 +175,7 @@ func (s *ReportService) gatherData(ctx context.Context, sched ReportSchedule) Re
 
 	// Errors
 	rows, _ = nucleus.Query[countRow](ctx, s.db.SQL(),
-		`SELECT CAST(COUNT(*) AS TEXT) AS count FROM error_events WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`,
+		`SELECT CAST(COUNT(*) AS TEXT) AS count FROM error_events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
 		sched.SiteID, fromMs, toMs)
 	if len(rows) > 0 {
 		data.Errors = rows[0].Count
@@ -197,7 +197,12 @@ func buildEmailHTML(data ReportData) string {
 </table>
 </div>
 </body></html>`, data.Period, data.Pageviews, data.Visitors,
-		func() string { if data.Errors != "0" { return "#ef4444" }; return "#09090b" }(),
+		func() string {
+			if data.Errors != "0" {
+				return "#ef4444"
+			}
+			return "#09090b"
+		}(),
 		data.Errors)
 }
 

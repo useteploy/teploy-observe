@@ -38,10 +38,12 @@ type ServiceSummary struct {
 const apdexThresholdMs int64 = 500
 
 // apdex computes the Apdex score (0..1) for a slice of durations.
-//   satisfied = duration <= t
-//   tolerated = t < duration <= 4t
-//   frustrated = duration > 4t
-//   score = (satisfied + tolerated/2) / total
+//
+//	satisfied = duration <= t
+//	tolerated = t < duration <= 4t
+//	frustrated = duration > 4t
+//	score = (satisfied + tolerated/2) / total
+//
 // Returns 0 for an empty input.
 func apdex(durations []int64, t int64) float64 {
 	if len(durations) == 0 || t <= 0 {
@@ -78,7 +80,7 @@ func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to
 	rows, err := nucleus.Query[rawStat](ctx, q.db.SQL(),
 		`SELECT service_name, request_count, error_count, duration_sum, p50_ms, p95_ms, p99_ms
 		 FROM service_stats
-		 WHERE site_id = $1 AND CAST(ts_bucket AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(ts_bucket AS BIGINT) < CAST($3 AS BIGINT)`,
+		 WHERE site_id = $1 AND ts_bucket >= $2 AND ts_bucket < $3`,
 		siteID, fromMs, toMs,
 	)
 	if err != nil {
@@ -146,8 +148,8 @@ func (q *QueryService) serviceApdex(ctx context.Context, siteID string, from, to
 		`SELECT service_name, CAST(duration_ms AS TEXT) AS duration_ms
 		 FROM spans
 		 WHERE site_id = $1 AND parent_span_id = ''
-		   AND CAST(start_time AS BIGINT) >= CAST($2 AS BIGINT)
-		   AND CAST(start_time AS BIGINT) < CAST($3 AS BIGINT)`,
+		   AND start_time >= $2
+		   AND start_time < $3`,
 		siteID, fromMs, toMs,
 	)
 	if err != nil {
@@ -193,7 +195,7 @@ func (q *QueryService) ListOperations(ctx context.Context, siteID, service strin
 	rows, err := nucleus.Query[rawStat](ctx, q.db.SQL(),
 		`SELECT operation_name, request_count, error_count, duration_sum, p50_ms, p95_ms, p99_ms
 		 FROM service_stats
-		 WHERE site_id = $1 AND service_name = $2 AND CAST(ts_bucket AS BIGINT) >= CAST($3 AS BIGINT) AND CAST(ts_bucket AS BIGINT) < CAST($4 AS BIGINT)`,
+		 WHERE site_id = $1 AND service_name = $2 AND ts_bucket >= $3 AND ts_bucket < $4`,
 		siteID, service, fromMs, toMs,
 	)
 	if err != nil {
@@ -267,7 +269,7 @@ func (q *QueryService) SearchTraces(ctx context.Context, siteID string, from, to
 
 	// start_time is stored as TEXT (digit-string) and Nucleus doesn't coerce it
 	// to BIGINT for the comparison — both sides need an explicit cast.
-	where := "site_id = $1 AND CAST(start_time AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(start_time AS BIGINT) < CAST($3 AS BIGINT)"
+	where := "site_id = $1 AND start_time >= $2 AND start_time < $3"
 	params := []any{siteID, fromMs, toMs}
 	idx := 4
 
@@ -375,8 +377,8 @@ func (q *QueryService) ServiceDependencies(ctx context.Context, siteID string, f
 		`SELECT src_service, dst_service, call_count, error_count, avg_duration
 		 FROM service_dependencies
 		 WHERE site_id = $1
-		   AND CAST(ts_bucket AS BIGINT) >= CAST($2 AS BIGINT)
-		   AND CAST(ts_bucket AS BIGINT) < CAST($3 AS BIGINT)`,
+		   AND ts_bucket >= $2
+		   AND ts_bucket < $3`,
 		siteID, fromMs, toMs,
 	)
 	if err != nil {
@@ -468,8 +470,8 @@ func (q *QueryService) ListPerformanceIssues(ctx context.Context, siteID string,
 			CAST(last_seen AS TEXT) AS last_seen
 		 FROM performance_issues
 		 WHERE site_id = $1
-		   AND CAST(last_seen AS BIGINT) >= CAST($2 AS BIGINT)
-		   AND CAST(first_seen AS BIGINT) <= CAST($3 AS BIGINT)`,
+		   AND last_seen >= $2
+		   AND first_seen <= $3`,
 		siteID, dbutil.IntParam(fromMs), dbutil.IntParam(toMs),
 	)
 	if err != nil {
@@ -481,10 +483,10 @@ func (q *QueryService) ListPerformanceIssues(ctx context.Context, siteID string,
 	// to fold post-CAST in case multiple bucket fires landed in this
 	// window.
 	type acc struct {
-		row       row
-		count     int64
-		first     int64
-		last      int64
+		row   row
+		count int64
+		first int64
+		last  int64
 	}
 	by := make(map[string]*acc)
 	for _, r := range rows {
@@ -547,7 +549,7 @@ func (q *QueryService) TraceErrors(ctx context.Context, traceID, siteID string) 
 			CAST(timestamp AS TEXT) AS timestamp,
 			issue_id
 		 FROM error_events
-		 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) <= CAST($3 AS BIGINT)
+		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp <= $3
 		 ORDER BY timestamp ASC`,
 		siteID, b[0].MinT, b[0].MaxT,
 	)

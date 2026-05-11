@@ -9,7 +9,7 @@
 //     refresh is implicit on every read. Materialization is a phase-2
 //     concern (cohort_members table + periodic refresh per the design
 //     doc); v1 keeps the contract simple.
-//   - Anonymous rows (distinct_id = '') are excluded by default. The
+//   - Anonymous rows (distinct_id = ”) are excluded by default. The
 //     caller can opt them in with a flag — useful for ops who haven't
 //     wired identify() yet and want to see traffic shape.
 //   - All aggregates scan as native int64 in Go (per nucleus dogfood
@@ -110,8 +110,8 @@ func (s *Service) ListPersons(ctx context.Context, siteID string, fromMs, toMs i
 	        MAX(browser) AS top_browser
 	 FROM events
 	 WHERE site_id = $1
-	   AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT)
-	   AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
+	   AND timestamp >= $2
+	   AND timestamp < $3
 	   %s
 	 GROUP BY distinct_id
 	 ORDER BY last_seen_ms DESC
@@ -128,7 +128,7 @@ func (s *Service) ListPersons(ctx context.Context, siteID string, fromMs, toMs i
 }
 
 // PersonDetail returns the aggregate row for distinctID plus the most
-// recent 100 events as a vertical timeline. distinctID = '' returns an
+// recent 100 events as a vertical timeline. distinctID = ” returns an
 // empty result on purpose — anonymous-aggregated detail makes no sense.
 func (s *Service) PersonDetail(ctx context.Context, siteID, distinctID string) (PersonDetail, error) {
 	if siteID == "" || distinctID == "" {
@@ -201,8 +201,8 @@ func (s *Service) CountPersons(ctx context.Context, siteID string, fromMs, toMs 
 	q := fmt.Sprintf(`SELECT COUNT(DISTINCT distinct_id) AS total
 	 FROM events
 	 WHERE site_id = $1
-	   AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT)
-	   AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
+	   AND timestamp >= $2
+	   AND timestamp < $3
 	   %s`, anonClause)
 
 	rows, err := nucleus.Query[countRow](ctx, s.db.SQL(), q, siteID, from, to)

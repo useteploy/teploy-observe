@@ -112,11 +112,11 @@ func (s *LLMService) Ingest(ctx context.Context, input LLMInput) (LLMResponse, e
 
 // LLMStats returns aggregate LLM usage statistics.
 type LLMStats struct {
-	TotalCalls       string `json:"total_calls" db:"total_calls"`
-	TotalTokens      string `json:"total_tokens" db:"total_tokens"`
-	TotalCostUSD     string `json:"total_cost_usd" db:"total_cost_usd"`
-	AvgLatencyMs     string `json:"avg_latency_ms" db:"avg_latency_ms"`
-	ErrorCount       string `json:"error_count" db:"error_count"`
+	TotalCalls   string `json:"total_calls" db:"total_calls"`
+	TotalTokens  string `json:"total_tokens" db:"total_tokens"`
+	TotalCostUSD string `json:"total_cost_usd" db:"total_cost_usd"`
+	AvgLatencyMs string `json:"avg_latency_ms" db:"avg_latency_ms"`
+	ErrorCount   string `json:"error_count" db:"error_count"`
 }
 
 type ModelStats struct {
@@ -158,7 +158,7 @@ func (s *LLMService) Stats(ctx context.Context, siteID string, from, to time.Tim
 			COALESCE(SUM(CAST(cost_usd AS DOUBLE)), 0) AS cost,
 			COALESCE(AVG(CAST(latency_ms AS BIGINT)), 0) AS latency,
 			COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) AS errors
-		 FROM llm_traces WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)`,
+		 FROM llm_traces WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
 		siteID, fromMs, toMs,
 	)
 	if err != nil {
@@ -205,7 +205,7 @@ func (s *LLMService) ModelBreakdown(ctx context.Context, siteID string, from, to
 			COALESCE(SUM(CAST(total_tokens AS BIGINT)), 0) AS total_tokens,
 			COALESCE(SUM(CAST(cost_usd AS DOUBLE)), 0) AS total_cost_usd,
 			COALESCE(AVG(CAST(latency_ms AS BIGINT)), 0) AS avg_latency_ms
-		 FROM llm_traces WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
+		 FROM llm_traces WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		 GROUP BY model, provider
 		 ORDER BY call_count DESC`,
 		siteID, fromMs, toMs,
@@ -228,7 +228,9 @@ func (s *LLMService) ModelBreakdown(ctx context.Context, siteID string, from, to
 }
 
 func (s *LLMService) RecentTraces(ctx context.Context, siteID string, limit int) ([]LLMTrace, error) {
-	if limit <= 0 { limit = 20 }
+	if limit <= 0 {
+		limit = 20
+	}
 	return nucleus.Query[LLMTrace](ctx, s.db.SQL(),
 		fmt.Sprintf(`SELECT trace_id, tenant_id, site_id, session_id, span_id, timestamp,
 			model, provider, operation, prompt_tokens, completion_tokens, total_tokens,
@@ -246,16 +248,18 @@ func estimateCost(model string, promptTokens, completionTokens int) float64 {
 	// Prices per 1K tokens (approximate, 2026 pricing)
 	type pricing struct{ input, output float64 }
 	prices := map[string]pricing{
-		"gpt-4":         {0.03, 0.06},
-		"gpt-4-turbo":   {0.01, 0.03},
-		"gpt-4o":        {0.005, 0.015},
-		"gpt-3.5-turbo": {0.0005, 0.0015},
-		"claude-3-opus": {0.015, 0.075},
+		"gpt-4":           {0.03, 0.06},
+		"gpt-4-turbo":     {0.01, 0.03},
+		"gpt-4o":          {0.005, 0.015},
+		"gpt-3.5-turbo":   {0.0005, 0.0015},
+		"claude-3-opus":   {0.015, 0.075},
 		"claude-3-sonnet": {0.003, 0.015},
-		"claude-3-haiku": {0.00025, 0.00125},
+		"claude-3-haiku":  {0.00025, 0.00125},
 	}
 	p, ok := prices[model]
-	if !ok { p = pricing{0.001, 0.002} } // default
+	if !ok {
+		p = pricing{0.001, 0.002}
+	} // default
 	return (float64(promptTokens)/1000)*p.input + (float64(completionTokens)/1000)*p.output
 }
 

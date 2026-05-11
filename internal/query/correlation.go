@@ -15,14 +15,14 @@ import (
 
 // Correlation represents a property value correlated with a target event.
 type Correlation struct {
-	Property   string  `json:"property"`
-	Value      string  `json:"value"`
-	Uplift     float64 `json:"uplift"`      // % increase vs baseline
-	Occurrences int    `json:"occurrences"` // how many times this property+value appeared
-	Conversions int    `json:"conversions"` // how many converted
-	Rate        float64 `json:"rate"`       // conversion rate for this segment
+	Property     string  `json:"property"`
+	Value        string  `json:"value"`
+	Uplift       float64 `json:"uplift"`      // % increase vs baseline
+	Occurrences  int     `json:"occurrences"` // how many times this property+value appeared
+	Conversions  int     `json:"conversions"` // how many converted
+	Rate         float64 `json:"rate"`        // conversion rate for this segment
 	BaselineRate float64 `json:"baseline_rate"`
-	Significant  bool   `json:"significant"`
+	Significant  bool    `json:"significant"`
 }
 
 type correlationEvent struct {
@@ -42,7 +42,7 @@ func (s *StatsService) CorrelationAnalysis(ctx context.Context, siteID, targetEv
 	rows, err := nucleus.Query[correlationEvent](ctx, s.db.SQL(),
 		`SELECT session_id, event_type, COALESCE(properties, '') AS properties
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)
+		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		 ORDER BY session_id`,
 		siteID, fromMs, toMs,
 	)
@@ -133,7 +133,7 @@ func (s *StatsService) CorrelationAnalysis(ctx context.Context, siteID, targetEv
 			pooledP := float64(totalConverted) / float64(totalSessions)
 			se := math.Sqrt(pooledP * (1 - pooledP) * (1.0/float64(pv.occurrences) + 1.0/float64(totalSessions-pv.occurrences)))
 			if se > 0 {
-				z := math.Abs(rate - baselineRate) / se
+				z := math.Abs(rate-baselineRate) / se
 				significant = z > 1.96 // p < 0.05
 			}
 		}

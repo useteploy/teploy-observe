@@ -100,7 +100,9 @@ func (s *InfraService) ListHosts(ctx context.Context, siteID string) ([]HostSumm
 }
 
 func (s *InfraService) HostHistory(ctx context.Context, siteID, hostname string, from, to time.Time, limit int) ([]HostMetric, error) {
-	if limit <= 0 { limit = 100 }
+	if limit <= 0 {
+		limit = 100
+	}
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 	return nucleus.Query[HostMetric](ctx, s.db.SQL(),
@@ -108,7 +110,7 @@ func (s *InfraService) HostHistory(ctx context.Context, siteID, hostname string,
 			cpu_percent, memory_percent, memory_used_mb, memory_total_mb,
 			disk_percent, disk_used_gb, disk_total_gb,
 			net_rx_bytes, net_tx_bytes, load_1m, load_5m, load_15m
-		 FROM host_metrics WHERE site_id = $1 AND hostname = $2 AND CAST(timestamp AS BIGINT) >= CAST($3 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($4 AS BIGINT)
+		 FROM host_metrics WHERE site_id = $1 AND hostname = $2 AND timestamp >= $3 AND timestamp < $4
 		 ORDER BY timestamp DESC LIMIT %d`, limit),
 		siteID, hostname, fromMs, toMs,
 	)

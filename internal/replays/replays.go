@@ -107,8 +107,8 @@ type IngestInput struct {
 	// DistinctID, when present, is the user identifier the SDK passed
 	// via identify(userId). Hashed with the per-site session_salt
 	// before storage.
-	DistinctID    string `json:"distinct_id,omitempty"`
-	Events        []struct {
+	DistinctID string `json:"distinct_id,omitempty"`
+	Events     []struct {
 		Type      string `json:"type"`
 		Timestamp int64  `json:"timestamp"`
 		Data      any    `json:"data"`
@@ -283,7 +283,7 @@ func (s *ReplayService) ListReplays(ctx context.Context, siteID string, from, to
 			CAST(start_time AS TEXT) AS start_time,
 			duration_ms, page_count, url, browser, os, device, has_error
 		 FROM replay_sessions
-		 WHERE site_id = $1 AND CAST(start_time AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(start_time AS BIGINT) < CAST($3 AS BIGINT)
+		 WHERE site_id = $1 AND start_time >= $2 AND start_time < $3
 		 ORDER BY start_time DESC
 		 LIMIT %d OFFSET %d`, limit, offset),
 		siteID, fromMs, toMs,

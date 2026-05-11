@@ -61,12 +61,12 @@ func NewService(db *nucleus.Client) *Service {
 // attributes (country, browser, etc.) on each event.
 type Rule struct {
 	Type     string `json:"type"`
-	Name     string `json:"name,omitempty"`     // event type for type=event
-	Window   string `json:"window,omitempty"`   // e.g. "30d" / "7d" / "24h" — type=event
+	Name     string `json:"name,omitempty"`      // event type for type=event
+	Window   string `json:"window,omitempty"`    // e.g. "30d" / "7d" / "24h" — type=event
 	MinCount int    `json:"min_count,omitempty"` // type=event; >=1 means "at least one"
-	Key      string `json:"key,omitempty"`      // column for type=property
-	Operator string `json:"operator,omitempty"` // "=" / "!=" — type=property
-	Value    string `json:"value,omitempty"`    // type=property
+	Key      string `json:"key,omitempty"`       // column for type=property
+	Operator string `json:"operator,omitempty"`  // "=" / "!=" — type=property
+	Value    string `json:"value,omitempty"`     // type=property
 }
 
 // Definition is the full saved cohort rule. Op is "and" for v1; "or"
@@ -107,7 +107,7 @@ func ParseDefinition(rule string) (Definition, error) {
 }
 
 // EvaluateCohort returns the list of distinct_ids that match the given
-// rule for siteID. Anonymous (distinct_id = '') is always excluded
+// rule for siteID. Anonymous (distinct_id = ”) is always excluded
 // from cohort membership; a cohort of "anonymous users" is not a
 // useful concept.
 func (s *Service) EvaluateCohort(ctx context.Context, siteID string, def Definition) ([]string, error) {
@@ -208,7 +208,7 @@ func (s *Service) evalEventRule(ctx context.Context, siteID string, r Rule) ([]s
 	 FROM events
 	 WHERE site_id = $1
 	   AND event_type = $2
-	   AND CAST(timestamp AS BIGINT) >= CAST($3 AS BIGINT)
+	   AND timestamp >= $3
 	   AND distinct_id != ''
 	 GROUP BY distinct_id`
 	rows, err := nucleus.Query[countedRow](ctx, s.db.SQL(), q, siteID, r.Name, from)
@@ -474,7 +474,7 @@ func (s *Service) Refresh(ctx context.Context, siteID, cohortID string) (*Cohort
 	return s.Update(ctx, siteID, cohortID, existing.Name, existing.Description, def)
 }
 
-// Delete soft-deletes a cohort by writing a tombstone row (name='').
+// Delete soft-deletes a cohort by writing a tombstone row (name=”).
 // Hard DELETE is unreliable across replacing_mergetree merges in
 // Nucleus today (finding #10 family); a tombstone is the safe pattern.
 //

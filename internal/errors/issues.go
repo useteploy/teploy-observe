@@ -304,7 +304,7 @@ func (s *IssueService) DailyCounts(ctx context.Context, siteID string, days int)
 		`SELECT (CAST(timestamp AS BIGINT) / 86400000) * 86400000 AS bucket,
 		        COUNT(*) AS count
 		 FROM error_events
-		 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT)
+		 WHERE site_id = $1 AND timestamp >= $2
 		 GROUP BY (CAST(timestamp AS BIGINT) / 86400000) * 86400000
 		 ORDER BY bucket ASC`,
 		siteID, fromMs,
@@ -321,7 +321,7 @@ func (s *IssueService) DailyCounts(ctx context.Context, siteID string, days int)
 
 	result := make([]DailyCount, 0, days)
 	for i := 0; i < days; i++ {
-		d := today.AddDate(0, 0, -(days-1-i))
+		d := today.AddDate(0, 0, -(days - 1 - i))
 		key := d.Format("2006-01-02")
 		result = append(result, DailyCount{Day: key, Count: byDay[key]})
 	}

@@ -96,7 +96,7 @@ func (s *LogService) SearchLogs(ctx context.Context, siteID string, from, to tim
 		offset = 0
 	}
 
-	where := "site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)"
+	where := "site_id = $1 AND timestamp >= $2 AND timestamp < $3"
 	params := []any{siteID, fromMs, toMs}
 	idx := 4
 
@@ -145,7 +145,7 @@ func (s *LogService) LogStats(ctx context.Context, siteID string, from, to time.
 	return nucleus.Query[LevelCount](ctx, s.db.SQL(),
 		`SELECT level, COUNT(*) AS count
 		 FROM logs
-		 WHERE site_id = $1 AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT) AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
+		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		 GROUP BY level
 		 ORDER BY count DESC`,
 		siteID, fromMs, toMs,
@@ -154,9 +154,9 @@ func (s *LogService) LogStats(ctx context.Context, siteID string, from, to time.
 
 // HistogramBucket represents log counts per level for a single time bucket.
 type HistogramBucket struct {
-	Bucket int64            `json:"bucket" db:"bucket"`
-	Level  string           `json:"level" db:"level"`
-	Count  int64            `json:"count" db:"count"`
+	Bucket int64  `json:"bucket" db:"bucket"`
+	Level  string `json:"level" db:"level"`
+	Count  int64  `json:"count" db:"count"`
 }
 
 // Histogram returns per-level log counts bucketed by `bucketMs` milliseconds
@@ -175,8 +175,8 @@ func (s *LogService) Histogram(ctx context.Context, siteID string, from, to time
 		        COUNT(*) AS count
 		 FROM logs
 		 WHERE site_id = $1
-		   AND CAST(timestamp AS BIGINT) >= CAST($2 AS BIGINT)
-		   AND CAST(timestamp AS BIGINT) < CAST($3 AS BIGINT)
+		   AND timestamp >= $2
+		   AND timestamp < $3
 		 GROUP BY (CAST(timestamp AS BIGINT) / CAST($4 AS BIGINT)) * CAST($4 AS BIGINT), level
 		 ORDER BY bucket ASC`,
 		siteID, fromMs, toMs, bucketStr,

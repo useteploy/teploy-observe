@@ -171,8 +171,8 @@ func (s *Service) Query(ctx context.Context, siteID, url string, fromMs, toMs in
 			count
 		 FROM click_heatmaps
 		 WHERE site_id = $1 AND url = $2
-		   AND CAST(created_at AS BIGINT) >= CAST($3 AS BIGINT)
-		   AND CAST(created_at AS BIGINT) <  CAST($4 AS BIGINT)`,
+		   AND created_at >= $3
+		   AND created_at < $4`,
 		siteID, url, dbutil.IntParam(fromMs), dbutil.IntParam(toMs),
 	)
 	if err != nil {
