@@ -17,15 +17,12 @@ builds:
       - -X main.version={{.Version}}
       - -X main.commit={{.Commit}}
       - -X main.date={{.Date}}
-    goos: [linux, darwin, windows]
+    goos: [linux, darwin]
     goarch: [amd64, arm64]
 
 archives:
   - id: observe-tar
     formats: [tar.gz]
-    format_overrides:
-      - goos: windows
-        formats: [zip]
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{- if eq .Arch "amd64" }}x86_64{{- else }}{{ .Arch }}{{ end }}
 
@@ -101,13 +98,3 @@ brews:
       bin.install "observe"
     test: |
       system "#{bin}/observe", "--version"
-
-scoops:
-  - name: observe
-    repository:
-      owner: useteploy
-      name: scoop-bucket
-      token: '{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}'
-    homepage: 'https://github.com/useteploy/teploy-observe'
-    description: 'Self-hosted, single-binary replacement for PostHog + Umami + SigNoz + Sentry'
-    license: 'AGPL-3.0-or-later'
