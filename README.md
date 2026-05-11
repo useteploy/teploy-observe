@@ -43,6 +43,10 @@ Open `http://localhost:3000`. Default login: `admin` / `observe`.
 curl -sL https://raw.githubusercontent.com/useteploy/teploy-observe/main/scripts/install.sh | sh
 ```
 
+The script generates a random admin password and prints it on completion;
+it is also stored in `/etc/observe/observe.env` and rotatable from
+**Settings → Users**.
+
 ### Build from source
 
 ```bash

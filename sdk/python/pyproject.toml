@@ -22,7 +22,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/useteploy/teploy-observe"
-Repository = "https://github.com/teploy/observe"
+Repository = "https://github.com/useteploy/teploy-observe"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -15,7 +15,7 @@ set -eu
 OBSERVE_VERSION="${OBSERVE_VERSION:-latest}"
 OBSERVE_PREFIX="${OBSERVE_PREFIX:-/usr/local/bin}"
 OBSERVE_NO_SERVICE="${OBSERVE_NO_SERVICE:-}"
-REPO="teploy/observe"
+REPO="useteploy/teploy-observe"
 
 #
 # ─── helpers ────────────────────────────────────────────────────────────
@@ -54,8 +54,8 @@ detect() {
     *) die "unsupported OS: $UNAME_OS" ;;
   esac
   case "$UNAME_ARCH" in
-    x86_64|amd64) ARCH=amd64 ;;
-    aarch64|arm64) ARCH=arm64 ;;
+    x86_64|amd64) ARCH=amd64; ARCHIVE_ARCH=x86_64 ;;
+    aarch64|arm64) ARCH=arm64; ARCHIVE_ARCH=arm64 ;;
     *) die "unsupported arch: $UNAME_ARCH" ;;
   esac
   log "Detected platform: $OS/$ARCH"
@@ -74,7 +74,8 @@ fetch_url() {
   else
     TAG="$OBSERVE_VERSION"
   fi
-  URL="https://github.com/$REPO/releases/download/$TAG/observe-$OS-$ARCH.tar.gz"
+  STRIPPED_TAG="${TAG#v}"
+  URL="https://github.com/$REPO/releases/download/$TAG/observe_${STRIPPED_TAG}_${OS}_${ARCHIVE_ARCH}.tar.gz"
   log "Downloading $URL"
 }
 
