@@ -40,50 +40,10 @@ changelog:
       - '^chore:'
       - '^test:'
 
-dockers:
-  - image_templates:
-      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-amd64'
-    dockerfile: Dockerfile
-    use: buildx
-    build_flag_templates:
-      - --platform=linux/amd64
-      - --label=org.opencontainers.image.title={{ .ProjectName }}
-      - --label=org.opencontainers.image.version={{ .Version }}
-      - --label=org.opencontainers.image.source=https://github.com/useteploy/teploy-observe
-      - --label=org.opencontainers.image.licenses=AGPL-3.0-or-later
-    extra_files:
-      - cmd
-      - internal
-      - migrations
-      - go.mod
-      - go.sum
-  - image_templates:
-      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-arm64'
-    dockerfile: Dockerfile
-    use: buildx
-    build_flag_templates:
-      - --platform=linux/arm64
-      - --label=org.opencontainers.image.title={{ .ProjectName }}
-      - --label=org.opencontainers.image.version={{ .Version }}
-      - --label=org.opencontainers.image.source=https://github.com/useteploy/teploy-observe
-      - --label=org.opencontainers.image.licenses=AGPL-3.0-or-later
-    goarch: arm64
-    extra_files:
-      - cmd
-      - internal
-      - migrations
-      - go.mod
-      - go.sum
-
-docker_manifests:
-  - name_template: 'ghcr.io/useteploy/teploy-observe:{{ .Version }}'
-    image_templates:
-      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-amd64'
-      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-arm64'
-  - name_template: 'ghcr.io/useteploy/teploy-observe:latest'
-    image_templates:
-      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-amd64'
-      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-arm64'
+# Docker / GHCR images deferred to v0.1.1 — Dockerfile needs vendor/ in
+# the goreleaser build context (extra_files), and the COPY semantics
+# need to match the binary-from-dist pattern goreleaser prefers. Users
+# can `docker compose up` from a fresh clone in the meantime per README.
 
 brews:
   - name: observe
