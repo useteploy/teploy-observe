@@ -50,7 +50,7 @@ brews:
     repository:
       owner: useteploy
       name: homebrew-tap
-      token: '{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}'
+      token: '{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}'  # populated from secrets.HOMEBREW_TAP_TOKEN in release.yml
     homepage: 'https://github.com/useteploy/teploy-observe'
     description: 'Self-hosted, single-binary replacement for PostHog + Umami + SigNoz + Sentry'
     license: 'AGPL-3.0-or-later'
