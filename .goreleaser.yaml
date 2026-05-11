@@ -2,18 +2,16 @@ version: 2
 
 project_name: observe
 
-before:
-  hooks:
-    - go mod tidy
-
 builds:
   - id: observe
     main: ./cmd/observe
     binary: observe
     env:
       - CGO_ENABLED=0
+      - GOFLAGS=-mod=vendor
     flags:
       - -trimpath
+      - -mod=vendor
     ldflags:
       - -s -w
       - -X main.version={{.Version}}
