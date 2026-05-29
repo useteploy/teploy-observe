@@ -46,3 +46,7 @@ Thumbs.db
 # Internal planning and launch notes — local only, not shipped to the repo
 MASTER_PLAN.md
 marketing/launch/
+
+# Private notes — local only, never committed
+/_internal/
+/INTERNAL.md
