@@ -17,14 +17,7 @@ Two processes. ~100MB idle. Runs on a $5 VPS.
 ### Homebrew (macOS, Linux)
 
 ```bash
-brew install useteploy/tap/observe
-```
-
-### Scoop (Windows)
-
-```bash
-scoop bucket add useteploy https://github.com/useteploy/scoop-bucket
-scoop install observe
+brew install useteploy/tap/teploy-observe
 ```
 
 ### Docker

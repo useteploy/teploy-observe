@@ -1,11 +1,11 @@
 version: 2
 
-project_name: observe
+project_name: teploy-observe
 
 builds:
-  - id: observe
+  - id: teploy-observe
     main: ./cmd/observe
-    binary: observe
+    binary: teploy-observe
     env:
       - CGO_ENABLED=0
       - GOFLAGS=-mod=vendor
@@ -21,7 +21,7 @@ builds:
     goarch: [amd64, arm64]
 
 archives:
-  - id: observe-tar
+  - id: teploy-observe-tar
     formats: [tar.gz]
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{- if eq .Arch "amd64" }}x86_64{{- else }}{{ .Arch }}{{ end }}
@@ -45,14 +45,14 @@ changelog:
 # is needed at image-build time. The from-source Dockerfile stays for
 # `docker compose up` dev use.
 dockers:
-  - id: observe-amd64
+  - id: teploy-observe-amd64
     goos: linux
     goarch: amd64
     dockerfile: Dockerfile.goreleaser
     use: buildx
     image_templates:
-      - 'ghcr.io/useteploy/observe:{{ .Version }}-amd64'
-      - 'ghcr.io/useteploy/observe:latest-amd64'
+      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-amd64'
+      - 'ghcr.io/useteploy/teploy-observe:latest-amd64'
     build_flag_templates:
       - '--platform=linux/amd64'
       - '--label=org.opencontainers.image.title={{ .ProjectName }}'
@@ -60,14 +60,14 @@ dockers:
       - '--label=org.opencontainers.image.revision={{ .FullCommit }}'
       - '--label=org.opencontainers.image.source=https://github.com/useteploy/teploy-observe'
       - '--label=org.opencontainers.image.licenses=AGPL-3.0-or-later'
-  - id: observe-arm64
+  - id: teploy-observe-arm64
     goos: linux
     goarch: arm64
     dockerfile: Dockerfile.goreleaser
     use: buildx
     image_templates:
-      - 'ghcr.io/useteploy/observe:{{ .Version }}-arm64'
-      - 'ghcr.io/useteploy/observe:latest-arm64'
+      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-arm64'
+      - 'ghcr.io/useteploy/teploy-observe:latest-arm64'
     build_flag_templates:
       - '--platform=linux/arm64'
       - '--label=org.opencontainers.image.title={{ .ProjectName }}'
@@ -77,17 +77,17 @@ dockers:
       - '--label=org.opencontainers.image.licenses=AGPL-3.0-or-later'
 
 docker_manifests:
-  - name_template: 'ghcr.io/useteploy/observe:{{ .Version }}'
+  - name_template: 'ghcr.io/useteploy/teploy-observe:{{ .Version }}'
     image_templates:
-      - 'ghcr.io/useteploy/observe:{{ .Version }}-amd64'
-      - 'ghcr.io/useteploy/observe:{{ .Version }}-arm64'
-  - name_template: 'ghcr.io/useteploy/observe:latest'
+      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-amd64'
+      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-arm64'
+  - name_template: 'ghcr.io/useteploy/teploy-observe:latest'
     image_templates:
-      - 'ghcr.io/useteploy/observe:latest-amd64'
-      - 'ghcr.io/useteploy/observe:latest-arm64'
+      - 'ghcr.io/useteploy/teploy-observe:latest-amd64'
+      - 'ghcr.io/useteploy/teploy-observe:latest-arm64'
 
 brews:
-  - name: observe
+  - name: teploy-observe
     repository:
       owner: useteploy
       name: homebrew-tap
@@ -96,6 +96,6 @@ brews:
     description: 'Self-hosted, single-binary replacement for PostHog + Umami + SigNoz + Sentry'
     license: 'AGPL-3.0-or-later'
     install: |
-      bin.install "observe"
+      bin.install "teploy-observe"
     test: |
-      system "#{bin}/observe", "version"
+      system "#{bin}/teploy-observe", "version"

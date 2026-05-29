@@ -87,7 +87,7 @@ func main() {
 			runRestore(cfg, logger)
 			return
 		case "version":
-			fmt.Println("observe " + version)
+			fmt.Println("teploy-observe " + version)
 			return
 		case "upgrade":
 			runUpgrade(cfg, logger, os.Args[2:])
@@ -981,8 +981,8 @@ func main() {
 		}
 	}()
 
-	// PID file lets `observe upgrade` find this process and send SIGTERM.
-	// Env snapshot lets `observe upgrade` re-launch the new binary with
+	// PID file lets `teploy-observe upgrade` find this process and send SIGTERM.
+	// Env snapshot lets `teploy-observe upgrade` re-launch the new binary with
 	// the same OBSERVE_* configuration even when the upgrader was invoked
 	// from a different shell. Both are best-effort.
 	dataDir := os.Getenv("OBSERVE_DATA_DIR")
@@ -1032,16 +1032,16 @@ func printHelp() {
 	os.Stdout.WriteString(`Observe — self-hosted analytics, errors, logs, traces, replays.
 
 Usage:
-  observe              Start the HTTP server (default).
-  observe backup       Stream a tar archive of all tables to stdout.
-  observe restore      Read a tar archive from stdin and insert into tables.
-  observe upgrade      Drain ingest, swap binary, resume — zero event loss.
-  observe reindex      Rebuild the FTS index from error_events.
-  observe version      Print the observe version.
-  observe help         Show this message.
+  teploy-observe              Start the HTTP server (default).
+  teploy-observe backup       Stream a tar archive of all tables to stdout.
+  teploy-observe restore      Read a tar archive from stdin and insert into tables.
+  teploy-observe upgrade      Drain ingest, swap binary, resume — zero event loss.
+  teploy-observe reindex      Rebuild the FTS index from error_events.
+  teploy-observe version      Print the teploy-observe version.
+  teploy-observe help         Show this message.
 
 Upgrade flags:
-  --target <path>      Path to the new binary (default: ./observe-new)
+  --target <path>      Path to the new binary (default: ./teploy-observe-new)
   --data-dir <path>    Override OBSERVE_DATA_DIR for PID lookup
 
 Reindex flags:
@@ -1060,12 +1060,12 @@ Env vars:
   OBSERVE_SEED_DEMO            "false" skips first-boot demo seeding
 
 Example backup:
-  observe backup | zstd > observe-$(date +%F).tar.zst
-  zstdcat observe-2026-04-17.tar.zst | observe restore
+  teploy-observe backup | zstd > teploy-observe-$(date +%F).tar.zst
+  zstdcat teploy-observe-2026-04-17.tar.zst | teploy-observe restore
 
 Example upgrade:
-  cp /tmp/observe-new ./observe-new
-  ./observe upgrade --target ./observe-new
+  cp /tmp/teploy-observe-new ./teploy-observe-new
+  ./teploy-observe upgrade --target ./teploy-observe-new
 `)
 }
 
@@ -1115,7 +1115,7 @@ func runRestore(cfg config.Config, logger *slog.Logger) {
 //   7. Wait up to 60s for /healthz to return 200.
 //   8. On any failure after the swap, restore the previous binary.
 func runUpgrade(cfg config.Config, logger *slog.Logger, args []string) {
-	target := "./observe-new"
+	target := "./teploy-observe-new"
 	dataDir := os.Getenv("OBSERVE_DATA_DIR")
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -1134,7 +1134,7 @@ func runUpgrade(cfg config.Config, logger *slog.Logger, args []string) {
 			dataDir = args[i+1]
 			i++
 		case "-h", "--help":
-			fmt.Println("usage: observe upgrade [--target PATH] [--data-dir PATH]")
+			fmt.Println("usage: teploy-observe upgrade [--target PATH] [--data-dir PATH]")
 			return
 		default:
 			logger.Error("upgrade: unknown argument", "arg", args[i])
@@ -1153,7 +1153,7 @@ func runUpgrade(cfg config.Config, logger *slog.Logger, args []string) {
 
 	// 1. Pre-flight the target.
 	logger.Info("upgrade: pre-flighting target", "target", absTarget)
-	currentVersionStr := "observe " + version
+	currentVersionStr := "teploy-observe " + version
 	targetVersion, err := upgrade.PreflightTarget(absTarget, currentVersionStr)
 	if err != nil {
 		logger.Error("upgrade: pre-flight failed", "err", err)
@@ -3682,8 +3682,8 @@ func shareViewHandler(shareSvc *share.ShareService, uiFS fs.FS) http.HandlerFunc
 }
 
 // newProcAttrDetached returns a SysProcAttr that detaches the spawned child
-// from the upgrader's process group so the new observe outlives the
-// `observe upgrade` command. On unix this means Setsid=true.
+// from the upgrader's process group so the new teploy-observe outlives the
+// `teploy-observe upgrade` command. On unix this means Setsid=true.
 func newProcAttrDetached() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Setsid: true}
 }
