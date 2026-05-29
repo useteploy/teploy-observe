@@ -48,12 +48,14 @@ jobs:
       BUDGET_MAX_FAIL_PCT: ${{ github.event.inputs.max_fail_pct || '1' }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          # Non-recursive: we only need the Neutron submodule (for
-          # Neutron/nucleus). `recursive` pulls Neutron's own nested
-          # submodules, one of which (typescript/benchmarks/remix3-app) is
-          # undeclared upstream and fails checkout before the bench runs.
-          submodules: true
+        # actions/checkout's own `submodules: true` still runs `git submodule
+        # foreach --recursive` for credential persistence, which trips on
+        # Neutron's undeclared nested submodule (typescript/benchmarks/
+        # remix3-app). Skip its handling entirely and do a flat manual init
+        # of the only submodule we actually need (Neutron, for nucleus).
+
+      - name: Init Neutron submodule (non-recursive)
+        run: git submodule update --init --depth=1 Neutron
 
       - uses: actions/setup-go@v5
         with:
