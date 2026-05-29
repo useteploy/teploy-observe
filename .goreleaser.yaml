@@ -40,10 +40,51 @@ changelog:
       - '^chore:'
       - '^test:'
 
-# Docker / GHCR images deferred to v0.1.1 — Dockerfile needs vendor/ in
-# the goreleaser build context (extra_files), and the COPY semantics
-# need to match the binary-from-dist pattern goreleaser prefers. Users
-# can `docker compose up` from a fresh clone in the meantime per README.
+# Docker / GHCR multi-arch images. goreleaser copies the pre-built binary
+# into Dockerfile.goreleaser's build context, so no vendor/ or Go toolchain
+# is needed at image-build time. The from-source Dockerfile stays for
+# `docker compose up` dev use.
+dockers:
+  - id: observe-amd64
+    goos: linux
+    goarch: amd64
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    image_templates:
+      - 'ghcr.io/useteploy/observe:{{ .Version }}-amd64'
+      - 'ghcr.io/useteploy/observe:latest-amd64'
+    build_flag_templates:
+      - '--platform=linux/amd64'
+      - '--label=org.opencontainers.image.title={{ .ProjectName }}'
+      - '--label=org.opencontainers.image.version={{ .Version }}'
+      - '--label=org.opencontainers.image.revision={{ .FullCommit }}'
+      - '--label=org.opencontainers.image.source=https://github.com/useteploy/teploy-observe'
+      - '--label=org.opencontainers.image.licenses=AGPL-3.0-or-later'
+  - id: observe-arm64
+    goos: linux
+    goarch: arm64
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    image_templates:
+      - 'ghcr.io/useteploy/observe:{{ .Version }}-arm64'
+      - 'ghcr.io/useteploy/observe:latest-arm64'
+    build_flag_templates:
+      - '--platform=linux/arm64'
+      - '--label=org.opencontainers.image.title={{ .ProjectName }}'
+      - '--label=org.opencontainers.image.version={{ .Version }}'
+      - '--label=org.opencontainers.image.revision={{ .FullCommit }}'
+      - '--label=org.opencontainers.image.source=https://github.com/useteploy/teploy-observe'
+      - '--label=org.opencontainers.image.licenses=AGPL-3.0-or-later'
+
+docker_manifests:
+  - name_template: 'ghcr.io/useteploy/observe:{{ .Version }}'
+    image_templates:
+      - 'ghcr.io/useteploy/observe:{{ .Version }}-amd64'
+      - 'ghcr.io/useteploy/observe:{{ .Version }}-arm64'
+  - name_template: 'ghcr.io/useteploy/observe:latest'
+    image_templates:
+      - 'ghcr.io/useteploy/observe:latest-amd64'
+      - 'ghcr.io/useteploy/observe:latest-arm64'
 
 brews:
   - name: observe
@@ -57,4 +98,4 @@ brews:
     install: |
       bin.install "observe"
     test: |
-      system "#{bin}/observe", "--version"
+      system "#{bin}/observe", "version"

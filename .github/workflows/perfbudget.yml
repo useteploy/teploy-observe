@@ -49,7 +49,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          # Non-recursive: we only need the Neutron submodule (for
+          # Neutron/nucleus). `recursive` pulls Neutron's own nested
+          # submodules, one of which (typescript/benchmarks/remix3-app) is
+          # undeclared upstream and fails checkout before the bench runs.
+          submodules: true
 
       - uses: actions/setup-go@v5
         with:
