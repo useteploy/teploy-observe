@@ -63,9 +63,9 @@ import (
 	"github.com/useteploy/teploy-observe/internal/views"
 )
 
-// observeVersion is the version string printed by `observe version` and
-// reported to the in-process meta service. Bump it on each release.
-const observeVersion = "0.1.0"
+// version is injected at build time by goreleaser via -X main.version.
+// Defaults to "dev" for `go run`/`go install` builds outside a release.
+var version = "dev"
 
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
@@ -87,7 +87,7 @@ func main() {
 			runRestore(cfg, logger)
 			return
 		case "version":
-			fmt.Println("observe " + observeVersion)
+			fmt.Println("observe " + version)
 			return
 		case "upgrade":
 			runUpgrade(cfg, logger, os.Args[2:])
@@ -282,7 +282,7 @@ func main() {
 	scheduler := jobs.NewScheduler(rollups, retention, logger)
 
 	// Self-observability service
-	metaSvc := meta.New(db, retention, observeVersion)
+	metaSvc := meta.New(db, retention, version)
 
 	// Self-instrumentation: trace every HTTP request + ship panics to /errors,
 	// scoped to site_id=_meta. Off by default (adds ingest load to the same
@@ -332,7 +332,7 @@ func main() {
 		neutron.WithMiddleware(ingest.RequestInfoMiddleware),
 		neutron.WithMiddleware(config.DemoModeMiddleware(cfg.DemoMode)),
 		neutron.WithNucleusChecker(db),
-		neutron.WithOpenAPIInfo("Teploy Observe", observeVersion),
+		neutron.WithOpenAPIInfo("Teploy Observe", version),
 		// /docs is reserved for the in-product docs page; Swagger UI lives at /api/docs.
 		neutron.DisableDefaultDocs(),
 	)
@@ -1153,7 +1153,7 @@ func runUpgrade(cfg config.Config, logger *slog.Logger, args []string) {
 
 	// 1. Pre-flight the target.
 	logger.Info("upgrade: pre-flighting target", "target", absTarget)
-	currentVersionStr := "observe " + observeVersion
+	currentVersionStr := "observe " + version
 	targetVersion, err := upgrade.PreflightTarget(absTarget, currentVersionStr)
 	if err != nil {
 		logger.Error("upgrade: pre-flight failed", "err", err)
