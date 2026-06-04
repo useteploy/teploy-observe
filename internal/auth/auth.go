@@ -88,16 +88,18 @@ func (s *AuthService) ValidateToken(tokenStr string) (neutronauth.Claims, error)
 	return neutronauth.ParseToken(tokenStr, s.jwtSecret)
 }
 
-// EnsureAdmin creates a default admin user if the admin_users table is empty.
-func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string) error {
+// EnsureAdmin creates the initial admin user if the admin_users table is empty.
+// It returns true if it created one. The caller is responsible for surfacing a
+// generated password — EnsureAdmin never logs the password itself.
+func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string) (bool, error) {
 	sql := s.db.SQL()
 
 	rows, err := nucleus.Query[countRow](ctx, sql, "SELECT COUNT(*) AS count FROM admin_users")
 	if err != nil {
-		return fmt.Errorf("auth: check admin users: %w", err)
+		return false, fmt.Errorf("auth: check admin users: %w", err)
 	}
 	if len(rows) > 0 && rows[0].Count > 0 {
-		return nil
+		return false, nil
 	}
 
 	id := generateID()
@@ -109,11 +111,11 @@ func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string
 		id, username, hash, now, RoleAdmin,
 	)
 	if err != nil {
-		return fmt.Errorf("auth: create default admin: %w", err)
+		return false, fmt.Errorf("auth: create default admin: %w", err)
 	}
 
-	s.logger.Info("created default admin user", "username", username, "password", password)
-	return nil
+	s.logger.Info("created initial admin user", "username", username)
+	return true, nil
 }
 
 // Login validates credentials and returns a JWT token.
@@ -135,14 +137,17 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (str
 	return s.GenerateToken(user.ID, user.Username, user.Role)
 }
 
-// HasAdminUsers returns true if at least one admin user exists.
-func (s *AuthService) HasAdminUsers(ctx context.Context) bool {
+// HasAdminUsers reports whether at least one admin user exists. The error is
+// returned (not swallowed as false) so callers can fail CLOSED on a DB outage —
+// treating a query failure as "no admins → grace period" previously let a
+// Nucleus outage bypass authentication entirely.
+func (s *AuthService) HasAdminUsers(ctx context.Context) (bool, error) {
 	sql := s.db.SQL()
 	rows, err := nucleus.Query[countRow](ctx, sql, "SELECT COUNT(*) AS count FROM admin_users")
 	if err != nil {
-		return false
+		return false, err
 	}
-	return len(rows) > 0 && rows[0].Count > 0
+	return len(rows) > 0 && rows[0].Count > 0, nil
 }
 
 // ChangePassword updates the password for the given user ID.
@@ -182,6 +187,14 @@ func checkPassword(password, hash string) bool {
 
 func generateID() string {
 	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// RandomSecret returns a 48-hex-char (24-byte) random string, for generating a
+// secret/salt/password that wasn't supplied via config.
+func RandomSecret() string {
+	b := make([]byte, 24)
 	rand.Read(b)
 	return hex.EncodeToString(b)
 }

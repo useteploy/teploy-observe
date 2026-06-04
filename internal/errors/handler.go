@@ -29,6 +29,10 @@ type ErrorInput struct {
 	Handled     bool         `json:"handled"`
 	Level       string       `json:"level"`
 	ReleaseTag  string       `json:"release"`
+	// ReleaseTagAlt accepts the alternate `release_tag` wire field some SDKs
+	// send, so the release isn't silently dropped on a key-name mismatch.
+	// Reconciled into ReleaseTag in the handler.
+	ReleaseTagAlt string     `json:"release_tag"`
 	Environment string       `json:"environment"`
 	URL         string       `json:"url"`
 	Browser     string       `json:"browser"`
@@ -126,6 +130,12 @@ func NewErrorHandler(db *nucleus.Client, issueSvc *IssueService, searchSvc *Sear
 // Returns the issue_id so callers can present a link to the user.
 func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (string, error) {
 	now := time.Now().UTC()
+
+	// Accept either `release` or `release_tag` for the release identifier so a
+	// wire-field mismatch doesn't silently drop it.
+	if input.ReleaseTag == "" && input.ReleaseTagAlt != "" {
+		input.ReleaseTag = input.ReleaseTagAlt
+	}
 
 	if input.ErrorType == "" && input.ErrorValue == "" {
 		input.ErrorType = "Error"

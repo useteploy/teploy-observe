@@ -38,7 +38,12 @@ func RequireRole(authSvc *AuthService, allowed ...string) neutron.Middleware {
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !authSvc.HasAdminUsers(r.Context()) {
+			hasAdmins, err := authSvc.HasAdminUsers(r.Context())
+			if err != nil {
+				neutron.WriteError(w, r, neutron.ErrInternal("auth check unavailable"))
+				return
+			}
+			if !hasAdmins {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -86,8 +91,14 @@ func queryTokenAllowed(r *http.Request) bool {
 func JWTAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Grace period: if no admin users exist, allow unauthenticated access
-			if !authSvc.HasAdminUsers(r.Context()) {
+			// Grace period: if no admin users exist, allow unauthenticated access.
+			// Fail closed on a DB error rather than treating it as grace.
+			hasAdmins, err := authSvc.HasAdminUsers(r.Context())
+			if err != nil {
+				neutron.WriteError(w, r, neutron.ErrInternal("auth check unavailable"))
+				return
+			}
+			if !hasAdmins {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -133,8 +144,14 @@ func APIKeyAuthMiddleware(authSvc *AuthService, defaultSiteID string) neutron.Mi
 			key := r.Header.Get("X-API-Key")
 
 			if key == "" {
-				// No key provided — check grace period
-				if !authSvc.HasAPIKeys(r.Context()) {
+				// No key provided — check grace period. Fail closed on a DB
+				// error instead of falling into the no-keys grace path.
+				hasKeys, err := authSvc.HasAPIKeys(r.Context())
+				if err != nil {
+					neutron.WriteError(w, r, neutron.ErrInternal("auth check unavailable"))
+					return
+				}
+				if !hasKeys {
 					// Grace period: no keys in system, use default site
 					siteID := r.Header.Get("X-Observe-Site")
 					if siteID == "" {

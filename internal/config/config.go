@@ -39,7 +39,7 @@ func Load() Config {
 		Addr:                envOr("OBSERVE_ADDR", ":3000"),
 		NucleusURL:          envOr("OBSERVE_NUCLEUS_URL", "postgres://localhost:5432/observe"),
 		SiteID:              envOr("OBSERVE_SITE_ID", "default"),
-		SessionSalt:         envOr("OBSERVE_SESSION_SALT", "observe-default-salt"),
+		SessionSalt:         envOr("OBSERVE_SESSION_SALT", ""),
 		BufferSize:          envInt("OBSERVE_BUFFER_SIZE", 100_000),
 		FlushInterval:       time.Duration(envInt("OBSERVE_FLUSH_INTERVAL_MS", 2000)) * time.Millisecond,
 		FlushSize:           envInt("OBSERVE_FLUSH_SIZE", 500),
@@ -48,7 +48,7 @@ func Load() Config {
 		RateLimit:           envInt("OBSERVE_RATE_LIMIT", 1000),
 		JWTSecret:           envOr("OBSERVE_JWT_SECRET", ""),
 		AdminUser:           envOr("OBSERVE_ADMIN_USER", "admin"),
-		AdminPassword:       envOr("OBSERVE_ADMIN_PASSWORD", "observe"),
+		AdminPassword:       envOr("OBSERVE_ADMIN_PASSWORD", ""),
 		DemoMode:            envOr("OBSERVE_DEMO_MODE", "") == "true",
 	}
 	return c

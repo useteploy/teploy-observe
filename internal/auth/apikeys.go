@@ -108,14 +108,16 @@ func (s *AuthService) RevokeAPIKey(ctx context.Context, keyID string) error {
 	return nil
 }
 
-// HasAPIKeys returns true if at least one API key exists in the system.
-func (s *AuthService) HasAPIKeys(ctx context.Context) bool {
+// HasAPIKeys reports whether at least one API key exists. The error is returned
+// (not swallowed as false) so the ingest middleware can fail CLOSED on a DB
+// outage instead of falling into the no-keys grace path and accepting writes.
+func (s *AuthService) HasAPIKeys(ctx context.Context) (bool, error) {
 	sql := s.db.SQL()
 	rows, err := nucleus.Query[countRow](ctx, sql, "SELECT COUNT(*) AS count FROM api_keys")
 	if err != nil {
-		return false
+		return false, err
 	}
-	return len(rows) > 0 && rows[0].Count > 0
+	return len(rows) > 0 && rows[0].Count > 0, nil
 }
 
 // ListAPIKeys returns all API keys for a site.

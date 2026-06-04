@@ -136,11 +136,30 @@ func main() {
 	}
 	logger.Info("migrations complete")
 
+	// Generate any secret not supplied via config, so there's no predictable
+	// hardcoded default. A generated admin password is surfaced once below; a
+	// generated session salt rotates session/visitor IDs on restart (set
+	// OBSERVE_SESSION_SALT to keep them stable).
+	generatedAdminPw := false
+	if cfg.AdminPassword == "" {
+		cfg.AdminPassword = auth.RandomSecret()
+		generatedAdminPw = true
+	}
+	if cfg.SessionSalt == "" {
+		cfg.SessionSalt = auth.RandomSecret()
+		logger.Warn("OBSERVE_SESSION_SALT not set — using a random salt; set it to keep session/visitor IDs stable across restarts")
+	}
+
 	// Auth service
 	authSvc := auth.NewAuthService(db, cfg.JWTSecret, logger)
-	if err := authSvc.EnsureAdmin(ctx, cfg.AdminUser, cfg.AdminPassword); err != nil {
+	createdAdmin, err := authSvc.EnsureAdmin(ctx, cfg.AdminUser, cfg.AdminPassword)
+	if err != nil {
 		logger.Error("failed to ensure admin user", "err", err)
 		os.Exit(1)
+	}
+	if createdAdmin && generatedAdminPw {
+		logger.Warn("generated a random admin password — SAVE THIS NOW (set OBSERVE_ADMIN_PASSWORD to choose your own)",
+			"username", cfg.AdminUser, "password", cfg.AdminPassword)
 	}
 
 	// Site service
