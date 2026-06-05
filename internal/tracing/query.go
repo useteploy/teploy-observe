@@ -66,70 +66,56 @@ func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
-	// service_stats stores per-bucket rows. Aggregate in Go because
-	// Nucleus doesn't support CAST inside aggregate functions.
+	// Compute RED metrics from raw spans, NOT the service_stats rollup. The
+	// rollup is written once per ingest batch with that batch's counts into a
+	// ReplacingMergeTree keyed on (service, operation, bucket); read-time dedup
+	// keeps only the newest version per key, so a bucket that spanned multiple
+	// ingest batches reported only the LAST batch's counts — RED metrics
+	// undercounted badly. Raw spans within retention are the source of truth,
+	// and Nucleus computes the counts + percentiles directly.
 	type rawStat struct {
 		ServiceName  string `db:"service_name"`
-		RequestCount string `db:"request_count"`
-		ErrorCount   string `db:"error_count"`
-		DurationSum  string `db:"duration_sum"`
-		P50          string `db:"p50_ms"`
-		P95          string `db:"p95_ms"`
-		P99          string `db:"p99_ms"`
+		RequestCount int64  `db:"request_count"`
+		ErrorCount   int64  `db:"error_count"`
+		DurationSum  int64  `db:"duration_sum"`
+		P50          int64  `db:"p50_ms"`
+		P95          int64  `db:"p95_ms"`
+		P99          int64  `db:"p99_ms"`
 	}
 	rows, err := nucleus.Query[rawStat](ctx, q.db.SQL(),
-		`SELECT service_name, request_count, error_count, duration_sum, p50_ms, p95_ms, p99_ms
-		 FROM service_stats
-		 WHERE site_id = $1 AND ts_bucket >= $2 AND ts_bucket < $3`,
+		`SELECT service_name,
+			COUNT(*) AS request_count,
+			SUM(CASE WHEN status_code = 'error' THEN 1 ELSE 0 END) AS error_count,
+			SUM(duration_ms) AS duration_sum,
+			CAST(percentile_cont(duration_ms, 0.50) AS BIGINT) AS p50_ms,
+			CAST(percentile_cont(duration_ms, 0.95) AS BIGINT) AS p95_ms,
+			CAST(percentile_cont(duration_ms, 0.99) AS BIGINT) AS p99_ms
+		 FROM spans
+		 WHERE site_id = $1 AND start_time >= $2 AND start_time < $3
+		 GROUP BY service_name`,
 		siteID, fromMs, toMs,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	type agg struct {
-		reqs, errs, durSum, p50, p95, p99 int64
-	}
-	m := make(map[string]*agg)
-	for _, r := range rows {
-		a, ok := m[r.ServiceName]
-		if !ok {
-			a = &agg{}
-			m[r.ServiceName] = a
-		}
-		a.reqs += parseInt(r.RequestCount)
-		a.errs += parseInt(r.ErrorCount)
-		a.durSum += parseInt(r.DurationSum)
-		if p := parseInt(r.P50); p > a.p50 {
-			a.p50 = p
-		}
-		if p := parseInt(r.P95); p > a.p95 {
-			a.p95 = p
-		}
-		if p := parseInt(r.P99); p > a.p99 {
-			a.p99 = p
-		}
-	}
-
-	// Compute Apdex per service from raw span durations in the same window.
-	// service_stats only stores aggregates, so the apdex buckets need a
-	// second pass against spans.
+	// Apdex per service from raw root-span durations in the same window.
 	apdexByService, err := q.serviceApdex(ctx, siteID, from, to, apdexThresholdMs)
 	if err != nil {
 		// Non-fatal — Apdex is best-effort, RED metrics still ship.
 		apdexByService = map[string]float64{}
 	}
 
-	result := make([]ServiceSummary, 0, len(m))
-	for name, a := range m {
+	result := make([]ServiceSummary, 0, len(rows))
+	for _, r := range rows {
 		avg := int64(0)
-		if a.reqs > 0 {
-			avg = a.durSum / a.reqs
+		if r.RequestCount > 0 {
+			avg = r.DurationSum / r.RequestCount
 		}
 		result = append(result, ServiceSummary{
-			ServiceName: name, RequestCount: a.reqs, ErrorCount: a.errs,
-			AvgDuration: avg, P50: a.p50, P95: a.p95, P99: a.p99,
-			ApdexScore: apdexByService[name],
+			ServiceName: r.ServiceName, RequestCount: r.RequestCount, ErrorCount: r.ErrorCount,
+			AvgDuration: avg, P50: r.P50, P95: r.P95, P99: r.P99,
+			ApdexScore: apdexByService[r.ServiceName],
 		})
 	}
 	return result, nil
@@ -183,58 +169,43 @@ func (q *QueryService) ListOperations(ctx context.Context, siteID, service strin
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
+	// RED per operation from raw spans (see ListServices for why the
+	// service_stats rollup is not the source of truth).
 	type rawStat struct {
 		OpName      string `db:"operation_name"`
-		ReqCount    string `db:"request_count"`
-		ErrCount    string `db:"error_count"`
-		DurationSum string `db:"duration_sum"`
-		P50         string `db:"p50_ms"`
-		P95         string `db:"p95_ms"`
-		P99         string `db:"p99_ms"`
+		ReqCount    int64  `db:"request_count"`
+		ErrCount    int64  `db:"error_count"`
+		DurationSum int64  `db:"duration_sum"`
+		P50         int64  `db:"p50_ms"`
+		P95         int64  `db:"p95_ms"`
+		P99         int64  `db:"p99_ms"`
 	}
 	rows, err := nucleus.Query[rawStat](ctx, q.db.SQL(),
-		`SELECT operation_name, request_count, error_count, duration_sum, p50_ms, p95_ms, p99_ms
-		 FROM service_stats
-		 WHERE site_id = $1 AND service_name = $2 AND ts_bucket >= $3 AND ts_bucket < $4`,
+		`SELECT operation_name,
+			COUNT(*) AS request_count,
+			SUM(CASE WHEN status_code = 'error' THEN 1 ELSE 0 END) AS error_count,
+			SUM(duration_ms) AS duration_sum,
+			CAST(percentile_cont(duration_ms, 0.50) AS BIGINT) AS p50_ms,
+			CAST(percentile_cont(duration_ms, 0.95) AS BIGINT) AS p95_ms,
+			CAST(percentile_cont(duration_ms, 0.99) AS BIGINT) AS p99_ms
+		 FROM spans
+		 WHERE site_id = $1 AND service_name = $2 AND start_time >= $3 AND start_time < $4
+		 GROUP BY operation_name`,
 		siteID, service, fromMs, toMs,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	type agg struct {
-		reqs, errs, durSum, p50, p95, p99 int64
-	}
-	m := make(map[string]*agg)
+	result := make([]OperationSummary, 0, len(rows))
 	for _, r := range rows {
-		a, ok := m[r.OpName]
-		if !ok {
-			a = &agg{}
-			m[r.OpName] = a
-		}
-		a.reqs += parseInt(r.ReqCount)
-		a.errs += parseInt(r.ErrCount)
-		a.durSum += parseInt(r.DurationSum)
-		if p := parseInt(r.P50); p > a.p50 {
-			a.p50 = p
-		}
-		if p := parseInt(r.P95); p > a.p95 {
-			a.p95 = p
-		}
-		if p := parseInt(r.P99); p > a.p99 {
-			a.p99 = p
-		}
-	}
-
-	result := make([]OperationSummary, 0, len(m))
-	for name, a := range m {
 		avg := int64(0)
-		if a.reqs > 0 {
-			avg = a.durSum / a.reqs
+		if r.ReqCount > 0 {
+			avg = r.DurationSum / r.ReqCount
 		}
 		result = append(result, OperationSummary{
-			OperationName: name, RequestCount: a.reqs, ErrorCount: a.errs,
-			AvgDuration: avg, P50: a.p50, P95: a.p95, P99: a.p99,
+			OperationName: r.OpName, RequestCount: r.ReqCount, ErrorCount: r.ErrCount,
+			AvgDuration: avg, P50: r.P50, P95: r.P95, P99: r.P99,
 		})
 	}
 	return result, nil
@@ -366,56 +337,43 @@ func (q *QueryService) ServiceDependencies(ctx context.Context, siteID string, f
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
+	// Dependency edges from raw spans (parent span's service -> child span's
+	// service) via self-join, NOT the service_dependencies rollup — that is
+	// written per ingest batch and deduped to the newest version per edge, so
+	// call counts undercounted (same root cause as ListServices RED metrics).
 	type rawDep struct {
 		Src         string `db:"src_service"`
 		Dst         string `db:"dst_service"`
-		CallCount   string `db:"call_count"`
-		ErrorCount  string `db:"error_count"`
-		AvgDuration string `db:"avg_duration"`
+		CallCount   int64  `db:"call_count"`
+		ErrorCount  int64  `db:"error_count"`
+		DurationSum int64  `db:"duration_sum"`
 	}
 	rows, err := nucleus.Query[rawDep](ctx, q.db.SQL(),
-		`SELECT src_service, dst_service, call_count, error_count, avg_duration
-		 FROM service_dependencies
-		 WHERE site_id = $1
-		   AND ts_bucket >= $2
-		   AND ts_bucket < $3`,
+		`SELECT p.service_name AS src_service, c.service_name AS dst_service,
+			COUNT(*) AS call_count,
+			SUM(CASE WHEN c.status_code = 'error' THEN 1 ELSE 0 END) AS error_count,
+			SUM(c.duration_ms) AS duration_sum
+		 FROM spans c JOIN spans p ON c.parent_span_id = p.span_id AND c.site_id = p.site_id
+		 WHERE c.site_id = $1 AND c.start_time >= $2 AND c.start_time < $3
+		   AND p.service_name <> c.service_name AND p.service_name <> ''
+		 GROUP BY p.service_name, c.service_name`,
 		siteID, fromMs, toMs,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	type edgeKey struct{ src, dst string }
-	type edgeAcc struct {
-		calls, errors, durSumWeighted int64
-	}
-	m := make(map[edgeKey]*edgeAcc)
+	out := make([]Dependency, 0, len(rows))
 	for _, r := range rows {
-		k := edgeKey{r.Src, r.Dst}
-		acc, ok := m[k]
-		if !ok {
-			acc = &edgeAcc{}
-			m[k] = acc
-		}
-		calls := parseInt(r.CallCount)
-		acc.calls += calls
-		acc.errors += parseInt(r.ErrorCount)
-		// Reconstruct duration_sum from per-bucket avg * count so the
-		// re-averaged result is call-weighted, not bucket-weighted.
-		acc.durSumWeighted += parseInt(r.AvgDuration) * calls
-	}
-
-	out := make([]Dependency, 0, len(m))
-	for k, acc := range m {
 		avg := int64(0)
-		if acc.calls > 0 {
-			avg = acc.durSumWeighted / acc.calls
+		if r.CallCount > 0 {
+			avg = r.DurationSum / r.CallCount
 		}
 		out = append(out, Dependency{
-			SrcService:  k.src,
-			DstService:  k.dst,
-			CallCount:   acc.calls,
-			ErrorCount:  acc.errors,
+			SrcService:  r.Src,
+			DstService:  r.Dst,
+			CallCount:   r.CallCount,
+			ErrorCount:  r.ErrorCount,
 			AvgDuration: avg,
 		})
 	}
