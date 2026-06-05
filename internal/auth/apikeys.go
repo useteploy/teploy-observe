@@ -94,15 +94,28 @@ func (s *AuthService) ValidateAPIKey(ctx context.Context, key string) (string, e
 }
 
 // RevokeAPIKey marks an API key as revoked.
+//
+// api_keys is ORDER BY (tenant_id, key_hash). A Nucleus UPDATE that filters on a
+// column NOT in the ORDER BY key (here key_id) silently no-ops — the row keeps
+// revoked='false' and the key KEEPS AUTHENTICATING, a real security hole. So we
+// look the key up and UPDATE by its ORDER-BY columns (tenant_id, key_hash),
+// which actually lands the write. (UPDATEs on admin_users/sites work as-is
+// because they already filter on an ORDER-BY column.)
 func (s *AuthService) RevokeAPIKey(ctx context.Context, keyID string) error {
 	sql := s.db.SQL()
-	// Nucleus plain tables don't support UPDATE — delete and re-insert
-	// would be needed. For now, this is best-effort.
-	_, err := sql.Exec(ctx,
-		"UPDATE api_keys SET revoked = 'true' WHERE key_id = $1",
+
+	row, err := nucleus.QueryOne[apiKeyRow](ctx, sql,
+		"SELECT key_id, tenant_id, site_id, key_hash, label, created_at, revoked FROM api_keys WHERE key_id = $1",
 		keyID,
 	)
 	if err != nil {
+		return fmt.Errorf("auth: revoke api key: key %q not found: %w", keyID, err)
+	}
+
+	if _, err := sql.Exec(ctx,
+		"UPDATE api_keys SET revoked = 'true' WHERE tenant_id = $1 AND key_hash = $2",
+		row.TenantID, row.KeyHash,
+	); err != nil {
 		return fmt.Errorf("auth: revoke api key: %w", err)
 	}
 	return nil

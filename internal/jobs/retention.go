@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -13,7 +12,7 @@ import (
 // RetentionPolicy defines the TTL (in days) for a table + the SQL column to compare against.
 type RetentionPolicy struct {
 	Table  string
-	Column string // BIGINT-as-text column, typically "timestamp", "start_time", or "ts_bucket"
+	Column string // BIGINT epoch-ms column, typically "timestamp", "start_time", or "ts_bucket"
 	Days   int
 }
 
@@ -70,13 +69,14 @@ func (r *RetentionService) RunCleanup(ctx context.Context) error {
 			continue
 		}
 		cutoff := now.Add(-time.Duration(p.Days) * 24 * time.Hour).UnixMilli()
-		// Parameter is cast to BIGINT; column is also cast so text-typed BIGINT
-		// columns in Nucleus compare numerically rather than lexicographically.
-		query := fmt.Sprintf(
-			`DELETE FROM %s WHERE CAST(%s AS BIGINT) < $1`,
-			p.Table, p.Column,
-		)
-		affected, err := sql.Exec(ctx, query, strconv.FormatInt(cutoff, 10))
+		// Bind the cutoff as an int64 and compare against the BIGINT column
+		// directly. The old form (quoted text literal vs CAST(col AS BIGINT))
+		// matched nothing — Nucleus compared the column's numeric value against
+		// a text literal lexicographically, so every TTL was inert and storage
+		// grew unbounded. Nucleus now coerces a numeric param against a BIGINT
+		// (or text-numeric) column, so the plain `col < $1` deletes correctly.
+		query := fmt.Sprintf(`DELETE FROM %s WHERE %s < $1`, p.Table, p.Column)
+		affected, err := sql.Exec(ctx, query, cutoff)
 		if err != nil {
 			r.logger.Warn("retention: delete failed", "table", p.Table, "err", err)
 			if firstErr == nil {
