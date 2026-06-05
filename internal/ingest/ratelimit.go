@@ -60,6 +60,12 @@ func (rl *RateLimiter) SetSiteCap(siteID string, ratePerSecond int) {
 
 // Allow returns true if a request for (siteID, ip) is allowed. Either may be
 // empty; at least one must identify the caller.
+//
+// When a per-site cap is configured (SetSiteCap), the request must pass BOTH a
+// per-(site,ip) bucket (fairness — one noisy IP can't starve others) AND a
+// site-aggregate bucket (a true ceiling on the site's total rps regardless of
+// how many distinct IPs it spreads across). With no site cap set, only the
+// composite bucket applies, so default behavior is unchanged.
 func (rl *RateLimiter) Allow(siteID, ip string) bool {
 	key := siteID
 	if ip != "" {
@@ -77,20 +83,49 @@ func (rl *RateLimiter) Allow(siteID, ip string) bool {
 
 	rate := rl.rate
 	cap := rl.burst
+	siteOverride, hasSiteCap := 0, false
 	if siteID != "" {
 		if override, ok := rl.siteLimits[siteID]; ok {
 			// Site-specific override replaces both rate and burst; clamping
 			// up to the global burst would defeat per-site isolation.
 			rate = override
 			cap = override * 2
+			siteOverride, hasSiteCap = override, true
 		}
 	}
 
+	// Refill both buckets first, then consume only if both have a token, so a
+	// denial on one doesn't burn a token on the other.
+	composite := rl.refillLocked(key, rate, cap)
+	var aggregate *bucket
+	if hasSiteCap {
+		aggregate = rl.refillLocked("\x00site:"+siteID, siteOverride, siteOverride*2)
+	}
+
+	if composite.tokens <= 0 {
+		return false
+	}
+	if aggregate != nil && aggregate.tokens <= 0 {
+		return false
+	}
+	composite.tokens--
+	if aggregate != nil {
+		aggregate.tokens--
+	}
+	return true
+}
+
+// refillLocked fetches (or creates) the bucket for key, applies any retuned
+// rate/cap, refills tokens for elapsed time, and returns it without consuming a
+// token. Caller must hold rl.mu.
+func (rl *RateLimiter) refillLocked(key string, rate, cap int) *bucket {
 	b, ok := rl.buckets[key]
 	if !ok {
 		b = &bucket{tokens: cap, lastFill: time.Now(), cap: cap, rate: rate}
 		rl.buckets[key] = b
-	} else if b.rate != rate || b.cap != cap {
+		return b
+	}
+	if b.rate != rate || b.cap != cap {
 		// site cap was retuned since last request; apply now
 		b.rate = rate
 		b.cap = cap
@@ -98,22 +133,15 @@ func (rl *RateLimiter) Allow(siteID, ip string) bool {
 			b.tokens = cap
 		}
 	}
-
 	elapsed := time.Since(b.lastFill)
-	refill := int(elapsed/rl.interval) * b.rate
-	if refill > 0 {
+	if refill := int(elapsed/rl.interval) * b.rate; refill > 0 {
 		b.tokens += refill
 		if b.tokens > b.cap {
 			b.tokens = b.cap
 		}
 		b.lastFill = time.Now()
 	}
-
-	if b.tokens <= 0 {
-		return false
-	}
-	b.tokens--
-	return true
+	return b
 }
 
 func (rl *RateLimiter) cleanup() {

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"time"
 
@@ -41,6 +43,10 @@ type IngestInput struct {
 // IngestResponse is returned to the tracker.
 type IngestResponse struct {
 	OK bool `json:"ok"`
+	// Accepted/Rejected are populated by the batch endpoint; omitempty keeps the
+	// single-event response shape unchanged.
+	Accepted int `json:"accepted,omitempty"`
+	Rejected int `json:"rejected,omitempty"`
 }
 
 // Handler returns the typed Neutron handler for event ingestion.
@@ -222,12 +228,25 @@ func BatchHandler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.
 		if len(input.Events) == 0 {
 			return IngestResponse{OK: true}, nil
 		}
+		accepted, rejected := 0, 0
 		for _, ev := range input.Events {
 			if _, err := singleHandler(ctx, ev); err != nil {
+				// A permanent per-event client error (4xx, e.g. a malformed
+				// event) must not fail the whole batch — that previously left
+				// earlier events ingested and made the client retry the lot,
+				// duplicating them. Skip the bad event and count it. Transient
+				// errors (429 buffer-full / 5xx) still abort so the client
+				// retries the remainder.
+				var appErr *neutron.AppError
+				if errors.As(err, &appErr) && appErr.Status >= 400 && appErr.Status < 500 && appErr.Status != http.StatusTooManyRequests {
+					rejected++
+					continue
+				}
 				return IngestResponse{}, err
 			}
+			accepted++
 		}
-		return IngestResponse{OK: true}, nil
+		return IngestResponse{OK: true, Accepted: accepted, Rejected: rejected}, nil
 	}
 }
 

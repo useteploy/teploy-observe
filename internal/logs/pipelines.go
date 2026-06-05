@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -58,9 +60,52 @@ func (s *PipelineService) Create(ctx context.Context, siteID, name, rules string
 }
 
 func (s *PipelineService) List(ctx context.Context, siteID string) ([]Pipeline, error) {
-	return nucleus.Query[Pipeline](ctx, s.db.SQL(),
+	rows, err := nucleus.Query[Pipeline](ctx, s.db.SQL(),
 		`SELECT pipeline_id, tenant_id, site_id, name, priority, COALESCE(rules, '') AS rules, enabled, created_at, version
-		 FROM log_pipelines WHERE site_id = $1 AND enabled = 'true' ORDER BY priority ASC`, siteID)
+		 FROM log_pipelines WHERE site_id = $1 AND enabled = 'true'`, siteID)
+	if err != nil {
+		return nil, err
+	}
+	// priority is stored as TEXT; sort numerically in Go. A SQL `ORDER BY
+	// priority` sorts lexicographically, so "10" would run before "2" and
+	// pipelines apply in the wrong order.
+	sort.SliceStable(rows, func(i, j int) bool {
+		pi, _ := strconv.Atoi(rows[i].Priority)
+		pj, _ := strconv.Atoi(rows[j].Priority)
+		return pi < pj
+	})
+	return rows, nil
+}
+
+// ValidateRules parses the rules JSON and rejects rules that would otherwise
+// fail silently during processing: uncompilable regexes (regex_extract, drop,
+// mask, sample) and out-of-range sample percentages. Returned errors are safe
+// to surface to the API caller as a 400.
+func ValidateRules(rules string) error {
+	if strings.TrimSpace(rules) == "" {
+		return nil // an empty rule set is a valid no-op pipeline
+	}
+	var parsed []Rule
+	if err := json.Unmarshal([]byte(rules), &parsed); err != nil {
+		return fmt.Errorf("rules: invalid JSON: %w", err)
+	}
+	for i, r := range parsed {
+		switch r.Type {
+		case "regex_extract", "drop", "mask", "sample":
+			if r.Pattern != "" {
+				if _, err := regexp.Compile(r.Pattern); err != nil {
+					return fmt.Errorf("rule %d (%s): invalid regex %q: %w", i, r.Type, r.Pattern, err)
+				}
+			}
+		}
+		if r.Type == "sample" && r.Value != "" {
+			pct, err := strconv.Atoi(r.Value)
+			if err != nil || pct < 0 || pct > 100 {
+				return fmt.Errorf("rule %d (sample): value must be an integer 0-100, got %q", i, r.Value)
+			}
+		}
+	}
+	return nil
 }
 
 func (s *PipelineService) Delete(ctx context.Context, pipelineID string) error {
@@ -147,24 +192,38 @@ func (s *PipelineService) ProcessLog(ctx context.Context, siteID, message string
 				}
 
 			case "sample":
-				// Sample: keep only N% of matching logs
-				if rule.Pattern != "" {
-					// Simple hash-based sampling
-					hash := 0
-					for _, c := range message {
-						hash = hash*31 + int(c)
+				// Keep only N% of logs matching Pattern. An empty Pattern matches
+				// all logs. Previously the rule sampled every log regardless of
+				// Pattern, and the signed hash could go negative so `hash%100`
+				// was negative — skewing the kept fraction. Use an unsigned
+				// FNV-1a hash for a stable, uniform [0,99] bucket.
+				matched := rule.Pattern == ""
+				if !matched {
+					if m, err := regexp.MatchString(rule.Pattern, message); err == nil {
+						matched = m
 					}
-					pct, _ := strconv.Atoi(rule.Value)
-					if pct > 0 && (hash%100) >= pct {
-						return message, attrs, false
+				}
+				if matched {
+					if pct, _ := strconv.Atoi(rule.Value); pct > 0 {
+						h := fnv.New32a()
+						h.Write([]byte(message))
+						if int(h.Sum32()%100) >= pct {
+							return message, attrs, false
+						}
 					}
 				}
 
 			case "mask":
-				// Mask sensitive data in message
+				// Mask sensitive data in message. Fail CLOSED on an uncompilable
+				// pattern: a mask rule exists to hide sensitive data, so if we
+				// can't evaluate it we redact the whole message rather than risk
+				// leaking what it was meant to hide. Create-time ValidateRules
+				// blocks new invalid masks; this only guards pre-existing ones.
 				if rule.Pattern != "" {
-					re, _ := regexp.Compile(rule.Pattern)
-					if re != nil {
+					re, err := regexp.Compile(rule.Pattern)
+					if err != nil {
+						message = "[REDACTED]"
+					} else {
 						message = re.ReplaceAllString(message, "[REDACTED]")
 					}
 				}

@@ -139,5 +139,10 @@ func (s *WebhookService) fireSlack(url string, payload AlertPayload) error {
 		return err
 	}
 	resp.Body.Close()
+	// Slack returns 4xx (e.g. invalid_payload, channel_not_found) with a 200-less
+	// status; treat any >=400 as a delivery failure so it's logged, not swallowed.
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("slack webhook returned %d", resp.StatusCode)
+	}
 	return nil
 }

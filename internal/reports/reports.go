@@ -14,6 +14,7 @@ import (
 	"github.com/neutron-dev/neutron-go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/mailx"
 )
 
 type ReportService struct {
@@ -216,7 +217,8 @@ func sendEmail(host, port, user, pass, from, to, subject, html string) error {
 	if user != "" {
 		auth = smtp.PlainAuth("", user, pass, host)
 	}
-	return smtp.SendMail(host+":"+port, auth, from, strings.Split(to, ","), []byte(msg))
+	// Timeout-bounded send so one unreachable relay can't stall the report loop.
+	return mailx.SendMail(host+":"+port, host, auth, from, strings.Split(to, ","), []byte(msg), 0)
 }
 
 func genID() string {

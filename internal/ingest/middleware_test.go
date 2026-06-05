@@ -6,20 +6,23 @@ import (
 	"testing"
 )
 
+// ipFromMiddleware runs RequestInfoMiddleware with the given trusted proxies
+// and returns the client IP it derives for req.
+func ipFromMiddleware(trustedCSV string, req *http.Request) (ip, ua string) {
+	mw := RequestInfoMiddleware(ParseTrustedProxies(trustedCSV))
+	mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip = ClientIPFromContext(r.Context())
+		ua = UserAgentFromContext(r.Context())
+	})).ServeHTTP(httptest.NewRecorder(), req)
+	return
+}
+
 func TestRequestInfoMiddleware_ExtractsIP(t *testing.T) {
-	var gotIP, gotUA string
-
-	handler := RequestInfoMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotIP = ClientIPFromContext(r.Context())
-		gotUA = UserAgentFromContext(r.Context())
-	}))
-
 	req := httptest.NewRequest("GET", "/", nil)
 	req.RemoteAddr = "192.168.1.100:12345"
 	req.Header.Set("User-Agent", "TestBot/1.0")
 
-	handler.ServeHTTP(httptest.NewRecorder(), req)
-
+	gotIP, gotUA := ipFromMiddleware("", req)
 	if gotIP != "192.168.1.100" {
 		t.Errorf("expected IP 192.168.1.100, got %s", gotIP)
 	}
@@ -28,37 +31,41 @@ func TestRequestInfoMiddleware_ExtractsIP(t *testing.T) {
 	}
 }
 
-func TestRequestInfoMiddleware_XForwardedFor(t *testing.T) {
-	var gotIP string
-
-	handler := RequestInfoMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotIP = ClientIPFromContext(r.Context())
-	}))
-
+// Untrusted peer: a spoofed X-Forwarded-For must be ignored and the real peer
+// address used, so a client can't forge a fresh rate-limit identity.
+func TestRequestInfoMiddleware_XFFIgnoredFromUntrustedPeer(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
-	req.Header.Set("X-Forwarded-For", "10.0.0.1, 10.0.0.2, 10.0.0.3")
+	req.RemoteAddr = "203.0.113.9:5555"
+	req.Header.Set("X-Forwarded-For", "10.0.0.1, 10.0.0.2")
+	req.Header.Set("X-Real-Ip", "172.16.0.5")
 
-	handler.ServeHTTP(httptest.NewRecorder(), req)
-
-	if gotIP != "10.0.0.1" {
-		t.Errorf("expected first X-Forwarded-For IP 10.0.0.1, got %s", gotIP)
+	gotIP, _ := ipFromMiddleware("", req) // no trusted proxies
+	if gotIP != "203.0.113.9" {
+		t.Errorf("spoofed XFF should be ignored, expected peer 203.0.113.9, got %s", gotIP)
 	}
 }
 
-func TestRequestInfoMiddleware_XRealIP(t *testing.T) {
-	var gotIP string
-
-	handler := RequestInfoMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotIP = ClientIPFromContext(r.Context())
-	}))
-
+// Trusted peer: XFF is honored, returning the rightmost untrusted hop.
+func TestRequestInfoMiddleware_XFFFromTrustedProxy(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "10.0.0.2:5555" // the edge proxy
+	// client -> trusted 10.0.0.3 -> trusted peer 10.0.0.2. Real client is 198.51.100.7.
+	req.Header.Set("X-Forwarded-For", "198.51.100.7, 10.0.0.3")
+
+	gotIP, _ := ipFromMiddleware("10.0.0.0/24", req)
+	if gotIP != "198.51.100.7" {
+		t.Errorf("expected real client 198.51.100.7 through trusted proxy, got %s", gotIP)
+	}
+}
+
+func TestRequestInfoMiddleware_XRealIPFromTrustedProxy(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "10.0.0.2:5555"
 	req.Header.Set("X-Real-Ip", "172.16.0.5")
 
-	handler.ServeHTTP(httptest.NewRecorder(), req)
-
+	gotIP, _ := ipFromMiddleware("10.0.0.2", req)
 	if gotIP != "172.16.0.5" {
-		t.Errorf("expected X-Real-Ip 172.16.0.5, got %s", gotIP)
+		t.Errorf("expected X-Real-Ip 172.16.0.5 from trusted proxy, got %s", gotIP)
 	}
 }
 

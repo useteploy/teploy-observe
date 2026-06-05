@@ -223,8 +223,18 @@ func (s *AlertService) CheckRules(ctx context.Context) error {
 				`SELECT COUNT(*) AS count FROM alert_history
 				 WHERE rule_id = $1 AND triggered_at >= $2`,
 				rule.RuleID, cooldownFrom)
-			if err == nil && len(crows) > 0 && crows[0].Count > 0 {
+			if err != nil {
+				// Cooldown can't be confirmed. Skip this tick rather than fire:
+				// the previous code let a query error fall through and re-fire
+				// every interval (webhook/PagerDuty spam, duplicate incidents).
+				// Suppressing a few alerts during a DB blip is the safer failure
+				// mode, and the blip is independently visible in logs.
+				s.logger.Error("alert cooldown check failed; skipping to avoid duplicate fire",
+					"rule", rule.RuleID, "err", err)
 				continue
+			}
+			if len(crows) > 0 && crows[0].Count > 0 {
+				continue // still within cooldown window
 			}
 		}
 
@@ -261,24 +271,50 @@ func (s *AlertService) CheckRules(ctx context.Context) error {
 
 // queryMetric runs the metric query for a rule window and returns the value.
 func (s *AlertService) queryMetric(ctx context.Context, siteID, metric, fromMs, toMs string) (float64, error) {
-	type result struct {
-		Value float64 `db:"value"`
-	}
-
-	var q string
 	switch metric {
 	case "pageviews":
-		q = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3 AND event_type = 'pageview'`
+		return s.scalarMetric(ctx, siteID, fromMs, toMs,
+			`SELECT CAST(COUNT(*) AS TEXT) AS value FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3 AND event_type = 'pageview'`)
 	case "visitors":
-		q = `SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS value FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`
+		return s.scalarMetric(ctx, siteID, fromMs, toMs,
+			`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS value FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`)
 	case "error_count":
-		q = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM error_events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`
+		return s.scalarMetric(ctx, siteID, fromMs, toMs,
+			`SELECT CAST(COUNT(*) AS TEXT) AS value FROM error_events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`)
 	case "error_rate":
-		q = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM error_events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`
+		// Errors as a percentage (0..100, matching the rule UI's "(%)" label) of
+		// total events over the window. Computed in Go from two counts because
+		// numerator (error_events) and denominator (events) live in different
+		// tables. NOTE: this is deliberately errors/events, not the releases
+		// page's errors/sessions — the alert is a real-time rate over a short
+		// window and using sessions would couple it to the (separate, in-flight)
+		// session-rollup work and a different time column. Previously this metric
+		// was a raw error count mislabeled as a rate.
+		errs, err := s.scalarMetric(ctx, siteID, fromMs, toMs,
+			`SELECT CAST(COUNT(*) AS TEXT) AS value FROM error_events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`)
+		if err != nil {
+			return 0, err
+		}
+		events, err := s.scalarMetric(ctx, siteID, fromMs, toMs,
+			`SELECT CAST(COUNT(*) AS TEXT) AS value FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`)
+		if err != nil {
+			return 0, err
+		}
+		if events == 0 {
+			return 0, nil
+		}
+		return 100.0 * errs / events, nil
 	default:
 		return 0, fmt.Errorf("unknown metric: %s", metric)
 	}
+}
 
+// scalarMetric runs a single-value metric query (site_id, from, to) and returns
+// the scalar, or 0 if there are no rows.
+func (s *AlertService) scalarMetric(ctx context.Context, siteID, fromMs, toMs, q string) (float64, error) {
+	type result struct {
+		Value float64 `db:"value"`
+	}
 	rows, err := nucleus.Query[result](ctx, s.db.SQL(), q, siteID, fromMs, toMs)
 	if err != nil || len(rows) == 0 {
 		return 0, err

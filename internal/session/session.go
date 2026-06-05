@@ -19,8 +19,11 @@ func ID(siteID, ip, userAgent, salt string) string {
 		hash[0:4], hash[4:6], hash[6:8], hash[8:10], hash[10:16])
 }
 
-// VisitID generates a visit identifier that rotates after 30 minutes of
-// inactivity or at hourly boundaries. A session can contain multiple visits.
+// VisitID generates a visit identifier that rotates at clock-hour boundaries:
+// the timestamp is truncated to the hour, so all events in the same wall-clock
+// hour for a session share one visit. (It does NOT track 30-minute inactivity —
+// a true inactivity window would require per-session last-seen state.) A session
+// can contain multiple visits.
 func VisitID(sessionID string, ts time.Time) string {
 	hourBucket := ts.Truncate(time.Hour).Unix()
 	input := fmt.Sprintf("%s:%d", sessionID, hourBucket)

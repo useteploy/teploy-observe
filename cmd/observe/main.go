@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -349,7 +350,7 @@ func main() {
 				return nil
 			},
 		}),
-		neutron.WithMiddleware(ingest.RequestInfoMiddleware),
+		neutron.WithMiddleware(ingest.RequestInfoMiddleware(ingest.ParseTrustedProxies(cfg.TrustedProxies))),
 		neutron.WithMiddleware(config.DemoModeMiddleware(cfg.DemoMode)),
 		neutron.WithNucleusChecker(db),
 		neutron.WithOpenAPIInfo("Teploy Observe", version),
@@ -627,13 +628,27 @@ func main() {
 
 	// --- LLM observability (API key auth for ingest, JWT for queries) ---
 	r.HandleFunc("POST /api/v1/llm/ingest", func(w http.ResponseWriter, req *http.Request) {
-		var input llm.LLMInput
-		json.NewDecoder(req.Body).Decode(&input)
-		if input.SiteID == "" { input.SiteID = "default" }
-		result, err := llmSvc.Ingest(req.Context(), input)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		if err != nil { fmt.Fprintf(w, `{"ok":false,"error":"%s"}`, err.Error()); return }
+		var input llm.LLMInput
+		if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
+			// Was silently ignored: a malformed body proceeded as an empty
+			// record and returned success.
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"ok":false,"error":"invalid JSON body"}`))
+			return
+		}
+		if input.SiteID == "" { input.SiteID = "default" }
+		result, err := llmSvc.Ingest(req.Context(), input)
+		if err != nil {
+			// Was HTTP 200 with the raw err reflected into hand-built JSON
+			// (success-on-failure + an escaping hazard). Return 5xx with a
+			// generic message; the detail is logged server-side.
+			logger.Error("llm ingest failed", "site", input.SiteID, "err", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"ok":false,"error":"ingest failed"}`))
+			return
+		}
 		json.NewEncoder(w).Encode(result)
 	})
 	llmGroup := r.Group("/api/v1/llm", jwtMW)
@@ -646,13 +661,23 @@ func main() {
 
 	// --- Infrastructure monitoring (public agent reports, JWT for queries) ---
 	r.HandleFunc("POST /api/v1/infra/report", func(w http.ResponseWriter, req *http.Request) {
-		var input infra.MetricInput
-		json.NewDecoder(req.Body).Decode(&input)
-		if input.SiteID == "" { input.SiteID = "default" }
-		err := infraSvc.Report(req.Context(), input)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		if err != nil { fmt.Fprintf(w, `{"ok":false}`); return }
+		var input infra.MetricInput
+		if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"ok":false,"error":"invalid JSON body"}`))
+			return
+		}
+		if input.SiteID == "" { input.SiteID = "default" }
+		if err := infraSvc.Report(req.Context(), input); err != nil {
+			// Was HTTP 200 {"ok":false}: the agent treated a backend failure as
+			// delivered and never retried. Return 5xx so it does.
+			logger.Error("infra report failed", "site", input.SiteID, "err", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"ok":false,"error":"report failed"}`))
+			return
+		}
 		fmt.Fprintf(w, `{"ok":true}`)
 	})
 	infraGroup := r.Group("/api/v1/infra", jwtMW)
@@ -1884,6 +1909,9 @@ func createPipelineHandler(svc *logs.PipelineService) neutron.HandlerFunc[create
 	return func(ctx context.Context, input createPipelineInput) (logs.Pipeline, error) {
 		if input.SiteID == "" || input.Name == "" {
 			return logs.Pipeline{}, neutron.ErrBadRequest("site_id and name required")
+		}
+		if err := logs.ValidateRules(input.Rules); err != nil {
+			return logs.Pipeline{}, neutron.ErrBadRequest(err.Error())
 		}
 		p, err := svc.Create(ctx, input.SiteID, input.Name, input.Rules, input.Priority)
 		if err != nil { return logs.Pipeline{}, err }
@@ -3304,9 +3332,19 @@ func srcmapUploadHandler(svc *sourcemaps.SourceMapService) http.HandlerFunc {
 			return
 		}
 		defer file.Close()
-		data := make([]byte, 10*1024*1024) // max 10MB
-		n, _ := file.Read(data)
-		data = data[:n]
+		// A single file.Read can return fewer bytes than requested, silently
+		// truncating larger sourcemaps and breaking symbolication. Read fully up
+		// to the cap (+1 byte so an over-limit upload is detected, not truncated).
+		const maxSourcemap = 10 * 1024 * 1024 // 10MB
+		data, err := io.ReadAll(io.LimitReader(file, maxSourcemap+1))
+		if err != nil {
+			http.Error(w, "failed to read sourcemap", http.StatusBadRequest)
+			return
+		}
+		if len(data) > maxSourcemap {
+			http.Error(w, "sourcemap exceeds 10MB limit", http.StatusRequestEntityTooLarge)
+			return
+		}
 
 		if err := svc.Upload(r.Context(), siteID, release, filename, data); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)

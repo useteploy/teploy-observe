@@ -23,6 +23,11 @@ type Config struct {
 
 	// Rate limiting
 	RateLimit int
+	// TrustedProxies is a comma-separated list of CIDRs/IPs whose
+	// X-Forwarded-For / X-Real-Ip headers are trusted for client-IP
+	// extraction. Empty (default) means trust none — use the peer address —
+	// so a client can't spoof its IP to evade per-IP rate limiting.
+	TrustedProxies string
 
 	// Auth
 	JWTSecret     string
@@ -46,6 +51,7 @@ func Load() Config {
 		RawRetentionDays:    envInt("OBSERVE_RAW_RETENTION_DAYS", 30),
 		HourlyRetentionDays: envInt("OBSERVE_HOURLY_RETENTION_DAYS", 365),
 		RateLimit:           envInt("OBSERVE_RATE_LIMIT", 1000),
+		TrustedProxies:      envOr("OBSERVE_TRUSTED_PROXIES", ""),
 		JWTSecret:           envOr("OBSERVE_JWT_SECRET", ""),
 		AdminUser:           envOr("OBSERVE_ADMIN_USER", "admin"),
 		AdminPassword:       envOr("OBSERVE_ADMIN_PASSWORD", ""),

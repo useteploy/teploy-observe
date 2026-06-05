@@ -3,13 +3,10 @@ package sso
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -92,63 +89,20 @@ func (s *SSOService) GetSAMLMetadata(baseURL string) string {
 }
 
 // SAMLCallbackHandler handles the SAML assertion callback.
-// In a production implementation, this would validate the SAML response
-// signature and extract user attributes. For now, it demonstrates the flow.
+//
+// DISABLED (501): the previous implementation extracted the email from the
+// assertion with naive string scanning and performed NO signature, audience,
+// conditions, or replay validation. Any party able to POST a crafted XML body
+// could assert an arbitrary identity — a latent auth bypass the moment JWT
+// minting is wired in. Rather than ship an unsafe SAML path, the callback is
+// hard-disabled until it is reimplemented with a maintained library
+// (crewjam/saml) doing XML-DSig verification against the stored certificate
+// plus audience/conditions/replay (XSW) enforcement before any session is
+// minted. The unsigned assertion is never parsed.
 func (s *SSOService) SAMLCallbackHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		samlResponse := r.FormValue("SAMLResponse")
-		if samlResponse == "" {
-			http.Error(w, "missing SAMLResponse", http.StatusBadRequest)
-			return
-		}
-
-		// Decode base64 SAML response
-		decoded, err := base64.StdEncoding.DecodeString(samlResponse)
-		if err != nil {
-			http.Error(w, "invalid SAMLResponse encoding", http.StatusBadRequest)
-			return
-		}
-
-		// Extract email from SAML assertion (simplified — real impl validates signature)
-		responseStr := string(decoded)
-		email := extractSAMLAttribute(responseStr, "email")
-		if email == "" {
-			email = extractSAMLAttribute(responseStr, "EmailAddress")
-		}
-
-		if email == "" {
-			http.Error(w, "could not extract email from SAML assertion", http.StatusBadRequest)
-			return
-		}
-
-		// In production: look up or create user, generate JWT, redirect to dashboard
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"status": "ok",
-			"email":  email,
-			"note":   "SSO login flow — JWT generation would happen here",
-		})
+		http.Error(w, "SAML SSO login is not enabled on this instance", http.StatusNotImplemented)
 	}
-}
-
-func extractSAMLAttribute(xml, attrName string) string {
-	// Simplified XML attribute extraction — production would use proper XML parsing
-	idx := strings.Index(xml, attrName)
-	if idx < 0 {
-		return ""
-	}
-	// Look for the value after the attribute name
-	rest := xml[idx:]
-	start := strings.Index(rest, ">")
-	if start < 0 {
-		return ""
-	}
-	rest = rest[start+1:]
-	end := strings.Index(rest, "<")
-	if end < 0 {
-		return ""
-	}
-	return strings.TrimSpace(rest[:end])
 }
 
 func genID() string {

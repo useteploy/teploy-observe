@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/mailx"
 )
 
 type IntegrationService struct {
@@ -354,7 +356,8 @@ func (s *IntegrationService) fireEmail(configJSON string, p AlertPayload) error 
 	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: [Observe Alert] %s\r\n\r\n%s\r\n\r\nMetric: %s = %s (threshold: %s)",
 		cfg.From, cfg.To, p.Title, p.Message, p.Metric, p.Value, p.Threshold)
 	auth := smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.SMTPHost)
-	return smtp.SendMail(cfg.SMTPHost+":"+port, auth, cfg.From, strings.Split(cfg.To, ","), []byte(msg))
+	// Timeout-bounded send so a hung relay can't block the alert dispatch path.
+	return mailx.SendMail(cfg.SMTPHost+":"+port, cfg.SMTPHost, auth, cfg.From, strings.Split(cfg.To, ","), []byte(msg), 0)
 }
 
 func (s *IntegrationService) fireSlack(configJSON string, p AlertPayload) error {
