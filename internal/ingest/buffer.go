@@ -70,6 +70,15 @@ type Buffer struct {
 	stopCh        chan struct{}
 	wg            sync.WaitGroup
 	queue         *DiskQueue
+	// lastOffset is the WAL offset after the most recently appended event,
+	// guarded by mu. It is the checkpoint target for the current batch: every
+	// event in the buffer was WAL-appended at or below it, and no later event
+	// exists yet, so checkpointing it covers exactly the flushed batch.
+	lastOffset int64
+	// flushMu serializes Flush so batches insert and checkpoint in WAL order;
+	// the monotonic checkpoint clamp then can't advance past an un-inserted
+	// earlier batch.
+	flushMu sync.Mutex
 }
 
 // NewBuffer creates a new ingestion buffer. If queue is non-nil, every Push
@@ -95,13 +104,18 @@ func (b *Buffer) AttachQueue(q *DiskQueue) error {
 	if err != nil {
 		return err
 	}
-	if len(pending) == 0 {
-		return nil
-	}
 	b.mu.Lock()
-	b.events = append(b.events, pending...)
+	// Seed the high-water mark to the WAL end so the first flush after replay
+	// checkpoints past the replayed region; otherwise those events (already on
+	// disk below the new writes) would replay again on the next crash.
+	b.lastOffset = q.Offset()
+	if len(pending) > 0 {
+		b.events = append(b.events, pending...)
+	}
 	b.mu.Unlock()
-	b.logger.Info("ingest queue: replayed", "count", len(pending))
+	if len(pending) > 0 {
+		b.logger.Info("ingest queue: replayed", "count", len(pending))
+	}
 	return nil
 }
 
@@ -149,16 +163,20 @@ func (b *Buffer) Push(e Event) bool {
 		return false
 	}
 	b.events = append(b.events, e)
-	shouldFlush := len(b.events) >= b.flushSize
-	b.mu.Unlock()
-
-	// WAL before signaling flush. Failure is logged, not fatal, so a disk
-	// problem never drops an event from the in-memory path.
+	// WAL under mu so the on-disk order matches b.events order; lastOffset then
+	// tracks the offset of the final buffered event. A failed append is logged,
+	// not fatal — the in-memory path still flushes it, it just isn't crash-safe.
+	// The bufio write is in-memory (fsync is on the background loop), so holding
+	// mu here does not block on disk I/O.
 	if b.queue != nil {
-		if err := b.queue.Append(e); err != nil {
+		if off, err := b.queue.Append(e); err != nil {
 			b.logger.Warn("ingest queue: append failed", "err", err)
+		} else {
+			b.lastOffset = off
 		}
 	}
+	shouldFlush := len(b.events) >= b.flushSize
+	b.mu.Unlock()
 
 	if shouldFlush {
 		go b.Flush()
@@ -166,14 +184,24 @@ func (b *Buffer) Push(e Event) bool {
 	return true
 }
 
-// Flush drains the buffer and batch-inserts into Nucleus.
+// Flush drains the buffer and batch-inserts into Nucleus. It is serialized by
+// flushMu so batches are inserted and checkpointed in WAL order — without that,
+// a later batch finishing first could checkpoint past an earlier, still
+// un-inserted batch and drop it on crash.
 func (b *Buffer) Flush() {
+	b.flushMu.Lock()
+	defer b.flushMu.Unlock()
+
 	b.mu.Lock()
 	if len(b.events) == 0 {
 		b.mu.Unlock()
 		return
 	}
 	batch := b.events
+	// Checkpoint target captured with the batch: every buffered event was
+	// WAL-appended at or below lastOffset, so this offset covers exactly this
+	// batch. New pushes after we release mu get a higher offset and a later batch.
+	target := b.lastOffset
 	b.events = make([]Event, 0, b.flushSize)
 	b.mu.Unlock()
 
@@ -183,7 +211,9 @@ func (b *Buffer) Flush() {
 	b.logger.Info("flushing events", "count", len(batch))
 	if err := b.insertBatch(ctx, batch); err != nil {
 		b.logger.Error("flush failed", "count", len(batch), "err", err)
-		// Re-queue events that failed to insert (best effort, may drop under pressure)
+		// Re-queue events that failed to insert (best effort, may drop under
+		// pressure). We deliberately do NOT checkpoint, so these events stay in
+		// the WAL and a later successful flush checkpoints them via lastOffset.
 		b.mu.Lock()
 		remaining := b.maxSize - len(b.events)
 		if remaining > 0 {
@@ -197,7 +227,7 @@ func (b *Buffer) Flush() {
 	}
 	b.logger.Info("flushed events OK", "count", len(batch))
 	if b.queue != nil {
-		if err := b.queue.Checkpoint(); err != nil {
+		if err := b.queue.Checkpoint(target); err != nil {
 			b.logger.Warn("ingest queue: checkpoint failed", "err", err)
 		}
 	}

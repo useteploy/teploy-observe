@@ -125,7 +125,30 @@ func (s *Service) CloseByRule(ctx context.Context, ruleID string) error {
 }
 
 func (s *Service) ActiveByRule(ctx context.Context, ruleID string) ([]Incident, error) {
-	return s.dedupLatest(ctx, `rule_id = $1 AND ended_at = '0'`, ruleID)
+	return s.activeWhere(ctx, `rule_id = $1`, ruleID)
+}
+
+// activeWhere reads every incident row matching the scope, dedups to the latest
+// row per incident, then keeps only those still open (ended_at == 0).
+//
+// The open filter MUST run after dedup. incidents is a plain mergetree and
+// Close() appends a second row with ended_at>0, so an open row and a closed row
+// for the same incident coexist. Filtering ended_at='0' in SQL drops the closed
+// (latest) row, and dedup then surfaces the stale open row — leaving a closed
+// incident "active" forever, which also permanently suppresses OnTrigger
+// auto-declare for that rule.
+func (s *Service) activeWhere(ctx context.Context, whereFrag string, args ...any) ([]Incident, error) {
+	latest, err := s.dedupLatest(ctx, whereFrag, args...)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Incident, 0, len(latest))
+	for _, inc := range latest {
+		if inc.EndedAt == 0 {
+			out = append(out, inc)
+		}
+	}
+	return out, nil
 }
 
 // InRange returns incidents that overlap [from, to] for the given site.
@@ -160,7 +183,7 @@ func (s *Service) InRange(ctx context.Context, siteID string, from, to int64) ([
 
 // Active returns all open incidents (ended_at = 0) for a site.
 func (s *Service) Active(ctx context.Context, siteID string) ([]Incident, error) {
-	return s.dedupLatest(ctx, `site_id = $1 AND ended_at = '0'`, siteID)
+	return s.activeWhere(ctx, `site_id = $1`, siteID)
 }
 
 func (s *Service) dedupLatest(ctx context.Context, whereFrag string, args ...any) ([]Incident, error) {

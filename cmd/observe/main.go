@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -812,7 +813,11 @@ func main() {
 		neutron.WithTags("crons"), neutron.WithSummary("List cron monitors"))
 	neutron.Post(cronEditor, "", createCronHandler(cronSvc),
 		neutron.WithTags("crons"), neutron.WithSummary("Create cron monitor"))
-	// Public checkin endpoint (no auth)
+	// Public checkin endpoint (no auth). The {site_id}/{slug} form is the
+	// canonical, multi-site-correct route; the bare {slug} form maps to the
+	// "default" site for single-tenant installs.
+	r.HandleFunc("POST /api/v1/checkin/{site_id}/{slug}", cronCheckinHandler(cronSvc))
+	r.HandleFunc("GET /api/v1/checkin/{site_id}/{slug}", cronCheckinHandler(cronSvc))
 	r.HandleFunc("POST /api/v1/checkin/{slug}", cronCheckinHandler(cronSvc))
 	r.HandleFunc("GET /api/v1/checkin/{slug}", cronCheckinHandler(cronSvc))
 
@@ -2984,6 +2989,11 @@ func createCronHandler(svc *monitoring.CronService) neutron.HandlerFunc[createCr
 	}
 }
 
+// cronCheckinHandler records a heartbeat for the cron identified by {site_id}
+// and {slug}. The single-segment route omits {site_id} and falls back to the
+// "default" site for single-tenant installs. Arguments must be passed to
+// RecordCheckin in (site_id, slug) order — passing the slug as the site_id was
+// a latent bug that made every check-in 404 and fired missed-check for all crons.
 func cronCheckinHandler(svc *monitoring.CronService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		slug := r.PathValue("slug")
@@ -2991,8 +3001,18 @@ func cronCheckinHandler(svc *monitoring.CronService) http.HandlerFunc {
 			http.Error(w, "missing slug", http.StatusBadRequest)
 			return
 		}
-		if err := svc.RecordCheckin(r.Context(), slug, "", "ok", 0); err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
+		siteID := r.PathValue("site_id")
+		if siteID == "" {
+			siteID = "default"
+		}
+		if err := svc.RecordCheckin(r.Context(), siteID, slug, "ok", 0); err != nil {
+			// Only a genuine not-found is 404; backend errors are 5xx so the
+			// heartbeat client retries instead of giving up.
+			if errors.Is(err, monitoring.ErrCronNotFound) {
+				http.Error(w, err.Error(), http.StatusNotFound)
+			} else {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

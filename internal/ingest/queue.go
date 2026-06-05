@@ -87,46 +87,83 @@ func NewDiskQueue(dir, name string, fsyncInterval time.Duration, maxBytes int64,
 	return q, nil
 }
 
-// Append writes one event to the write-ahead log. The caller should still
-// push the event into its in-memory buffer as well — DiskQueue is only for
-// durability on crash recovery.
-func (q *DiskQueue) Append(e Event) error {
+// Append writes one event to the write-ahead log and returns the WAL byte
+// offset immediately after the written record. The caller must hold this
+// offset and pass the batch's maximum offset to Checkpoint after the batch
+// is durably stored — checkpointing the live q.offset instead would mark
+// later, not-yet-inserted records as durable and drop them on crash.
+//
+// The caller should still push the event into its in-memory buffer as well —
+// DiskQueue is only for durability on crash recovery.
+func (q *DiskQueue) Append(e Event) (int64, error) {
 	raw, err := json.Marshal(e)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.stopped {
-		return errors.New("ingest queue: closed")
+		return q.offset, errors.New("ingest queue: closed")
 	}
 	n, err := q.writer.Write(raw)
 	if err != nil {
-		return err
+		return q.offset, err
 	}
 	if err := q.writer.WriteByte('\n'); err != nil {
-		return err
+		q.offset += int64(n)
+		return q.offset, err
 	}
 	q.offset += int64(n) + 1
 	q.dirtySinceFlush = true
-	return nil
+	return q.offset, nil
 }
 
-// Checkpoint records that every byte <= offset has been successfully
-// flushed to the database. Called from Buffer.Flush after a successful
-// SQL insert.
-func (q *DiskQueue) Checkpoint() error {
+// Offset returns the current WAL byte position. Used by Buffer.AttachQueue to
+// seed its high-water mark so the first post-replay checkpoint advances to the
+// end of the replayed region (otherwise replayed events would re-replay on the
+// next crash).
+func (q *DiskQueue) Offset() int64 {
 	q.mu.Lock()
-	off := q.offset
-	q.mu.Unlock()
+	defer q.mu.Unlock()
+	return q.offset
+}
 
+// Checkpoint records that every byte <= target has been successfully flushed to
+// the database. Called from Buffer.Flush after a successful SQL insert with the
+// maximum WAL offset of the inserted batch.
+//
+// The checkpoint only ever advances (monotonic clamp): a stale or out-of-order
+// call can never roll it backward past data already confirmed durable. target
+// is also clamped to the current offset so a bogus value can't skip past
+// un-written bytes. The bufio flush and fsync run while holding q.mu so they
+// cannot race a concurrent Append or the fsyncLoop (bufio.Writer is not safe
+// for concurrent use).
+//
+// Correctness relies on the single-flusher invariant: Buffer serializes Flush
+// (and thus Checkpoint) so batches are inserted and checkpointed in WAL order.
+func (q *DiskQueue) Checkpoint(target int64) error {
+	q.mu.Lock()
+	if q.stopped {
+		q.mu.Unlock()
+		return errors.New("ingest queue: closed")
+	}
+	if target <= q.checkpoint {
+		q.mu.Unlock()
+		return nil // already durable up to (or past) target
+	}
+	if target > q.offset {
+		target = q.offset
+	}
 	if err := q.writer.Flush(); err != nil {
+		q.mu.Unlock()
 		return err
 	}
 	if err := q.file.Sync(); err != nil {
+		q.mu.Unlock()
 		return err
 	}
-	return q.writeCheckpoint(off)
+	q.mu.Unlock()
+	return q.writeCheckpoint(target)
 }
 
 func (q *DiskQueue) writeCheckpoint(offset int64) error {

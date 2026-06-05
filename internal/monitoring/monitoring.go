@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -14,6 +15,12 @@ import (
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
+
+// ErrCronNotFound is returned by RecordCheckin when no enabled cron monitor
+// matches the (site, slug). Callers map this to 404; any other error is a
+// backend failure and must map to 5xx so heartbeat clients retry instead of
+// treating a transient outage as "cron deleted".
+var ErrCronNotFound = errors.New("monitoring: cron not found")
 
 // ---------------------------------------------------------------------------
 // Uptime monitoring
@@ -319,8 +326,13 @@ func (s *CronService) RecordCheckin(ctx context.Context, siteID, slug, status st
 			grace_period, enabled, created_at, version
 		 FROM cron_monitors WHERE site_id = $1 AND slug = $2 AND enabled = 'true'`,
 		siteID, slug)
-	if err != nil || len(crons) == 0 {
-		return fmt.Errorf("monitoring: cron not found for slug %q", slug)
+	if err != nil {
+		// Real backend failure — surface it so the handler returns 5xx and the
+		// client retries, rather than conflating it with "no such cron" (404).
+		return fmt.Errorf("monitoring: lookup cron %q/%q: %w", siteID, slug, err)
+	}
+	if len(crons) == 0 {
+		return fmt.Errorf("%w: %q/%q", ErrCronNotFound, siteID, slug)
 	}
 	cron := crons[0]
 
