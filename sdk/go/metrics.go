@@ -245,27 +245,31 @@ func (c *Client) FlushMetrics(ctx context.Context) error {
 	hLabels := mb.hLabels
 	hNames := mb.hNames
 
-	mb.counters = map[string]*counterState{}
+	// Re-seed the next interval's counter map with the cumulative totals so
+	// the exported series stays monotonic. This must happen under the same
+	// lock as the swap — re-seeding in a second critical section (as before)
+	// let a concurrent Add() that landed between re-create and value-restore
+	// get silently overwritten by the restore. The new states are fresh
+	// structs, so the snapshot `counters` we hand to buildMetricsOTLP below
+	// is frozen and safe to read without the lock.
+	newCounters := make(map[string]*counterState, len(counters))
+	newCnLabels := make(map[string][]Label, len(counters))
+	newCnNames := make(map[string]string, len(counters))
+	for key, st := range counters {
+		newCounters[key] = &counterState{value: st.value}
+		newCnLabels[key] = cnLabels[key]
+		newCnNames[key] = cnNames[key]
+	}
+	mb.counters = newCounters
+	mb.cnLabels = newCnLabels
+	mb.cnNames = newCnNames
 	mb.gauges = nil
 	mb.histograms = map[string]*histogramState{}
-	mb.cnLabels = map[string][]Label{}
-	mb.cnNames = map[string]string{}
 	mb.gaugeNames = map[string]string{}
 	mb.gaugeLbls = map[string][]Label{}
 	mb.hLabels = map[string][]Label{}
 	mb.hNames = map[string]string{}
 	mb.mu.Unlock()
-
-	// Snapshot counter states preserving cumulative semantics — re-seed
-	// the next interval with the running totals so consumers see a
-	// monotonically increasing series.
-	for key, st := range counters {
-		st2 := *st
-		c.recordCounter(cnNames[key], 0, cnLabels[key]) // re-create entry
-		c.metrics.mu.Lock()
-		c.metrics.counters[key].value = st2.value
-		c.metrics.mu.Unlock()
-	}
 
 	envelope := buildMetricsOTLP(c.opts.ServiceName, c.opts.Environment, counters, gauges, histograms, cnNames, cnLabels, hNames, hLabels)
 	return c.postMetrics(ctx, envelope)

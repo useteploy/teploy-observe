@@ -237,6 +237,71 @@ func TestCounterRetainsCumulativeValueAcrossFlushes(t *testing.T) {
 	}
 }
 
+// TestConcurrentAddDuringFlushConservesTotal guards the re-seed race: when
+// Add() runs concurrently with FlushMetrics, every increment must survive. The
+// old two-critical-section re-seed could overwrite an Add() that landed between
+// the re-create and the value-restore. Run with -race for the data race itself;
+// the conservation assertion catches lost updates even without the race flag.
+func TestConcurrentAddDuringFlushConservesTotal(t *testing.T) {
+	var posts atomic.Int32
+	var bodies []map[string]any
+	var mu sync.Mutex
+	srv := captureMetricsServer(t, &posts, &bodies, &mu)
+	defer srv.Close()
+
+	c, _ := New(Options{Endpoint: srv.URL, LogFlushInterval: time.Hour})
+	defer c.Close()
+
+	const goroutines, perG = 8, 500
+	ctr := c.Counter("hits")
+
+	var writers sync.WaitGroup
+	done := make(chan struct{})
+	var flusher sync.WaitGroup
+	// Flusher: hammer FlushMetrics concurrently with the writers until the
+	// writers signal completion via done.
+	flusher.Add(1)
+	go func() {
+		defer flusher.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				_ = c.FlushMetrics(context.Background())
+			}
+		}
+	}()
+	for g := 0; g < goroutines; g++ {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			for i := 0; i < perG; i++ {
+				ctr.Add(1)
+			}
+		}()
+	}
+	writers.Wait()
+	close(done)
+	flusher.Wait()
+	if err := c.FlushMetrics(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	c.mu.Lock()
+	mb := c.metrics
+	c.mu.Unlock()
+	mb.mu.Lock()
+	var got float64
+	for _, st := range mb.counters {
+		got += st.value
+	}
+	mb.mu.Unlock()
+	if want := float64(goroutines * perG); got != want {
+		t.Fatalf("counter total = %v, want %v (lost updates from flush race)", got, want)
+	}
+}
+
 func TestNegativeCounterAddIsDropped(t *testing.T) {
 	c, _ := New(Options{Endpoint: "http://example", LogFlushInterval: time.Hour})
 	defer c.Close()
