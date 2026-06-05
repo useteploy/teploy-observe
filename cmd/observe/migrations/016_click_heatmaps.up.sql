@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS click_heatmaps (
     vw_bucket   BIGINT NOT NULL DEFAULT 0,
     count       TEXT NOT NULL DEFAULT '0',
     created_at  BIGINT NOT NULL,
-    version     TEXT NOT NULL DEFAULT '0'
+    version     BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'

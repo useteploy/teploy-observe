@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS issues (
     event_count    TEXT NOT NULL DEFAULT '1',
     user_count     TEXT NOT NULL DEFAULT '0',
     release_tag    TEXT NOT NULL DEFAULT '',
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'

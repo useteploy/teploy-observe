@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS goals (
     goal_type      TEXT NOT NULL DEFAULT 'page',
     goal_value     TEXT NOT NULL DEFAULT '',
     created_at     TEXT NOT NULL,
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS uptime_monitors (
     expected_status TEXT NOT NULL DEFAULT '200',
     enabled        TEXT NOT NULL DEFAULT 'true',
     created_at     TEXT NOT NULL,
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'
@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS cron_monitors (
     grace_period   TEXT NOT NULL DEFAULT '300',
     enabled        TEXT NOT NULL DEFAULT 'true',
     created_at     TEXT NOT NULL,
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'
@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS dashboards (
     description    TEXT NOT NULL DEFAULT '',
     created_by     TEXT NOT NULL DEFAULT '',
     created_at     TEXT NOT NULL,
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'
@@ -136,7 +136,7 @@ CREATE TABLE IF NOT EXISTS dashboard_panels (
     position_y     TEXT NOT NULL DEFAULT '0',
     width          TEXT NOT NULL DEFAULT '6',
     height         TEXT NOT NULL DEFAULT '4',
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'
@@ -186,7 +186,7 @@ CREATE TABLE IF NOT EXISTS tracked_links (
     slug           TEXT NOT NULL,
     click_count    TEXT NOT NULL DEFAULT '0',
     created_at     TEXT NOT NULL,
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'

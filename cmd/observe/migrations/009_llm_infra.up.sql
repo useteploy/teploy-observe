@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS log_pipelines (
     rules          JSONB,
     enabled        TEXT NOT NULL DEFAULT 'true',
     created_at     TEXT NOT NULL,
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'

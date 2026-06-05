@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS integrations (
     config         JSONB,
     enabled        TEXT NOT NULL DEFAULT 'true',
     created_at     TEXT NOT NULL,
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'
@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS saved_views (
     view_config    JSONB,
     created_by     TEXT NOT NULL DEFAULT '',
     created_at     TEXT NOT NULL,
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'
@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS report_schedules (
     enabled        TEXT NOT NULL DEFAULT 'true',
     last_sent      TEXT NOT NULL DEFAULT '0',
     created_at     TEXT NOT NULL,
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'

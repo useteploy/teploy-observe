@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS feature_flags (
     variants       JSONB,
     targeting      JSONB,
     created_at     TEXT NOT NULL,
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS experiments (
     started_at     TEXT NOT NULL DEFAULT '0',
     ended_at       TEXT NOT NULL DEFAULT '0',
     created_at     TEXT NOT NULL,
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'
@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS surveys (
     targeting      JSONB,
     status         TEXT NOT NULL DEFAULT 'draft',
     created_at     TEXT NOT NULL,
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'

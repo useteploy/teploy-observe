@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS service_stats (
     p50_ms         TEXT NOT NULL DEFAULT '0',
     p95_ms         TEXT NOT NULL DEFAULT '0',
     p99_ms         TEXT NOT NULL DEFAULT '0',
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'
@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS service_dependencies (
     error_count    TEXT NOT NULL DEFAULT '0',
     avg_duration   TEXT NOT NULL DEFAULT '0',
     ts_bucket      BIGINT NOT NULL,
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'

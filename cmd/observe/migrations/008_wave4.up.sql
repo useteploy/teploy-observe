@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS groups (
     name           TEXT NOT NULL DEFAULT '',
     properties     JSONB,
     created_at     TEXT NOT NULL,
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'
@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS sso_configs (
     attribute_map  JSONB,
     enabled        TEXT NOT NULL DEFAULT 'false',
     created_at     TEXT NOT NULL,
-    version        TEXT NOT NULL DEFAULT '0'
+    version        BIGINT NOT NULL DEFAULT 0
 ) WITH (
     engine = 'replacing_mergetree',
     version_column = 'version'
