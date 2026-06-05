@@ -79,10 +79,21 @@ func Handler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.Handl
 			return IngestResponse{}, neutron.ErrBadRequest("too many properties (max 50)")
 		}
 
-		// Site ID priority: JSON body > middleware context (header) > empty
-		siteID := input.SiteID
-		if siteID == "" {
-			siteID = SiteIDFromContext(ctx)
+		// Site scoping: when the request is authenticated by an API key, that
+		// key's site (bound into the context by APIKeyAuthMiddleware) is
+		// AUTHORITATIVE. A body site_id that disagrees is a cross-tenant write
+		// attempt and is rejected — otherwise a holder of any one valid key
+		// could forge/poison events under any other site. Only fall back to the
+		// body site_id when there is no key-bound context site (the no-keys
+		// grace period on a fresh/single-tenant install).
+		ctxSite := SiteIDFromContext(ctx)
+		siteID := ctxSite
+		if ctxSite != "" {
+			if input.SiteID != "" && input.SiteID != ctxSite {
+				return IngestResponse{}, neutron.ErrForbidden("site_id does not match API key")
+			}
+		} else {
+			siteID = input.SiteID
 		}
 		if siteID == "" {
 			return IngestResponse{}, neutron.ErrBadRequest("missing site_id")
