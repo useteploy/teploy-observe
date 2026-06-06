@@ -125,6 +125,54 @@ func TestListPersons_AggregatesByDistinctID(t *testing.T) {
 	}
 }
 
+// TestListPersons_TopCountryIsMostRecent pins that TopCountry/TopBrowser reflect
+// the most-recent value (argMax over timestamp), not the lexically-largest one
+// (the old MAX(col) bug). Values are chosen so most-recent != lexical max.
+func TestListPersons_TopCountryIsMostRecent(t *testing.T) {
+	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
+	if dsn == "" {
+		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	db, err := nucleus.Connect(ctx, dsn)
+	if err != nil {
+		t.Skipf("nucleus not reachable at %s — skipping", dsn)
+	}
+	defer db.Close()
+
+	site := "test_persons_mr_" + personsToken()
+	base := time.Date(2099, 9, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	plant := func(country, browser string, offsetMs int64) {
+		_, err := db.SQL().Exec(ctx,
+			`INSERT INTO events (event_id, tenant_id, site_id, session_id, visit_id,
+				timestamp, event_type, country, browser, distinct_id)
+			 VALUES ($1, 'default', $2, 's1', 's1', $3, 'pageview', $4, $5, 'u1')`,
+			personsRandID(), site, strconv.FormatInt(base+offsetMs, 10), country, browser)
+		if err != nil {
+			t.Fatalf("plant: %v", err)
+		}
+	}
+	// Earlier = lexically larger; later = lexically smaller. MAX() would pick the
+	// earlier (ZZ / Safari); argMax-over-timestamp must pick the later (AA / Chrome).
+	plant("ZZ", "Safari", 1000)
+	plant("AA", "Chrome", 5000)
+
+	rows, err := NewService(db).ListPersons(ctx, site, base, base+10000, 50, 0, false)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want 1 person, got %d", len(rows))
+	}
+	if rows[0].TopCountry != "AA" {
+		t.Fatalf("TopCountry = %q, want AA (most recent, not lexical max ZZ)", rows[0].TopCountry)
+	}
+	if rows[0].TopBrowser != "Chrome" {
+		t.Fatalf("TopBrowser = %q, want Chrome (most recent)", rows[0].TopBrowser)
+	}
+}
+
 // TestListPersons_PaginationAndCount pins limit/offset behaviour and
 // the CountPersons helper.
 func TestListPersons_PaginationAndCount(t *testing.T) {

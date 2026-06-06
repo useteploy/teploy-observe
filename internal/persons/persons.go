@@ -106,8 +106,8 @@ func (s *Service) ListPersons(ctx context.Context, siteID string, fromMs, toMs i
 	        MAX(CAST(timestamp AS BIGINT)) AS last_seen_ms,
 	        COUNT(*) AS event_count,
 	        COUNT(DISTINCT session_id) AS session_count,
-	        MAX(country) AS top_country,
-	        MAX(browser) AS top_browser
+	        argMax(country, CAST(timestamp AS BIGINT)) AS top_country,
+	        argMax(browser, CAST(timestamp AS BIGINT)) AS top_browser
 	 FROM events
 	 WHERE site_id = $1
 	   AND timestamp >= $2
@@ -142,8 +142,8 @@ func (s *Service) PersonDetail(ctx context.Context, siteID, distinctID string) (
 	        MAX(CAST(timestamp AS BIGINT)) AS last_seen_ms,
 	        COUNT(*) AS event_count,
 	        COUNT(DISTINCT session_id) AS session_count,
-	        MAX(country) AS top_country,
-	        MAX(browser) AS top_browser
+	        argMax(country, CAST(timestamp AS BIGINT)) AS top_country,
+	        argMax(browser, CAST(timestamp AS BIGINT)) AS top_browser
 	 FROM events
 	 WHERE site_id = $1 AND distinct_id = $2
 	 GROUP BY distinct_id`
