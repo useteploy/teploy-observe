@@ -262,6 +262,13 @@ func main() {
 	scheduledExportSvc := jobs.NewExportService(db, explorerSvc, logger)
 	incidentSvc := incidents.NewService(db)
 
+	// A cron check-in resolves any open missed-cron incident for that monitor.
+	cronSvc.OnCheckin = func(ctx context.Context, c monitoring.CronMonitor) {
+		if err := incidentSvc.CloseByRule(ctx, "cron:"+c.CronID); err != nil {
+			logger.Warn("cron incident auto-resolve failed", "cron", c.CronID, "err", err)
+		}
+	}
+
 	// W2.B: cross-site board summary. SiteLookup adapts the SiteService
 	// (Get returns Site) to the BoardService's small SiteMeta tuple so
 	// internal/query doesn't have to import internal/sites.
@@ -867,6 +874,8 @@ func main() {
 		neutron.WithTags("monitors"), neutron.WithSummary("Create uptime monitor"))
 	neutron.Get(uptimeGroup, "/{monitor_id}/results", monitorResultsHandler(uptimeSvc),
 		neutron.WithTags("monitors"), neutron.WithSummary("Get monitor results"))
+	neutron.Delete(uptimeAdmin, "/{monitor_id}", deleteMonitorHandler(uptimeSvc),
+		neutron.WithTags("monitors"), neutron.WithSummary("Delete (disable) uptime monitor"))
 
 	// --- Cron monitors (JWT auth + public checkin; editor+ writes) ---
 	cronGroup := r.Group("/api/v1/crons", jwtMW)
@@ -875,9 +884,13 @@ func main() {
 		neutron.WithTags("crons"), neutron.WithSummary("List cron monitors"))
 	neutron.Post(cronEditor, "", createCronHandler(cronSvc),
 		neutron.WithTags("crons"), neutron.WithSummary("Create cron monitor"))
-	// Public checkin endpoint (no auth). The {site_id}/{slug} form is the
-	// canonical, multi-site-correct route; the bare {slug} form maps to the
-	// "default" site for single-tenant installs.
+	neutron.Delete(cronEditor, "/{cron_id}", deleteCronHandler(cronSvc),
+		neutron.WithTags("crons"), neutron.WithSummary("Delete (disable) cron monitor"))
+	// Public checkin (no auth). Preferred form is an opaque per-cron ping token
+	// (returned at creation): possession of the token authorizes the heartbeat.
+	r.HandleFunc("POST /api/v1/checkin/token/{ping_token}", cronCheckinByTokenHandler(cronSvc))
+	r.HandleFunc("GET /api/v1/checkin/token/{ping_token}", cronCheckinByTokenHandler(cronSvc))
+	// Legacy slug forms, retained for back-compat with existing monitors.
 	r.HandleFunc("POST /api/v1/checkin/{site_id}/{slug}", cronCheckinHandler(cronSvc))
 	r.HandleFunc("GET /api/v1/checkin/{site_id}/{slug}", cronCheckinHandler(cronSvc))
 	r.HandleFunc("POST /api/v1/checkin/{slug}", cronCheckinHandler(cronSvc))
@@ -1041,6 +1054,41 @@ func main() {
 		for {
 			uptimeSvc.RunChecks(context.Background())
 			time.Sleep(30 * time.Second)
+		}
+	}()
+
+	// Missed-cron detection loop (every 60s). Without this, CheckMissed was
+	// dead code and a silently-dead cron was never alerted. Each missing cron
+	// opens a deduped incident (keyed on cron:<id>); a subsequent check-in
+	// that brings it back inside its grace period auto-resolves the incident.
+	go func() {
+		time.Sleep(45 * time.Second)
+		for {
+			ctx := context.Background()
+			missed, err := cronSvc.CheckMissed(ctx)
+			if err != nil {
+				logger.Error("cron missed-check failed", "err", err)
+			}
+			missingNow := make(map[string]bool, len(missed))
+			for _, c := range missed {
+				ruleKey := "cron:" + c.CronID
+				missingNow[ruleKey] = true
+				if active, _ := incidentSvc.ActiveByRule(ctx, ruleKey); len(active) > 0 {
+					continue // already open — dedup
+				}
+				_, err := incidentSvc.Create(ctx, incidents.CreateInput{
+					SiteID:      c.SiteID,
+					Title:       fmt.Sprintf("Cron missed: %s", c.Name),
+					Description: fmt.Sprintf("cron %q (slug %q) has not checked in within its %ds grace period", c.Name, c.Slug, c.GracePeriod),
+					Severity:    "warning",
+					Source:      incidents.SourceCron,
+					RuleID:      ruleKey,
+				}, "cron")
+				if err != nil {
+					logger.Warn("cron incident auto-create failed", "cron", c.CronID, "err", err)
+				}
+			}
+			time.Sleep(60 * time.Second)
 		}
 	}()
 
@@ -3049,6 +3097,20 @@ func monitorResultsHandler(svc *monitoring.UptimeService) neutron.HandlerFunc[mo
 	}
 }
 
+type deleteMonitorInput struct {
+	MonitorID string `path:"monitor_id"`
+	SiteID    string `query:"site_id"`
+}
+
+func deleteMonitorHandler(svc *monitoring.UptimeService) neutron.HandlerFunc[deleteMonitorInput, neutron.Empty] {
+	return func(ctx context.Context, input deleteMonitorInput) (neutron.Empty, error) {
+		if input.SiteID == "" {
+			return neutron.Empty{}, neutron.ErrBadRequest("site_id required")
+		}
+		return neutron.Empty{}, svc.DeleteMonitor(ctx, input.SiteID, input.MonitorID)
+	}
+}
+
 // --- Cron monitor handlers ---
 
 type listCronsInput struct {
@@ -3106,6 +3168,39 @@ func cronCheckinHandler(svc *monitoring.CronService) http.HandlerFunc {
 			// heartbeat client retries instead of giving up.
 			if errors.Is(err, monitoring.ErrCronNotFound) {
 				http.Error(w, err.Error(), http.StatusNotFound)
+			} else {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	}
+}
+
+type deleteCronInput struct {
+	CronID string `path:"cron_id"`
+	SiteID string `query:"site_id"`
+}
+
+func deleteCronHandler(svc *monitoring.CronService) neutron.HandlerFunc[deleteCronInput, neutron.Empty] {
+	return func(ctx context.Context, input deleteCronInput) (neutron.Empty, error) {
+		if input.SiteID == "" {
+			return neutron.Empty{}, neutron.ErrBadRequest("site_id required")
+		}
+		return neutron.Empty{}, svc.DeleteCron(ctx, input.SiteID, input.CronID)
+	}
+}
+
+// cronCheckinByTokenHandler records a heartbeat for the cron identified by its
+// opaque ping token. Unauthenticated by design (heartbeats come from arbitrary
+// job runners) but the token — not a guessable site/slug — is the bearer secret.
+func cronCheckinByTokenHandler(svc *monitoring.CronService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := r.PathValue("ping_token")
+		if err := svc.RecordCheckinByToken(r.Context(), token, "ok", 0); err != nil {
+			if errors.Is(err, monitoring.ErrCronNotFound) {
+				http.Error(w, "not found", http.StatusNotFound)
 			} else {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 			}

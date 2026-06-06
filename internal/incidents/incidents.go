@@ -19,6 +19,7 @@ import (
 const (
 	SourceAlert  = "alert"
 	SourceManual = "manual"
+	SourceCron   = "cron"
 )
 
 type Incident struct {

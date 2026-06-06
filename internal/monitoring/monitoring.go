@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -32,6 +33,9 @@ type UptimeService struct {
 	db     *nucleus.Client
 	logger *slog.Logger
 	client *http.Client
+
+	mu        sync.Mutex
+	lastCheck map[string]time.Time // monitor_id -> last check time
 }
 
 // NewUptimeService creates a new UptimeService.
@@ -42,7 +46,8 @@ func NewUptimeService(db *nucleus.Client, logger *slog.Logger) *UptimeService {
 		// SSRF-safe: blocks dialing private/loopback/link-local/metadata IPs and
 		// re-validates redirects, so an operator-supplied monitor URL can't be
 		// pointed at 169.254.169.254, internal services, or the Tailscale mesh.
-		client: netsafe.Client(30 * time.Second),
+		client:    netsafe.Client(30 * time.Second),
+		lastCheck: make(map[string]time.Time),
 	}
 }
 
@@ -131,16 +136,18 @@ func (s *UptimeService) ListMonitors(ctx context.Context, siteID string) ([]Moni
 	return rows, nil
 }
 
-// DeleteMonitor disables a monitor by re-inserting with enabled='false' and a bumped version.
-func (s *UptimeService) DeleteMonitor(ctx context.Context, monitorID string) error {
+// DeleteMonitor disables a monitor by re-inserting with enabled='false' and a
+// bumped version. Scoped by site_id so a caller cannot disable another site's
+// monitor by guessing its id.
+func (s *UptimeService) DeleteMonitor(ctx context.Context, siteID, monitorID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO uptime_monitors (monitor_id, tenant_id, site_id, name, url, method,
 			interval_secs, expected_status, enabled, created_at, version)
 		 SELECT monitor_id, tenant_id, site_id, name, url, method,
-			interval_secs, expected_status, 'false', created_at, $2
-		 FROM uptime_monitors WHERE monitor_id = $1`,
-		monitorID, now,
+			interval_secs, expected_status, 'false', created_at, $3
+		 FROM uptime_monitors WHERE monitor_id = $1 AND site_id = $2`,
+		monitorID, siteID, now,
 	)
 	if err != nil {
 		return fmt.Errorf("monitoring: delete monitor: %w", err)
@@ -189,7 +196,11 @@ func (s *UptimeService) recordResult(ctx context.Context, m Monitor, statusCode 
 	}
 }
 
-// RunChecks iterates all enabled monitors across all sites and checks each one.
+// RunChecks iterates all enabled monitors across all sites and checks the ones
+// whose configured interval has elapsed. Previously every monitor was checked
+// on every tick (so interval_secs was ignored) and checks ran serially (so one
+// slow target stalled the rest). Eligible checks now run concurrently under a
+// bounded worker pool, each with a per-check timeout.
 func (s *UptimeService) RunChecks(ctx context.Context) error {
 	monitors, err := nucleus.Query[Monitor](ctx, s.db.SQL(),
 		`SELECT monitor_id, tenant_id, site_id, name, url, method,
@@ -199,9 +210,42 @@ func (s *UptimeService) RunChecks(ctx context.Context) error {
 		return fmt.Errorf("monitoring: run checks query: %w", err)
 	}
 
+	now := time.Now()
+	var due []Monitor
+	s.mu.Lock()
 	for _, m := range monitors {
-		s.CheckMonitor(ctx, m)
+		interval := time.Duration(m.IntervalSecs) * time.Second
+		if interval <= 0 {
+			interval = 60 * time.Second
+		}
+		if last, ok := s.lastCheck[m.MonitorID]; ok && now.Sub(last) < interval {
+			continue
+		}
+		s.lastCheck[m.MonitorID] = now
+		due = append(due, m)
 	}
+	s.mu.Unlock()
+
+	const maxConcurrent = 10
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+	for _, m := range due {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(m Monitor) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			// Cap one hung target so it can't block the worker indefinitely.
+			timeout := time.Duration(m.IntervalSecs) * time.Second
+			if timeout <= 0 || timeout > 30*time.Second {
+				timeout = 30 * time.Second
+			}
+			cctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			s.CheckMonitor(cctx, m)
+		}(m)
+	}
+	wg.Wait()
 	return nil
 }
 
@@ -234,6 +278,10 @@ func (s *UptimeService) ListResults(ctx context.Context, monitorID string, limit
 type CronService struct {
 	db     *nucleus.Client
 	logger *slog.Logger
+
+	// OnCheckin, if set, is invoked after a successful check-in so a caller can
+	// resolve any open missed-cron incident for that monitor.
+	OnCheckin func(ctx context.Context, cron CronMonitor)
 }
 
 // NewCronService creates a new CronService.
@@ -251,6 +299,7 @@ type CronMonitor struct {
 	Schedule    string `json:"schedule"`
 	GracePeriod int    `json:"grace_period" db:"grace_period"`
 	Enabled     bool   `json:"enabled"`
+	PingToken   string `json:"ping_token" db:"ping_token"`
 	CreatedAt   string `json:"created_at" db:"created_at"`
 	Version     string `json:"-" db:"version"`
 }
@@ -281,13 +330,15 @@ func (s *CronService) CreateCron(ctx context.Context, c CronMonitor) (*CronMonit
 	if c.GracePeriod == 0 {
 		c.GracePeriod = 300
 	}
+	// Opaque high-entropy token: possession of it is what authorizes a heartbeat.
+	c.PingToken = genID() + genID()
 
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO cron_monitors (cron_id, tenant_id, site_id, name, slug, schedule,
-			grace_period, enabled, created_at, version)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			grace_period, enabled, ping_token, created_at, version)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		c.CronID, c.TenantID, c.SiteID, c.Name, c.Slug, c.Schedule,
-		strconv.Itoa(c.GracePeriod), strconv.FormatBool(c.Enabled), now, now,
+		strconv.Itoa(c.GracePeriod), strconv.FormatBool(c.Enabled), c.PingToken, now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("monitoring: create cron: %w", err)
@@ -299,7 +350,7 @@ func (s *CronService) CreateCron(ctx context.Context, c CronMonitor) (*CronMonit
 func (s *CronService) ListCrons(ctx context.Context, siteID string) ([]CronMonitor, error) {
 	rows, err := nucleus.Query[CronMonitor](ctx, s.db.SQL(),
 		`SELECT cron_id, tenant_id, site_id, name, slug, schedule,
-			grace_period, enabled, created_at, version
+			grace_period, enabled, COALESCE(ping_token, '') AS ping_token, created_at, version
 		 FROM cron_monitors WHERE site_id = $1 AND enabled = 'true'
 		 ORDER BY created_at DESC`, siteID)
 	if err != nil {
@@ -311,16 +362,18 @@ func (s *CronService) ListCrons(ctx context.Context, siteID string) ([]CronMonit
 	return rows, nil
 }
 
-// DeleteCron disables a cron monitor by re-inserting with enabled='false' and a bumped version.
-func (s *CronService) DeleteCron(ctx context.Context, cronID string) error {
+// DeleteCron disables a cron monitor by re-inserting with enabled='false' and a
+// bumped version. Scoped by site_id so a caller cannot disable another site's
+// cron by guessing its id.
+func (s *CronService) DeleteCron(ctx context.Context, siteID, cronID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO cron_monitors (cron_id, tenant_id, site_id, name, slug, schedule,
-			grace_period, enabled, created_at, version)
+			grace_period, enabled, ping_token, created_at, version)
 		 SELECT cron_id, tenant_id, site_id, name, slug, schedule,
-			grace_period, 'false', created_at, $2
-		 FROM cron_monitors WHERE cron_id = $1`,
-		cronID, now,
+			grace_period, 'false', ping_token, created_at, $3
+		 FROM cron_monitors WHERE cron_id = $1 AND site_id = $2`,
+		cronID, siteID, now,
 	)
 	if err != nil {
 		return fmt.Errorf("monitoring: delete cron: %w", err)
@@ -328,12 +381,35 @@ func (s *CronService) DeleteCron(ctx context.Context, cronID string) error {
 	return nil
 }
 
+// RecordCheckinByToken records a heartbeat for the cron identified by its opaque
+// ping token. Possession of the token authorizes the heartbeat; an unknown token
+// maps to ErrCronNotFound (404). This replaces the old guessable (site_id, slug)
+// scheme that allowed cross-site check-in spoofing.
+func (s *CronService) RecordCheckinByToken(ctx context.Context, token, status string, durationMs int64) error {
+	if token == "" {
+		return fmt.Errorf("%w: empty token", ErrCronNotFound)
+	}
+	crons, err := nucleus.Query[CronMonitor](ctx, s.db.SQL(),
+		`SELECT cron_id, tenant_id, site_id, name, slug, schedule,
+			grace_period, enabled, COALESCE(ping_token, '') AS ping_token, created_at, version
+		 FROM cron_monitors WHERE ping_token = $1 AND enabled = 'true'`,
+		token)
+	if err != nil {
+		return fmt.Errorf("monitoring: lookup cron by token: %w", err)
+	}
+	if len(crons) == 0 {
+		return fmt.Errorf("%w: token", ErrCronNotFound)
+	}
+	return s.insertCheckin(ctx, crons[0], status, durationMs)
+}
+
 // RecordCheckin records a heartbeat checkin for a cron job identified by slug.
+// Retained for the legacy slug check-in routes; new monitors use ping tokens.
 func (s *CronService) RecordCheckin(ctx context.Context, siteID, slug, status string, durationMs int64) error {
 	// Look up the cron monitor by slug
 	crons, err := nucleus.Query[CronMonitor](ctx, s.db.SQL(),
 		`SELECT cron_id, tenant_id, site_id, name, slug, schedule,
-			grace_period, enabled, created_at, version
+			grace_period, enabled, COALESCE(ping_token, '') AS ping_token, created_at, version
 		 FROM cron_monitors WHERE site_id = $1 AND slug = $2 AND enabled = 'true'`,
 		siteID, slug)
 	if err != nil {
@@ -344,8 +420,10 @@ func (s *CronService) RecordCheckin(ctx context.Context, siteID, slug, status st
 	if len(crons) == 0 {
 		return fmt.Errorf("%w: %q/%q", ErrCronNotFound, siteID, slug)
 	}
-	cron := crons[0]
+	return s.insertCheckin(ctx, crons[0], status, durationMs)
+}
 
+func (s *CronService) insertCheckin(ctx context.Context, cron CronMonitor, status string, durationMs int64) error {
 	checkinID := genID()
 	now := time.Now().UTC().UnixMilli()
 	nowStr := dbutil.IntParam(now)
@@ -354,7 +432,7 @@ func (s *CronService) RecordCheckin(ctx context.Context, siteID, slug, status st
 		status = "ok"
 	}
 
-	_, err = s.db.SQL().Exec(ctx,
+	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO cron_checkins (checkin_id, tenant_id, cron_id, site_id,
 			timestamp, status, duration_ms)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -364,6 +442,9 @@ func (s *CronService) RecordCheckin(ctx context.Context, siteID, slug, status st
 	if err != nil {
 		return fmt.Errorf("monitoring: record checkin: %w", err)
 	}
+	if s.OnCheckin != nil {
+		s.OnCheckin(ctx, cron)
+	}
 	return nil
 }
 
@@ -372,7 +453,7 @@ func (s *CronService) RecordCheckin(ctx context.Context, siteID, slug, status st
 func (s *CronService) CheckMissed(ctx context.Context) ([]CronMonitor, error) {
 	crons, err := nucleus.Query[CronMonitor](ctx, s.db.SQL(),
 		`SELECT cron_id, tenant_id, site_id, name, slug, schedule,
-			grace_period, enabled, created_at, version
+			grace_period, enabled, COALESCE(ping_token, '') AS ping_token, created_at, version
 		 FROM cron_monitors WHERE enabled = 'true'`)
 	if err != nil {
 		return nil, fmt.Errorf("monitoring: check missed query: %w", err)
