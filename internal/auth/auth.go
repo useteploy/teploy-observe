@@ -132,6 +132,9 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (str
 		username,
 	)
 	if err != nil {
+		// Run a bcrypt comparison against a fixed dummy hash even when the user
+		// doesn't exist, so the response time doesn't leak username existence.
+		checkPassword(password, dummyBcryptHash)
 		return "", fmt.Errorf("auth: invalid credentials")
 	}
 
@@ -189,6 +192,11 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 // beyond it. Callers must reject longer passwords rather than store the empty
 // hash the error path used to produce (which silently locked accounts out).
 const maxPasswordBytes = 72
+
+// dummyBcryptHash is a valid bcrypt hash (of a random string) used to spend the
+// same CPU on a nonexistent-user login as a real one, removing the timing
+// side-channel that would otherwise reveal which usernames exist.
+const dummyBcryptHash = "$2a$10$N9qo8uLOickgx2ZMRZoMye1J7.6FkVqI3rR0pQ1bQ8XfQ9qK0e2C"
 
 func hashPassword(password string) (string, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)

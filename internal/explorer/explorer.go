@@ -33,8 +33,11 @@ func (s *ExplorerService) Execute(ctx context.Context, sql string) (*QueryResult
 	if err != nil {
 		return &QueryResult{Error: err.Error()}, nil
 	}
-	if kind == stmtSelect && !hasLimit(sql) {
-		sql = strings.TrimRight(strings.TrimSpace(sql), ";") + " LIMIT 100"
+	if kind == stmtSelect {
+		// Always wrap in an outer LIMIT rather than substring-matching for an
+		// existing LIMIT — a LIMIT inside a subquery does not bound the outer
+		// result, so hasLimit() could leave a query effectively unbounded.
+		sql = "SELECT * FROM (" + strings.TrimRight(strings.TrimSpace(sql), ";") + ") _q LIMIT 100"
 	}
 
 	pool := s.db.Pool()
@@ -51,9 +54,14 @@ func (s *ExplorerService) Execute(ctx context.Context, sql string) (*QueryResult
 		columns[i] = string(fd.Name)
 	}
 
-	// Scan rows
+	// Scan rows. Hard cap as defense in depth so memory stays bounded even if
+	// the outer LIMIT wrapper is ever bypassed.
+	const maxScanRows = 1000
 	var resultRows []map[string]any
 	for rows.Next() {
+		if len(resultRows) >= maxScanRows {
+			break
+		}
 		vals, err := rows.Values()
 		if err != nil {
 			return &QueryResult{Error: err.Error(), Columns: columns}, nil
@@ -284,10 +292,3 @@ func isIdentPart(c byte) bool {
 	return isIdentStart(c) || (c >= '0' && c <= '9')
 }
 
-// hasLimit returns true if the SQL statement already has a top-level LIMIT clause.
-func hasLimit(sql string) bool {
-	up := strings.ToUpper(sql)
-	// crude but effective: a LIMIT token outside of strings/comments.
-	// For our purpose the Contains check is safe because LIMIT is a reserved word.
-	return strings.Contains(up, " LIMIT ") || strings.Contains(up, "\nLIMIT ") || strings.HasSuffix(strings.TrimSpace(up), "LIMIT")
-}
