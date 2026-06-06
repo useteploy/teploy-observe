@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"time"
 
@@ -207,7 +208,24 @@ func Restore(ctx context.Context, db *nucleus.Client, r io.Reader) error {
 	return nil
 }
 
+// validIdent matches a safe SQL identifier (table or column). Restore data
+// comes from an attacker-controllable tar archive, and table/column names are
+// interpolated into INSERT statements (not bindable as params), so they MUST be
+// validated against an allowlist + charset or the archive can inject SQL.
+var validIdent = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
+
+var restorableTables = func() map[string]bool {
+	m := make(map[string]bool, len(Tables))
+	for _, t := range Tables {
+		m[t] = true
+	}
+	return m
+}()
+
 func restoreTable(ctx context.Context, db *nucleus.Client, r io.Reader, table string) error {
+	if !restorableTables[table] {
+		return fmt.Errorf("refusing to restore unknown table %q (not in the backup allowlist)", table)
+	}
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 1<<20), 16<<20) // up to 16 MiB per row
 	sqlc := db.SQL()
@@ -231,6 +249,9 @@ func restoreTable(ctx context.Context, db *nucleus.Client, r io.Reader, table st
 func insertRow(ctx context.Context, sqlc *nucleus.SQLModel, table string, row map[string]any) error {
 	cols := make([]string, 0, len(row))
 	for k := range row {
+		if !validIdent.MatchString(k) {
+			return fmt.Errorf("refusing to restore row with unsafe column name %q", k)
+		}
 		cols = append(cols, k)
 	}
 	// Stable order for reproducibility.

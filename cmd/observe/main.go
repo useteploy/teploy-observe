@@ -699,9 +699,14 @@ func main() {
 	r.Handle("POST /v1/traces", otlpHandler)
 
 	// --- SQL Explorer (JWT + editor role; query tables stays read-only) ---
-	r.Handle("POST /api/v1/query", jwtMW(requireEditor(explorerQueryHandler(explorerSvc))))
-	r.Handle("POST /api/v1/query/explain", jwtMW(requireEditor(explorerExplainHandler(explorerSvc))))
-	r.Handle("GET /api/v1/query/tables", jwtMW(explorerTablesHandler(explorerSvc)))
+	// Admin-only: the raw SQL explorer can read any table, including
+	// secret-bearing ones (instance_settings, share_links.token,
+	// sites.session_salt, webhooks.secret, api_keys.key_hash). An editor must
+	// not be able to exfiltrate those, and /query/tables previously had no role
+	// gate at all.
+	r.Handle("POST /api/v1/query", jwtMW(requireAdmin(explorerQueryHandler(explorerSvc))))
+	r.Handle("POST /api/v1/query/explain", jwtMW(requireAdmin(explorerExplainHandler(explorerSvc))))
+	r.Handle("GET /api/v1/query/tables", jwtMW(requireAdmin(explorerTablesHandler(explorerSvc))))
 
 	// --- AI query assistant (admin reads/writes config; editor+ may ask) ---
 	r.Handle("GET /api/v1/ai/config", jwtMW(requireAdmin(aiConfigGetHandler(aiSvc))))
