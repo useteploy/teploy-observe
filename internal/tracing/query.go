@@ -242,6 +242,10 @@ func (q *QueryService) SearchTraces(ctx context.Context, siteID string, from, to
 	// to BIGINT for the comparison — both sides need an explicit cast.
 	where := "site_id = $1 AND start_time >= $2 AND start_time < $3"
 	params := []any{siteID, fromMs, toMs}
+	// Site+time-only filter for the span-count aggregate, so a status/service
+	// filter on the root-span search doesn't undercount a trace's total spans.
+	baseWhere := where
+	baseParams := []any{siteID, fromMs, toMs}
 	idx := 4
 
 	if service != "" {
@@ -271,14 +275,38 @@ func (q *QueryService) SearchTraces(ctx context.Context, siteID string, from, to
 			operation_name AS root_op,
 			CAST(start_time AS TEXT) AS start_time,
 			CAST(duration_ms AS TEXT) AS duration_ms,
-			'1' AS span_count,
+			'0' AS span_count,
 			status_code
 		 FROM spans
 		 WHERE %s AND parent_span_id = ''
 		 ORDER BY start_time DESC
 		 LIMIT %d OFFSET %d`, where, limit, offset)
 
-	return nucleus.Query[TraceSummary](ctx, q.db.SQL(), q2, params...)
+	summaries, err := nucleus.Query[TraceSummary](ctx, q.db.SQL(), q2, params...)
+	if err != nil || len(summaries) == 0 {
+		return summaries, err
+	}
+
+	// span_count was previously hardcoded to 1. Compute the real per-trace span
+	// count with a second aggregate and fold it in by trace_id (Nucleus rejects
+	// some single-query aggregate shapes, hence the separate pass).
+	type spanCountRow struct {
+		TraceID string `db:"trace_id"`
+		N       int64  `db:"n"`
+	}
+	counts, cErr := nucleus.Query[spanCountRow](ctx, q.db.SQL(),
+		fmt.Sprintf(`SELECT trace_id, COUNT(*) AS n FROM spans WHERE %s GROUP BY trace_id`, baseWhere),
+		baseParams...)
+	if cErr == nil {
+		byTrace := make(map[string]int64, len(counts))
+		for _, c := range counts {
+			byTrace[c.TraceID] = c.N
+		}
+		for i := range summaries {
+			summaries[i].SpanCount = byTrace[summaries[i].TraceID]
+		}
+	}
+	return summaries, nil
 }
 
 // Span is a stored span for the waterfall view.
@@ -353,7 +381,7 @@ func (q *QueryService) ServiceDependencies(ctx context.Context, siteID string, f
 			COUNT(*) AS call_count,
 			SUM(CASE WHEN c.status_code = 'error' THEN 1 ELSE 0 END) AS error_count,
 			SUM(c.duration_ms) AS duration_sum
-		 FROM spans c JOIN spans p ON c.parent_span_id = p.span_id AND c.site_id = p.site_id
+		 FROM spans c JOIN spans p ON c.parent_span_id = p.span_id AND c.site_id = p.site_id AND c.trace_id = p.trace_id
 		 WHERE c.site_id = $1 AND c.start_time >= $2 AND c.start_time < $3
 		   AND p.service_name <> c.service_name AND p.service_name <> ''
 		 GROUP BY p.service_name, c.service_name`,
