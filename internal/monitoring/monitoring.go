@@ -14,6 +14,7 @@ import (
 	"github.com/neutron-dev/neutron-go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/netsafe"
 )
 
 // ErrCronNotFound is returned by RecordCheckin when no enabled cron monitor
@@ -38,7 +39,10 @@ func NewUptimeService(db *nucleus.Client, logger *slog.Logger) *UptimeService {
 	return &UptimeService{
 		db:     db,
 		logger: logger,
-		client: &http.Client{Timeout: 30 * time.Second},
+		// SSRF-safe: blocks dialing private/loopback/link-local/metadata IPs and
+		// re-validates redirects, so an operator-supplied monitor URL can't be
+		// pointed at 169.254.169.254, internal services, or the Tailscale mesh.
+		client: netsafe.Client(30 * time.Second),
 	}
 }
 
@@ -81,6 +85,12 @@ func (s *UptimeService) CreateMonitor(ctx context.Context, m Monitor) (*Monitor,
 	}
 	if m.Method == "" {
 		m.Method = "GET"
+	}
+	if m.Method != "GET" && m.Method != "HEAD" {
+		return nil, fmt.Errorf("monitor method must be GET or HEAD")
+	}
+	if err := netsafe.ValidateURL(m.URL); err != nil {
+		return nil, fmt.Errorf("monitor url: %w", err)
 	}
 	if !m.Enabled {
 		m.Enabled = true

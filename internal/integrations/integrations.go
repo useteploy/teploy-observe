@@ -18,6 +18,7 @@ import (
 	"github.com/neutron-dev/neutron-go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/mailx"
+	"github.com/useteploy/teploy-observe/internal/netsafe"
 )
 
 type IntegrationService struct {
@@ -27,7 +28,9 @@ type IntegrationService struct {
 }
 
 func NewIntegrationService(db *nucleus.Client, logger *slog.Logger) *IntegrationService {
-	return &IntegrationService{db: db, logger: logger, client: &http.Client{Timeout: 10 * time.Second}}
+	// netsafe client blocks dialing private/loopback/metadata IPs (SSRF) for
+	// every outbound integration (Jira/Slack/webhook/etc.) at dial time.
+	return &IntegrationService{db: db, logger: logger, client: netsafe.Client(10 * time.Second)}
 }
 
 type Integration struct {

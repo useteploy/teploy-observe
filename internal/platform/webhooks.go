@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/netsafe"
 )
 
 type WebhookService struct {
@@ -23,7 +25,7 @@ func NewWebhookService(db *nucleus.Client, logger *slog.Logger) *WebhookService 
 	return &WebhookService{
 		db:     db,
 		logger: logger,
-		client: &http.Client{Timeout: 10 * time.Second},
+		client: netsafe.Client(10 * time.Second),
 	}
 }
 
@@ -43,6 +45,9 @@ type Webhook struct {
 func (s *WebhookService) Create(ctx context.Context, siteID, name, webhookType, url string) (*Webhook, error) {
 	if webhookType != "slack" && webhookType != "http" {
 		webhookType = "http"
+	}
+	if err := netsafe.ValidateURL(url); err != nil {
+		return nil, fmt.Errorf("webhook url: %w", err)
 	}
 	id := genID()
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
