@@ -580,9 +580,13 @@ func main() {
 		neutron.WithTags("sites"),
 		neutron.WithSummary("Create a new site"),
 	)
-	neutron.Delete(siteAdmin, "/sites/{site_id}", deleteSiteHandler(siteSvc),
+	neutron.Delete(siteAdmin, "/sites/{site_id}", deleteSiteHandler(siteSvc, authSvc),
 		neutron.WithTags("sites"),
 		neutron.WithSummary("Delete a site"),
+	)
+	neutron.Put(siteAdmin, "/sites/{site_id}/privacy", setSitePrivacyHandler(siteSvc),
+		neutron.WithTags("sites"),
+		neutron.WithSummary("Set per-site raw distinct_id privacy opt-out"),
 	)
 	neutron.Post(siteAdmin, "/sites/{site_id}/keys", createAPIKeyHandler(authSvc),
 		neutron.WithTags("sites"),
@@ -1626,16 +1630,34 @@ func setSiteRatelimitHandler(siteSvc *sites.SiteService, rl *ingest.RateLimiter)
 	}
 }
 
-func deleteSiteHandler(siteSvc *sites.SiteService) neutron.HandlerFunc[deleteSiteInput, neutron.Empty] {
+func deleteSiteHandler(siteSvc *sites.SiteService, authSvc *auth.AuthService) neutron.HandlerFunc[deleteSiteInput, neutron.Empty] {
 	return func(ctx context.Context, input deleteSiteInput) (neutron.Empty, error) {
 		if input.SiteID == "" {
 			return neutron.Empty{}, neutron.ErrBadRequest("site_id is required")
 		}
-		err := siteSvc.Delete(ctx, input.SiteID)
-		if err != nil {
+		if err := siteSvc.Delete(ctx, input.SiteID); err != nil {
 			return neutron.Empty{}, err
 		}
+		// Revoke the site's API keys so a deleted site can't keep ingesting
+		// (ingest doesn't otherwise check that the key's site still exists).
+		if err := authSvc.RevokeKeysForSite(ctx, input.SiteID); err != nil {
+			slog.Warn("revoke keys for deleted site failed", "site", input.SiteID, "err", err)
+		}
 		return neutron.Empty{}, nil
+	}
+}
+
+type setSitePrivacyInput struct {
+	SiteID string `path:"site_id"`
+	RawOptIn bool `json:"raw_distinct_id"`
+}
+
+func setSitePrivacyHandler(siteSvc *sites.SiteService) neutron.HandlerFunc[setSitePrivacyInput, neutron.Empty] {
+	return func(ctx context.Context, input setSitePrivacyInput) (neutron.Empty, error) {
+		if input.SiteID == "" {
+			return neutron.Empty{}, neutron.ErrBadRequest("site_id is required")
+		}
+		return neutron.Empty{}, siteSvc.SetRawDistinctID(ctx, input.SiteID, input.RawOptIn)
 	}
 }
 

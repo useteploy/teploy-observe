@@ -121,6 +121,33 @@ func (s *AuthService) RevokeAPIKey(ctx context.Context, keyID string) error {
 	return nil
 }
 
+// RevokeKeysForSite revokes every API key bound to a site. A Nucleus UPDATE
+// filtered on site_id (not in the ORDER BY) silently no-ops, so we list the
+// site's keys and revoke each by its (tenant_id, key_hash) ORDER-BY columns.
+// Called on site deletion so a deleted site's keys can't keep ingesting.
+func (s *AuthService) RevokeKeysForSite(ctx context.Context, siteID string) error {
+	sql := s.db.SQL()
+	rows, err := nucleus.Query[apiKeyRow](ctx, sql,
+		"SELECT key_id, tenant_id, site_id, key_hash, label, created_at, revoked FROM api_keys WHERE site_id = $1",
+		siteID,
+	)
+	if err != nil {
+		return fmt.Errorf("auth: revoke keys for site: %w", err)
+	}
+	for _, r := range rows {
+		if r.Revoked == "true" {
+			continue
+		}
+		if _, err := sql.Exec(ctx,
+			"UPDATE api_keys SET revoked = 'true' WHERE tenant_id = $1 AND key_hash = $2",
+			r.TenantID, r.KeyHash,
+		); err != nil {
+			return fmt.Errorf("auth: revoke key %q: %w", r.KeyID, err)
+		}
+	}
+	return nil
+}
+
 // HasAPIKeys reports whether at least one API key exists. The error is returned
 // (not swallowed as false) so the ingest middleware can fail CLOSED on a DB
 // outage instead of falling into the no-keys grace path and accepting writes.

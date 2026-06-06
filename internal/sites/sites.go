@@ -198,7 +198,22 @@ func (s *SiteService) SetRatelimit(ctx context.Context, siteID string, ratePerSe
 	return nil
 }
 
-// Delete removes a site by ID.
+// SetRawDistinctID flips the per-site privacy opt-out (store raw distinct_id vs
+// hash it) and invalidates the privacy cache so the next ingest sees the change.
+func (s *SiteService) SetRawDistinctID(ctx context.Context, siteID string, optIn bool) error {
+	_, err := s.db.SQL().Exec(ctx,
+		"UPDATE sites SET raw_distinct_id = $1 WHERE site_id = $2",
+		optIn, siteID,
+	)
+	if err != nil {
+		return fmt.Errorf("sites: set raw_distinct_id: %w", err)
+	}
+	s.InvalidatePrivacyConfig(siteID)
+	return nil
+}
+
+// Delete removes a site by ID and drops its cached privacy config so a deleted
+// (or recreated) site can't keep serving a stale salt/opt-out.
 func (s *SiteService) Delete(ctx context.Context, siteID string) error {
 	sql := s.db.SQL()
 	_, err := sql.Exec(ctx,
@@ -208,6 +223,7 @@ func (s *SiteService) Delete(ctx context.Context, siteID string) error {
 	if err != nil {
 		return fmt.Errorf("sites: delete: %w", err)
 	}
+	s.InvalidatePrivacyConfig(siteID)
 	return nil
 }
 
