@@ -15,12 +15,21 @@ import (
 
 // LogService handles log ingestion and querying.
 type LogService struct {
-	db *nucleus.Client
-	Bx *Broadcaster
+	db        *nucleus.Client
+	Bx        *Broadcaster
+	pipelines *PipelineService
 }
 
 func NewLogService(db *nucleus.Client) *LogService {
 	return &LogService{db: db, Bx: NewBroadcaster()}
+}
+
+// SetPipelines wires the pipeline processor into the ingest path so drop/mask/
+// sample/parse rules are actually applied on every ingested log. Without this
+// the configured rules are inert (sensitive data the operator asked to mask
+// would be stored in cleartext).
+func (s *LogService) SetPipelines(p *PipelineService) {
+	s.pipelines = p
 }
 
 // Log represents a stored log entry. Timestamps serialize as RFC3339 strings.
@@ -49,6 +58,18 @@ type LogInput struct {
 
 // IngestLog inserts a single log entry into the logs table.
 func (s *LogService) IngestLog(ctx context.Context, input LogInput) (string, error) {
+	// Apply configured pipelines (drop/mask/sample/parse) before persisting.
+	// A drop/sample rule that returns keep=false skips the insert silently
+	// (no error to the client). SiteID must already be resolved by the caller.
+	if s.pipelines != nil {
+		msg, attrs, keep := s.pipelines.ProcessLog(ctx, input.SiteID, input.Message, input.Attributes)
+		if !keep {
+			return "", nil
+		}
+		input.Message = msg
+		input.Attributes = attrs
+	}
+
 	id, err := generateID()
 	if err != nil {
 		return "", fmt.Errorf("generate log id: %w", err)

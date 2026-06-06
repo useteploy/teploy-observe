@@ -11,17 +11,60 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 )
 
+// pipelineCacheTTL bounds how long the per-site pipeline set is cached on the
+// ingest hot path. ProcessLog runs on every log line, so a query-per-log would
+// be a severe regression; a few seconds of staleness on rule changes is fine.
+const pipelineCacheTTL = 5 * time.Second
+
+type pipelineCacheEntry struct {
+	pipelines []Pipeline
+	expires   time.Time
+}
+
 type PipelineService struct {
 	db *nucleus.Client
+
+	mu    sync.Mutex
+	cache map[string]pipelineCacheEntry
 }
 
 func NewPipelineService(db *nucleus.Client) *PipelineService {
-	return &PipelineService{db: db}
+	return &PipelineService{db: db, cache: make(map[string]pipelineCacheEntry)}
+}
+
+// invalidate drops the cached pipeline set for a site after a write so a
+// create/delete is reflected within the TTL window at the latest.
+func (s *PipelineService) invalidate(siteID string) {
+	s.mu.Lock()
+	delete(s.cache, siteID)
+	s.mu.Unlock()
+}
+
+// listCached returns the enabled pipelines for a site, backed by a short-TTL
+// cache so the ingest path does not issue a DB query per log line.
+func (s *PipelineService) listCached(ctx context.Context, siteID string) ([]Pipeline, error) {
+	now := time.Now()
+	s.mu.Lock()
+	if e, ok := s.cache[siteID]; ok && now.Before(e.expires) {
+		s.mu.Unlock()
+		return e.pipelines, nil
+	}
+	s.mu.Unlock()
+
+	pipelines, err := s.List(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.cache[siteID] = pipelineCacheEntry{pipelines: pipelines, expires: now.Add(pipelineCacheTTL)}
+	s.mu.Unlock()
+	return pipelines, nil
 }
 
 type Pipeline struct {
@@ -56,6 +99,7 @@ func (s *PipelineService) Create(ctx context.Context, siteID, name, rules string
 	if err != nil {
 		return nil, fmt.Errorf("create pipeline: %w", err)
 	}
+	s.invalidate(siteID)
 	return &Pipeline{PipelineID: id, SiteID: siteID, Name: name, Priority: strconv.Itoa(priority), Rules: rules, Enabled: "true", CreatedAt: now}, nil
 }
 
@@ -115,13 +159,20 @@ func (s *PipelineService) Delete(ctx context.Context, pipelineID string) error {
 		 SELECT pipeline_id, tenant_id, site_id, name, priority, rules, 'false', created_at, $2
 		 FROM log_pipelines WHERE pipeline_id = $1`,
 		pipelineID, now)
+	if err == nil {
+		// Delete is keyed by pipeline_id, not site_id; clear the whole cache
+		// rather than guess which site owned it. Deletes are rare.
+		s.mu.Lock()
+		s.cache = make(map[string]pipelineCacheEntry)
+		s.mu.Unlock()
+	}
 	return err
 }
 
 // ProcessLog applies all pipelines to a log entry, modifying its attributes.
 // Returns false if the log should be dropped.
 func (s *PipelineService) ProcessLog(ctx context.Context, siteID, message string, attrs map[string]any) (string, map[string]any, bool) {
-	pipelines, err := s.List(ctx, siteID)
+	pipelines, err := s.listCached(ctx, siteID)
 	if err != nil || len(pipelines) == 0 {
 		return message, attrs, true
 	}

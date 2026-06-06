@@ -242,13 +242,13 @@ func main() {
 	llmSvc := llm.NewLLMService(db)
 	infraSvc := infra.NewInfraService(db)
 	pipelineSvc := logs.NewPipelineService(db)
-	_ = pipelineSvc // Used in log ingest pipeline
 	groupSvc := groups.NewGroupService(db)
 	ssoSvc := sso.NewSSOService(db)
 	flagSvc := flags.NewFlagService(db)
 	experimentSvc := experiments.NewExperimentService(db)
 	surveySvc := surveys.NewSurveyService(db)
 	logSvc := logs.NewLogService(db)
+	logSvc.SetPipelines(pipelineSvc)
 	uptimeSvc := monitoring.NewUptimeService(db, logger)
 	cronSvc := monitoring.NewCronService(db, logger)
 	linkSvc := tracking.NewLinkService(db)
@@ -389,7 +389,8 @@ func main() {
 		MaxAge:       86400,
 	})
 	// Auth runs before the limiter so the limiter can key on site_id.
-	ingestGroup := r.Group("/api/v1", ingestCORS, auth.APIKeyAuthMiddleware(authSvc, cfg.SiteID), rateLimiter.Middleware)
+	apiKeyMW := auth.APIKeyAuthMiddleware(authSvc, cfg.SiteID)
+	ingestGroup := r.Group("/api/v1", ingestCORS, apiKeyMW, rateLimiter.Middleware)
 	neutron.Post(ingestGroup, "/events", ingest.Handler(buf, cfg.SessionSalt, siteSvc),
 		neutron.WithTags("ingest"),
 		neutron.WithSummary("Ingest analytics event"),
@@ -710,8 +711,12 @@ func main() {
 		neutron.WithTags("logs"), neutron.WithSummary("Create log pipeline"))
 
 	// --- OTLP standard endpoint (compatible with all OTLP HTTP exporters) ---
+	// Authenticated like every other ingest path: the API-key middleware
+	// resolves site_id into the request context, so a client cannot inject
+	// spans for another tenant via the X-Observe-Site header. Standard OTLP
+	// exporters supply the key via OTEL_EXPORTER_OTLP_HEADERS=X-API-Key=...
 	otlpHandler := tracing.NewOTLPHandler(traceIngest)
-	r.Handle("POST /v1/traces", otlpHandler)
+	r.Handle("POST /v1/traces", apiKeyMW(otlpHandler))
 
 	// --- SQL Explorer (JWT + editor role; query tables stays read-only) ---
 	// Admin-only: the raw SQL explorer can read any table, including
@@ -967,7 +972,7 @@ func main() {
 	// main.go diff to a single line (matches the boards / attribution /
 	// funnels convention above). Placed at the END of route registrations
 	// to minimize merge conflict surface with parallel waves.
-	RegisterMetricsRoutes(r, jwtMW, metricsSvc)
+	RegisterMetricsRoutes(r, jwtMW, apiKeyMW, metricsSvc)
 
 	// --- Persons API ---
 	// C2 Wave 4: aggregate over events.distinct_id. Read-only; no editor

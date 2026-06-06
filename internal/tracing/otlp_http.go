@@ -1,11 +1,12 @@
 package tracing
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+
+	"github.com/useteploy/teploy-observe/internal/ingest"
 )
 
 // OTLPHandler returns an http.HandlerFunc that accepts OTLP traces via HTTP.
@@ -31,12 +32,12 @@ func (h *OTLPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	contentType := r.Header.Get("Content-Type")
-	siteID := r.Header.Get("X-Observe-Site")
+	// site_id is resolved by the API-key middleware from the validated key,
+	// never trusted from a client-supplied header/query param.
+	siteID := ingest.SiteIDFromContext(r.Context())
 	if siteID == "" {
-		siteID = r.URL.Query().Get("site_id")
-	}
-	if siteID == "" {
-		siteID = "default"
+		http.Error(w, `{"error":"missing site_id"}`, http.StatusBadRequest)
+		return
 	}
 
 	switch {
@@ -64,7 +65,7 @@ func (h *OTLPHandler) handleJSON(w http.ResponseWriter, r *http.Request, siteID 
 		return
 	}
 
-	result, err := h.svc.Ingest(context.Background(), siteID, req)
+	result, err := h.svc.Ingest(r.Context(), siteID, req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

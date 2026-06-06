@@ -14,7 +14,8 @@ import (
 // RegisterMetricsRoutes wires the metrics API onto the root router. Three
 // concerns are bundled here:
 //
-//   1. OTLP HTTP ingest at POST /v1/metrics — no JWT (parity with /v1/traces).
+//   1. OTLP HTTP ingest at POST /v1/metrics — API-key authenticated (parity
+//      with /v1/traces); site_id comes from the validated key, not the body.
 //   2. Metric-name listing at GET /api/v1/metrics/list — JWT-only read.
 //   3. Aggregated query at GET /api/v1/metrics/query — JWT-only read.
 //      Phase-2 callers can also request the per-label-set series shape via
@@ -23,9 +24,9 @@ import (
 // Kept in its own file so the merge-conflict surface against parallel
 // agents stays a single line addition in main.go (mirrors the
 // RegisterBoardsRoutes / RegisterAttributionRoutes convention).
-func RegisterMetricsRoutes(r *neutron.Router, jwtMW neutron.Middleware, svc *metrics.Service) {
+func RegisterMetricsRoutes(r *neutron.Router, jwtMW, apiKeyMW neutron.Middleware, svc *metrics.Service) {
 	otlpHandler := metrics.NewOTLPHandler(svc)
-	r.Handle("POST /v1/metrics", otlpHandler)
+	r.Handle("POST /v1/metrics", apiKeyMW(otlpHandler))
 
 	r.Handle("GET /api/v1/metrics/list", jwtMW(metricsListHandler(svc)))
 	r.Handle("GET /api/v1/metrics/query", jwtMW(metricsQueryHandler(svc)))
