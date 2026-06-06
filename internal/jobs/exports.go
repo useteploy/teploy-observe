@@ -113,6 +113,11 @@ func (s *ExportService) Create(ctx context.Context, in CreateInput) (ScheduledEx
 	if _, err := explorer.ClassifyReadOnlySQL(in.SQL); err != nil {
 		return ScheduledExport{}, fmt.Errorf("sql rejected: %w", err)
 	}
+	// Reject cron specs isDue can't interpret, so a standard 5-field expression
+	// doesn't silently never run.
+	if !isValidCronSpec(in.Cron) {
+		return ScheduledExport{}, fmt.Errorf("unsupported cron %q: use @hourly, @daily, @weekly, or */N * * * *", in.Cron)
+	}
 	// Encrypt the S3/R2 secret key at rest. Fail closed rather than persist it
 	// in plaintext (the destination_cfg column is readable by the explorer/DB).
 	if in.Destination.SecretAccessKey != "" {
@@ -173,8 +178,14 @@ func (s *ExportService) RunExport(ctx context.Context, id string) error {
 	return s.runOne(ctx, e)
 }
 
+// exportTimeout bounds a single scheduled export so a hung query or upload
+// can't stall RunDue (and the whole scheduler) indefinitely.
+const exportTimeout = 10 * time.Minute
+
 func (s *ExportService) runOne(ctx context.Context, e ScheduledExport) error {
 	start := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, exportTimeout)
+	defer cancel()
 	rowCount, uploadErr := s.executeAndUpload(ctx, e)
 	status := "ok"
 	errMsg := ""
@@ -353,6 +364,22 @@ func isDue(spec string, lastRunMs int64, now time.Time) bool {
 		if n, err := strconv.Atoi(numStr); err == nil && n > 0 {
 			return now.Sub(last) >= time.Duration(n)*time.Minute
 		}
+	}
+	return false
+}
+
+// isValidCronSpec reports whether spec is one isDue can actually interpret.
+// Keep this in lockstep with isDue.
+func isValidCronSpec(spec string) bool {
+	s := strings.TrimSpace(spec)
+	switch s {
+	case "@hourly", "@daily", "@weekly":
+		return true
+	}
+	if strings.HasPrefix(s, "*/") && strings.HasSuffix(s, " * * * *") {
+		numStr := strings.TrimSuffix(strings.TrimPrefix(s, "*/"), " * * * *")
+		n, err := strconv.Atoi(numStr)
+		return err == nil && n > 0
 	}
 	return false
 }
