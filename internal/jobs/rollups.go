@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -68,12 +69,6 @@ func (r *RollupService) RunHourlyRollup(ctx context.Context) error {
 
 	r.logger.Info("hourly rollup complete", "window_start", windowStart, "window_end", windowEnd)
 
-	// Update HLL keys for approximate visitor counts
-	if err := r.updateHLL(ctx, startMs, endMs, 3600000); err != nil {
-		r.logger.Error("hourly HLL update failed", "err", err)
-		// Non-fatal — SQL rollup succeeded
-	}
-
 	return nil
 }
 
@@ -131,75 +126,7 @@ func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 
 	r.logger.Info("daily rollup complete", "window_start", windowStart, "window_end", windowEnd)
 
-	// Update HLL keys for approximate visitor counts (daily buckets)
-	if err := r.updateHLL(ctx, startMs, endMs, 86400000); err != nil {
-		r.logger.Error("daily HLL update failed", "err", err)
-	}
-
 	return nil
-}
-
-// hllEvent is a minimal event row for HLL visitor counting.
-type hllEvent struct {
-	SiteID    string `db:"site_id"`
-	SessionID string `db:"session_id"`
-	Bucket    int64  `db:"bucket"`
-}
-
-// updateHLL feeds session_ids into HyperLogLog keys per site+time bucket.
-// Key format: hll:visitors:{site_id}:{bucket_ms}
-// This provides O(1) approximate visitor counts that scale to any volume.
-func (r *RollupService) updateHLL(ctx context.Context, startMs, endMs int64, bucketMs int64) error {
-	rows, err := nucleus.Query[hllEvent](ctx, r.db.SQL(),
-		fmt.Sprintf(`SELECT site_id, session_id,
-			(CAST(timestamp AS BIGINT) / %d) * %d AS bucket
-		 FROM events
-		 WHERE timestamp >= $1 AND timestamp < $2`,
-			bucketMs, bucketMs),
-		startMs, endMs,
-	)
-	if err != nil {
-		return fmt.Errorf("hll query: %w", err)
-	}
-
-	kv := r.db.KV()
-	added := 0
-	for _, row := range rows {
-		key := fmt.Sprintf("hll:visitors:%s:%d", row.SiteID, row.Bucket)
-		if _, err := kv.PFAdd(ctx, key, row.SessionID); err != nil {
-			return fmt.Errorf("hll pfadd: %w", err)
-		}
-		added++
-	}
-
-	r.logger.Debug("HLL update complete", "events", added, "bucket_size", bucketMs)
-	return nil
-}
-
-// HLLVisitors returns the approximate unique visitor count for a site
-// over the given time range using HyperLogLog. Falls back to -1 if
-// no HLL data exists (caller should use SQL COUNT DISTINCT).
-func (r *RollupService) HLLVisitors(ctx context.Context, siteID string, fromMs, toMs int64, bucketMs int64) (int64, error) {
-	kv := r.db.KV()
-	var total int64
-	hasData := false
-
-	for bucket := (fromMs / bucketMs) * bucketMs; bucket < toMs; bucket += bucketMs {
-		key := fmt.Sprintf("hll:visitors:%s:%d", siteID, bucket)
-		count, err := kv.PFCount(ctx, key)
-		if err != nil {
-			continue
-		}
-		if count > 0 {
-			hasData = true
-			total += count
-		}
-	}
-
-	if !hasData {
-		return -1, nil
-	}
-	return total, nil
 }
 
 // sessionEvent is a raw event row used during session rollup.
@@ -237,8 +164,32 @@ func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 
 	sql := r.db.SQL()
 
-	rows, err := nucleus.Query[sessionEvent](ctx, sql,
-		`SELECT tenant_id, site_id, session_id, timestamp,
+	// Find which sessions received events in the window. We then recompute each
+	// touched session over its FULL event history (not just the window), because
+	// a session longer than the window would otherwise have its complete row
+	// overwritten by a partial-tail computation under ReplacingMergeTree —
+	// corrupting first_ts/entry_url/pageviews/is_bounce for long sessions.
+	type sidRow struct {
+		SessionID string `db:"session_id"`
+	}
+	sidRows, err := nucleus.Query[sidRow](ctx, sql,
+		`SELECT DISTINCT session_id FROM events WHERE timestamp >= $1`, cutoff)
+	if err != nil {
+		return fmt.Errorf("session rollup keys: %w", err)
+	}
+	if len(sidRows) == 0 {
+		r.logger.Debug("session rollup: no events")
+		return nil
+	}
+
+	sids := make([]string, 0, len(sidRows))
+	for _, s := range sidRows {
+		if s.SessionID != "" {
+			sids = append(sids, s.SessionID)
+		}
+	}
+
+	const selectCols = `SELECT tenant_id, site_id, session_id, timestamp,
 			COALESCE(pathname, '') AS pathname,
 			COALESCE(referrer, '') AS referrer,
 			COALESCE(browser, '') AS browser,
@@ -252,26 +203,34 @@ func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 			COALESCE(utm_medium, '') AS utm_medium,
 			COALESCE(utm_campaign, '') AS utm_campaign,
 			COALESCE(release_tag, '') AS release_tag
-		 FROM events
-		 WHERE timestamp >= $1
-		 ORDER BY session_id, timestamp`,
-		cutoff,
-	)
-	if err != nil {
-		return fmt.Errorf("session rollup query: %w", err)
-	}
+		 FROM events`
 
-	if len(rows) == 0 {
-		r.logger.Debug("session rollup: no events")
-		return nil
-	}
-
-	// Group events by session key (tenant+site+session)
+	// Group events by session key (tenant+site+session). Re-read the complete
+	// history for the touched sessions in bounded IN-list batches.
 	type sessKey struct{ Tenant, Site, Session string }
 	grouped := make(map[sessKey][]sessionEvent)
-	for _, e := range rows {
-		k := sessKey{e.TenantID, e.SiteID, e.SessionID}
-		grouped[k] = append(grouped[k], e)
+	const chunk = 500
+	for i := 0; i < len(sids); i += chunk {
+		end := i + chunk
+		if end > len(sids) {
+			end = len(sids)
+		}
+		batch := sids[i:end]
+		ph := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for j, s := range batch {
+			ph[j] = fmt.Sprintf("$%d", j+1)
+			args[j] = s
+		}
+		q := selectCols + ` WHERE session_id IN (` + strings.Join(ph, ",") + `) ORDER BY session_id, timestamp`
+		rows, err := nucleus.Query[sessionEvent](ctx, sql, q, args...)
+		if err != nil {
+			return fmt.Errorf("session rollup query: %w", err)
+		}
+		for _, e := range rows {
+			k := sessKey{e.TenantID, e.SiteID, e.SessionID}
+			grouped[k] = append(grouped[k], e)
+		}
 	}
 
 	const insertSQL = `INSERT INTO sessions (
