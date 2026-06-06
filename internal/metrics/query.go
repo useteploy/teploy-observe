@@ -75,11 +75,12 @@ func (s *Service) ListMetrics(ctx context.Context, siteID string) ([]MetricInfo,
 
 // pointRow is the scan target for raw point pulls before aggregation.
 type pointRow struct {
-	TsNs       int64   `db:"ts_ns"`
-	Value      float64 `db:"value"`
-	Histogram  string  `db:"histogram"`
-	Kind       string  `db:"metric_kind"`
-	Attributes string  `db:"attributes"`
+	TsNs        int64   `db:"ts_ns"`
+	Value       float64 `db:"value"`
+	Histogram   string  `db:"histogram"`
+	Kind        string  `db:"metric_kind"`
+	Attributes  string  `db:"attributes"`
+	Temporality string  `db:"aggregation_temporality"`
 }
 
 // Aggregation names the supported reducers for Query.
@@ -213,7 +214,8 @@ func (s *Service) QuerySeries(ctx context.Context, siteID, name string, labels m
 	// `ts_ns >= literal` returns zero rows even when the row is in range.
 	// The tracing package solved this the same way for `start_time`.
 	rows, err := nucleus.Query[pointRow](ctx, s.db.SQL(),
-		`SELECT ts_ns, value, histogram, metric_kind, attributes
+		`SELECT ts_ns, value, histogram, metric_kind, attributes,
+		        COALESCE(aggregation_temporality, 'cumulative') AS aggregation_temporality
 		 FROM metric_points
 		 WHERE site_id = $1 AND metric_name = $2
 		   AND ts_ns >= $3
@@ -361,6 +363,16 @@ func scalarReduce(rows []pointRow, agg Aggregation, stepMs int64) []Point {
 // are simply omitted (rather than emitting a zero-rate sentinel that
 // would distort downstream alerting).
 func rateReduce(rows []pointRow, stepMs int64) []Point {
+	if len(rows) == 0 {
+		return []Point{}
+	}
+	// Delta-temporality counters carry the per-interval increment in each point,
+	// so consecutive-differencing them is wrong — bucket and sum instead, then
+	// divide by the bucket length. Reset detection doesn't apply (deltas are
+	// non-negative). Temporality is uniform within a series, so read row 0.
+	if rows[0].Temporality == "delta" {
+		return deltaRateReduce(rows, stepMs)
+	}
 	if len(rows) < 2 {
 		return []Point{}
 	}
@@ -408,6 +420,31 @@ func rateReduce(rows []pointRow, stepMs int64) []Point {
 			continue
 		}
 		out = append(out, Point{TsMs: b.tsMs, Value: b.sum / float64(b.n)})
+	}
+	return out
+}
+
+// deltaRateReduce computes per-bucket rate for delta-temporality counters:
+// rate = sum(deltas in bucket) / bucket_seconds.
+func deltaRateReduce(rows []pointRow, stepMs int64) []Point {
+	bucketSecs := float64(stepMs) / 1000.0
+	if bucketSecs <= 0 {
+		bucketSecs = 60
+	}
+	sums := map[int64]float64{}
+	keys := []int64{}
+	for _, r := range rows {
+		tsMs := r.TsNs / 1_000_000
+		key := (tsMs / stepMs) * stepMs
+		if _, ok := sums[key]; !ok {
+			keys = append(keys, key)
+		}
+		sums[key] += r.Value
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	out := make([]Point, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, Point{TsMs: k, Value: sums[k] / bucketSecs})
 	}
 	return out
 }

@@ -370,6 +370,23 @@ func TestAggregateSeries_RoutesByAgg(t *testing.T) {
 	}
 }
 
+// TestRate_DeltaTemporality verifies delta counters are bucket-summed and
+// divided by the bucket length, not consecutive-differenced. Two deltas of 3
+// and 9 in a 60s bucket → (3+9)/60 = 0.2/s.
+func TestRate_DeltaTemporality(t *testing.T) {
+	rows := []pointRow{
+		{TsNs: 10_000_000_000, Value: 3, Kind: "sum", Temporality: "delta"},
+		{TsNs: 20_000_000_000, Value: 9, Kind: "sum", Temporality: "delta"},
+	}
+	got := aggregateSeries(rows, AggRate, 60_000)
+	if len(got) != 1 {
+		t.Fatalf("delta rate: want 1 bucket, got %d (%+v)", len(got), got)
+	}
+	if want := 12.0 / 60.0; got[0].Value != want {
+		t.Fatalf("delta rate: got %v, want %v", got[0].Value, want)
+	}
+}
+
 // Per-label-set fan-out emulated via two separate row buckets keyed by
 // label fingerprint. Smoke-tests the groupKey + Series wiring without
 // needing a live DB.
