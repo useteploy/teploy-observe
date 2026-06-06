@@ -34,6 +34,13 @@ func (s *StatsService) Retention(ctx context.Context, siteID string, from, to ti
 		}
 	}
 
+	// Clamp the window so a single request can't trigger an unbounded events
+	// scan / map build. 186 days covers the widest realistic retention grid.
+	const maxRetentionWindow = 186 * 24 * time.Hour
+	if to.Sub(from) > maxRetentionWindow {
+		from = to.Add(-maxRetentionWindow)
+	}
+
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
@@ -61,9 +68,9 @@ func (s *StatsService) Retention(ctx context.Context, siteID string, from, to ti
 	events, err := nucleus.Query[eventRow](ctx, s.db.SQL(),
 		`SELECT session_id, CAST(timestamp AS TEXT) AS timestamp
 		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2
+		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		 ORDER BY session_id, timestamp ASC`,
-		siteID, fromMs,
+		siteID, fromMs, toMs,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("retention query events: %w", err)

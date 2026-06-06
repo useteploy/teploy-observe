@@ -879,10 +879,14 @@ func (s *StatsService) EventProperties(ctx context.Context, siteID string, from,
 		SessionID  string `json:"session_id" db:"session_id"`
 	}
 	rows, err := nucleus.Query[raw](ctx, s.db.SQL(),
+		// ORDER BY timestamp DESC makes the 5000-row cap deterministic (the most
+		// recent events) rather than an arbitrary slice, so breakdowns are stable
+		// across calls.
 		`SELECT COALESCE(properties, '') AS properties, session_id
 		 FROM events
 		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		   AND event_type = $4 AND properties != ''
+		 ORDER BY timestamp DESC
 		 LIMIT 5000`,
 		siteID, fromMs, toMs, eventType,
 	)
