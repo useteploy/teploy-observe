@@ -173,7 +173,16 @@ func (s *IssueService) ListIssues(ctx context.Context, siteID, status string, li
 		 LIMIT %d OFFSET %d`, limit, offset)
 		params = []any{siteID}
 	}
-	return nucleus.Query[Issue](ctx, s.db.SQL(), q, params...)
+	issues, err := nucleus.Query[Issue](ctx, s.db.SQL(), q, params...)
+	if err != nil {
+		return nil, err
+	}
+	// user_count is computed on read (the stored column is always 0). Bounded
+	// by the page limit, so the per-issue lookups stay cheap.
+	for i := range issues {
+		issues[i].UserCount = s.affectedUsers(ctx, siteID, issues[i].IssueID)
+	}
+	return issues, nil
 }
 
 // GetIssue returns a single issue by ID.
@@ -191,7 +200,28 @@ func (s *IssueService) GetIssue(ctx context.Context, issueID, siteID string) (*I
 	if len(rows) == 0 {
 		return nil, nil
 	}
+	rows[0].UserCount = s.affectedUsers(ctx, siteID, rows[0].IssueID)
 	return &rows[0], nil
+}
+
+type issueCountRow struct {
+	N int64 `db:"n"`
+}
+
+// affectedUsers computes distinct sessions that hit an issue, on read. The
+// stored issues.user_count was never incremented (always 0); error_events has
+// no distinct_id column, so COUNT(DISTINCT session_id) is the available proxy
+// for "users affected". Best-effort: returns 0 on any error.
+func (s *IssueService) affectedUsers(ctx context.Context, siteID, issueID string) int64 {
+	rows, err := nucleus.Query[issueCountRow](ctx, s.db.SQL(),
+		`SELECT COUNT(DISTINCT session_id) AS n FROM error_events
+		 WHERE site_id = $1 AND issue_id = $2 AND session_id <> ''`,
+		siteID, issueID,
+	)
+	if err != nil || len(rows) == 0 {
+		return 0
+	}
+	return rows[0].N
 }
 
 // ErrorEvent represents a stored error event.
