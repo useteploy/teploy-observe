@@ -669,7 +669,22 @@ func main() {
 			w.Write([]byte(`{"ok":false,"error":"invalid JSON body"}`))
 			return
 		}
-		if input.SiteID == "" { input.SiteID = "default" }
+		if input.SiteID == "" {
+			input.SiteID = "default"
+		}
+		// This endpoint is keyless (agent flow), so validate the site exists to
+		// stop anonymous callers creating junk sites / polluting another site's
+		// host metrics, and bound the identifier lengths.
+		if len(input.SiteID) > 64 || len(input.Hostname) > 253 {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"ok":false,"error":"field too long"}`))
+			return
+		}
+		if _, err := siteSvc.Get(req.Context(), input.SiteID); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"ok":false,"error":"unknown site_id"}`))
+			return
+		}
 		if err := infraSvc.Report(req.Context(), input); err != nil {
 			// Was HTTP 200 {"ok":false}: the agent treated a backend failure as
 			// delivered and never retried. Return 5xx so it does.

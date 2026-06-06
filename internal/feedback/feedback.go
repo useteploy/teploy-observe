@@ -42,6 +42,15 @@ type FeedbackInput struct {
 }
 
 func (s *FeedbackService) Submit(ctx context.Context, input FeedbackInput) (string, error) {
+	// This endpoint is public (runs in untrusted end-user browsers), so bound
+	// every field to keep an anonymous flood from ballooning storage per write.
+	if input.SiteID == "" {
+		return "", fmt.Errorf("missing site_id")
+	}
+	if len(input.Message) > 5000 || len(input.Email) > 320 || len(input.URL) > 2048 ||
+		len(input.Category) > 64 || len(input.SessionID) > 128 || len(input.SiteID) > 64 {
+		return "", fmt.Errorf("feedback field too long")
+	}
 	id := genID()
 	now := time.Now().UTC().UnixMilli()
 	if input.Category == "" {

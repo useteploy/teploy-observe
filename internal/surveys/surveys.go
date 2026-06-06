@@ -106,13 +106,35 @@ func (s *SurveyService) GetActive(ctx context.Context, siteID string) ([]Survey,
 
 // SubmitResponse records a survey response.
 func (s *SurveyService) SubmitResponse(ctx context.Context, surveyID, siteID, userID string, answers map[string]any) (string, error) {
+	// Public endpoint (untrusted browsers): the survey must exist, be active,
+	// and belong to the claimed site — otherwise anyone could write responses to
+	// any site's survey or to an arbitrary survey_id.
+	type svRow struct {
+		SiteID string `db:"site_id"`
+		Status string `db:"status"`
+	}
+	sv, err := nucleus.Query[svRow](ctx, s.db.SQL(),
+		"SELECT site_id, status FROM surveys WHERE survey_id = $1", surveyID)
+	if err != nil || len(sv) == 0 {
+		return "", fmt.Errorf("survey not found")
+	}
+	if sv[0].SiteID != siteID {
+		return "", fmt.Errorf("survey does not belong to this site")
+	}
+	if sv[0].Status != "active" {
+		return "", fmt.Errorf("survey is not active")
+	}
+
 	id := genID()
 	answersJSON := ""
 	if answers != nil {
 		raw, _ := json.Marshal(answers)
 		answersJSON = string(raw)
 	}
-	_, err := s.db.SQL().Exec(ctx,
+	if len(answersJSON) > 16384 {
+		return "", fmt.Errorf("answers payload too large")
+	}
+	_, err = s.db.SQL().Exec(ctx,
 		`INSERT INTO survey_responses (response_id, tenant_id, survey_id, site_id, user_id, answers, timestamp)
 		 VALUES ($1, 'default', $2, $3, $4, $5, $6)`,
 		id, surveyID, siteID, userID, answersJSON, time.Now().UTC().UnixMilli(),
