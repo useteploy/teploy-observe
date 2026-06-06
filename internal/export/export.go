@@ -6,14 +6,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/neutron-dev/neutron-go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
+
+// maxExportWindow bounds how wide a single export range may be, so a request
+// can't ask the server to scan an unbounded slice of history. Memory stays O(1)
+// per row via streaming regardless; this just caps total work.
+const maxExportWindow = 186 * 24 * time.Hour
 
 type ExportService struct {
 	db *nucleus.Client
@@ -95,6 +103,10 @@ func (s *ExportService) Handler() http.HandlerFunc {
 		if err != nil {
 			to = time.Now().UTC()
 		}
+		if to.Sub(from) > maxExportWindow {
+			http.Error(w, "export range too wide (max ~6 months); narrow from/to", http.StatusBadRequest)
+			return
+		}
 
 		ctx := r.Context()
 
@@ -111,7 +123,10 @@ func (s *ExportService) exportEvents(ctx context.Context, w http.ResponseWriter,
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
-	rows, err := nucleus.Query[eventRow](ctx, s.db.SQL(),
+	// Stream rows from a cursor so memory stays O(1) per row; the previous
+	// implementation buffered the entire result set, so one wide export could
+	// OOM the server and take down ingestion for every site.
+	rows, err := s.db.Pool().Query(ctx,
 		`SELECT event_id, site_id, session_id, event_type, timestamp,
 			COALESCE(url, '') AS url, COALESCE(pathname, '') AS pathname,
 			COALESCE(referrer, '') AS referrer, COALESCE(browser, '') AS browser,
@@ -122,28 +137,34 @@ func (s *ExportService) exportEvents(ctx context.Context, w http.ResponseWriter,
 		 FROM events
 		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		 ORDER BY timestamp DESC`,
-		siteID, fromMs, toMs,
+		pgx.QueryExecModeSimpleProtocol, siteID, fromMs, toMs,
 	)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("query failed: %v", err), http.StatusInternalServerError)
+		queryError(w, err)
 		return
+	}
+	defer rows.Close()
+
+	header := []string{"event_id", "session_id", "event_type", "timestamp", "url", "pathname", "referrer", "browser", "os", "device", "country", "language", "utm_source", "utm_medium", "properties"}
+	scan := func() (eventRow, error) {
+		var r eventRow
+		err := rows.Scan(&r.EventID, &r.SiteID, &r.SessionID, &r.EventType, &r.Timestamp,
+			&r.URL, &r.Pathname, &r.Referrer, &r.Browser, &r.OS, &r.Device,
+			&r.Country, &r.Language, &r.UTMSource, &r.UTMMedium, &r.Properties)
+		return r, err
+	}
+	toRow := func(r eventRow) []string {
+		return []string{r.EventID, r.SessionID, r.EventType, strconv.FormatInt(r.Timestamp, 10),
+			r.URL, r.Pathname, r.Referrer, r.Browser, r.OS, r.Device,
+			r.Country, r.Language, r.UTMSource, r.UTMMedium, r.Properties}
 	}
 
 	if format == "csv" {
 		setCSVHeaders(w, "events")
-		cw := csv.NewWriter(w)
-		cw.Write([]string{"event_id", "session_id", "event_type", "timestamp", "url", "pathname", "referrer", "browser", "os", "device", "country", "language", "utm_source", "utm_medium", "properties"})
-		for _, r := range rows {
-			cw.Write([]string{
-				r.EventID, r.SessionID, r.EventType, strconv.FormatInt(r.Timestamp, 10),
-				r.URL, r.Pathname, r.Referrer, r.Browser, r.OS, r.Device,
-				r.Country, r.Language, r.UTMSource, r.UTMMedium, r.Properties,
-			})
-		}
-		cw.Flush()
+		streamCSV(w, rows, header, scan, toRow)
 	} else {
 		setJSONHeaders(w, "events")
-		writeJSONArray(w, rows)
+		streamJSON(w, rows, scan)
 	}
 }
 
@@ -151,7 +172,7 @@ func (s *ExportService) exportSessions(ctx context.Context, w http.ResponseWrite
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
-	rows, err := nucleus.Query[sessionRow](ctx, s.db.SQL(),
+	rows, err := s.db.Pool().Query(ctx,
 		`SELECT session_id, site_id, first_ts, last_ts, pageviews,
 			COALESCE(entry_url, '') AS entry_url, COALESCE(exit_url, '') AS exit_url,
 			COALESCE(browser, '') AS browser, COALESCE(os, '') AS os,
@@ -160,29 +181,93 @@ func (s *ExportService) exportSessions(ctx context.Context, w http.ResponseWrite
 		 FROM sessions
 		 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3
 		 ORDER BY first_ts DESC`,
-		siteID, fromMs, toMs,
+		pgx.QueryExecModeSimpleProtocol, siteID, fromMs, toMs,
 	)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("query failed: %v", err), http.StatusInternalServerError)
+		queryError(w, err)
 		return
+	}
+	defer rows.Close()
+
+	header := []string{"session_id", "first_ts", "last_ts", "pageviews", "entry_url", "exit_url", "browser", "os", "device", "country", "is_bounce"}
+	scan := func() (sessionRow, error) {
+		var r sessionRow
+		err := rows.Scan(&r.SessionID, &r.SiteID, &r.FirstTS, &r.LastTS, &r.Pageviews,
+			&r.EntryURL, &r.ExitURL, &r.Browser, &r.OS, &r.Device, &r.Country, &r.IsBounce)
+		return r, err
+	}
+	toRow := func(r sessionRow) []string {
+		return []string{r.SessionID, strconv.FormatInt(r.FirstTS, 10), strconv.FormatInt(r.LastTS, 10),
+			strconv.FormatInt(r.Pageviews, 10), r.EntryURL, r.ExitURL,
+			r.Browser, r.OS, r.Device, r.Country, r.IsBounce}
 	}
 
 	if format == "csv" {
 		setCSVHeaders(w, "sessions")
-		cw := csv.NewWriter(w)
-		cw.Write([]string{"session_id", "first_ts", "last_ts", "pageviews", "entry_url", "exit_url", "browser", "os", "device", "country", "is_bounce"})
-		for _, r := range rows {
-			cw.Write([]string{
-				r.SessionID, strconv.FormatInt(r.FirstTS, 10), strconv.FormatInt(r.LastTS, 10),
-				strconv.FormatInt(r.Pageviews, 10), r.EntryURL, r.ExitURL,
-				r.Browser, r.OS, r.Device, r.Country, r.IsBounce,
-			})
-		}
-		cw.Flush()
+		streamCSV(w, rows, header, scan, toRow)
 	} else {
 		setJSONHeaders(w, "sessions")
-		writeJSONArray(w, rows)
+		streamJSON(w, rows, scan)
 	}
+}
+
+// streamCSV writes the header then each scanned row, sanitizing every cell
+// against CSV/formula injection, flushing periodically to bound buffering.
+func streamCSV[T any](w http.ResponseWriter, rows pgx.Rows, header []string, scan func() (T, error), toRow func(T) []string) {
+	cw := csv.NewWriter(w)
+	_ = cw.Write(header)
+	n := 0
+	for rows.Next() {
+		v, err := scan()
+		if err != nil {
+			break
+		}
+		rec := toRow(v)
+		for i := range rec {
+			rec[i] = csvSafe(rec[i])
+		}
+		_ = cw.Write(rec)
+		if n++; n%1000 == 0 {
+			cw.Flush()
+		}
+	}
+	cw.Flush()
+}
+
+// streamJSON writes a JSON array incrementally so memory stays O(1) per row.
+func streamJSON[T any](w http.ResponseWriter, rows pgx.Rows, scan func() (T, error)) {
+	enc := json.NewEncoder(w)
+	io.WriteString(w, "[")
+	first := true
+	for rows.Next() {
+		v, err := scan()
+		if err != nil {
+			break
+		}
+		if !first {
+			io.WriteString(w, ",")
+		}
+		first = false
+		_ = enc.Encode(v) // Encode appends a newline; acceptable inside the array
+	}
+	io.WriteString(w, "]")
+}
+
+// csvSafe neutralizes spreadsheet formula injection: a cell beginning with one
+// of = + - @ (or a control char) is prefixed with an apostrophe so it is not
+// interpreted as a formula on open.
+func csvSafe(s string) string {
+	if s != "" && strings.ContainsRune("=+-@\t\r", rune(s[0])) {
+		return "'" + s
+	}
+	return s
+}
+
+// queryError logs the detail server-side and returns a generic message so raw
+// (possibly attacker-influenced) SQL errors aren't reflected to the client.
+func queryError(w http.ResponseWriter, err error) {
+	slog.Error("export query failed", "err", err)
+	http.Error(w, "export failed", http.StatusInternalServerError)
 }
 
 func setCSVHeaders(w http.ResponseWriter, name string) {
@@ -195,8 +280,3 @@ func setJSONHeaders(w http.ResponseWriter, name string) {
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="observe-%s.json"`, name))
 }
 
-func writeJSONArray(w io.Writer, data any) {
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	enc.Encode(data)
-}

@@ -445,7 +445,9 @@ func main() {
 	r.Handle("GET /api/v1/stats/live", jwtMW(liveSvc.Handler()))
 
 	// --- Data export (JWT auth) ---
-	r.Handle("GET /api/v1/export", jwtMW(exportSvc.Handler()))
+	// Raw data export is editor+; a viewer should not be able to exfiltrate the
+	// full event/session stream or trigger a heavy scan.
+	r.Handle("GET /api/v1/export", jwtMW(requireEditor(exportSvc.Handler())))
 
 	// --- Password change (JWT auth) ---
 	neutron.Post(r.Group("/api/v1/auth", jwtMW), "/password", changePasswordHandler(authSvc),
