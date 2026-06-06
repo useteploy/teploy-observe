@@ -9,6 +9,7 @@ import (
 	"html"
 	"io"
 	"io/fs"
+	"net"
 	"log/slog"
 	"net/http"
 	"os"
@@ -369,7 +370,10 @@ func main() {
 	r := app.Router()
 
 	// --- Auth API (public) ---
-	neutron.Post(r, "/api/v1/auth/login", loginHandler(authSvc),
+	// IP-keyed rate limit on login throttles password brute-force (10/min/IP).
+	loginLimiter := ingest.NewRateLimiter(10, time.Minute, 10)
+	loginGroup := r.Group("/api/v1", ipRateLimitMW(loginLimiter))
+	neutron.Post(loginGroup, "/auth/login", loginHandler(authSvc),
 		neutron.WithTags("auth"),
 		neutron.WithSummary("Login and receive JWT token"),
 	)
@@ -396,9 +400,11 @@ func main() {
 		AllowHeaders: []string{"Content-Type", "X-API-Key"},
 		MaxAge:       86400,
 	})
-	// Auth runs before the limiter so the limiter can key on site_id.
+	// Auth runs before the limiter so the limiter can key on site_id. BodyLimit
+	// rejects oversized payloads with 413 before they are buffered/decoded
+	// (batch is capped at 100 events, so 2 MiB is ample).
 	apiKeyMW := auth.APIKeyAuthMiddleware(authSvc, cfg.SiteID)
-	ingestGroup := r.Group("/api/v1", ingestCORS, apiKeyMW, rateLimiter.Middleware)
+	ingestGroup := r.Group("/api/v1", ingestCORS, apiKeyMW, rateLimiter.Middleware, neutron.BodyLimit(2<<20))
 	neutron.Post(ingestGroup, "/events", ingest.Handler(buf, cfg.SessionSalt, siteSvc),
 		neutron.WithTags("ingest"),
 		neutron.WithSummary("Ingest analytics event"),
@@ -580,7 +586,8 @@ func main() {
 		neutron.WithTags("sites"),
 		neutron.WithSummary("Generate API key for a site"),
 	)
-	neutron.Get(siteGroup, "/sites/{site_id}/keys", listAPIKeysHandler(authSvc),
+	// Admin-only: API keys are secrets; a viewer/editor must not enumerate them.
+	neutron.Get(siteAdmin, "/sites/{site_id}/keys", listAPIKeysHandler(authSvc),
 		neutron.WithTags("sites"),
 		neutron.WithSummary("List API keys for a site"),
 	)
@@ -649,7 +656,9 @@ func main() {
 	// --- SSO (public endpoints) ---
 	r.HandleFunc("GET /api/v1/sso/metadata", ssoMetadataHandler(ssoSvc, cfg.Addr))
 	r.HandleFunc("POST /api/v1/sso/callback", ssoSvc.SAMLCallbackHandler())
-	neutron.Get(r.Group("/api/v1/sso", jwtMW), "/configs", listSSOHandler(ssoSvc),
+	// Admin-only: SSO configs include IdP certificates/metadata; writes are
+	// admin-only, so reads are too.
+	neutron.Get(r.Group("/api/v1/sso", jwtMW, requireAdmin), "/configs", listSSOHandler(ssoSvc),
 		neutron.WithTags("sso"), neutron.WithSummary("List SSO configs"))
 	neutron.Post(r.Group("/api/v1/sso", jwtMW, requireAdmin), "/configs", createSSOHandler(ssoSvc),
 		neutron.WithTags("sso"), neutron.WithSummary("Create SSO config"))
@@ -783,7 +792,10 @@ func main() {
 	neutron.Get(flagGroup, "/{flag_id}/history", flagHistoryHandler(flagSvc),
 		neutron.WithTags("flags"), neutron.WithSummary("Flag change log"))
 	// Public evaluate endpoint (no JWT, uses API key or site_id)
-	r.HandleFunc("POST /api/v1/flags/evaluate", flagEvaluateHandler(flagSvc))
+	// Public flag SDK endpoint: generous per-site/IP cap (60/min) for the
+	// browser evaluation path.
+	flagEvalLimiter := ingest.NewRateLimiter(60, time.Minute, 120)
+	r.HandleFunc("POST /api/v1/flags/evaluate", flagEvaluateHandler(flagSvc, flagEvalLimiter))
 
 	// --- Experiments (JWT auth; editor+ writes) ---
 	expGroup := r.Group("/api/v1/experiments", jwtMW)
@@ -837,7 +849,8 @@ func main() {
 	r.Handle("GET /api/docs/", neutron.SwaggerUI(app.OpenAPI()))
 
 	// --- Self-observability (/meta) ---
-	metaGroup := r.Group("/api/v1", jwtMW)
+	// Admin-only: the meta snapshot exposes build version + operational internals.
+	metaGroup := r.Group("/api/v1", jwtMW, requireAdmin)
 	neutron.Get(metaGroup, "/meta", func(ctx context.Context, _ neutron.Empty) (meta.Snapshot, error) {
 		return metaSvc.Snapshot(ctx)
 	}, neutron.WithTags("meta"), neutron.WithSummary("Observe self-observability snapshot"))
@@ -853,7 +866,8 @@ func main() {
 	})
 
 	// --- Source maps (JWT auth) ---
-	r.Handle("POST /api/v1/sourcemaps/upload", jwtMW(srcmapUploadHandler(srcmapSvc)))
+	// Editor+: uploading a source map is a write; a viewer must not poison it.
+	r.Handle("POST /api/v1/sourcemaps/upload", jwtMW(requireEditor(srcmapUploadHandler(srcmapSvc))))
 
 	// --- Log query API (JWT auth) ---
 	logGroup := r.Group("/api/v1/logs", jwtMW)
@@ -2436,18 +2450,42 @@ func flagHistoryHandler(svc *flags.FlagService) neutron.HandlerFunc[flagHistoryI
 	}
 }
 
-func flagEvaluateHandler(svc *flags.FlagService) http.HandlerFunc {
+// flagEvaluateHandler is the public, browser-callable flag SDK endpoint. It is
+// IP-rate-limited to curb enumeration / write floods and validates input so a
+// malformed request returns 400 instead of a silent {enabled:false} oracle.
+func flagEvaluateHandler(svc *flags.FlagService, rl *ingest.RateLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		ip := r.RemoteAddr
+		if host, _, err := net.SplitHostPort(ip); err == nil {
+			ip = host
+		}
 		var input struct {
 			SiteID  string            `json:"site_id"`
 			FlagKey string            `json:"flag_key"`
 			UserID  string            `json:"user_id"`
 			Context map[string]string `json:"context"`
 		}
-		json.NewDecoder(r.Body).Decode(&input)
-		result, _ := svc.Evaluate(r.Context(), input.SiteID, input.FlagKey, input.UserID, input.Context)
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+		if input.SiteID == "" || input.FlagKey == "" {
+			http.Error(w, `{"error":"site_id and flag_key required"}`, http.StatusBadRequest)
+			return
+		}
+		// Rate limit per (site, ip): bounds write floods into flag_evaluations.
+		if !rl.Allow(input.SiteID, ip) {
+			http.Error(w, `{"error":"too many requests"}`, http.StatusTooManyRequests)
+			return
+		}
+		result, err := svc.Evaluate(r.Context(), input.SiteID, input.FlagKey, input.UserID, input.Context)
+		if err != nil {
+			http.Error(w, `{"error":"evaluation failed"}`, http.StatusInternalServerError)
+			return
+		}
 		json.NewEncoder(w).Encode(result)
 	}
 }
@@ -3901,6 +3939,24 @@ func dailyErrorCountsHandler(svc *obserrors.IssueService) neutron.HandlerFunc[da
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
 		return emptyOnNil(svc.DailyCounts(ctx, input.SiteID, input.Days))
+	}
+}
+
+// ipRateLimitMW rate-limits by client IP alone (no site_id), for public,
+// unauthenticated endpoints like login where we want to throttle brute force.
+func ipRateLimitMW(rl *ingest.RateLimiter) neutron.Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ip := r.RemoteAddr
+			if host, _, err := net.SplitHostPort(ip); err == nil {
+				ip = host
+			}
+			if !rl.Allow("", ip) {
+				http.Error(w, `{"error":"too many requests"}`, http.StatusTooManyRequests)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
 	}
 }
 

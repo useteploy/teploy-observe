@@ -205,6 +205,10 @@ func matchesTargeting(rules []TargetingRule, userCtx map[string]string) bool {
 			if !strings.Contains(actual, fmt.Sprintf("%v", r.Value)) {
 				return false
 			}
+		default:
+			// Fail closed: an unknown operator must not silently match (which
+			// would expose a flag to everyone), so treat the rule as unmatched.
+			return false
 		}
 	}
 	return true
