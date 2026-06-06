@@ -171,6 +171,9 @@ func cohortMembersHandler(svc *cohorts.Service) neutron.HandlerFunc[cohortMember
 		if limit <= 0 {
 			limit = 50
 		}
+		if limit > 500 {
+			limit = 500
+		}
 		members, err := svc.Members(ctx, in.SiteID, in.CohortID, limit, in.Offset)
 		if err != nil {
 			return cohortMembersResult{}, err

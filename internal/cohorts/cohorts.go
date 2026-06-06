@@ -529,8 +529,10 @@ func (s *Service) Members(ctx context.Context, siteID, cohortID string, limit, o
 	if offset >= len(ids) {
 		return []string{}, nil
 	}
+	// end < offset catches integer overflow when limit is huge (offset+limit
+	// wraps negative), which would otherwise panic on the slice bounds.
 	end := offset + limit
-	if limit <= 0 || end > len(ids) {
+	if limit <= 0 || end < offset || end > len(ids) {
 		end = len(ids)
 	}
 	return ids[offset:end], nil
