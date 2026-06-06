@@ -123,7 +123,10 @@ func (s *SiteService) Create(ctx context.Context, domain, name string) (Site, er
 func (s *SiteService) Get(ctx context.Context, siteID string) (Site, error) {
 	sql := s.db.SQL()
 	site, err := nucleus.QueryOne[Site](ctx, sql,
-		"SELECT site_id, tenant_id, domain, name, created_at, session_salt FROM sites WHERE site_id = $1",
+		// raw_distinct_id MUST be selected — it drives the per-site privacy
+		// opt-out on the ingest hot path (PrivacyConfig reads it). Omitting it
+		// silently zero-valued RawDistinctID, defeating the opt-out.
+		"SELECT site_id, tenant_id, domain, name, created_at, session_salt, raw_distinct_id FROM sites WHERE site_id = $1",
 		siteID,
 	)
 	if err != nil {

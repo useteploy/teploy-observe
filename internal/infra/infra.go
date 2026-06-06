@@ -89,12 +89,20 @@ type HostSummary struct {
 }
 
 func (s *InfraService) ListHosts(ctx context.Context, siteID string) ([]HostSummary, error) {
-	// Get the latest metric for each hostname
+	// One CURRENT row per host. host_metrics is append-only (one row per report
+	// tick), so an unaggregated SELECT returned every historical row per host —
+	// the UI showed dozens of duplicate, stale entries. argMax(col, timestamp)
+	// collapses to the newest sample per hostname.
 	return nucleus.Query[HostSummary](ctx, s.db.SQL(),
-		`SELECT hostname, cpu_percent, memory_percent, disk_percent, load_1m,
-			CAST(timestamp AS TEXT) AS last_seen
+		`SELECT hostname,
+			argMax(cpu_percent, timestamp)    AS cpu_percent,
+			argMax(memory_percent, timestamp) AS memory_percent,
+			argMax(disk_percent, timestamp)   AS disk_percent,
+			argMax(load_1m, timestamp)        AS load_1m,
+			CAST(max(timestamp) AS TEXT)      AS last_seen
 		 FROM host_metrics WHERE site_id = $1
-		 ORDER BY hostname, timestamp DESC`,
+		 GROUP BY hostname
+		 ORDER BY hostname`,
 		siteID,
 	)
 }

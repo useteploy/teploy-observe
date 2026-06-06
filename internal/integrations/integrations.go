@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/smtp"
@@ -267,6 +268,18 @@ func (s *IntegrationService) Replay(ctx context.Context, deliveryID string) erro
 	return s.fireAndRecord(ctx, intgs[0], payload, false, true)
 }
 
+// checkResp closes resp and returns an error when the remote signalled failure
+// (>=300), so fireAndRecord records status='failed' and a useful message
+// instead of silently 'ok'. Reads a bounded body snippet for the message.
+func checkResp(provider string, resp *http.Response) error {
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("%s: status %d: %s", provider, resp.StatusCode, strings.TrimSpace(string(snippet)))
+	}
+	return nil
+}
+
 func (s *IntegrationService) fireJira(configJSON string, p AlertPayload) error {
 	var cfg JiraConfig
 	json.Unmarshal([]byte(configJSON), &cfg)
@@ -288,8 +301,7 @@ func (s *IntegrationService) fireJira(configJSON string, p AlertPayload) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
-	return nil
+	return checkResp("jira", resp)
 }
 
 func (s *IntegrationService) fireGitHub(configJSON string, p AlertPayload) error {
@@ -311,8 +323,7 @@ func (s *IntegrationService) fireGitHub(configJSON string, p AlertPayload) error
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
-	return nil
+	return checkResp("github", resp)
 }
 
 func (s *IntegrationService) firePagerDuty(configJSON string, p AlertPayload) error {
@@ -339,8 +350,7 @@ func (s *IntegrationService) firePagerDuty(configJSON string, p AlertPayload) er
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
-	return nil
+	return checkResp("pagerduty", resp)
 }
 
 func (s *IntegrationService) fireEmail(configJSON string, p AlertPayload) error {
@@ -374,8 +384,7 @@ func (s *IntegrationService) fireSlack(configJSON string, p AlertPayload) error 
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
-	return nil
+	return checkResp("slack", resp)
 }
 
 func genID() string {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -244,23 +245,41 @@ func (s *LLMService) RecentTraces(ctx context.Context, siteID string, limit int)
 }
 
 // estimateCost provides rough cost estimates for common models.
+// modelPrice is USD per 1K tokens; modelPrices is ordered longest-prefix-first
+// so prefix matching resolves the most specific family first ("gpt-4o-mini"
+// before "gpt-4o", "gpt-4-turbo" before "gpt-4"). Real-world model strings are
+// dated/versioned ("gpt-4o-2024-08-06", "claude-3-5-sonnet-20241022"), so the
+// old exact-match-only table charged almost everything the wrong default.
+type modelPrice struct {
+	prefix        string
+	input, output float64
+}
+
+var modelPrices = []modelPrice{
+	{"gpt-4o-mini", 0.00015, 0.0006},
+	{"gpt-4o", 0.005, 0.015},
+	{"gpt-4-turbo", 0.01, 0.03},
+	{"gpt-4", 0.03, 0.06},
+	{"gpt-3.5-turbo", 0.0005, 0.0015},
+	{"o3-mini", 0.0011, 0.0044},
+	{"o1-mini", 0.0011, 0.0044},
+	{"o1", 0.015, 0.06},
+	{"claude-3-5-sonnet", 0.003, 0.015},
+	{"claude-3-5-haiku", 0.0008, 0.004},
+	{"claude-3-opus", 0.015, 0.075},
+	{"claude-3-sonnet", 0.003, 0.015},
+	{"claude-3-haiku", 0.00025, 0.00125},
+}
+
 func estimateCost(model string, promptTokens, completionTokens int) float64 {
-	// Prices per 1K tokens (approximate, 2026 pricing)
-	type pricing struct{ input, output float64 }
-	prices := map[string]pricing{
-		"gpt-4":           {0.03, 0.06},
-		"gpt-4-turbo":     {0.01, 0.03},
-		"gpt-4o":          {0.005, 0.015},
-		"gpt-3.5-turbo":   {0.0005, 0.0015},
-		"claude-3-opus":   {0.015, 0.075},
-		"claude-3-sonnet": {0.003, 0.015},
-		"claude-3-haiku":  {0.00025, 0.00125},
+	in, out := 0.001, 0.002 // conservative default for unknown models
+	for _, mp := range modelPrices {
+		if model == mp.prefix || strings.HasPrefix(model, mp.prefix) {
+			in, out = mp.input, mp.output
+			break
+		}
 	}
-	p, ok := prices[model]
-	if !ok {
-		p = pricing{0.001, 0.002}
-	} // default
-	return (float64(promptTokens)/1000)*p.input + (float64(completionTokens)/1000)*p.output
+	return (float64(promptTokens)/1000)*in + (float64(completionTokens)/1000)*out
 }
 
 func genID() string {

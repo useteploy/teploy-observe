@@ -103,7 +103,12 @@ func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string
 	}
 
 	id := generateID()
-	hash := hashPassword(password)
+	hash, err := hashPassword(password)
+	if err != nil {
+		// Never insert an empty hash — that would create an admin nobody can
+		// log into (and that fails open in any "no real hash" check).
+		return false, err
+	}
 	now := dbutil.IntParam(time.Now().UnixMilli())
 
 	_, err = sql.Exec(ctx,
@@ -164,7 +169,15 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 	if len(newPassword) < 8 {
 		return fmt.Errorf("new password must be at least 8 characters")
 	}
-	newHash := hashPassword(newPassword)
+	if len(newPassword) > maxPasswordBytes {
+		// bcrypt errors past 72 bytes; the old code stored the resulting empty
+		// hash and locked the account out. Reject loudly instead.
+		return fmt.Errorf("new password must be at most %d bytes", maxPasswordBytes)
+	}
+	newHash, err := hashPassword(newPassword)
+	if err != nil {
+		return err
+	}
 	_, err = s.db.SQL().Exec(ctx,
 		"UPDATE admin_users SET password_hash = $1 WHERE id = $2",
 		newHash, user.ID,
@@ -172,13 +185,17 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 	return err
 }
 
-func hashPassword(password string) string {
+// maxPasswordBytes is bcrypt's hard input ceiling — GenerateFromPassword errors
+// beyond it. Callers must reject longer passwords rather than store the empty
+// hash the error path used to produce (which silently locked accounts out).
+const maxPasswordBytes = 72
+
+func hashPassword(password string) (string, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		// Fallback should never happen with valid input
-		return ""
+		return "", fmt.Errorf("auth: hash password: %w", err)
 	}
-	return string(hash)
+	return string(hash), nil
 }
 
 func checkPassword(password, hash string) bool {
