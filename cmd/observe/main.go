@@ -1188,6 +1188,9 @@ Env vars:
   OBSERVE_NUCLEUS_URL          Nucleus/Postgres DSN
   OBSERVE_DATA_DIR             Data directory (PID file, WAL queue)
   OBSERVE_JWT_SECRET           JWT signing secret (required in prod)
+  OBSERVE_SECRET_KEY           Master key for encrypting stored secrets
+                               (LLM API key, S3/R2 credentials) at rest;
+                               required to configure those features
   OBSERVE_ADMIN_USER           First-boot admin username (default: admin)
   OBSERVE_ADMIN_PASSWORD       First-boot admin password (default: observe)
   OBSERVE_DEMO_MODE            "true" blocks write ops for public demos

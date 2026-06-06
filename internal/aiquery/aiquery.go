@@ -24,6 +24,7 @@ import (
 	"github.com/neutron-dev/neutron-go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/secretbox"
 )
 
 const (
@@ -32,8 +33,9 @@ const (
 )
 
 // Config holds the admin-supplied LLM connection settings. Provider is
-// informational ("openai", "anthropic", "ollama", "compatible"); all
-// providers that speak the OpenAI chat-completions wire format work.
+// informational ("openai", "ollama", "compatible"); every provider must speak
+// the OpenAI chat-completions wire format. Anthropic is supported only via an
+// OpenAI-compatible proxy, not its native /v1/messages API.
 type Config struct {
 	Provider string `json:"provider"`
 	Endpoint string `json:"endpoint"`
@@ -99,6 +101,15 @@ func (s *Service) SetConfig(ctx context.Context, cfg Config) error {
 	if cfg.Model == "" {
 		cfg.Model = "gpt-4o-mini"
 	}
+	// Encrypt the API key at rest. Fail closed: refuse to persist a secret in
+	// plaintext rather than silently leaking it into instance_settings.
+	if cfg.APIKey != "" {
+		enc, err := secretbox.Encrypt(cfg.APIKey)
+		if err != nil {
+			return fmt.Errorf("aiquery: cannot store API key: %w (set OBSERVE_SECRET_KEY)", err)
+		}
+		cfg.APIKey = enc
+	}
 	raw, err := json.Marshal(cfg)
 	if err != nil {
 		return err
@@ -116,6 +127,13 @@ func (s *Service) loadFullConfig(ctx context.Context) (Config, error) {
 	var c Config
 	if err := json.Unmarshal([]byte(raw), &c); err != nil {
 		return Config{}, fmt.Errorf("aiquery: parse config: %w", err)
+	}
+	if c.APIKey != "" {
+		dec, err := secretbox.Decrypt(c.APIKey)
+		if err != nil {
+			return Config{}, fmt.Errorf("aiquery: decrypt API key: %w", err)
+		}
+		c.APIKey = dec
 	}
 	return c, nil
 }
@@ -167,11 +185,11 @@ func (s *Service) Generate(ctx context.Context, question, schemaCard string) (Ge
 		return GenerateResult{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// All supported providers speak the OpenAI chat-completions wire format
+	// (Anthropic is reached via an OpenAI-compatible proxy, not directly), so
+	// only the Bearer header is sent. Sending Anthropic-only headers here was
+	// misleading: this code can neither build nor parse Anthropic's native API.
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-	// Anthropic messages API uses a different header; add both so
-	// OpenAI-compatible endpoints and Anthropic direct both work.
-	req.Header.Set("x-api-key", cfg.APIKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
 
 	start := time.Now()
 	resp, err := s.client.Do(req)
@@ -180,9 +198,12 @@ func (s *Service) Generate(ctx context.Context, question, schemaCard string) (Ge
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	// Bound the upstream body and do not reflect raw upstream content to the
+	// caller (it can contain the provider's own error detail / echoed input).
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if resp.StatusCode >= 400 {
-		return GenerateResult{}, fmt.Errorf("aiquery: upstream %d: %s", resp.StatusCode, string(body))
+		s.logger.Error("aiquery upstream error", "status", resp.StatusCode, "body", string(body))
+		return GenerateResult{}, fmt.Errorf("aiquery: upstream returned %d", resp.StatusCode)
 	}
 
 	var parsed chatResponse
@@ -235,13 +256,23 @@ type chatResponse struct {
 // "SQL only" instruction.
 func PostProcess(raw string) string {
 	s := strings.TrimSpace(raw)
-	// Strip ```sql ... ``` or ``` ... ``` wrappers.
-	if strings.HasPrefix(s, "```") {
-		if idx := strings.Index(s, "\n"); idx != -1 {
-			s = s[idx+1:]
-		}
-		if idx := strings.LastIndex(s, "```"); idx != -1 {
-			s = s[:idx]
+	if !strings.HasPrefix(s, "```") {
+		return s
+	}
+	s = strings.TrimPrefix(s, "```")
+	// Strip the trailing fence.
+	if idx := strings.LastIndex(s, "```"); idx != -1 {
+		s = s[:idx]
+	}
+	s = strings.TrimSpace(s)
+	// Strip a leading "sql" language tag (the only tag we emit/expect),
+	// whether the code follows on the same line or the next. We don't strip an
+	// arbitrary leading word because "```SELECT 1```" has no language tag and
+	// SELECT must survive.
+	if low := strings.ToLower(s); strings.HasPrefix(low, "sql") {
+		rest := s[3:]
+		if rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '\n' || rest[0] == '\r' {
+			s = strings.TrimSpace(rest)
 		}
 	}
 	return strings.TrimSpace(s)

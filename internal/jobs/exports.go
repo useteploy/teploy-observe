@@ -23,6 +23,7 @@ import (
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 	"github.com/useteploy/teploy-observe/internal/explorer"
+	"github.com/useteploy/teploy-observe/internal/secretbox"
 )
 
 // S3Destination is the encrypted-at-rest config payload for S3/R2 exports.
@@ -112,6 +113,15 @@ func (s *ExportService) Create(ctx context.Context, in CreateInput) (ScheduledEx
 	if _, err := explorer.ClassifyReadOnlySQL(in.SQL); err != nil {
 		return ScheduledExport{}, fmt.Errorf("sql rejected: %w", err)
 	}
+	// Encrypt the S3/R2 secret key at rest. Fail closed rather than persist it
+	// in plaintext (the destination_cfg column is readable by the explorer/DB).
+	if in.Destination.SecretAccessKey != "" {
+		enc, err := secretbox.Encrypt(in.Destination.SecretAccessKey)
+		if err != nil {
+			return ScheduledExport{}, fmt.Errorf("cannot store destination secret: %w (set OBSERVE_SECRET_KEY)", err)
+		}
+		in.Destination.SecretAccessKey = enc
+	}
 	cfgJSON, err := json.Marshal(in.Destination)
 	if err != nil {
 		return ScheduledExport{}, err
@@ -185,6 +195,13 @@ func (s *ExportService) executeAndUpload(ctx context.Context, e ScheduledExport)
 	var dest S3Destination
 	if err := json.Unmarshal([]byte(e.DestinationCfg), &dest); err != nil {
 		return 0, fmt.Errorf("parse destination: %w", err)
+	}
+	if dest.SecretAccessKey != "" {
+		dec, err := secretbox.Decrypt(dest.SecretAccessKey)
+		if err != nil {
+			return 0, fmt.Errorf("decrypt destination secret: %w", err)
+		}
+		dest.SecretAccessKey = dec
 	}
 
 	rows, err := s.db.Pool().Query(ctx, e.SQL, pgx.QueryExecModeSimpleProtocol)
