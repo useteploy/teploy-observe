@@ -38,6 +38,7 @@ type SourceMapMeta struct {
 	Version  int      `json:"version"`
 	File     string   `json:"file"`
 	Sources  []string `json:"sources"`
+	Names    []string `json:"names"`
 	Mappings string   `json:"mappings"`
 }
 
@@ -96,7 +97,7 @@ func (s *SourceMapService) ResolveFrame(ctx context.Context, siteID, release, fi
 	}
 
 	// Decode VLQ mappings and find the closest match
-	mapping := decodeMappings(meta.Mappings, meta.Sources, line, col)
+	mapping := decodeMappings(meta.Mappings, meta.Sources, meta.Names, line, col)
 	return mapping, nil
 }
 
@@ -141,9 +142,14 @@ func kvKey(siteID, release, filename string) string {
 }
 
 // decodeMappings parses VLQ-encoded source map mappings and finds the closest
-// mapping to the given line and column. This is a simplified decoder that
-// handles the most common cases.
-func decodeMappings(mappings string, sources []string, targetLine, targetCol int) *SourceMapping {
+// mapping on the target line. The source index, source line, source column and
+// name index are deltas that accumulate across ALL preceding lines — only the
+// generated column resets at each line (';'). The previous version decoded the
+// target line in isolation with all accumulators starting at 0, producing wrong
+// original positions for every frame past the first mappings line. This walks
+// from line 0, advancing the accumulators on every segment, and only does the
+// closest-column match once it reaches the target line.
+func decodeMappings(mappings string, sources, names []string, targetLine, targetCol int) *SourceMapping {
 	if mappings == "" {
 		return nil
 	}
@@ -153,47 +159,61 @@ func decodeMappings(mappings string, sources []string, targetLine, targetCol int
 		return nil
 	}
 
-	// Decode segments on the target line
-	line := lines[targetLine-1]
-	if line == "" {
-		return nil
-	}
-
-	segments := strings.Split(line, ",")
-	var genCol, srcIdx, srcLine, srcCol, nameIdx int
-
+	// Accumulators carried across lines.
+	var srcIdx, srcLine, srcCol, nameIdx int
 	var bestMapping *SourceMapping
-	bestDist := int(^uint(0) >> 1) // max int
 
-	for _, seg := range segments {
-		values := decodeVLQ(seg)
-		if len(values) < 4 {
-			if len(values) >= 1 {
-				genCol += values[0]
-			}
+	for li := 0; li < targetLine; li++ {
+		genCol := 0 // generated column resets at each line
+		isTarget := li == targetLine-1
+		bestDist := int(^uint(0) >> 1) // max int
+
+		if lines[li] == "" {
 			continue
 		}
-		genCol += values[0]
-		srcIdx += values[1]
-		srcLine += values[2]
-		srcCol += values[3]
-		if len(values) >= 5 {
-			nameIdx += values[4]
-		}
-
-		dist := abs(genCol - (targetCol - 1))
-		if dist < bestDist {
-			bestDist = dist
-			src := ""
-			if srcIdx >= 0 && srcIdx < len(sources) {
-				src = sources[srcIdx]
+		for _, seg := range strings.Split(lines[li], ",") {
+			if seg == "" {
+				continue
 			}
-			bestMapping = &SourceMapping{
-				GeneratedLine:   targetLine,
-				GeneratedColumn: genCol + 1,
-				OriginalFile:    src,
-				OriginalLine:    srcLine + 1,
-				OriginalColumn:  srcCol + 1,
+			values := decodeVLQ(seg)
+			if len(values) == 0 {
+				continue
+			}
+			genCol += values[0]
+			if len(values) < 4 {
+				// Generated-column-only segment: no source mapping.
+				continue
+			}
+			srcIdx += values[1]
+			srcLine += values[2]
+			srcCol += values[3]
+			hasName := len(values) >= 5
+			if hasName {
+				nameIdx += values[4]
+			}
+
+			if !isTarget {
+				continue
+			}
+			dist := abs(genCol - (targetCol - 1))
+			if dist < bestDist {
+				bestDist = dist
+				src := ""
+				if srcIdx >= 0 && srcIdx < len(sources) {
+					src = sources[srcIdx]
+				}
+				name := ""
+				if hasName && nameIdx >= 0 && nameIdx < len(names) {
+					name = names[nameIdx]
+				}
+				bestMapping = &SourceMapping{
+					GeneratedLine:   targetLine,
+					GeneratedColumn: genCol + 1,
+					OriginalFile:    src,
+					OriginalLine:    srcLine + 1,
+					OriginalColumn:  srcCol + 1,
+					OriginalName:    name,
+				}
 			}
 		}
 	}
