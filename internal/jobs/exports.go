@@ -237,7 +237,7 @@ func (s *ExportService) executeAndUpload(ctx context.Context, e ScheduledExport)
 			vals, _ := rows.Values()
 			rec := make([]string, len(columns))
 			for i, v := range vals {
-				rec[i] = fmt.Sprintf("%v", v)
+				rec[i] = csvSafe(fmt.Sprintf("%v", v))
 			}
 			_ = cw.Write(rec)
 			n++
@@ -366,6 +366,15 @@ func isDue(spec string, lastRunMs int64, now time.Time) bool {
 		}
 	}
 	return false
+}
+
+// csvSafe neutralizes spreadsheet formula injection: a cell beginning with one
+// of = + - @ (or a control char) is apostrophe-prefixed.
+func csvSafe(s string) string {
+	if s != "" && strings.ContainsRune("=+-@\t\r", rune(s[0])) {
+		return "'" + s
+	}
+	return s
 }
 
 // isValidCronSpec reports whether spec is one isDue can actually interpret.

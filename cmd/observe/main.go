@@ -658,6 +658,8 @@ func main() {
 		neutron.WithTags("groups"), neutron.WithSummary("Create group"))
 	neutron.Post(grpAdmin, "/{group_id}/members", addGroupMemberHandler(groupSvc),
 		neutron.WithTags("groups"), neutron.WithSummary("Add member to group"))
+	neutron.Get(grpGroup, "/metrics", groupMetricsHandler(groupSvc),
+		neutron.WithTags("groups"), neutron.WithSummary("Group member + event counts"))
 
 	// --- SSO (public endpoints) ---
 	r.HandleFunc("GET /api/v1/sso/metadata", ssoMetadataHandler(ssoSvc, cfg.Addr))
@@ -2065,6 +2067,22 @@ type listGroupsInput struct{ SiteID string `query:"site_id"` }
 func listGroupsHandler(svc *groups.GroupService) neutron.HandlerFunc[listGroupsInput, []groups.Group] {
 	return func(ctx context.Context, input listGroupsInput) ([]groups.Group, error) {
 		return emptyOnNil(svc.List(ctx, input.SiteID))
+	}
+}
+
+type groupMetricsInput struct {
+	SiteID string `query:"site_id"`
+	From   string `query:"from"`
+	To     string `query:"to"`
+}
+
+func groupMetricsHandler(svc *groups.GroupService) neutron.HandlerFunc[groupMetricsInput, []groups.GroupStats] {
+	return func(ctx context.Context, input groupMetricsInput) ([]groups.GroupStats, error) {
+		if input.SiteID == "" {
+			return nil, neutron.ErrBadRequest("site_id required")
+		}
+		from, to := parseTimeRange(input.From, input.To)
+		return emptyOnNil(svc.GroupMetrics(ctx, input.SiteID, from, to))
 	}
 }
 

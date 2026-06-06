@@ -36,11 +36,14 @@ type ShareLink struct {
 // Create generates a new share link for the given site.
 func (s *ShareService) Create(ctx context.Context, siteID string) (ShareLink, error) {
 	sql := s.db.SQL()
-	token := generateToken()
+	token, err := generateToken()
+	if err != nil {
+		return ShareLink{}, fmt.Errorf("share: generate token: %w", err)
+	}
 	now := time.Now().UnixMilli()
 	nowStr := dbutil.IntParam(now)
 
-	_, err := sql.Exec(ctx,
+	_, err = sql.Exec(ctx,
 		"INSERT INTO share_links (token, site_id, created_at) VALUES ($1, $2, $3)",
 		token, siteID, nowStr,
 	)
@@ -97,8 +100,10 @@ func (s *ShareService) List(ctx context.Context, siteID string) ([]ShareLink, er
 	return rows, nil
 }
 
-func generateToken() string {
+func generateToken() (string, error) {
 	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }

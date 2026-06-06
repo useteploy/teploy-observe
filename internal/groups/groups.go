@@ -98,10 +98,9 @@ func (s *GroupService) GroupMetrics(ctx context.Context, siteID string, from, to
 
 		// Event count for members in time range
 		eventRows, _ := nucleus.Query[countRow](ctx, s.db.SQL(),
-			fmt.Sprintf(`SELECT CAST(COUNT(*) AS TEXT) AS count FROM events
+			`SELECT CAST(COUNT(*) AS TEXT) AS count FROM events
 			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-			   AND session_id IN (SELECT session_id FROM group_members WHERE group_id = $4 AND site_id = $1)
-			 LIMIT 1`),
+			   AND session_id IN (SELECT session_id FROM group_members WHERE group_id = $4 AND site_id = $1)`,
 			siteID, fromMs, toMs, g.GroupID)
 		eventCount := "0"
 		if len(eventRows) > 0 { eventCount = eventRows[0].Count }
