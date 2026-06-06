@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/mail"
 	"net/smtp"
 	"strconv"
 	"strings"
@@ -366,11 +367,43 @@ func (s *IntegrationService) fireEmail(configJSON string, p AlertPayload) error 
 	if port == "" {
 		port = "587"
 	}
+	// Guard against SMTP header injection via From/To/Subject.
+	if strings.ContainsAny(cfg.From, "\r\n") || strings.ContainsAny(p.Title, "\r\n") {
+		return fmt.Errorf("email: invalid character in header")
+	}
+	recipients, err := parseRecipients(cfg.To)
+	if err != nil {
+		return err
+	}
 	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: [Observe Alert] %s\r\n\r\n%s\r\n\r\nMetric: %s = %s (threshold: %s)",
-		cfg.From, cfg.To, p.Title, p.Message, p.Metric, p.Value, p.Threshold)
+		cfg.From, strings.Join(recipients, ", "), p.Title, p.Message, p.Metric, p.Value, p.Threshold)
 	auth := smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.SMTPHost)
 	// Timeout-bounded send so a hung relay can't block the alert dispatch path.
-	return mailx.SendMail(cfg.SMTPHost+":"+port, cfg.SMTPHost, auth, cfg.From, strings.Split(cfg.To, ","), []byte(msg), 0)
+	return mailx.SendMail(cfg.SMTPHost+":"+port, cfg.SMTPHost, auth, cfg.From, recipients, []byte(msg), 0)
+}
+
+// parseRecipients splits and validates a comma-separated recipient list,
+// rejecting CR/LF (header injection) and malformed addresses.
+func parseRecipients(to string) ([]string, error) {
+	var out []string
+	for _, r := range strings.Split(to, ",") {
+		r = strings.TrimSpace(r)
+		if r == "" {
+			continue
+		}
+		if strings.ContainsAny(r, "\r\n") {
+			return nil, fmt.Errorf("email: invalid character in recipient")
+		}
+		addr, err := mail.ParseAddress(r)
+		if err != nil {
+			return nil, fmt.Errorf("email: invalid recipient %q: %w", r, err)
+		}
+		out = append(out, addr.Address)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("email: no valid recipients")
+	}
+	return out, nil
 }
 
 func (s *IntegrationService) fireSlack(configJSON string, p AlertPayload) error {

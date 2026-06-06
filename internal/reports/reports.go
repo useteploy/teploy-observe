@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net/mail"
 	"net/smtp"
 	"strconv"
 	"strings"
@@ -113,15 +114,24 @@ func (s *ReportService) RunScheduled(ctx context.Context, smtpHost, smtpPort, sm
 			continue
 		}
 
+		// Don't advance last_sent unless a real send happened — otherwise a
+		// report with no SMTP/recipients is marked "sent" and never delivers,
+		// and the schedule stops being due so it won't auto-send once configured.
+		if smtpHost == "" {
+			s.logger.Warn("report not sent: SMTP unconfigured", "schedule", sched.Name)
+			continue
+		}
+		if sched.Recipients == "" {
+			s.logger.Warn("report not sent: no recipients", "schedule", sched.Name)
+			continue
+		}
+
 		data := s.gatherData(ctx, sched)
 		html := buildEmailHTML(data)
 
-		if smtpHost != "" && sched.Recipients != "" {
-			err := sendEmail(smtpHost, smtpPort, smtpUser, smtpPass, fromEmail, sched.Recipients, "Observe Report: "+data.Period, html)
-			if err != nil {
-				s.logger.Error("report email failed", "schedule", sched.Name, "err", err)
-				continue
-			}
+		if err := sendEmail(smtpHost, smtpPort, smtpUser, smtpPass, fromEmail, sched.Recipients, "Observe Report: "+data.Period, html); err != nil {
+			s.logger.Error("report email failed", "schedule", sched.Name, "err", err)
+			continue
 		}
 
 		// Update last_sent (best-effort — failure means report may re-send next cycle)
@@ -211,14 +221,47 @@ func sendEmail(host, port, user, pass, from, to, subject, html string) error {
 	if port == "" {
 		port = "587"
 	}
+	// Guard against SMTP header injection: a CR/LF in from/subject could inject
+	// extra headers, and each recipient must be a valid address.
+	if strings.ContainsAny(from, "\r\n") || strings.ContainsAny(subject, "\r\n") {
+		return fmt.Errorf("reports: invalid character in email header")
+	}
+	recipients, err := parseRecipients(to)
+	if err != nil {
+		return err
+	}
 	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n%s",
-		from, to, subject, html)
+		from, strings.Join(recipients, ", "), subject, html)
 	var auth smtp.Auth
 	if user != "" {
 		auth = smtp.PlainAuth("", user, pass, host)
 	}
 	// Timeout-bounded send so one unreachable relay can't stall the report loop.
-	return mailx.SendMail(host+":"+port, host, auth, from, strings.Split(to, ","), []byte(msg), 0)
+	return mailx.SendMail(host+":"+port, host, auth, from, recipients, []byte(msg), 0)
+}
+
+// parseRecipients splits a comma-separated recipient list and validates each
+// address, rejecting CR/LF (header-injection) and malformed entries.
+func parseRecipients(to string) ([]string, error) {
+	var out []string
+	for _, r := range strings.Split(to, ",") {
+		r = strings.TrimSpace(r)
+		if r == "" {
+			continue
+		}
+		if strings.ContainsAny(r, "\r\n") {
+			return nil, fmt.Errorf("reports: invalid character in recipient")
+		}
+		addr, err := mail.ParseAddress(r)
+		if err != nil {
+			return nil, fmt.Errorf("reports: invalid recipient %q: %w", r, err)
+		}
+		out = append(out, addr.Address)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("reports: no valid recipients")
+	}
+	return out, nil
 }
 
 func genID() string {
