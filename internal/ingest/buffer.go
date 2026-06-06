@@ -104,6 +104,19 @@ func (b *Buffer) AttachQueue(q *DiskQueue) error {
 	if err != nil {
 		return err
 	}
+	// Exactly-once: a crash between a flush's DB commit and its WAL checkpoint
+	// leaves committed events still in the WAL, so replay would re-insert (and
+	// double-count) them. Drop any pending event whose event_id is already in
+	// the DB before replaying. This is a one-time, startup-only cost on the rare
+	// post-crash path; the hot ingest path is untouched.
+	if len(pending) > 0 {
+		before := len(pending)
+		pending = b.dropAlreadyCommitted(pending)
+		if dropped := before - len(pending); dropped > 0 {
+			b.logger.Info("ingest queue: skipped already-committed events on replay", "dropped", dropped)
+		}
+	}
+
 	b.mu.Lock()
 	// Seed the high-water mark to the WAL end so the first flush after replay
 	// checkpoints past the replayed region; otherwise those events (already on
@@ -117,6 +130,72 @@ func (b *Buffer) AttachQueue(q *DiskQueue) error {
 		b.logger.Info("ingest queue: replayed", "count", len(pending))
 	}
 	return nil
+}
+
+// dropAlreadyCommitted returns the subset of events whose event_id is NOT
+// already present in the events table — so a WAL replay of committed-but-not-
+// checkpointed events doesn't double-count them. Bounded by a timestamp floor
+// so the lookup uses the (…, timestamp, …) sort-key prefix instead of a full
+// scan. On any error it FAILS OPEN (keeps all events) — preserving durability
+// at the cost of a possible duplicate, which is the pre-existing behavior.
+func (b *Buffer) dropAlreadyCommitted(pending []Event) []Event {
+	if len(pending) == 0 {
+		return pending
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Collect ids and the earliest timestamp to bound the scan.
+	ids := make([]string, 0, len(pending))
+	minTS := pending[0].Timestamp
+	for _, e := range pending {
+		ids = append(ids, e.EventID)
+		if e.Timestamp < minTS {
+			minTS = e.Timestamp
+		}
+	}
+
+	existing := make(map[string]struct{}, len(ids))
+	type idRow struct {
+		EventID string `db:"event_id"`
+	}
+	const chunk = 500
+	for i := 0; i < len(ids); i += chunk {
+		end := i + chunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[i:end]
+		ph := make([]string, len(batch))
+		args := make([]any, 0, len(batch)+1)
+		args = append(args, dbutil.IntParam(minTS))
+		for j, id := range batch {
+			ph[j] = fmt.Sprintf("$%d", j+2)
+			args = append(args, id)
+		}
+		q := fmt.Sprintf(
+			"SELECT event_id FROM events WHERE timestamp >= $1 AND event_id IN (%s)",
+			strings.Join(ph, ","))
+		rows, err := nucleus.Query[idRow](ctx, b.db.SQL(), q, args...)
+		if err != nil {
+			// Fail open: keep all pending (durability over dedup).
+			b.logger.Warn("ingest queue: replay dedup lookup failed, keeping all pending", "err", err)
+			return pending
+		}
+		for _, r := range rows {
+			existing[r.EventID] = struct{}{}
+		}
+	}
+	if len(existing) == 0 {
+		return pending
+	}
+	out := pending[:0]
+	for _, e := range pending {
+		if _, dup := existing[e.EventID]; !dup {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // Start begins the periodic flush loop.
