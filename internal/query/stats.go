@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"sort"
 	"time"
@@ -71,6 +72,44 @@ func tsColumn(table string) string {
 	return "ts_bucket"
 }
 
+// rollupColumns is the set of filterable columns present on each pre-aggregated
+// table. Columns absent here (notably distinct_id for cohort filters, and
+// language) only exist on the raw events table.
+var rollupColumns = map[string]map[string]bool{
+	"stats_hourly": {
+		"pathname": true, "event_type": true,
+	},
+	"stats_daily": {
+		"pathname": true, "event_type": true, "referrer": true,
+		"browser": true, "os": true, "country": true, "device": true,
+		"utm_source": true, "utm_medium": true, "utm_campaign": true,
+	},
+}
+
+// sessionsFilterColumns are the filterable columns present on the sessions
+// table (no distinct_id/pathname/event_type, which only exist on events).
+var sessionsFilterColumns = map[string]bool{
+	"referrer": true, "browser": true, "os": true, "device": true,
+	"country": true, "language": true,
+	"utm_source": true, "utm_medium": true, "utm_campaign": true,
+}
+
+// tableForFilters picks the source table by time range (tableFor) but forces
+// the raw events table whenever the active filters reference a column the chosen
+// rollup table doesn't have. Without this, a cohort (distinct_id) or language
+// filter over a range >24h hit a rollup table missing the column and produced
+// empty/erroring charts.
+func tableForFilters(from, to time.Time, filters *FilterBuilder) string {
+	table := tableFor(from, to)
+	if table == "events" || filters == nil {
+		return table
+	}
+	if filters.ReferencesColumnsOutside(rollupColumns[table]) {
+		return "events"
+	}
+	return table
+}
+
 // filterSQL returns the SQL fragment and params for a FilterBuilder, or empty
 // values if the builder is nil or has no filters.
 func filterSQL(filters *FilterBuilder) (string, []any) {
@@ -121,7 +160,7 @@ type TimeSeriesPoint struct {
 func (s *StatsService) PageviewTimeSeries(ctx context.Context, siteID string, from, to time.Time, interval string, filters *FilterBuilder) ([]TimeSeriesPoint, error) {
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
-	table := tableFor(from, to)
+	table := tableForFilters(from, to, filters)
 	ts := tsColumn(table)
 	fSQL, _ := filterSQL(filters)
 	allParams := baseParams(siteID, fromMs, toMs, filters)
@@ -176,7 +215,7 @@ func (s *StatsService) TopPages(ctx context.Context, siteID string, from, to tim
 	if limit <= 0 {
 		limit = 10
 	}
-	table := tableFor(from, to)
+	table := tableForFilters(from, to, filters)
 	ts := tsColumn(table)
 	fSQL, _ := filterSQL(filters)
 	allParams := baseParams(siteID, fromMs, toMs, filters)
@@ -223,7 +262,7 @@ func (s *StatsService) TopReferrers(ctx context.Context, siteID string, from, to
 	if limit <= 0 {
 		limit = 10
 	}
-	table := tableFor(from, to)
+	table := tableForFilters(from, to, filters)
 	ts := tsColumn(table)
 	fSQL, _ := filterSQL(filters)
 	allParams := baseParams(siteID, fromMs, toMs, filters)
@@ -280,7 +319,7 @@ func (s *StatsService) TopBrowsers(ctx context.Context, siteID string, from, to 
 	if limit <= 0 {
 		limit = 10
 	}
-	table := tableFor(from, to)
+	table := tableForFilters(from, to, filters)
 	ts := tsColumn(table)
 	fSQL, _ := filterSQL(filters)
 	allParams := baseParams(siteID, fromMs, toMs, filters)
@@ -326,7 +365,7 @@ func (s *StatsService) TopCountries(ctx context.Context, siteID string, from, to
 	if limit <= 0 {
 		limit = 10
 	}
-	table := tableFor(from, to)
+	table := tableForFilters(from, to, filters)
 	ts := tsColumn(table)
 	fSQL, _ := filterSQL(filters)
 	allParams := baseParams(siteID, fromMs, toMs, filters)
@@ -371,7 +410,7 @@ func (s *StatsService) TopOS(ctx context.Context, siteID string, from, to time.T
 	if limit <= 0 {
 		limit = 10
 	}
-	table := tableFor(from, to)
+	table := tableForFilters(from, to, filters)
 	ts := tsColumn(table)
 	fSQL, _ := filterSQL(filters)
 	allParams := baseParams(siteID, fromMs, toMs, filters)
@@ -416,7 +455,7 @@ func (s *StatsService) TopDevices(ctx context.Context, siteID string, from, to t
 	if limit <= 0 {
 		limit = 10
 	}
-	table := tableFor(from, to)
+	table := tableForFilters(from, to, filters)
 	ts := tsColumn(table)
 	fSQL, _ := filterSQL(filters)
 	allParams := baseParams(siteID, fromMs, toMs, filters)
@@ -528,7 +567,7 @@ type sessionStats struct {
 func (s *StatsService) Overview(ctx context.Context, siteID string, from, to time.Time, filters *FilterBuilder) (OverviewStats, error) {
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
-	table := tableFor(from, to)
+	table := tableForFilters(from, to, filters)
 	ts := tsColumn(table)
 	fSQL, _ := filterSQL(filters)
 	allParams := baseParams(siteID, fromMs, toMs, filters)
@@ -568,19 +607,25 @@ func (s *StatsService) Overview(ctx context.Context, siteID string, from, to tim
 		result.Sessions = rows[0].Sessions
 	}
 
-	// Query sessions table for bounce rate and average duration.
-	// Sessions table uses first_ts for time filtering.
-	sessParams := baseParams(siteID, fromMs, toMs, filters)
+	// Query sessions table for bounce rate and average duration. The sessions
+	// table has only a subset of filterable columns (no distinct_id/pathname/
+	// event_type), so apply only the compatible filters — otherwise a cohort or
+	// pathname filter referenced a missing column and the query errored, which
+	// was then silently swallowed and bounce/duration showed as 0.
+	sessFilters := filters.Subset(sessionsFilterColumns)
+	sessSQL, _ := filterSQL(sessFilters)
+	sessParams := baseParams(siteID, fromMs, toMs, sessFilters)
 	sessQ := fmt.Sprintf(`SELECT
 		        SUM(CASE WHEN is_bounce = 'true' THEN 1 ELSE 0 END) AS bounces,
 		        COUNT(*) AS total_sessions,
 		        SUM(CAST(last_ts AS BIGINT) - CAST(first_ts AS BIGINT)) AS duration_sum
 		 FROM sessions
-		 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3%s`, fSQL)
+		 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3%s`, sessSQL)
 
 	sessRows, err := nucleus.Query[sessionStats](ctx, s.db.SQL(), sessQ, sessParams...)
 	if err != nil {
-		// Non-fatal: return what we have without bounce/duration
+		// Non-fatal, but log it rather than silently returning zero bounce/duration.
+		slog.Warn("overview: sessions sub-query failed", "site", siteID, "err", err)
 		return result, nil
 	}
 	if len(sessRows) > 0 && sessRows[0].TotalSessions > 0 {
