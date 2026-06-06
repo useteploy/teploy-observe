@@ -139,7 +139,13 @@ func Handler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.Handl
 
 		var sw, sh int
 		if input.Screen != "" {
-			fmt.Sscanf(input.Screen, "%dx%d", &sw, &sh)
+			// Require both fields to parse and clamp to a sane range so
+			// negative/oversized/partial ("1920x0") garbage never reaches the
+			// INTEGER columns or the rollups.
+			if n, _ := fmt.Sscanf(input.Screen, "%dx%d", &sw, &sh); n != 2 ||
+				sw <= 0 || sw > 65535 || sh <= 0 || sh > 65535 {
+				sw, sh = 0, 0
+			}
 		}
 
 		// Extract UTM params from URL

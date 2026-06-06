@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -75,6 +76,10 @@ func generateSlug() (string, error) {
 
 // CreateLink creates a new tracked link with a random 8-char slug.
 func (s *LinkService) CreateLink(ctx context.Context, tenantID, siteID, name, destination string) (TrackedLink, error) {
+	if !validDestination(destination) {
+		return TrackedLink{}, fmt.Errorf("tracking: destination must be an absolute http(s) URL")
+	}
+
 	linkID, err := generateID(16)
 	if err != nil {
 		return TrackedLink{}, err
@@ -122,6 +127,26 @@ func (s *LinkService) ListLinks(ctx context.Context, tenantID, siteID string) ([
 	if err != nil {
 		return nil, fmt.Errorf("tracking: list links: %w", err)
 	}
+
+	// Derive click counts from the append-only link_clicks table (exact and
+	// concurrency-safe) rather than trusting the denormalized click_count column.
+	type clickCount struct {
+		LinkID string `db:"link_id"`
+		Count  int64  `db:"count"`
+	}
+	counts, err := nucleus.Query[clickCount](ctx, s.DB.SQL(),
+		`SELECT link_id, COUNT(*) AS count FROM link_clicks WHERE tenant_id = $1 GROUP BY link_id`,
+		tenantID,
+	)
+	if err == nil {
+		byID := make(map[string]int64, len(counts))
+		for _, c := range counts {
+			byID[c.LinkID] = c.Count
+		}
+		for i := range links {
+			links[i].ClickCount = fmt.Sprintf("%d", byID[links[i].LinkID])
+		}
+	}
 	return links, nil
 }
 
@@ -164,28 +189,21 @@ func (s *LinkService) RecordClick(ctx context.Context, slug, referrer, country, 
 		return fmt.Errorf("tracking: insert click: %w", err)
 	}
 
-	// Bump click_count by re-inserting with a higher version (ReplacingMergeTree).
-	newCount := fmt.Sprintf("%d", parseInt(link.ClickCount)+1)
-	newVersion := fmt.Sprintf("%d", parseInt(link.Version)+1)
-
-	_, err = s.DB.SQL().Exec(ctx,
-		`INSERT INTO tracked_links (link_id, tenant_id, site_id, name, destination, slug, click_count, created_at, version)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		link.LinkID, link.TenantID, link.SiteID, link.Name, link.Destination,
-		link.Slug, newCount, link.CreatedAt, newVersion,
-	)
-	if err != nil {
-		return fmt.Errorf("tracking: bump click count: %w", err)
-	}
-
+	// click_count is derived at read time from the append-only link_clicks table
+	// (see ListLinks), so we no longer maintain a denormalized counter here — a
+	// read-modify-write re-insert into a ReplacingMergeTree structurally loses
+	// concurrent increments.
 	return nil
 }
 
-// parseInt parses a string to int64, returning 0 on failure.
-func parseInt(s string) int64 {
-	var n int64
-	fmt.Sscanf(s, "%d", &n)
-	return n
+// validDestination requires an absolute http(s) URL with a host, rejecting
+// javascript:/data:/file:/relative/empty values.
+func validDestination(dest string) bool {
+	u, err := url.Parse(dest)
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 // ClickHandler returns an http.HandlerFunc that looks up a link by slug from the
@@ -202,6 +220,14 @@ func (s *LinkService) ClickHandler() http.HandlerFunc {
 		link, err := s.GetLinkBySlug(r.Context(), slug)
 		if err != nil {
 			http.Error(w, "link not found", http.StatusNotFound)
+			return
+		}
+
+		// Defense in depth: reject a non-http(s) destination even for legacy rows
+		// created before validation existed (closes the open-redirect / scheme
+		// abuse vector).
+		if !validDestination(link.Destination) {
+			http.Error(w, "invalid destination", http.StatusBadRequest)
 			return
 		}
 

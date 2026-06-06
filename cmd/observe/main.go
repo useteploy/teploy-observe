@@ -182,8 +182,10 @@ func main() {
 	errorHandler := obserrors.NewErrorHandler(db, issueSvc, searchSvc, srcmapSvc).
 		WithPrivacy(siteSvc.PrivacyConfig, cfg.SessionSalt)
 
-	// Seed demo data for empty tables unless disabled.
-	if os.Getenv("OBSERVE_SEED_DEMO") != "false" {
+	// Seed demo data only when explicitly opted in (or in demo mode). Default is
+	// OFF so a fresh production install never injects fabricated logs/errors/
+	// traces/replays into site_id="default".
+	if cfg.DemoMode || os.Getenv("OBSERVE_SEED_DEMO") == "true" {
 		seed.Run(ctx, db, errorHandler, logger)
 	}
 
@@ -1216,7 +1218,8 @@ Env vars:
   OBSERVE_ADMIN_USER           First-boot admin username (default: admin)
   OBSERVE_ADMIN_PASSWORD       First-boot admin password (default: observe)
   OBSERVE_DEMO_MODE            "true" blocks write ops for public demos
-  OBSERVE_SEED_DEMO            "false" skips first-boot demo seeding
+  OBSERVE_SEED_DEMO            "true" enables first-boot demo seeding
+                               (off by default; also on when demo mode is set)
 
 Example backup:
   teploy-observe backup | zstd > teploy-observe-$(date +%F).tar.zst
@@ -2972,6 +2975,9 @@ type logSearchInput struct {
 
 func logSearchHandler(svc *logs.LogService) neutron.HandlerFunc[logSearchInput, []logs.Log] {
 	return func(ctx context.Context, input logSearchInput) ([]logs.Log, error) {
+		if input.SiteID == "" {
+			return nil, neutron.ErrBadRequest("site_id required")
+		}
 		from, to := parseTimeRange(input.From, input.To)
 		return emptyOnNil(svc.SearchLogs(ctx, input.SiteID, from, to, input.Level, input.Service, input.Query, input.Limit, input.Offset))
 	}
