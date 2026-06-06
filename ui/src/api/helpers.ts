@@ -2,6 +2,26 @@
 
 const enc = encodeURIComponent;
 
+// Public "share link" mode: shareViewHandler injects these meta tags. In shared
+// mode we have no JWT, so reads carry the share token instead and a 401 must NOT
+// bounce the anonymous viewer to /login.
+function metaContent(name: string): string {
+  if (typeof document === "undefined") return "";
+  const el = document.querySelector(`meta[name="${name}"]`);
+  return el?.getAttribute("content") || "";
+}
+
+const shareToken = (): string => metaContent("observe-share-token");
+export const isShared = (): boolean => metaContent("observe-shared") === "true";
+
+// withShare appends the share token to a request path in shared mode so the
+// server's jwt-or-share middleware authorizes the read and pins the site_id.
+function withShare(path: string): string {
+  const tok = shareToken();
+  if (!tok) return path;
+  return path + (path.includes("?") ? "&" : "?") + "share_token=" + enc(tok);
+}
+
 // activeCohortID reads ?cohort_id= from the page URL so every analytics
 // query auto-includes the active cohort filter without each call site
 // having to plumb it. C2 (Wave 4): the chip on /insights writes the
@@ -41,10 +61,12 @@ export async function get<T>(path: string): Promise<T> {
   const token = localStorage.getItem("obs_token");
   const headers: Record<string, string> = {};
   if (token) headers["Authorization"] = `Bearer ${token}`;
-  const res = await fetch(path, { headers });
+  const res = await fetch(withShare(path), { headers });
   if (res.status === 401) {
-    localStorage.removeItem("obs_token");
-    window.location.href = "/login";
+    if (!isShared()) {
+      localStorage.removeItem("obs_token");
+      window.location.href = "/login";
+    }
     throw new Error("Unauthorized");
   }
   if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
@@ -57,8 +79,10 @@ export async function post<T>(path: string, body: unknown): Promise<T> {
   if (token) headers["Authorization"] = `Bearer ${token}`;
   const res = await fetch(path, { method: "POST", headers, body: JSON.stringify(body) });
   if (res.status === 401) {
-    localStorage.removeItem("obs_token");
-    window.location.href = "/login";
+    if (!isShared()) {
+      localStorage.removeItem("obs_token");
+      window.location.href = "/login";
+    }
     throw new Error("Unauthorized");
   }
   if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
@@ -71,8 +95,10 @@ export async function del<T = { ok: boolean }>(path: string): Promise<T> {
   if (token) headers["Authorization"] = `Bearer ${token}`;
   const res = await fetch(path, { method: "DELETE", headers });
   if (res.status === 401) {
-    localStorage.removeItem("obs_token");
-    window.location.href = "/login";
+    if (!isShared()) {
+      localStorage.removeItem("obs_token");
+      window.location.href = "/login";
+    }
     throw new Error("Unauthorized");
   }
   if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);

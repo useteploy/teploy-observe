@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -439,7 +440,12 @@ func main() {
 	// grants read access).
 	requireAdmin := auth.RequireRole(authSvc, auth.RoleAdmin)
 	requireEditor := auth.RequireRole(authSvc, auth.RoleAdmin, auth.RoleEditor)
-	query.RegisterRoutes(r, statsSvc, jwtMW)
+	// Stats reads accept EITHER a JWT or a valid public share token. With a
+	// share token the request is allowed (GET only) but site_id is FORCED to the
+	// token's site, so a token can only read its own dashboard data — this is
+	// what makes public share links actually render instead of bouncing the
+	// viewer to /login.
+	query.RegisterRoutes(r, statsSvc, jwtOrShareMW(jwtMW, shareSvc))
 
 	// --- Live event stream (JWT auth, registered on root router to avoid group prefix bug) ---
 	r.Handle("GET /api/v1/stats/live", jwtMW(liveSvc.Handler()))
@@ -542,7 +548,7 @@ func main() {
 	// --- Share link management API (JWT auth; editor+ for writes) ---
 	shareGroup := r.Group("/api/v1", jwtMW)
 	shareEditor := shareGroup.Group("", requireEditor)
-	neutron.Post(shareEditor, "/sites/{site_id}/share", createShareHandler(shareSvc),
+	neutron.Post(shareEditor, "/sites/{site_id}/share", createShareHandler(shareSvc, siteSvc),
 		neutron.WithTags("share"),
 		neutron.WithSummary("Create a share link for a site"),
 	)
@@ -1713,10 +1719,14 @@ type createShareInput struct {
 	SiteID string `path:"site_id"`
 }
 
-func createShareHandler(shareSvc *share.ShareService) neutron.HandlerFunc[createShareInput, share.ShareLink] {
+func createShareHandler(shareSvc *share.ShareService, siteSvc *sites.SiteService) neutron.HandlerFunc[createShareInput, share.ShareLink] {
 	return func(ctx context.Context, input createShareInput) (share.ShareLink, error) {
 		if input.SiteID == "" {
 			return share.ShareLink{}, neutron.ErrBadRequest("site_id is required")
+		}
+		// Don't mint share links for nonexistent sites (avoids dangling links).
+		if s, err := siteSvc.Get(ctx, input.SiteID); err != nil || s.SiteID == "" {
+			return share.ShareLink{}, neutron.ErrNotFound("site not found")
 		}
 		return shareSvc.Create(ctx, input.SiteID)
 	}
@@ -3894,8 +3904,45 @@ func dailyErrorCountsHandler(svc *obserrors.IssueService) neutron.HandlerFunc[da
 	}
 }
 
-// shareViewHandler resolves a share token and serves the dashboard UI with
-// the site_id injected as a query parameter redirect.
+// jwtOrShareMW lets a request through if it carries either a valid JWT or a
+// valid public share token (X-Share-Token header or ?share_token=). For a share
+// token the request must be a GET and site_id is overwritten with the token's
+// resolved site, so a token can only ever read its own site's data. Anything
+// else falls through to the normal JWT middleware.
+func jwtOrShareMW(jwtMW neutron.Middleware, shareSvc *share.ShareService) neutron.Middleware {
+	return func(next http.Handler) http.Handler {
+		jwtNext := jwtMW(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			tok := r.Header.Get("X-Share-Token")
+			if tok == "" {
+				tok = r.URL.Query().Get("share_token")
+			}
+			if tok == "" {
+				jwtNext.ServeHTTP(w, r)
+				return
+			}
+			if r.Method != http.MethodGet {
+				neutron.WriteError(w, r, neutron.ErrUnauthorized("share token is read-only"))
+				return
+			}
+			siteID, err := shareSvc.Resolve(r.Context(), tok)
+			if err != nil || siteID == "" {
+				neutron.WriteError(w, r, neutron.ErrUnauthorized("invalid share token"))
+				return
+			}
+			// Pin site_id to the token's site (ignore any client-supplied value).
+			q := r.URL.Query()
+			q.Set("site_id", siteID)
+			r.URL.RawQuery = q.Encode()
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// shareViewHandler resolves a share token and serves the dashboard UI in
+// "shared" mode: the site_id and the token are injected as escaped meta tags so
+// the SPA can route reads through the token-scoped stats API instead of bouncing
+// the anonymous viewer to /login.
 func shareViewHandler(shareSvc *share.ShareService, uiFS fs.FS) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.PathValue("token")
@@ -3916,13 +3963,15 @@ func shareViewHandler(shareSvc *share.ShareService, uiFS fs.FS) http.HandlerFunc
 			return
 		}
 
-		// Inject site_id as a meta tag the frontend can read.
-		// Insert before </head>.
-		inject := fmt.Sprintf(`<meta name="observe-site-id" content="%s"><meta name="observe-shared" content="true">`, siteID)
-		html := strings.Replace(string(data), "</head>", inject+"</head>", 1)
+		// Escape values before embedding them in HTML attributes (reflected-XSS
+		// sink otherwise). The token here is the path token, already validated.
+		inject := fmt.Sprintf(
+			`<meta name="observe-site-id" content="%s"><meta name="observe-shared" content="true"><meta name="observe-share-token" content="%s">`,
+			html.EscapeString(siteID), html.EscapeString(token))
+		page := strings.Replace(string(data), "</head>", inject+"</head>", 1)
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(html))
+		w.Write([]byte(page))
 	}
 }
 
