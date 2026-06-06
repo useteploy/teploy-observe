@@ -177,10 +177,13 @@ func (s *IssueService) ListIssues(ctx context.Context, siteID, status string, li
 	if err != nil {
 		return nil, err
 	}
-	// user_count is computed on read (the stored column is always 0). Bounded
-	// by the page limit, so the per-issue lookups stay cheap.
+	// user_count and event_count are computed on read (the stored counters race
+	// under concurrent flushes — read-modify-write into a ReplacingMergeTree
+	// loses increments). COUNT over error_events is exact and concurrency-safe.
+	// Bounded by the page limit, so the per-issue lookups stay cheap.
 	for i := range issues {
 		issues[i].UserCount = s.affectedUsers(ctx, siteID, issues[i].IssueID)
+		issues[i].EventCount = s.eventCount(ctx, siteID, issues[i].IssueID)
 	}
 	return issues, nil
 }
@@ -201,7 +204,22 @@ func (s *IssueService) GetIssue(ctx context.Context, issueID, siteID string) (*I
 		return nil, nil
 	}
 	rows[0].UserCount = s.affectedUsers(ctx, siteID, rows[0].IssueID)
+	rows[0].EventCount = s.eventCount(ctx, siteID, rows[0].IssueID)
 	return &rows[0], nil
+}
+
+// eventCount returns the exact number of events for an issue, computed on read
+// from the append-only error_events table (the stored issues.event_count is
+// racey). Best-effort: returns 0 on any error.
+func (s *IssueService) eventCount(ctx context.Context, siteID, issueID string) int64 {
+	rows, err := nucleus.Query[issueCountRow](ctx, s.db.SQL(),
+		`SELECT COUNT(*) AS n FROM error_events WHERE site_id = $1 AND issue_id = $2`,
+		siteID, issueID,
+	)
+	if err != nil || len(rows) == 0 {
+		return 0
+	}
+	return rows[0].N
 }
 
 type issueCountRow struct {
