@@ -149,10 +149,15 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 	if input.ReplayID != "" {
 		kv := s.db.KV()
 		key := "replay_seen:" + input.SiteID + ":" + replayID
-		if seen, _ := kv.Get(ctx, key); seen != nil {
-			insertSession = false
-		} else {
-			_ = kv.Set(ctx, key, []byte("1"))
+		// Atomic claim: only the batch that wins SetNX inserts the session row,
+		// closing the check-then-set race that produced duplicate sessions. The
+		// dedupe key self-expires (keys are 1-byte; TTL bounds growth).
+		claimed, err := kv.SetNX(ctx, key, []byte("1"))
+		if err == nil {
+			insertSession = claimed
+			if claimed {
+				_, _ = kv.Expire(ctx, key, 6*time.Hour)
+			}
 		}
 	}
 
