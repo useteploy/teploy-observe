@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -114,14 +115,32 @@ func (s *ExperimentService) RecordExposure(ctx context.Context, experimentID, si
 	return err
 }
 
-// RecordConversion marks an exposure as converted.
+// RecordConversion records that an exposed user converted. The conversion is
+// stored in its own append-only table (not a row-copy back into exposures,
+// which used to duplicate rows and corrupt counts). The user's variant is
+// resolved from their exposure so Results can attribute the conversion without
+// a join. A conversion with no prior exposure is ignored.
 func (s *ExperimentService) RecordConversion(ctx context.Context, experimentID, siteID, userID string) error {
-	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
-	_, err := s.db.SQL().Exec(ctx,
-		`INSERT INTO experiment_exposures (exposure_id, tenant_id, experiment_id, site_id, user_id, variant, converted, timestamp)
-		 SELECT exposure_id, tenant_id, experiment_id, site_id, user_id, variant, 'true', $3
-		 FROM experiment_exposures WHERE experiment_id = $1 AND user_id = $2`,
-		experimentID, userID, now)
+	type vrow struct {
+		Variant string `db:"variant"`
+	}
+	rows, err := nucleus.Query[vrow](ctx, s.db.SQL(),
+		`SELECT variant FROM experiment_exposures
+		 WHERE experiment_id = $1 AND site_id = $2 AND user_id = $3
+		 ORDER BY timestamp DESC LIMIT 1`,
+		experimentID, siteID, userID)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return nil // no exposure to convert
+	}
+
+	id := genID()
+	_, err = s.db.SQL().Exec(ctx,
+		`INSERT INTO experiment_conversions (conversion_id, tenant_id, experiment_id, site_id, user_id, variant, timestamp)
+		 VALUES ($1, 'default', $2, $3, $4, $5, $6)`,
+		id, experimentID, siteID, userID, rows[0].Variant, time.Now().UTC().UnixMilli())
 	return err
 }
 
@@ -136,28 +155,43 @@ func (s *ExperimentService) Results(ctx context.Context, experimentID, siteID st
 		return nil, fmt.Errorf("experiment not found")
 	}
 
-	type row struct {
-		Variant   string `db:"variant"`
-		Total     string `db:"total"`
-		Converted string `db:"converted"`
+	type cntRow struct {
+		Variant string `db:"variant"`
+		Count   string `db:"count"`
 	}
 
-	rows, err := nucleus.Query[row](ctx, s.db.SQL(),
-		`SELECT variant,
-			CAST(COUNT(*) AS TEXT) AS total,
-			CAST(SUM(CASE WHEN converted = 'true' THEN 1 ELSE 0 END) AS TEXT) AS converted
+	// Exposures: distinct users per variant. ORDER BY variant gives a stable
+	// slice so the Bayesian control selection below is deterministic.
+	expRows, err := nucleus.Query[cntRow](ctx, s.db.SQL(),
+		`SELECT variant, CAST(COUNT(DISTINCT user_id) AS TEXT) AS count
 		 FROM experiment_exposures
 		 WHERE experiment_id = $1 AND site_id = $2
-		 GROUP BY variant`,
+		 GROUP BY variant ORDER BY variant`,
 		experimentID, siteID)
 	if err != nil {
 		return nil, err
 	}
 
+	// Conversions: distinct converting users per variant.
+	convRows, err := nucleus.Query[cntRow](ctx, s.db.SQL(),
+		`SELECT variant, CAST(COUNT(DISTINCT user_id) AS TEXT) AS count
+		 FROM experiment_conversions
+		 WHERE experiment_id = $1 AND site_id = $2
+		 GROUP BY variant ORDER BY variant`,
+		experimentID, siteID)
+	if err != nil {
+		return nil, err
+	}
+	convByVariant := make(map[string]int64, len(convRows))
+	for _, r := range convRows {
+		c, _ := strconv.ParseInt(r.Count, 10, 64)
+		convByVariant[r.Variant] = c
+	}
+
 	var variants []VariantResult
-	for _, r := range rows {
-		total, _ := strconv.ParseInt(r.Total, 10, 64)
-		conv, _ := strconv.ParseInt(r.Converted, 10, 64)
+	for _, r := range expRows {
+		total, _ := strconv.ParseInt(r.Count, 10, 64)
+		conv := convByVariant[r.Variant]
 		rate := 0.0
 		if total > 0 {
 			rate = float64(conv) / float64(total)
@@ -165,24 +199,42 @@ func (s *ExperimentService) Results(ctx context.Context, experimentID, siteID st
 		variants = append(variants, VariantResult{Variant: r.Variant, Exposures: total, Conversions: conv, ConversionRate: rate})
 	}
 
-	// Bayesian: compute probability each variant beats the control (first row).
+	// Put the declared control variant (first entry in the experiment's variants
+	// JSON, or one keyed "control") at index 0 so the Bayesian comparison is
+	// against the true control rather than whatever sorted first.
+	orderControlFirst(variants, controlKey(exps[0].Variants))
+
+	// Bayesian: compute probability each variant beats the control (index 0).
 	// Uses Beta(1+conv, 1+nonconv) conjugate prior with a 4000-sample Monte Carlo.
 	if len(variants) >= 2 {
 		computeBayesianProbabilities(variants)
 	}
 
+	// Significance/winner are gated on the configured minimum sample so a tiny
+	// sample cannot falsely report a winner.
 	significant := false
 	winner := ""
 	if len(variants) >= 2 {
-		significant = chiSquaredSignificant(variants)
-		best := variants[0]
-		for _, v := range variants[1:] {
-			if v.ConversionRate > best.ConversionRate {
-				best = v
+		var totalExposures int64
+		minArm := int64(1<<62 - 1)
+		for _, v := range variants {
+			totalExposures += v.Exposures
+			if v.Exposures < minArm {
+				minArm = v.Exposures
 			}
 		}
-		if significant {
-			winner = best.Variant
+		minSample := int64(exps[0].MinSample)
+		if totalExposures >= minSample && minArm > 0 {
+			significant = chiSquaredSignificant(variants)
+			if significant {
+				best := variants[0]
+				for _, v := range variants[1:] {
+					if v.ConversionRate > best.ConversionRate {
+						best = v
+					}
+				}
+				winner = best.Variant
+			}
 		}
 	}
 
@@ -192,6 +244,45 @@ func (s *ExperimentService) Results(ctx context.Context, experimentID, siteID st
 		Significant: significant,
 		Winner:      winner,
 	}, nil
+}
+
+// controlKey returns the key of the control variant: the one keyed "control"
+// if present, else the first declared variant. Empty if variantsJSON is blank
+// or unparseable.
+func controlKey(variantsJSON string) string {
+	if variantsJSON == "" {
+		return ""
+	}
+	var vs []struct {
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal([]byte(variantsJSON), &vs); err != nil || len(vs) == 0 {
+		return ""
+	}
+	for _, v := range vs {
+		if v.Key == "control" {
+			return v.Key
+		}
+	}
+	return vs[0].Key
+}
+
+// orderControlFirst moves the variant matching key to index 0, preserving the
+// relative order of the rest. No-op if key is empty or not found.
+func orderControlFirst(variants []VariantResult, key string) {
+	if key == "" {
+		return
+	}
+	for i, v := range variants {
+		if v.Variant == key {
+			if i != 0 {
+				ctrl := variants[i]
+				copy(variants[1:i+1], variants[0:i])
+				variants[0] = ctrl
+			}
+			return
+		}
+	}
 }
 
 // chiSquaredSignificant performs a simplified chi-squared test for 2+ variants.
@@ -210,6 +301,10 @@ func chiSquaredSignificant(variants []VariantResult) bool {
 	}
 
 	overallRate := float64(totalConversions) / float64(totalExposures)
+	df := len(variants) - 1
+	// Yates continuity correction for the 2x2 (df=1) case reduces small-sample
+	// over-rejection. Only applied for two variants where it is well-defined.
+	yates := df == 1
 	chiSq := 0.0
 	for _, v := range variants {
 		if v.Exposures == 0 {
@@ -218,14 +313,21 @@ func chiSquaredSignificant(variants []VariantResult) bool {
 		expected := float64(v.Exposures) * overallRate
 		notExpected := float64(v.Exposures) * (1 - overallRate)
 		if expected > 0 {
-			chiSq += math.Pow(float64(v.Conversions)-expected, 2) / expected
+			d := math.Abs(float64(v.Conversions) - expected)
+			if yates {
+				d = math.Max(0, d-0.5)
+			}
+			chiSq += d * d / expected
 		}
 		if notExpected > 0 {
-			chiSq += math.Pow(float64(v.Exposures-v.Conversions)-notExpected, 2) / notExpected
+			d := math.Abs(float64(v.Exposures-v.Conversions) - notExpected)
+			if yates {
+				d = math.Max(0, d-0.5)
+			}
+			chiSq += d * d / notExpected
 		}
 	}
 
-	df := len(variants) - 1
 	criticals := []float64{0, 3.84, 5.99, 7.81, 9.49, 11.07}
 	if df < len(criticals) {
 		return chiSq > criticals[df]

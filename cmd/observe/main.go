@@ -412,6 +412,18 @@ func main() {
 		neutron.WithSummary("Ingest OTLP traces"),
 	)
 
+	// --- Experiment exposure/conversion ingest (API key auth) ---
+	// Without these write paths the A/B results page is always empty. site_id
+	// is taken from the validated key, not the body.
+	neutron.Post(ingestGroup, "/experiments/expose", experimentExposeHandler(experimentSvc),
+		neutron.WithTags("experiments"),
+		neutron.WithSummary("Record an experiment exposure"),
+	)
+	neutron.Post(ingestGroup, "/experiments/convert", experimentConvertHandler(experimentSvc),
+		neutron.WithTags("experiments"),
+		neutron.WithSummary("Record an experiment conversion"),
+	)
+
 	// --- Stats API (JWT auth) ---
 	jwtMW := auth.JWTAuthMiddleware(authSvc)
 	// Role enforcers layered on top of JWT. Admin = full access to config and
@@ -2405,6 +2417,37 @@ func createExperimentHandler(svc *experiments.ExperimentService) neutron.Handler
 		e, err := svc.Create(ctx, input.SiteID, input.Name, input.FlagKey, input.GoalMetric, input.GoalValue, input.Variants, input.MinSample)
 		if err != nil { return experiments.Experiment{}, err }
 		return *e, nil
+	}
+}
+
+type experimentExposeInput struct {
+	ExperimentID string `json:"experiment_id"`
+	UserID       string `json:"user_id"`
+	Variant      string `json:"variant"`
+}
+
+func experimentExposeHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[experimentExposeInput, neutron.Empty] {
+	return func(ctx context.Context, input experimentExposeInput) (neutron.Empty, error) {
+		siteID := ingest.SiteIDFromContext(ctx)
+		if siteID == "" || input.ExperimentID == "" || input.UserID == "" {
+			return neutron.Empty{}, neutron.ErrBadRequest("experiment_id and user_id required")
+		}
+		return neutron.Empty{}, svc.RecordExposure(ctx, input.ExperimentID, siteID, input.UserID, input.Variant)
+	}
+}
+
+type experimentConvertInput struct {
+	ExperimentID string `json:"experiment_id"`
+	UserID       string `json:"user_id"`
+}
+
+func experimentConvertHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[experimentConvertInput, neutron.Empty] {
+	return func(ctx context.Context, input experimentConvertInput) (neutron.Empty, error) {
+		siteID := ingest.SiteIDFromContext(ctx)
+		if siteID == "" || input.ExperimentID == "" || input.UserID == "" {
+			return neutron.Empty{}, neutron.ErrBadRequest("experiment_id and user_id required")
+		}
+		return neutron.Empty{}, svc.RecordConversion(ctx, input.ExperimentID, siteID, input.UserID)
 	}
 }
 
