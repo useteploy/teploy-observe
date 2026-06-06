@@ -209,18 +209,20 @@ func (b *Buffer) Flush() {
 	defer cancel()
 
 	b.logger.Info("flushing events", "count", len(batch))
-	if err := b.insertBatch(ctx, batch); err != nil {
-		b.logger.Error("flush failed", "count", len(batch), "err", err)
-		// Re-queue events that failed to insert (best effort, may drop under
-		// pressure). We deliberately do NOT checkpoint, so these events stay in
-		// the WAL and a later successful flush checkpoints them via lastOffset.
+	if committed, err := b.insertBatch(ctx, batch); err != nil {
+		// Only the unsubmitted tail is re-queued; already-committed chunks are
+		// dropped from the retry set so a later flush cannot double-insert them.
+		unsent := batch[committed:]
+		b.logger.Error("flush failed", "committed", committed, "requeue", len(unsent), "err", err)
+		// We deliberately do NOT checkpoint, so these events stay in the WAL and
+		// a later successful flush checkpoints them via lastOffset.
 		b.mu.Lock()
 		remaining := b.maxSize - len(b.events)
 		if remaining > 0 {
-			if len(batch) > remaining {
-				batch = batch[:remaining]
+			if len(unsent) > remaining {
+				unsent = unsent[:remaining]
 			}
-			b.events = append(b.events, batch...)
+			b.events = append(b.events, unsent...)
 		}
 		b.mu.Unlock()
 		return
@@ -316,9 +318,14 @@ func eventsRecentArgs(dst []any, e *Event) []any {
 	)
 }
 
-func (b *Buffer) insertBatch(ctx context.Context, batch []Event) error {
-	sql := b.db.SQL()
-
+// insertBatch inserts events in chunks. Each chunk's events + events_recent
+// inserts run inside a single transaction so a failure of the second can never
+// leave the first committed (which previously let events_recent diverge from
+// events). It returns the number of events successfully committed so the caller
+// re-queues only the unsubmitted tail rather than the whole batch — that whole-
+// batch re-queue was the main way a flush retry double-counted already-inserted
+// events.
+func (b *Buffer) insertBatch(ctx context.Context, batch []Event) (committed int, err error) {
 	// Chunk size chosen so each statement stays well under protocol limits
 	// even for wide rows (29 cols * 50 rows = 1450 placeholders).
 	const batchSize = 50
@@ -341,12 +348,23 @@ func (b *Buffer) insertBatch(ctx context.Context, batch []Event) error {
 			recentArgs = eventsRecentArgs(recentArgs, &chunk[i])
 		}
 
-		if _, err := sql.Exec(ctx, eventsQuery, eventsArgs...); err != nil {
-			return fmt.Errorf("batch insert events %d-%d: %w", start+1, end, err)
+		tx, txErr := b.db.Begin(ctx)
+		if txErr != nil {
+			return committed, fmt.Errorf("batch begin tx %d-%d: %w", start+1, end, txErr)
 		}
-		if _, err := sql.Exec(ctx, recentQuery, recentArgs...); err != nil {
-			return fmt.Errorf("batch insert recent %d-%d: %w", start+1, end, err)
+		txSQL := tx.SQL()
+		if _, e := txSQL.Exec(ctx, eventsQuery, eventsArgs...); e != nil {
+			_ = tx.Rollback(ctx)
+			return committed, fmt.Errorf("batch insert events %d-%d: %w", start+1, end, e)
 		}
+		if _, e := txSQL.Exec(ctx, recentQuery, recentArgs...); e != nil {
+			_ = tx.Rollback(ctx)
+			return committed, fmt.Errorf("batch insert recent %d-%d: %w", start+1, end, e)
+		}
+		if e := tx.Commit(ctx); e != nil {
+			return committed, fmt.Errorf("batch commit %d-%d: %w", start+1, end, e)
+		}
+		committed = end
 	}
-	return nil
+	return committed, nil
 }
