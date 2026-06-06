@@ -50,7 +50,7 @@ type Panel struct {
 	DashboardID string `json:"dashboard_id" db:"dashboard_id"`
 	PanelType   string `json:"panel_type" db:"panel_type"` // metric, timeseries, table, bar
 	Title       string `json:"title" db:"title"`
-	QueryType   string `json:"query_type" db:"query_type"`     // pageviews, visitors, errors, custom_sql
+	QueryType   string `json:"query_type" db:"query_type"`     // pageviews, visitors, errors, metric_series
 	QueryConfig string `json:"query_config" db:"query_config"` // JSONB
 	PositionX   string `json:"position_x" db:"position_x"`
 	PositionY   string `json:"position_y" db:"position_y"`
@@ -91,9 +91,30 @@ func (s *DashboardService) Create(ctx context.Context, siteID, name, description
 }
 
 func (s *DashboardService) List(ctx context.Context, siteID string) ([]Dashboard, error) {
-	return nucleus.Query[Dashboard](ctx, s.db.SQL(),
+	rows, err := nucleus.Query[Dashboard](ctx, s.db.SQL(),
 		`SELECT dashboard_id, tenant_id, site_id, name, description, created_by, created_at, version
 		 FROM dashboards WHERE site_id = $1 ORDER BY created_at DESC`, siteID)
+	if err != nil {
+		return nil, err
+	}
+	// Nucleus ReplacingMergeTree read-time dedup is unreliable, so keep the
+	// max-version row per id in Go and drop soft-deleted tombstones (name == '').
+	latest := map[string]Dashboard{}
+	for _, d := range rows {
+		if cur, ok := latest[d.DashboardID]; !ok || versionLess(cur.Version, d.Version) {
+			latest[d.DashboardID] = d
+		}
+	}
+	out := make([]Dashboard, 0, len(latest))
+	for _, d := range rows { // preserve created_at DESC order, one entry per id
+		if l, ok := latest[d.DashboardID]; ok && d.Version == l.Version {
+			if l.Name != "" {
+				out = append(out, l)
+			}
+			delete(latest, d.DashboardID)
+		}
+	}
+	return out, nil
 }
 
 func (s *DashboardService) Get(ctx context.Context, dashboardID string) (*Dashboard, error) {
@@ -103,7 +124,24 @@ func (s *DashboardService) Get(ctx context.Context, dashboardID string) (*Dashbo
 	if err != nil || len(rows) == 0 {
 		return nil, err
 	}
-	return &rows[0], nil
+	best := rows[0]
+	for _, d := range rows[1:] {
+		if versionLess(best.Version, d.Version) {
+			best = d
+		}
+	}
+	if best.Name == "" { // soft-deleted tombstone
+		return nil, nil
+	}
+	return &best, nil
+}
+
+// versionLess reports whether numeric version a < b (versions are millisecond
+// epoch strings).
+func versionLess(a, b string) bool {
+	ai, _ := strconv.ParseInt(a, 10, 64)
+	bi, _ := strconv.ParseInt(b, 10, 64)
+	return ai < bi
 }
 
 func (s *DashboardService) Delete(ctx context.Context, dashboardID string) error {
@@ -123,6 +161,15 @@ func (s *DashboardService) Delete(ctx context.Context, dashboardID string) error
 func IsValidPanelType(t string) bool {
 	switch t {
 	case "metric", "timeseries", "table", "bar", "metric_series":
+		return true
+	}
+	return false
+}
+
+// isValidQueryType reports whether ExecutePanel can run the query type.
+func isValidQueryType(t string) bool {
+	switch t {
+	case "pageviews", "visitors", "errors", "metric_series":
 		return true
 	}
 	return false
@@ -156,6 +203,12 @@ func (s *DashboardService) AddPanel(ctx context.Context, dashboardID string, pan
 		if panel.QueryType == "" {
 			panel.QueryType = "metric_series"
 		}
+	}
+
+	// Reject query types ExecutePanel can't run (e.g. the never-implemented
+	// custom_sql) so an unrenderable panel never lands in the DB.
+	if panel.QueryType != "" && !isValidQueryType(panel.QueryType) {
+		return nil, fmt.Errorf("dashboards: unsupported query_type %q", panel.QueryType)
 	}
 
 	if panel.Width == "" {
@@ -312,7 +365,9 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 		return map[string]string{"value": rows[0].Count}, nil
 
 	default:
-		return map[string]string{"value": "0"}, nil
+		// Surface an unimplemented/unknown query type as broken rather than
+		// returning a fake 0 (custom_sql was never implemented).
+		return nil, fmt.Errorf("unsupported query_type %q", panel.QueryType)
 	}
 }
 
