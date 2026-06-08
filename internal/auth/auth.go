@@ -188,9 +188,13 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 	return err
 }
 
-// ForceResetAdminPassword unconditionally updates every admin user's password
-// hash. Used by the OBSERVE_RESET_ADMIN_PASSWORD startup escape hatch when an
-// operator is locked out and cannot supply the current password.
+// ForceResetAdminPassword replaces the first admin user's password.
+// Used by the OBSERVE_RESET_ADMIN_PASSWORD startup escape hatch.
+//
+// Nucleus finding #30: UPDATE does not invalidate the server-side query result
+// cache, so a plain UPDATE is not visible to subsequent SELECTs on the same SQL
+// text. We DELETE + INSERT instead — the INSERT lands as a new physical row and
+// bypasses the stale cache entry for the prior row.
 func (s *AuthService) ForceResetAdminPassword(ctx context.Context, password string) error {
 	if len(password) < 8 {
 		return fmt.Errorf("password must be at least 8 characters")
@@ -202,12 +206,26 @@ func (s *AuthService) ForceResetAdminPassword(ctx context.Context, password stri
 	if err != nil {
 		return err
 	}
-	_, err = s.db.SQL().Exec(ctx,
-		"UPDATE admin_users SET password_hash = $1 WHERE role = $2",
-		hash, RoleAdmin,
+
+	user, err := nucleus.QueryOne[adminUserRow](ctx, s.db.SQL(),
+		"SELECT id, username, password_hash, created_at, role FROM admin_users WHERE role = $1",
+		RoleAdmin,
 	)
 	if err != nil {
-		return fmt.Errorf("auth: force reset password: %w", err)
+		return fmt.Errorf("auth: no admin user found to reset: %w", err)
+	}
+
+	if _, err = s.db.SQL().Exec(ctx, "DELETE FROM admin_users WHERE id = $1", user.ID); err != nil {
+		return fmt.Errorf("auth: force reset delete: %w", err)
+	}
+
+	now := dbutil.IntParam(time.Now().UnixMilli())
+	_, err = s.db.SQL().Exec(ctx,
+		"INSERT INTO admin_users (id, username, password_hash, created_at, role) VALUES ($1, $2, $3, $4, $5)",
+		user.ID, user.Username, hash, now, user.Role,
+	)
+	if err != nil {
+		return fmt.Errorf("auth: force reset insert: %w", err)
 	}
 	return nil
 }
