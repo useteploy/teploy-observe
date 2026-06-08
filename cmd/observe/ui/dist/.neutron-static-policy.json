@@ -1,6 +1,11 @@
 {
-  "generatedAt": "2026-05-10T20:43:54.530Z",
+  "generatedAt": "2026-06-08T21:34:05.976Z",
   "headers": {
+    "/*": {
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "DENY",
+      "Referrer-Policy": "strict-origin-when-cross-origin"
+    },
     "/assets/*": {
       "Cache-Control": "public, max-age=31536000, immutable"
     },

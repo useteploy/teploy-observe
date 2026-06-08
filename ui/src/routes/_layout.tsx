@@ -31,7 +31,7 @@ function DemoBanner() {
 
 export default function Layout({ children }: { children: preact.ComponentChildren }) {
   const path = typeof window !== "undefined" ? window.location.pathname : "";
-  const isBareLayout = path === "/login" || path === "/onboard";
+  const isBareLayout = path === "/login" || path === "/onboard" || path === "/setup";
 
   if (isBareLayout) {
     return (

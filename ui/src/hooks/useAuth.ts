@@ -5,10 +5,16 @@ export function useAuth() {
   const [authenticated, setAuthenticated] = useState(authApi.isAuthenticated());
 
   useEffect(() => {
-    // Redirect to login if not authenticated (except on login page)
-    if (!authenticated && typeof window !== "undefined" && window.location.pathname !== "/login") {
-      window.location.href = "/login";
-    }
+    if (authenticated || typeof window === "undefined") return;
+    const path = window.location.pathname;
+    if (path === "/login" || path === "/setup") return;
+    authApi.checkSetup()
+      .then(({ needs_setup }) => {
+        window.location.href = needs_setup ? "/setup" : "/login";
+      })
+      .catch(() => {
+        window.location.href = "/login";
+      });
   }, [authenticated]);
 
   const login = async (username: string, password: string) => {

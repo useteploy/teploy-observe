@@ -188,6 +188,30 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 	return err
 }
 
+// ForceResetAdminPassword unconditionally updates every admin user's password
+// hash. Used by the OBSERVE_RESET_ADMIN_PASSWORD startup escape hatch when an
+// operator is locked out and cannot supply the current password.
+func (s *AuthService) ForceResetAdminPassword(ctx context.Context, password string) error {
+	if len(password) < 8 {
+		return fmt.Errorf("password must be at least 8 characters")
+	}
+	if len(password) > maxPasswordBytes {
+		return fmt.Errorf("password must be at most %d bytes", maxPasswordBytes)
+	}
+	hash, err := hashPassword(password)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.SQL().Exec(ctx,
+		"UPDATE admin_users SET password_hash = $1 WHERE role = $2",
+		hash, RoleAdmin,
+	)
+	if err != nil {
+		return fmt.Errorf("auth: force reset password: %w", err)
+	}
+	return nil
+}
+
 // maxPasswordBytes is bcrypt's hard input ceiling — GenerateFromPassword errors
 // beyond it. Callers must reject longer passwords rather than store the empty
 // hash the error path used to produce (which silently locked accounts out).

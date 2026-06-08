@@ -140,15 +140,6 @@ func main() {
 	}
 	logger.Info("migrations complete")
 
-	// Generate any secret not supplied via config, so there's no predictable
-	// hardcoded default. A generated admin password is surfaced once below; a
-	// generated session salt rotates session/visitor IDs on restart (set
-	// OBSERVE_SESSION_SALT to keep them stable).
-	generatedAdminPw := false
-	if cfg.AdminPassword == "" {
-		cfg.AdminPassword = auth.RandomSecret()
-		generatedAdminPw = true
-	}
 	if cfg.SessionSalt == "" {
 		cfg.SessionSalt = auth.RandomSecret()
 		logger.Warn("OBSERVE_SESSION_SALT not set — using a random salt; set it to keep session/visitor IDs stable across restarts")
@@ -156,14 +147,26 @@ func main() {
 
 	// Auth service
 	authSvc := auth.NewAuthService(db, cfg.JWTSecret, logger)
-	createdAdmin, err := authSvc.EnsureAdmin(ctx, cfg.AdminUser, cfg.AdminPassword)
-	if err != nil {
-		logger.Error("failed to ensure admin user", "err", err)
-		os.Exit(1)
+
+	// CLI escape hatch: OBSERVE_RESET_ADMIN_PASSWORD force-updates the admin's
+	// password hash on startup without requiring the current password. Useful
+	// when locked out. Unset the env var after recovery.
+	if resetPw := os.Getenv("OBSERVE_RESET_ADMIN_PASSWORD"); resetPw != "" {
+		if err := authSvc.ForceResetAdminPassword(ctx, resetPw); err != nil {
+			logger.Warn("OBSERVE_RESET_ADMIN_PASSWORD: reset failed", "err", err)
+		} else {
+			logger.Info("OBSERVE_RESET_ADMIN_PASSWORD: admin password updated")
+		}
 	}
-	if createdAdmin && generatedAdminPw {
-		logger.Warn("generated a random admin password — SAVE THIS NOW (set OBSERVE_ADMIN_PASSWORD to choose your own)",
-			"username", cfg.AdminUser, "password", cfg.AdminPassword)
+
+	// Auto-seed the first admin only when OBSERVE_ADMIN_PASSWORD is explicitly
+	// set. An empty password means a fresh install: the /setup wizard in the
+	// browser lets the operator choose credentials interactively on first visit.
+	if cfg.AdminPassword != "" {
+		if _, err := authSvc.EnsureAdmin(ctx, cfg.AdminUser, cfg.AdminPassword); err != nil {
+			logger.Error("failed to ensure admin user", "err", err)
+			os.Exit(1)
+		}
 	}
 
 	// Site service
@@ -863,6 +866,13 @@ func main() {
 		return metaSvc.Snapshot(ctx)
 	}, neutron.WithTags("meta"), neutron.WithSummary("Observe self-observability snapshot"))
 
+	// --- First-run setup wizard (public, no auth) ---
+	// GET returns {"needs_setup":bool}. POST creates the first admin and returns
+	// a JWT so the browser is immediately logged in. The POST refuses once an
+	// admin exists, so these endpoints become inert after initial setup.
+	r.HandleFunc("GET /api/v1/auth/setup", setupStatusHandler(authSvc))
+	r.HandleFunc("POST /api/v1/auth/setup", setupCreateHandler(authSvc))
+
 	// --- Public config (UI reads this to know about demo mode, etc.) ---
 	r.HandleFunc("GET /api/v1/config", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1508,6 +1518,70 @@ func orAll(s string) string {
 		return "<all>"
 	}
 	return s
+}
+
+// --- Setup wizard handlers (public) ---
+
+func setupStatusHandler(authSvc *auth.AuthService) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		has, err := authSvc.HasAdminUsers(req.Context())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"db unavailable"}`))
+			return
+		}
+		if has {
+			w.Write([]byte(`{"needs_setup":false}`))
+		} else {
+			w.Write([]byte(`{"needs_setup":true}`))
+		}
+	}
+}
+
+type setupCreateInput struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func setupCreateHandler(authSvc *auth.AuthService) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var input setupCreateInput
+		if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":"invalid JSON"}`))
+			return
+		}
+		if input.Username == "" || input.Password == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":"username and password required"}`))
+			return
+		}
+		if len(input.Password) < 8 {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":"password must be at least 8 characters"}`))
+			return
+		}
+		created, err := authSvc.EnsureAdmin(req.Context(), input.Username, input.Password)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"failed to create admin"}`))
+			return
+		}
+		if !created {
+			w.WriteHeader(http.StatusConflict)
+			w.Write([]byte(`{"error":"setup already complete"}`))
+			return
+		}
+		token, err := authSvc.Login(req.Context(), input.Username, input.Password)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"login after setup failed"}`))
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"token": token})
+	}
 }
 
 // --- Auth handlers ---
