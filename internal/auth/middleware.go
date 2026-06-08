@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-dev/neutron-go/neutronauth"
 
 	"github.com/useteploy/teploy-observe/internal/ingest"
 )
@@ -129,6 +130,9 @@ func JWTAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 				role = RoleViewer
 			}
 			ctx := WithRole(r.Context(), role)
+			// Store full claims so handlers can read sub/username/role via
+			// neutronauth.ClaimsFromContext (e.g. changePasswordHandler).
+			ctx = neutronauth.WithClaims(ctx, claims)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
