@@ -16,31 +16,38 @@ app: observe
 domain: observe.example.com
 server: observe.example.com
 
-image: observe
 port: 3000
 platform: linux/amd64
 
-# Build the image locally each deploy (uses the repo Dockerfile).
-# Switch to pulling a prebuilt image by removing this and setting image: ghcr.io/...
-build_local: true
+# Build mode: with no `image` set, Teploy builds from the repo Dockerfile.
+# Default (build_local unset) builds on the server — best for this vendored
+# Go module, since it compiles natively for the server's arch with no local
+# Docker or cross-build needed. Set `build_local: true` to build on your
+# machine and ship the image over SSH instead, or set
+# `image: ghcr.io/useteploy/teploy-observe` to pull a prebuilt image.
 
 # Graceful shutdown — give ingest buffer 30s to flush before SIGKILL.
 stop_timeout: 30
 
 # Nucleus runs as a Teploy accessory (separate container, sidecar to observe).
-# Observe talks to it via the docker network at `nucleus:5432`.
+# Teploy names the accessory's network alias `<app>-<name>`, so observe
+# reaches it at `observe-nucleus:5432` (see OBSERVE_NUCLEUS_URL below).
 accessories:
   nucleus:
     image: ghcr.io/neutron-build/nucleus:latest
     port: 5432
     env:
+      # Single-node sidecar on a private network: allow no-auth SQL and the
+      # cluster/replication transports to bind non-loopback without a token.
       NUCLEUS_ALLOW_NO_AUTH: "1"
+      NUCLEUS_ALLOW_INSECURE_CLUSTER: "1"
+      NUCLEUS_ALLOW_INSECURE_REPLICATION: "1"
     volumes:
-      nucleus_data: /data
+      nucleus-data: /data
 
 env:
   OBSERVE_ADDR: ":3000"
-  OBSERVE_NUCLEUS_URL: "postgres://nucleus:5432/observe"
+  OBSERVE_NUCLEUS_URL: "postgres://observe-nucleus:5432/observe"
   OBSERVE_SITE_ID: "default"
   OBSERVE_SESSION_SALT: "${TEPLOY_OBSERVE_SESSION_SALT}"
   OBSERVE_JWT_SECRET: "${TEPLOY_OBSERVE_JWT_SECRET}"
@@ -54,7 +61,7 @@ env:
   OBSERVE_SEED_DEMO: "false"
 
 volumes:
-  observe_state: /var/lib/observe
+  observe-state: /var/lib/observe
 
 # Optional: Slack webhook on deploy success/failure.
 # notifications:

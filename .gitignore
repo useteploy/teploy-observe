@@ -50,3 +50,6 @@ marketing/launch/
 # Private notes — local only, never committed
 /_internal/
 /INTERNAL.md
+
+# Private infra deploy overlay (Tailscale server IP)
+teploy.home.yml
