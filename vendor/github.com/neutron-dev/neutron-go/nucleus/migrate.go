@@ -147,7 +147,7 @@ func (c *Client) MigrateDown(ctx context.Context, migrations []Migration, steps 
 
 // MigrationStatus returns all applied migrations.
 func (c *Client) MigrationStatus(ctx context.Context) ([]MigrationRecord, error) {
-	rows, err := c.pool.Query(ctx, "SELECT version, name, applied_at FROM _neutron_migrations ORDER BY version")
+	rows, err := c.pool.Query(ctx, "SELECT CAST(version AS TEXT), name, applied_at FROM _neutron_migrations ORDER BY version")
 	if err != nil {
 		return nil, fmt.Errorf("nucleus: migration status: %w", err)
 	}
@@ -156,16 +156,26 @@ func (c *Client) MigrationStatus(ctx context.Context) ([]MigrationRecord, error)
 	var records []MigrationRecord
 	for rows.Next() {
 		var r MigrationRecord
-		if err := rows.Scan(&r.Version, &r.Name, &r.AppliedAt); err != nil {
+		var vStr string
+		if err := rows.Scan(&vStr, &r.Name, &r.AppliedAt); err != nil {
 			return nil, err
 		}
+		v, err := strconv.Atoi(vStr)
+		if err != nil {
+			return nil, fmt.Errorf("nucleus: parse migration version %q: %w", vStr, err)
+		}
+		r.Version = v
 		records = append(records, r)
 	}
 	return records, rows.Err()
 }
 
 func (c *Client) appliedVersions(ctx context.Context) (map[int]bool, error) {
-	rows, err := c.pool.Query(ctx, "SELECT version FROM _neutron_migrations")
+	// CAST to TEXT: Nucleus returns INTEGER columns with the binary wire
+	// encoding even when format code 0 (text) is negotiated, causing pgx's
+	// text decoder to fail with strconv.ParseInt on binary bytes. Casting to
+	// TEXT forces a proper string value safe to parse regardless of wire format.
+	rows, err := c.pool.Query(ctx, "SELECT CAST(version AS TEXT) FROM _neutron_migrations")
 	if err != nil {
 		return nil, fmt.Errorf("nucleus: query applied versions: %w", err)
 	}
@@ -173,9 +183,13 @@ func (c *Client) appliedVersions(ctx context.Context) (map[int]bool, error) {
 
 	applied := make(map[int]bool)
 	for rows.Next() {
-		var v int
-		if err := rows.Scan(&v); err != nil {
+		var vStr string
+		if err := rows.Scan(&vStr); err != nil {
 			return nil, err
+		}
+		v, err := strconv.Atoi(vStr)
+		if err != nil {
+			return nil, fmt.Errorf("nucleus: parse migration version %q: %w", vStr, err)
 		}
 		applied[v] = true
 	}
