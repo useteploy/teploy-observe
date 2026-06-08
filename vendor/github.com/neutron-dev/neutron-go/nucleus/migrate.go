@@ -147,7 +147,7 @@ func (c *Client) MigrateDown(ctx context.Context, migrations []Migration, steps 
 
 // MigrationStatus returns all applied migrations.
 func (c *Client) MigrationStatus(ctx context.Context) ([]MigrationRecord, error) {
-	rows, err := c.pool.Query(ctx, "SELECT CAST(version AS TEXT), name, applied_at FROM _neutron_migrations ORDER BY version")
+	rows, err := c.pool.Query(ctx, "SELECT version, name, applied_at FROM _neutron_migrations ORDER BY version")
 	if err != nil {
 		return nil, fmt.Errorf("nucleus: migration status: %w", err)
 	}
@@ -156,13 +156,13 @@ func (c *Client) MigrationStatus(ctx context.Context) ([]MigrationRecord, error)
 	var records []MigrationRecord
 	for rows.Next() {
 		var r MigrationRecord
-		var vStr string
-		if err := rows.Scan(&vStr, &r.Name, &r.AppliedAt); err != nil {
+		var rawVer []byte
+		if err := rows.Scan(&rawVer, &r.Name, &r.AppliedAt); err != nil {
 			return nil, err
 		}
-		v, err := strconv.Atoi(vStr)
+		v, err := scanInt(rawVer)
 		if err != nil {
-			return nil, fmt.Errorf("nucleus: parse migration version %q: %w", vStr, err)
+			return nil, fmt.Errorf("nucleus: parse migration version: %w", err)
 		}
 		r.Version = v
 		records = append(records, r)
@@ -171,11 +171,7 @@ func (c *Client) MigrationStatus(ctx context.Context) ([]MigrationRecord, error)
 }
 
 func (c *Client) appliedVersions(ctx context.Context) (map[int]bool, error) {
-	// CAST to TEXT: Nucleus returns INTEGER columns with the binary wire
-	// encoding even when format code 0 (text) is negotiated, causing pgx's
-	// text decoder to fail with strconv.ParseInt on binary bytes. Casting to
-	// TEXT forces a proper string value safe to parse regardless of wire format.
-	rows, err := c.pool.Query(ctx, "SELECT CAST(version AS TEXT) FROM _neutron_migrations")
+	rows, err := c.pool.Query(ctx, "SELECT version FROM _neutron_migrations")
 	if err != nil {
 		return nil, fmt.Errorf("nucleus: query applied versions: %w", err)
 	}
@@ -183,17 +179,50 @@ func (c *Client) appliedVersions(ctx context.Context) (map[int]bool, error) {
 
 	applied := make(map[int]bool)
 	for rows.Next() {
-		var vStr string
-		if err := rows.Scan(&vStr); err != nil {
+		var rawVer []byte
+		if err := rows.Scan(&rawVer); err != nil {
 			return nil, err
 		}
-		v, err := strconv.Atoi(vStr)
+		v, err := scanInt(rawVer)
 		if err != nil {
-			return nil, fmt.Errorf("nucleus: parse migration version %q: %w", vStr, err)
+			return nil, fmt.Errorf("nucleus: parse migration version: %w", err)
 		}
 		applied[v] = true
 	}
 	return applied, rows.Err()
+}
+
+// scanInt decodes an integer value from raw pgwire bytes. Nucleus declares text
+// format (code 0) in RowDescription but sends big-endian binary bytes for
+// INTEGER columns — pgx's text decoder then fails. We inspect the bytes: if all
+// are ASCII digits, treat as text; otherwise decode as big-endian int32/int64.
+func scanInt(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, fmt.Errorf("empty value")
+	}
+	// Text path: all bytes are ASCII digit characters.
+	allDigits := true
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if allDigits {
+		n, err := strconv.ParseInt(string(b), 10, 64)
+		return int(n), err
+	}
+	// Binary path: big-endian 4-byte or 8-byte integer.
+	switch len(b) {
+	case 4:
+		return int(int32(b[0])<<24 | int32(b[1])<<16 | int32(b[2])<<8 | int32(b[3])), nil
+	case 8:
+		v := int64(b[0])<<56 | int64(b[1])<<48 | int64(b[2])<<40 | int64(b[3])<<32 |
+			int64(b[4])<<24 | int64(b[5])<<16 | int64(b[6])<<8 | int64(b[7])
+		return int(v), nil
+	default:
+		return 0, fmt.Errorf("unexpected %d-byte integer", len(b))
+	}
 }
 
 // LoadMigrations reads migration files from an embedded filesystem.
