@@ -181,9 +181,16 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 	if err != nil {
 		return err
 	}
+	// Nucleus finding #30: UPDATE does not reliably invalidate the server-side
+	// query result cache. DELETE + INSERT ensures the next SELECT sees a fresh
+	// physical row, bypassing any stale cache entry for the old hash.
+	if _, err = s.db.SQL().Exec(ctx, "DELETE FROM admin_users WHERE id = $1", user.ID); err != nil {
+		return fmt.Errorf("auth: change password delete: %w", err)
+	}
+	now := dbutil.IntParam(time.Now().UnixMilli())
 	_, err = s.db.SQL().Exec(ctx,
-		"UPDATE admin_users SET password_hash = $1 WHERE id = $2",
-		newHash, user.ID,
+		"INSERT INTO admin_users (id, username, password_hash, created_at, role) VALUES ($1, $2, $3, $4, $5)",
+		user.ID, user.Username, newHash, now, user.Role,
 	)
 	return err
 }
