@@ -638,6 +638,7 @@ interface ScheduledExport {
 function ExportsSection() {
   const [exports, setExports] = useState<ScheduledExport[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
   const [showCreate, setShowCreate] = useState(false);
   const [form, setForm] = useState({
     name: "", sql: "", cron: "@daily", format: "ndjson",
@@ -646,9 +647,20 @@ function ExportsSection() {
 
   const load = async () => {
     setLoading(true);
+    setLoadError("");
     try {
       const r = await fetch("/api/v1/exports/scheduled", { headers: { Authorization: "Bearer " + localStorage.getItem("observe_token") } });
-      setExports(await r.json());
+      if (!r.ok) {
+        const body = await r.text();
+        let msg = `Server error ${r.status}`;
+        try { msg = JSON.parse(body).error ?? msg; } catch { /* non-JSON */ }
+        setLoadError(msg);
+        return;
+      }
+      const data = await r.json();
+      setExports(Array.isArray(data) ? data : []);
+    } catch (e) {
+      setLoadError(String(e));
     } finally {
       setLoading(false);
     }
@@ -698,6 +710,15 @@ function ExportsSection() {
   };
 
   if (loading) return <SettingsSkeleton />;
+  if (loadError) return (
+    <div class="settings-section">
+      <h2>Scheduled SQL exports</h2>
+      <div class="obs-empty-state" style={{ color: "var(--obs-danger, #e54)" }}>
+        Failed to load exports: {loadError}
+      </div>
+      <button class="obs-btn" onClick={load} style={{ marginTop: "8px" }}>Retry</button>
+    </div>
+  );
   return (
     <div class="settings-section">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
