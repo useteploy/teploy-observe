@@ -5,7 +5,10 @@ project_name: teploy-observe
 builds:
   - id: teploy-observe
     main: ./cmd/observe
-    binary: teploy-observe
+    # Command/binary name is the short `observe` (repo stays namespaced
+    # teploy-observe, like ripgrep's repo vs the `rg` command). Keep this in sync
+    # with scripts/install.sh (installs `observe`) and the brew formula below.
+    binary: observe
     env:
       - CGO_ENABLED=0
       - GOFLAGS=-mod=vendor
@@ -23,8 +26,10 @@ builds:
 archives:
   - id: teploy-observe-tar
     formats: [tar.gz]
+    # Asset name uses the short command name `observe` (not ProjectName), so the
+    # download URL in scripts/install.sh resolves: observe_<ver>_<os>_<arch>.tar.gz
     name_template: >-
-      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{- if eq .Arch "amd64" }}x86_64{{- else }}{{ .Arch }}{{ end }}
+      observe_{{ .Version }}_{{ .Os }}_{{- if eq .Arch "amd64" }}x86_64{{- else }}{{ .Arch }}{{ end }}
 
 checksum:
   name_template: 'checksums.txt'
@@ -87,7 +92,7 @@ docker_manifests:
       - 'ghcr.io/useteploy/teploy-observe:latest-arm64'
 
 brews:
-  - name: teploy-observe
+  - name: observe
     repository:
       owner: useteploy
       name: homebrew-tap
@@ -96,6 +101,6 @@ brews:
     description: 'Self-hosted, single-binary replacement for PostHog + Umami + SigNoz + Sentry'
     license: 'AGPL-3.0-or-later'
     install: |
-      bin.install "teploy-observe"
+      bin.install "observe"
     test: |
-      system "#{bin}/teploy-observe", "version"
+      system "#{bin}/observe", "version"
