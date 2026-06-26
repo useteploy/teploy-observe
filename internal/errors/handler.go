@@ -257,15 +257,15 @@ func customFingerprint(parts []string) string {
 
 func jsonOrEmpty(v any) string {
 	if v == nil {
-		return ""
+		return "null"
 	}
 	raw, err := json.Marshal(v)
 	if err != nil {
-		return ""
+		return "null"
 	}
 	s := string(raw)
-	if s == "null" || s == "[]" || s == "{}" {
-		return ""
+	if s == "" {
+		return "null"
 	}
 	return s
 }

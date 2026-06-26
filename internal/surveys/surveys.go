@@ -126,7 +126,7 @@ func (s *SurveyService) SubmitResponse(ctx context.Context, surveyID, siteID, us
 	}
 
 	id := genID()
-	answersJSON := ""
+	answersJSON := "null"
 	if answers != nil {
 		raw, _ := json.Marshal(answers)
 		answersJSON = string(raw)

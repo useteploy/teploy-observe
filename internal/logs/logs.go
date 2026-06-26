@@ -75,7 +75,7 @@ func (s *LogService) IngestLog(ctx context.Context, input LogInput) (string, err
 		return "", fmt.Errorf("generate log id: %w", err)
 	}
 
-	attrsJSON := ""
+	attrsJSON := "null"
 	if len(input.Attributes) > 0 {
 		raw, err := json.Marshal(input.Attributes)
 		if err != nil {

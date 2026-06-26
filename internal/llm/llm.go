@@ -82,10 +82,11 @@ func (s *LLMService) Ingest(ctx context.Context, input LLMInput) (LLMResponse, e
 		input.Status = "ok"
 	}
 
-	metaJSON := ""
+	metaJSON := "null"
 	if input.Metadata != nil {
-		raw, _ := json.Marshal(input.Metadata)
-		metaJSON = string(raw)
+		if raw, err := json.Marshal(input.Metadata); err == nil {
+			metaJSON = string(raw)
+		}
 	}
 
 	// Auto-calculate cost if not provided

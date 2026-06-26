@@ -202,7 +202,7 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 
 	for _, ev := range input.Events {
 		eventID := genID()
-		dataJSON := ""
+		dataJSON := "null"
 		if ev.Data != nil {
 			if raw, err := json.Marshal(ev.Data); err == nil {
 				dataJSON = string(raw)
