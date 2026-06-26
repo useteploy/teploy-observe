@@ -405,6 +405,17 @@ func main() {
 		AllowHeaders: []string{"Content-Type", "X-API-Key"},
 		MaxAge:       86400,
 	})
+	// Go 1.22 method routing rejects OPTIONS before middleware runs, so the
+	// ingestCORS middleware never fires for browser preflight requests. Register
+	// an explicit wildcard OPTIONS handler that returns the same CORS headers
+	// and 204 — this covers /api/v1/events, /api/v1/events/batch, /api/v1/errors, etc.
+	r.HandleFunc("OPTIONS /api/v1/{path...}", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		w.WriteHeader(http.StatusNoContent)
+	})
 	// Auth runs before the limiter so the limiter can key on site_id. BodyLimit
 	// rejects oversized payloads with 413 before they are buffered/decoded
 	// (batch is capped at 100 events, so 2 MiB is ample).
