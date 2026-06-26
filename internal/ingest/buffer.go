@@ -360,15 +360,16 @@ func buildPlaceholders(rows, cols int) string {
 	return b.String()
 }
 
-// propertiesJSON returns the event's properties as a JSON string, or "" if
-// there are none. Empty-string is stored as an empty JSON object by the caller.
+// propertiesJSON returns the event's properties as a JSON string. Returns "{}"
+// (not "") for nil/empty properties — Nucleus rejects empty-string for JSONB
+// columns and makes the row invisible to WHERE-clause queries.
 func propertiesJSON(p map[string]any) string {
 	if p == nil {
-		return ""
+		return "{}"
 	}
 	raw, err := json.Marshal(p)
 	if err != nil {
-		return ""
+		return "{}"
 	}
 	return string(raw)
 }
