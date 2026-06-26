@@ -8,7 +8,6 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
 // JourneyStep represents a page-to-page transition with its count.
@@ -42,8 +41,8 @@ func (s *StatsService) Journeys(ctx context.Context, siteID string, from, to tim
 	if limit <= 0 {
 		limit = 10
 	}
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 
 	rows, err := nucleus.Query[journeyEvent](ctx, s.db.SQL(),
 		`SELECT session_id, COALESCE(pathname, '/') AS pathname, timestamp

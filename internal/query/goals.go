@@ -9,7 +9,6 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
 var randRead = rand.Read
@@ -69,8 +68,8 @@ func (s *StatsService) GoalConversions(ctx context.Context, siteID string, from,
 		return nil, nil
 	}
 
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 
 	// Get total visitors for the period
 	type countRow struct {

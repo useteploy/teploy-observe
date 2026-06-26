@@ -7,7 +7,6 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
 // RetentionCohort represents one row of the retention grid.
@@ -41,8 +40,8 @@ func (s *StatsService) Retention(ctx context.Context, siteID string, from, to ti
 		from = to.Add(-maxRetentionWindow)
 	}
 
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 
 	// Get all sessions with first_ts in the time range
 	rows, err := nucleus.Query[sessionFirstLast](ctx, s.db.SQL(),

@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
-
-	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
 // CohortResolver returns the list of distinct_ids for a cohort. It's
@@ -120,7 +118,10 @@ func filterSQL(filters *FilterBuilder) (string, []any) {
 }
 
 // baseParams builds the standard parameter list: siteID, fromMs, toMs, plus any filter params.
-func baseParams(siteID string, fromMs, toMs string, filters *FilterBuilder) []any {
+// fromMs and toMs are raw int64 milliseconds. Passing int64 (not string) causes pgx
+// SimpleProtocol to encode them as unquoted numeric literals, which Nucleus can compare
+// against BIGINT columns without a text→int cast (which Nucleus rejects).
+func baseParams(siteID string, fromMs, toMs int64, filters *FilterBuilder) []any {
 	params := []any{siteID, fromMs, toMs}
 	if filters != nil {
 		params = append(params, filters.Params()...)
@@ -134,7 +135,7 @@ type RealtimeResult struct {
 }
 
 func (s *StatsService) RealtimeVisitors(ctx context.Context, siteID string, minutes int) (int, error) {
-	cutoff := dbutil.IntParam(time.Now().UTC().Add(-time.Duration(minutes) * time.Minute).UnixMilli())
+	cutoff := time.Now().UTC().Add(-time.Duration(minutes) * time.Minute).UnixMilli()
 	rows, err := nucleus.Query[RealtimeResult](ctx, s.db.SQL(),
 		`SELECT COUNT(DISTINCT session_id) AS active_visitors
 		 FROM events_recent
@@ -158,8 +159,8 @@ type TimeSeriesPoint struct {
 }
 
 func (s *StatsService) PageviewTimeSeries(ctx context.Context, siteID string, from, to time.Time, interval string, filters *FilterBuilder) ([]TimeSeriesPoint, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	table := tableForFilters(from, to, filters)
 	ts := tsColumn(table)
 	fSQL, _ := filterSQL(filters)
@@ -210,8 +211,8 @@ type TopPage struct {
 }
 
 func (s *StatsService) TopPages(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]TopPage, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
@@ -257,8 +258,8 @@ type TopReferrer struct {
 }
 
 func (s *StatsService) TopReferrers(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]TopReferrer, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
@@ -314,8 +315,8 @@ type BrowserStat struct {
 }
 
 func (s *StatsService) TopBrowsers(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]BrowserStat, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
@@ -360,8 +361,8 @@ type CountryStat struct {
 }
 
 func (s *StatsService) TopCountries(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]CountryStat, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
@@ -405,8 +406,8 @@ type OSStat struct {
 }
 
 func (s *StatsService) TopOS(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]OSStat, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
@@ -450,8 +451,8 @@ type DeviceStat struct {
 }
 
 func (s *StatsService) TopDevices(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]DeviceStat, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
@@ -503,8 +504,8 @@ type channelRow struct {
 }
 
 func (s *StatsService) TopChannels(ctx context.Context, siteID string, from, to time.Time, filters *FilterBuilder) ([]ChannelStat, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	fSQL, _ := filterSQL(filters)
 	allParams := baseParams(siteID, fromMs, toMs, filters)
 
@@ -565,8 +566,8 @@ type sessionStats struct {
 }
 
 func (s *StatsService) Overview(ctx context.Context, siteID string, from, to time.Time, filters *FilterBuilder) (OverviewStats, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	table := tableForFilters(from, to, filters)
 	ts := tsColumn(table)
 	fSQL, _ := filterSQL(filters)
@@ -668,8 +669,8 @@ type LanguageStat struct {
 }
 
 func (s *StatsService) TopLanguages(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]LanguageStat, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
@@ -699,8 +700,8 @@ type ScreenStat struct {
 }
 
 func (s *StatsService) TopScreens(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]ScreenStat, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
@@ -730,8 +731,8 @@ type UTMStat struct {
 }
 
 func (s *StatsService) TopUTM(ctx context.Context, siteID string, from, to time.Time, utmType string, limit int, filters *FilterBuilder) ([]UTMStat, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
@@ -769,8 +770,8 @@ type EntryPageStat struct {
 }
 
 func (s *StatsService) TopEntryPages(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]EntryPageStat, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
@@ -800,8 +801,8 @@ type ExitPageStat struct {
 }
 
 func (s *StatsService) TopExitPages(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]ExitPageStat, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
@@ -832,8 +833,8 @@ type CustomEventStat struct {
 }
 
 func (s *StatsService) CustomEvents(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]CustomEventStat, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
@@ -868,8 +869,8 @@ type PropertyStat struct {
 // EventProperties returns property key→value breakdowns for a specific event type.
 // Aggregated in Go because Nucleus doesn't support jsonb_each or similar.
 func (s *StatsService) EventProperties(ctx context.Context, siteID string, from, to time.Time, eventType string, limit int) ([]PropertyStat, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 20
 	}
@@ -959,8 +960,8 @@ type SessionSummary struct {
 }
 
 func (s *StatsService) Sessions(ctx context.Context, siteID string, from, to time.Time, limit int) ([]SessionSummary, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 20
 	}
@@ -1024,8 +1025,8 @@ type PropertyKeyStat struct {
 }
 
 func (s *StatsService) EventPropertyKeys(ctx context.Context, siteID, eventName string, from, to time.Time) ([]PropertyKeyStat, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 
 	type eventRow struct {
 		Properties string `db:"properties"`
@@ -1076,8 +1077,8 @@ func (s *StatsService) EventPropertyValues(ctx context.Context, siteID, eventNam
 		return nil, fmt.Errorf("event property values: invalid property key")
 	}
 
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 
 	// Inline propKey via Sprintf after validation (Nucleus SimpleProtocol
 	// may not handle parameterized JSONB ->> operator positions).

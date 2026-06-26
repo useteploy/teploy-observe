@@ -10,7 +10,6 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
 // Correlation represents a property value correlated with a target event.
@@ -35,8 +34,8 @@ type correlationEvent struct {
 // targetEvent: the event type to correlate with (e.g., "signup")
 // Returns properties whose presence significantly increases the rate of the target event.
 func (s *StatsService) CorrelationAnalysis(ctx context.Context, siteID, targetEvent string, from, to time.Time) ([]Correlation, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 
 	// Get all events with properties in the time range
 	rows, err := nucleus.Query[correlationEvent](ctx, s.db.SQL(),

@@ -8,7 +8,6 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
 // FunnelStep defines one step in a funnel (event type or pathname match).
@@ -40,8 +39,8 @@ func (s *StatsService) Funnel(ctx context.Context, siteID string, from, to time.
 		return nil, nil
 	}
 
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 
 	// Fetch all events in the time range for this site
 	rows, err := nucleus.Query[funnelEvent](ctx, s.db.SQL(),
@@ -118,8 +117,8 @@ func (s *StatsService) FunnelByBreakdown(ctx context.Context, siteID string, fro
 		return nil, fmt.Errorf("unsupported breakdown: %s", breakdownBy)
 	}
 
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
 
 	type breakdownRow struct {
 		SessionID string `db:"session_id"`
