@@ -85,7 +85,7 @@ func (s *IngestService) ingest(ctx context.Context, siteID string, req ExportTra
 			sp.ServiceName, sp.OperationName, sp.SpanKind,
 			sp.StartMs, sp.EndMs, sp.DurationMs,
 			sp.StatusCode, sp.StatusMessage,
-			sp.AttributesJSON, sp.ResourceJSON, sp.EventsJSON,
+			nullableJSON(sp.AttributesJSON), nullableJSON(sp.ResourceJSON), nullableJSON(sp.EventsJSON),
 		)
 		if err != nil {
 			return IngestResponse{}, fmt.Errorf("insert span: %w", err)
@@ -386,6 +386,18 @@ func percentile(sorted []int64, p float64) int64 {
 	}
 	idx := int(float64(len(sorted)-1) * p)
 	return sorted[idx]
+}
+
+// nullableJSON maps an empty JSON string to a SQL NULL. The JSONB columns
+// (attributes, resource, events) are nullable; handing Nucleus an empty
+// string '' for a JSONB column makes the whole INSERT silently vanish (the
+// row count says 1 but nothing persists, since '' is not valid JSON). Spans
+// frequently have no attributes/events, so those must be written as NULL.
+func nullableJSON(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 func jsonOrEmpty(v any) string {
