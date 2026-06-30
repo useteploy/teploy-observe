@@ -19,7 +19,7 @@ func AttrsToMap(attrs []KeyValue) map[string]string {
 		case kv.Value.StringValue != "":
 			m[kv.Key] = kv.Value.StringValue
 		case kv.Value.IntValue != "":
-			m[kv.Key] = kv.Value.IntValue
+			m[kv.Key] = string(kv.Value.IntValue)
 		case kv.Value.BoolValue:
 			m[kv.Key] = "true"
 		case kv.Value.DoubleValue != 0:
@@ -102,10 +102,10 @@ type HistogramShape struct {
 func MarshalHistogram(dp HistogramDataPoint) string {
 	counts := make([]int64, 0, len(dp.BucketCounts))
 	for _, c := range dp.BucketCounts {
-		v, _ := parseInt64(c)
+		v, _ := parseInt64(string(c))
 		counts = append(counts, v)
 	}
-	total, _ := parseInt64(dp.Count)
+	total, _ := parseInt64(string(dp.Count))
 	bounds := dp.ExplicitBounds
 	if bounds == nil {
 		bounds = []float64{}

@@ -1,10 +1,12 @@
 package metrics
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/useteploy/teploy-observe/internal/ingest"
 )
@@ -49,7 +51,21 @@ func (h *OTLPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *OTLPHandler) handleJSON(w http.ResponseWriter, r *http.Request, siteID string) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
+	// OTLP HTTP exporters gzip the body and set Content-Encoding: gzip.
+	// Decompress before parsing or json.Unmarshal chokes on the gzip magic
+	// byte and 400s every export. Mirrors the tracing OTLP handler.
+	var src io.Reader = r.Body
+	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
+		gz, gerr := gzip.NewReader(r.Body)
+		if gerr != nil {
+			http.Error(w, "invalid gzip body", http.StatusBadRequest)
+			return
+		}
+		defer gz.Close()
+		src = gz
+	}
+
+	body, err := io.ReadAll(io.LimitReader(src, 10*1024*1024)) // 10MB max (decompressed)
 	if err != nil {
 		http.Error(w, "read error", http.StatusBadRequest)
 		return

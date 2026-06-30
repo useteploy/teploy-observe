@@ -1,10 +1,30 @@
 package metrics
 
+import "strings"
+
 // OTLP JSON types for ExportMetricsServiceRequest.
 // These mirror the OpenTelemetry protobuf-to-JSON mapping for the metrics
 // signal. Only the fields Observe actually persists are decoded — anything
 // extra in the wire payload is silently ignored, matching the tracing
 // package's tolerance policy.
+
+// jsonInt is an OTLP int64 field (data-point asInt, histogram count/bucket
+// counts, attribute intValue). The OTLP/JSON spec encodes int64 as a quoted
+// string, but real-world exporters emit bare JSON numbers. Accept both,
+// storing the canonical decimal string — otherwise a single numeric field
+// fails json.Unmarshal for the whole batch and the export 400s. Mirrors
+// tracing.jsonInt.
+type jsonInt string
+
+func (j *jsonInt) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "null" || s == "" {
+		*j = ""
+		return nil
+	}
+	*j = jsonInt(strings.Trim(s, `"`))
+	return nil
+}
 
 type ExportMetricsRequest struct {
 	ResourceMetrics []ResourceMetrics `json:"resourceMetrics"`
@@ -63,7 +83,7 @@ type NumberDataPoint struct {
 	Attributes   []KeyValue `json:"attributes"`
 	TimeUnixNano string     `json:"timeUnixNano"`
 	AsDouble     float64    `json:"asDouble,omitempty"`
-	AsInt        string     `json:"asInt,omitempty"`
+	AsInt        jsonInt    `json:"asInt,omitempty"`
 }
 
 // HistogramDataPoint mirrors the OTLP histogram shape: parallel arrays
@@ -71,9 +91,9 @@ type NumberDataPoint struct {
 type HistogramDataPoint struct {
 	Attributes     []KeyValue `json:"attributes"`
 	TimeUnixNano   string     `json:"timeUnixNano"`
-	Count          string     `json:"count"`
+	Count          jsonInt    `json:"count"`
 	Sum            float64    `json:"sum"`
-	BucketCounts   []string   `json:"bucketCounts"`
+	BucketCounts   []jsonInt  `json:"bucketCounts"`
 	ExplicitBounds []float64  `json:"explicitBounds"`
 }
 
@@ -84,7 +104,7 @@ type KeyValue struct {
 
 type AnyValue struct {
 	StringValue string  `json:"stringValue,omitempty"`
-	IntValue    string  `json:"intValue,omitempty"`
+	IntValue    jsonInt `json:"intValue,omitempty"`
 	BoolValue   bool    `json:"boolValue,omitempty"`
 	DoubleValue float64 `json:"doubleValue,omitempty"`
 }

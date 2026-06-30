@@ -104,7 +104,7 @@ func (s *Service) insertNumber(ctx context.Context, sql *nucleus.SQLModel, siteI
 	tsNs, _ := strconv.ParseInt(dp.TimeUnixNano, 10, 64)
 	value := dp.AsDouble
 	if value == 0 && dp.AsInt != "" {
-		if iv, err := strconv.ParseInt(dp.AsInt, 10, 64); err == nil {
+		if iv, err := strconv.ParseInt(string(dp.AsInt), 10, 64); err == nil {
 			value = float64(iv)
 		}
 	}

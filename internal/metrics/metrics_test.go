@@ -46,7 +46,7 @@ func TestMarshalUnmarshalHistogram(t *testing.T) {
 	dp := HistogramDataPoint{
 		Count:          "10",
 		Sum:            123.4,
-		BucketCounts:   []string{"1", "2", "3", "4"},
+		BucketCounts:   []jsonInt{"1", "2", "3", "4"},
 		ExplicitBounds: []float64{1, 5, 10},
 	}
 	raw := MarshalHistogram(dp)
@@ -301,10 +301,10 @@ func TestQuantileReduce_AggregatesPerBucket(t *testing.T) {
 	// Two histogram observations in the same 60s bucket should sum their
 	// counts before solving the quantile.
 	histA := MarshalHistogram(HistogramDataPoint{
-		Count: "10", BucketCounts: []string{"5", "5", "0"}, ExplicitBounds: []float64{10, 50},
+		Count: "10", BucketCounts: []jsonInt{"5", "5", "0"}, ExplicitBounds: []float64{10, 50},
 	})
 	histB := MarshalHistogram(HistogramDataPoint{
-		Count: "10", BucketCounts: []string{"0", "0", "10"}, ExplicitBounds: []float64{10, 50},
+		Count: "10", BucketCounts: []jsonInt{"0", "0", "10"}, ExplicitBounds: []float64{10, 50},
 	})
 	rows := []pointRow{
 		{TsNs: 1_000_000_000, Histogram: histA, Kind: "histogram"},
