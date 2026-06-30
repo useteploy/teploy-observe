@@ -686,30 +686,15 @@ func main() {
 		neutron.WithTags("sso"), neutron.WithSummary("Create SSO config"))
 
 	// --- LLM observability (API key auth for ingest, JWT for queries) ---
-	r.HandleFunc("POST /api/v1/llm/ingest", func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		var input llm.LLMInput
-		if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
-			// Was silently ignored: a malformed body proceeded as an empty
-			// record and returned success.
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"ok":false,"error":"invalid JSON body"}`))
-			return
-		}
-		if input.SiteID == "" { input.SiteID = "default" }
-		result, err := llmSvc.Ingest(req.Context(), input)
-		if err != nil {
-			// Was HTTP 200 with the raw err reflected into hand-built JSON
-			// (success-on-failure + an escaping hazard). Return 5xx with a
-			// generic message; the detail is logged server-side.
-			logger.Error("llm ingest failed", "site", input.SiteID, "err", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`{"ok":false,"error":"ingest failed"}`))
-			return
-		}
-		json.NewEncoder(w).Encode(result)
-	})
+	// This was previously a raw r.HandleFunc with NO auth middleware at all —
+	// despite the comment, anyone on the internet could POST arbitrary
+	// usage/cost data into any site_id (it even defaulted to the literal
+	// "default" site when none was given). llmIngestHandler (below) already
+	// existed, correctly resolving site_id from the validated API key like
+	// every other ingest route, but was never wired in — dead code shadowed
+	// by this insecure duplicate. Route through ingestGroup instead.
+	neutron.Post(ingestGroup, "/llm/ingest", llmIngestHandler(llmSvc),
+		neutron.WithTags("llm"), neutron.WithSummary("Ingest LLM call record"))
 	llmGroup := r.Group("/api/v1/llm", jwtMW)
 	neutron.Get(llmGroup, "/stats", llmStatsHandler(llmSvc),
 		neutron.WithTags("llm"), neutron.WithSummary("LLM usage stats"))
