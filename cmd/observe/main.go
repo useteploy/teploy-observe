@@ -861,6 +861,8 @@ func main() {
 	// --- Log ingestion (API key auth) ---
 	neutron.Post(ingestGroup, "/logs", logIngestHandler(logSvc),
 		neutron.WithTags("logs"), neutron.WithSummary("Ingest log entry"))
+	neutron.Post(ingestGroup, "/logs/batch", logIngestBatchHandler(logSvc),
+		neutron.WithTags("logs"), neutron.WithSummary("Ingest batch of log entries"))
 
 	// --- Replay ingestion (API key auth) ---
 	neutron.Post(ingestGroup, "/replays", replayIngestHandler(replaySvc),
@@ -3084,6 +3086,32 @@ func logIngestHandler(svc *logs.LogService) neutron.HandlerFunc[logs.LogInput, l
 			return logIngestResponse{}, err
 		}
 		return logIngestResponse{OK: true, LogID: id}, nil
+	}
+}
+
+type logBatchInput struct {
+	Logs []logs.LogInput `json:"logs"`
+}
+
+type logBatchResponse struct {
+	OK       bool `json:"ok"`
+	Accepted int  `json:"accepted"`
+	Rejected int  `json:"rejected"`
+}
+
+func logIngestBatchHandler(svc *logs.LogService) neutron.HandlerFunc[logBatchInput, logBatchResponse] {
+	return func(ctx context.Context, input logBatchInput) (logBatchResponse, error) {
+		siteID := ingest.SiteIDFromContext(ctx)
+		for i := range input.Logs {
+			if input.Logs[i].SiteID == "" {
+				input.Logs[i].SiteID = siteID
+			}
+		}
+		result, err := svc.IngestLogs(ctx, input.Logs)
+		if err != nil {
+			return logBatchResponse{}, err
+		}
+		return logBatchResponse{OK: true, Accepted: result.Accepted, Rejected: result.Rejected}, nil
 	}
 }
 

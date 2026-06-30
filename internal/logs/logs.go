@@ -106,6 +106,38 @@ func (s *LogService) IngestLog(ctx context.Context, input LogInput) (string, err
 	return id, nil
 }
 
+// maxLogBatchSize caps a single /logs/batch request, mirroring the events
+// batch cap — bounds request size and worst-case per-request insert count.
+const maxLogBatchSize = 200
+
+// LogBatchResult reports how many of a batch's entries were stored.
+type LogBatchResult struct {
+	Accepted int `json:"accepted"`
+	Rejected int `json:"rejected"`
+}
+
+// IngestLogs ingests a batch of log entries in one call. A structured
+// transport (e.g. a batching Pino destination) accumulates lines client-side
+// and flushes them together — this is the server side of that contract, so a
+// high-throughput logger doesn't burn one request (and one rate-limit token)
+// per line. Per-entry failures are counted and skipped rather than aborting
+// the batch: a single malformed line must not drop the rest, and the client
+// has no way to retry only the bad entries anyway.
+func (s *LogService) IngestLogs(ctx context.Context, inputs []LogInput) (LogBatchResult, error) {
+	if len(inputs) > maxLogBatchSize {
+		return LogBatchResult{}, fmt.Errorf("batch too large: %d entries (max %d)", len(inputs), maxLogBatchSize)
+	}
+	result := LogBatchResult{}
+	for _, input := range inputs {
+		if _, err := s.IngestLog(ctx, input); err != nil {
+			result.Rejected++
+			continue
+		}
+		result.Accepted++
+	}
+	return result, nil
+}
+
 // SearchLogs queries logs with optional filters.
 func (s *LogService) SearchLogs(ctx context.Context, siteID string, from, to time.Time, level, service, search string, limit, offset int) ([]Log, error) {
 	fromMs := dbutil.IntParam(from.UnixMilli())
