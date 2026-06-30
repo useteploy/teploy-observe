@@ -881,9 +881,18 @@ func main() {
 		_, _ = w.Write([]byte(`{"demo_mode":` + demo + `}`))
 	})
 
-	// --- Source maps (JWT auth) ---
-	// Editor+: uploading a source map is a write; a viewer must not poison it.
-	r.Handle("POST /api/v1/sourcemaps/upload", jwtMW(requireEditor(srcmapUploadHandler(srcmapSvc))))
+	// --- Source maps (API key OR JWT editor+ auth) ---
+	// Editor+ via JWT: uploading a source map is a write; a viewer must not
+	// poison it. ALSO accepts the site-scoped ingest API key so CI can
+	// upload build-time sourcemaps without storing interactive user
+	// credentials — Observe has no separate scoped-token mechanism for
+	// non-interactive writes yet (Sentry/Datadog use a dedicated Auth Token
+	// for this; deferred, see _internal/DEFERRED_scoped_auth_tokens.md).
+	// site_id is resolved from the validated key when one is used, never
+	// trusted from the client-supplied form field — same rule as every
+	// other ingest endpoint.
+	r.Handle("POST /api/v1/sourcemaps/upload",
+		apiKeyOrEditorJWT(authSvc, cfg.SiteID, jwtMW, requireEditor)(srcmapUploadHandler(srcmapSvc)))
 
 	// --- Log query API (JWT auth) ---
 	logGroup := r.Group("/api/v1/logs", jwtMW)
@@ -3677,9 +3686,46 @@ func createLinkHandler(svc *tracking.LinkService) neutron.HandlerFunc[createLink
 
 // --- Source map upload handler ---
 
+// apiKeyOrEditorJWT lets a route accept either the site-scoped ingest API
+// key (X-API-Key) or an editor+ JWT session, for write actions that need to
+// work from both CI (no interactive login) and the dashboard. On the API
+// key path, site_id is resolved from the validated key and stored in
+// context — handlers must read it from there (ingest.SiteIDFromContext),
+// never from a client-supplied field, exactly like every other ingest
+// route.
+func apiKeyOrEditorJWT(
+	authSvc *auth.AuthService,
+	defaultSiteID string,
+	jwtMW neutron.Middleware,
+	requireEditor neutron.Middleware,
+) neutron.Middleware {
+	return func(next http.Handler) http.Handler {
+		editorOnly := jwtMW(requireEditor(next))
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			key := r.Header.Get("X-API-Key")
+			if key == "" {
+				editorOnly.ServeHTTP(w, r)
+				return
+			}
+			siteID, err := authSvc.ValidateAPIKey(r.Context(), key)
+			if err != nil {
+				neutron.WriteError(w, r, neutron.ErrUnauthorized(err.Error()))
+				return
+			}
+			ctx := ingest.WithSiteID(r.Context(), siteID)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
 func srcmapUploadHandler(svc *sourcemaps.SourceMapService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		siteID := r.FormValue("site_id")
+		if ctxSiteID := ingest.SiteIDFromContext(r.Context()); ctxSiteID != "" {
+			// API-key path (apiKeyOrEditorJWT) — trust the validated key's
+			// site, ignore any client-supplied site_id form value.
+			siteID = ctxSiteID
+		}
 		release := r.FormValue("release")
 		filename := r.FormValue("filename")
 		if siteID == "" || release == "" || filename == "" {
