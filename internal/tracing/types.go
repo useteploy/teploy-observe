@@ -1,9 +1,30 @@
 package tracing
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // OTLP JSON types for ExportTraceServiceRequest.
 // These match the OpenTelemetry protobuf-to-JSON mapping.
+
+// jsonInt is an OTLP int64 attribute value. The OTLP/JSON spec encodes int64
+// as a quoted string, but real-world exporters (@vercel/otel + Next.js, which
+// set numeric attributes like http.status_code) emit it as a bare JSON number.
+// Accept both, storing the canonical decimal string — otherwise a single
+// numeric attribute fails json.Unmarshal for the whole batch and the export
+// 400s with "cannot unmarshal number ... intValue of type string".
+type jsonInt string
+
+func (j *jsonInt) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "null" || s == "" {
+		*j = ""
+		return nil
+	}
+	*j = jsonInt(strings.Trim(s, `"`)) // strip quotes when string-encoded
+	return nil
+}
 
 type ExportTraceRequest struct {
 	ResourceSpans []ResourceSpans `json:"resourceSpans"`
@@ -59,7 +80,7 @@ type KeyValue struct {
 
 type AnyValue struct {
 	StringValue string `json:"stringValue,omitempty"`
-	IntValue    string `json:"intValue,omitempty"`
+	IntValue    jsonInt `json:"intValue,omitempty"`
 	BoolValue   bool   `json:"boolValue,omitempty"`
 	DoubleValue float64 `json:"doubleValue,omitempty"`
 }
@@ -119,7 +140,7 @@ func AttrsToMap(attrs []KeyValue) map[string]string {
 		case kv.Value.StringValue != "":
 			m[kv.Key] = kv.Value.StringValue
 		case kv.Value.IntValue != "":
-			m[kv.Key] = kv.Value.IntValue
+			m[kv.Key] = string(kv.Value.IntValue)
 		case kv.Value.BoolValue:
 			m[kv.Key] = "true"
 		case kv.Value.DoubleValue != 0:
