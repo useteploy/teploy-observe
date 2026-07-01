@@ -8,6 +8,12 @@
   var endpoint = script.getAttribute('data-endpoint') || origin + '/api/v1/replays';
   var errorsEndpoint = script.getAttribute('data-errors-endpoint') || origin + '/api/v1/errors';
   var siteId = script.getAttribute('data-site-id') || '';
+  // Required once a site has any API key registered — APIKeyAuthMiddleware's
+  // no-keys grace period closes permanently the moment one key exists
+  // anywhere on the instance, and /api/v1/replays + /api/v1/errors both sit
+  // behind it. Without this, every send() call below silently 401s and no
+  // replay or rage-click data ever lands, on any site with a key configured.
+  var apiKey = script.getAttribute('data-api-key') || '';
   var maxEvents = parseInt(script.getAttribute('data-max-events') || '5000', 10);
   var flushInterval = parseInt(script.getAttribute('data-flush-interval') || '10000', 10);
   // Rage click: N clicks on the same target within W ms.
@@ -202,6 +208,41 @@
     });
   }
 
+  // sendBeacon can't carry custom headers, so it can never attach
+  // X-API-Key — on any site with a key configured (the normal case once a
+  // site is past the anonymous grace period) a beacon-only send would
+  // silently 401 and the data would just vanish. fetch's keepalive flag is
+  // the modern replacement: same "survives page unload" guarantee as
+  // sendBeacon, but supports headers. Only fall back to sendBeacon when no
+  // key is configured, matching the original behavior for grace-period
+  // (single-tenant, no-keys-yet) installs.
+  function send(url, payload) {
+    var body = JSON.stringify(payload);
+    if (apiKey) {
+      try {
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+          body: body,
+          keepalive: true
+        });
+        return;
+      } catch (e) {
+        // fall through to the no-key paths below on very old browsers
+        // without fetch/keepalive support
+      }
+    }
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }));
+    } else {
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', url, true);
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      if (apiKey) xhr.setRequestHeader('X-API-Key', apiKey);
+      xhr.send(body);
+    }
+  }
+
   function flush() {
     if (events.length === 0) return;
     var batch = events.splice(0);
@@ -221,15 +262,7 @@
     var distinctId = readDistinctID();
     if (distinctId) payload.distinct_id = distinctId;
 
-    var body = JSON.stringify(payload);
-    if (navigator.sendBeacon) {
-      navigator.sendBeacon(endpoint, new Blob([body], { type: 'application/json' }));
-    } else {
-      var xhr = new XMLHttpRequest();
-      xhr.open('POST', endpoint, true);
-      xhr.setRequestHeader('Content-Type', 'application/json');
-      xhr.send(body);
-    }
+    send(endpoint, payload);
   }
 
   // Read the distinct_id set by observe.js's identify(). Lives in
@@ -278,15 +311,7 @@
     };
     var distinctId = readDistinctID();
     if (distinctId) payload.distinct_id = distinctId;
-    var body = JSON.stringify(payload);
-    if (navigator.sendBeacon) {
-      navigator.sendBeacon(errorsEndpoint, new Blob([body], { type: 'application/json' }));
-    } else {
-      var xhr = new XMLHttpRequest();
-      xhr.open('POST', errorsEndpoint, true);
-      xhr.setRequestHeader('Content-Type', 'application/json');
-      xhr.send(body);
-    }
+    send(errorsEndpoint, payload);
   }
 
   // --- Public API ---
