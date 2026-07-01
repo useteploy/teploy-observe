@@ -11,6 +11,18 @@
 #   TEPLOY_OBSERVE_JWT_SECRET      — 32+ random bytes, `openssl rand -hex 32`
 #   TEPLOY_OBSERVE_SESSION_SALT    — another random 32-byte string
 #   TEPLOY_OBSERVE_ADMIN_PASSWORD  — initial admin password (change via /settings after)
+#
+# Shell-exported vars above only apply to the deploy that exports them — if
+# you forget to re-export before a later `teploy deploy`, these silently
+# fall back to empty, and Observe generates a fresh random JWT secret/salt
+# on every restart, invalidating all sessions (only a WARN log, easy to
+# miss). For a persistent deploy, set these once via
+# `teploy secret set OBSERVE_JWT_SECRET=... OBSERVE_SESSION_SALT=...
+# OBSERVE_ADMIN_PASSWORD=...` instead — secrets set that way always
+# override this file's env: block on every future deploy, no re-export
+# needed. To reset an already-seeded admin's password later (the plain
+# OBSERVE_ADMIN_PASSWORD only seeds on first boot), use the
+# OBSERVE_RESET_ADMIN_PASSWORD escape hatch the same way, then unset it.
 
 app: observe
 domain: observe.example.com
