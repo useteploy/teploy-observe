@@ -202,6 +202,16 @@ export function reset(): void {
   client.sessionId = makeId();
 }
 
+/**
+ * The current client-generated session id, or null before init(). Lets a
+ * separately-loaded script (e.g. observe-replay.js, which tracks its own
+ * session id via setSessionId()) correlate its events with this session
+ * rather than defaulting to an empty session_id.
+ */
+export function getSessionId(): string | null {
+  return client ? client.sessionId : null;
+}
+
 /** Submit an error. Sends immediately — not buffered. */
 export function captureException(err: Error, ctx?: { mechanism?: string; release?: string; tags?: Record<string, string> }): Promise<void> {
   if (!client) return Promise.resolve();
