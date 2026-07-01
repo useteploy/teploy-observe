@@ -38,7 +38,7 @@ export const settingsApi = {
   deleteSite: (siteId: string) =>
     del(`${BASE}/sites/${siteId}`),
   createAPIKey: (siteId: string) =>
-    post<{ api_key: string }>(`${BASE}/sites/${siteId}/keys`, {}),
+    post<{ key: string }>(`${BASE}/sites/${siteId}/keys`, {}),
   listAPIKeys: (siteId: string) =>
     get<APIKeyInfo[]>(`${BASE}/sites/${siteId}/keys`),
   revokeAPIKey: (keyId: string) =>

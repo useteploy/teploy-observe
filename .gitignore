@@ -53,3 +53,9 @@ marketing/launch/
 
 # Private infra deploy overlay (Tailscale server IP)
 teploy.home.yml
+
+# Private deploy overlays with real secrets inline (session salt, JWT
+# secret, admin password) — this repo mirrors to public GitHub, so any
+# teploy.*.yml beyond the base teploy.yml must never be trackable.
+teploy.*.yml
+!teploy.yml

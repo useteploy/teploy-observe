@@ -33,10 +33,7 @@ function DashboardInner() {
   return (
     <div class="obs-dashboard">
       <header class="obs-header">
-        <div class="obs-header-brand">
-          <div class="obs-header-logo">O</div>
-          <h1>Observe</h1>
-        </div>
+        <h1 class="obs-page-title">Dashboard</h1>
         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
           <ExportButton />
           <DatePicker />

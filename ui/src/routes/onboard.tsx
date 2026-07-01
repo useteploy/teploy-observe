@@ -2,6 +2,7 @@ import { useEffect, useState, useRef } from "preact/hooks";
 import { settingsApi } from "../api/settings.js";
 import type { Site } from "../api/settings.js";
 import { analyticsApi } from "../api/analytics.js";
+import { copyToClipboard } from "../lib/clipboard.js";
 import "../styles/onboard.css";
 
 export const config = { mode: "app" };
@@ -75,7 +76,7 @@ export default function OnboardPage() {
     setKeyLoading(true);
     try {
       const r = await settingsApi.createAPIKey(siteId);
-      setApiKey(r.api_key);
+      setApiKey(r.key);
     } catch (err) { console.error("create key failed", err); }
     finally { setKeyLoading(false); }
   };
@@ -86,10 +87,11 @@ export default function OnboardPage() {
   data-endpoint="${origin}/api/v1/events"
   defer></script>`;
 
-  const copy = (text: string) => {
-    navigator.clipboard?.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+  const copy = async (text: string) => {
+    if (await copyToClipboard(text)) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }
   };
 
   return (

@@ -107,34 +107,6 @@ p { line-height: 1.6; }
   border-bottom: 1px solid var(--obs-border-subtle);
 }
 
-.obs-header-brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.obs-header-logo {
-  width: 28px;
-  height: 28px;
-  border-radius: var(--obs-radius);
-  background: linear-gradient(135deg, var(--obs-accent), #a78bfa);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 700;
-  font-size: 13px;
-  color: #fff;
-  flex-shrink: 0;
-}
-
-.obs-header h1 {
-  font-size: 15px;
-  font-weight: 600;
-  margin: 0;
-  color: var(--obs-text);
-  letter-spacing: -0.01em;
-}
-
 /* ─── Cards ─── */
 .obs-card {
   background: var(--obs-card);

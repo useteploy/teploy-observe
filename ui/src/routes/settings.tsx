@@ -6,6 +6,7 @@ import Modal from "../components/shared/Modal.js";
 import ConfirmDialog from "../components/shared/ConfirmDialog.js";
 import "../styles/settings.css";
 import { useFilters } from "../hooks/useFilters.js";
+import { copyToClipboard } from "../lib/clipboard.js";
 
 export const config = { mode: "app" };
 
@@ -85,7 +86,7 @@ function SitesSection() {
   const handleGenerateKey = async (siteId: string) => {
     try {
       const result = await settingsApi.createAPIKey(siteId);
-      setNewKey({ key: result.api_key, siteId });
+      setNewKey({ key: result.key, siteId });
     } catch (err) { console.error("Failed to generate API key:", err); }
   };
 
@@ -164,7 +165,7 @@ function SitesSection() {
         <>
           <div class="settings-key-display">
             <span class="settings-key-value">{newKey.key}</span>
-            <button class="obs-btn obs-btn--sm" onClick={() => navigator.clipboard.writeText(newKey.key)}>Copy</button>
+            <button class="obs-btn obs-btn--sm" onClick={() => copyToClipboard(newKey.key)}>Copy</button>
           </div>
           <div class="settings-key-note">Save this key now. It will not be shown again.</div>
         </>

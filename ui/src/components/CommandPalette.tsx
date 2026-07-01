@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { copyToClipboard } from "../lib/clipboard.js";
 
 interface PaletteItem {
   label: string;
@@ -98,7 +99,7 @@ export default function CommandPalette() {
         keywords: "copy site id",
         action: () => {
           const siteId = new URLSearchParams(window.location.search).get("site_id") || "default";
-          navigator.clipboard?.writeText(siteId);
+          void copyToClipboard(siteId);
         },
       },
       {

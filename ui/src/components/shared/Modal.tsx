@@ -10,6 +10,12 @@ interface Props {
 
 export default function Modal({ open, onClose, title, children }: Props) {
   const modalRef = useRef<HTMLDivElement>(null);
+  // Inline onClose props get a new identity on every parent re-render
+  // (e.g. on each keystroke in a sibling form field). Reading it via ref
+  // keeps that churn out of the effect's deps below, so the effect only
+  // re-runs (and re-focuses the modal) when `open` itself changes.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
     if (!open) return;
@@ -19,7 +25,7 @@ export default function Modal({ open, onClose, title, children }: Props) {
     modalRef.current?.focus();
 
     const handleKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { onClose(); return; }
+      if (e.key === "Escape") { onCloseRef.current(); return; }
       // Focus trap
       if (e.key === "Tab" && modalRef.current) {
         const focusable = modalRef.current.querySelectorAll<HTMLElement>(
@@ -41,7 +47,7 @@ export default function Modal({ open, onClose, title, children }: Props) {
       document.body.style.overflow = "";
       document.removeEventListener("keydown", handleKey);
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
 
