@@ -3330,10 +3330,38 @@ func listCronsHandler(svc *monitoring.CronService) neutron.HandlerFunc[listCrons
 }
 
 type createCronInput struct {
-	SiteID      string `json:"site_id"`
-	Name        string `json:"name"`
+	SiteID string `json:"site_id"`
+	Name   string `json:"name"`
+	// Slug is the URL-safe identifier a heartbeat's POST
+	// /api/v1/checkin/{site_id}/{slug} matches against — defaults to a
+	// slugified Name when omitted. Never set: every monitor created via
+	// this endpoint got slug='' (CreateCron inserts CronMonitor.Slug
+	// verbatim, never derives it), so no heartbeat could ever match a
+	// monitor created this way. Fixed here rather than left for callers
+	// to work around, since RecordCheckin's lookup is strictly by slug.
+	Slug        string `json:"slug"`
 	Schedule    string `json:"schedule"`
 	GracePeriod int    `json:"grace_period"`
+}
+
+// slugify lowercases and replaces runs of non-alphanumeric characters with
+// a single hyphen, trimming leading/trailing hyphens. Good enough for
+// human-entered monitor names ("Usage Sync" -> "usage-sync"); doesn't need
+// to be collision-proof since cron monitor slugs are chosen by an editor,
+// not user-supplied at scale.
+func slugify(s string) string {
+	var b strings.Builder
+	prevHyphen := false
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevHyphen = false
+		} else if !prevHyphen && b.Len() > 0 {
+			b.WriteByte('-')
+			prevHyphen = true
+		}
+	}
+	return strings.TrimSuffix(b.String(), "-")
 }
 
 func createCronHandler(svc *monitoring.CronService) neutron.HandlerFunc[createCronInput, monitoring.CronMonitor] {
@@ -3341,8 +3369,12 @@ func createCronHandler(svc *monitoring.CronService) neutron.HandlerFunc[createCr
 		if input.SiteID == "" || input.Name == "" {
 			return monitoring.CronMonitor{}, neutron.ErrBadRequest("site_id and name required")
 		}
+		slug := input.Slug
+		if slug == "" {
+			slug = slugify(input.Name)
+		}
 		cm := monitoring.CronMonitor{
-			SiteID: input.SiteID, Name: input.Name,
+			SiteID: input.SiteID, Name: input.Name, Slug: slug,
 			Schedule: input.Schedule, GracePeriod: input.GracePeriod,
 		}
 		c, err := svc.CreateCron(ctx, cm)
