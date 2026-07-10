@@ -87,7 +87,7 @@ func TestReleaseHealth_ComputesCrashFreeAndAdoption(t *testing.T) {
 				stack_trace, breadcrumbs, contexts, extra, distinct_id
 			) VALUES ($1, 'default', $2, $3, '', $4, $4,
 				$5, 'TestErr', 'boom', 'captured', 'false', 'error', $6,
-				'', '', '', '', '', '', '', '', '', '')`,
+				'', '', '', '', '', 'null', 'null', 'null', 'null', '')`,
 			randomID(), siteID, sessID, randomID(),
 			strconv.FormatInt(tsMid+1, 10), release)
 		if err != nil {

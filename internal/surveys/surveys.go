@@ -58,7 +58,7 @@ func (s *SurveyService) Create(ctx context.Context, siteID, name, questions, app
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO surveys (survey_id, tenant_id, site_id, name, questions, appearance, targeting, status, created_at, version)
-		 VALUES ($1, 'default', $2, $3, $4, $5, $6, 'draft', $7, $8)`,
+		 VALUES ($1, 'default', $2, $3, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), 'draft', $7, $8)`,
 		id, siteID, name, questions, appearance, targeting, now, now,
 	)
 	if err != nil {
@@ -79,7 +79,7 @@ func (s *SurveyService) Activate(ctx context.Context, surveyID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO surveys (survey_id, tenant_id, site_id, name, questions, appearance, targeting, status, created_at, version)
-		 SELECT survey_id, tenant_id, site_id, name, questions, appearance, targeting, 'active', created_at, $2
+		 SELECT survey_id, tenant_id, site_id, name, NULLIF(CAST(questions AS TEXT), ''), NULLIF(CAST(appearance AS TEXT), ''), NULLIF(CAST(targeting AS TEXT), ''), 'active', created_at, $2
 		 FROM surveys WHERE survey_id = $1`,
 		surveyID, now)
 	return err
@@ -89,7 +89,7 @@ func (s *SurveyService) Close(ctx context.Context, surveyID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO surveys (survey_id, tenant_id, site_id, name, questions, appearance, targeting, status, created_at, version)
-		 SELECT survey_id, tenant_id, site_id, name, questions, appearance, targeting, 'closed', created_at, $2
+		 SELECT survey_id, tenant_id, site_id, name, NULLIF(CAST(questions AS TEXT), ''), NULLIF(CAST(appearance AS TEXT), ''), NULLIF(CAST(targeting AS TEXT), ''), 'closed', created_at, $2
 		 FROM surveys WHERE survey_id = $1`,
 		surveyID, now)
 	return err

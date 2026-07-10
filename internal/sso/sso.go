@@ -47,7 +47,7 @@ func (s *SSOService) Create(ctx context.Context, provider, entityID, ssoURL, cer
 
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO sso_configs (sso_id, tenant_id, provider, entity_id, sso_url, certificate, attribute_map, enabled, created_at, version)
-		 VALUES ($1, 'default', $2, $3, $4, $5, $6, 'false', $7, $8)`,
+		 VALUES ($1, 'default', $2, $3, $4, $5, NULLIF($6, ''), 'false', $7, $8)`,
 		id, provider, entityID, ssoURL, certificate, attributeMap, now, now,
 	)
 	if err != nil {
@@ -67,7 +67,7 @@ func (s *SSOService) Enable(ctx context.Context, ssoID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO sso_configs (sso_id, tenant_id, provider, entity_id, sso_url, certificate, attribute_map, enabled, created_at, version)
-		 SELECT sso_id, tenant_id, provider, entity_id, sso_url, certificate, attribute_map, 'true', created_at, $2
+		 SELECT sso_id, tenant_id, provider, entity_id, sso_url, certificate, NULLIF(CAST(attribute_map AS TEXT), ''), 'true', created_at, $2
 		 FROM sso_configs WHERE sso_id = $1`,
 		ssoID, now)
 	return err

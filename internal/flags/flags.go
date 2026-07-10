@@ -64,7 +64,7 @@ func (s *FlagService) Create(ctx context.Context, siteID, flagKey, name, descrip
 
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO feature_flags (flag_id, tenant_id, site_id, flag_key, name, description, flag_type, enabled, rollout_pct, variants, targeting, created_at, version)
-		 VALUES ($1, 'default', $2, $3, $4, $5, $6, 'false', $7, $8, $9, $10, $11)`,
+		 VALUES ($1, 'default', $2, $3, $4, $5, $6, 'false', $7, NULLIF($8, ''), NULLIF($9, ''), $10, $11)`,
 		id, siteID, flagKey, name, description, flagType,
 		strconv.Itoa(rolloutPct), variants, targeting, nowMs, nowMs,
 	)
@@ -146,7 +146,7 @@ func (s *FlagService) Toggle(ctx context.Context, flagID string, enabled bool) e
 	}
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO feature_flags (flag_id, tenant_id, site_id, flag_key, name, description, flag_type, enabled, rollout_pct, variants, targeting, created_at, version)
-		 SELECT flag_id, tenant_id, site_id, flag_key, name, description, flag_type, $2, rollout_pct, variants, targeting, created_at, $3
+		 SELECT flag_id, tenant_id, site_id, flag_key, name, description, flag_type, $2, rollout_pct, NULLIF(CAST(variants AS TEXT), ''), NULLIF(CAST(targeting AS TEXT), ''), created_at, $3
 		 FROM feature_flags WHERE flag_id = $1`,
 		flagID, val, now)
 	if err != nil {

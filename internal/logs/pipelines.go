@@ -93,7 +93,7 @@ func (s *PipelineService) Create(ctx context.Context, siteID, name, rules string
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO log_pipelines (pipeline_id, tenant_id, site_id, name, priority, rules, enabled, created_at, version)
-		 VALUES ($1, 'default', $2, $3, $4, $5, 'true', $6, $7)`,
+		 VALUES ($1, 'default', $2, $3, $4, NULLIF($5, ''), 'true', $6, $7)`,
 		id, siteID, name, strconv.Itoa(priority), rules, now, now,
 	)
 	if err != nil {
@@ -156,7 +156,7 @@ func (s *PipelineService) Delete(ctx context.Context, pipelineID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO log_pipelines (pipeline_id, tenant_id, site_id, name, priority, rules, enabled, created_at, version)
-		 SELECT pipeline_id, tenant_id, site_id, name, priority, rules, 'false', created_at, $2
+		 SELECT pipeline_id, tenant_id, site_id, name, priority, NULLIF(CAST(rules AS TEXT), ''), 'false', created_at, $2
 		 FROM log_pipelines WHERE pipeline_id = $1`,
 		pipelineID, now)
 	if err == nil {

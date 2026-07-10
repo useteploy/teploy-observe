@@ -502,13 +502,15 @@ func seedErrors(ctx context.Context, _ *nucleus.Client, svc *obserrors.Service) 
 	return nil
 }
 
+// mapToJSON always returns valid JSON — Nucleus (Postgres-parity) rejects
+// the empty string for JSONB columns.
 func mapToJSON(m map[string]any) string {
 	if len(m) == 0 {
-		return ""
+		return "null"
 	}
 	raw, err := jsonMarshal(m)
 	if err != nil {
-		return ""
+		return "null"
 	}
 	return raw
 }

@@ -78,7 +78,7 @@ func (s *IntegrationService) Create(ctx context.Context, siteID, name, intType, 
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO integrations (integration_id, tenant_id, site_id, name, int_type, config, enabled, created_at, version)
-		 VALUES ($1, 'default', $2, $3, $4, $5, 'true', $6, $7)`,
+		 VALUES ($1, 'default', $2, $3, $4, NULLIF($5, ''), 'true', $6, $7)`,
 		id, siteID, name, intType, config, now, now,
 	)
 	if err != nil {
@@ -97,7 +97,7 @@ func (s *IntegrationService) Delete(ctx context.Context, integrationID string) e
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO integrations (integration_id, tenant_id, site_id, name, int_type, config, enabled, created_at, version)
-		 SELECT integration_id, tenant_id, site_id, name, int_type, config, 'false', created_at, $2
+		 SELECT integration_id, tenant_id, site_id, name, int_type, NULLIF(CAST(config AS TEXT), ''), 'false', created_at, $2
 		 FROM integrations WHERE integration_id = $1`,
 		integrationID, now)
 	return err

@@ -55,7 +55,7 @@ func TestBoardSummary_AggregatesAcrossSites(t *testing.T) {
 				) VALUES ($1, 'default', $2, $3, $3, $4, 'pageview',
 					'https://x/', '/', '', '',
 					'', '', '', '', '', '', '', '',
-					0, 0, '', '', '')`,
+					0, 0, 'null', '', '')`,
 				boardsRandID(), site, sess,
 				strconv.FormatInt(tsMid+int64(i), 10),
 			)
@@ -79,7 +79,7 @@ func TestBoardSummary_AggregatesAcrossSites(t *testing.T) {
 				stack_trace, breadcrumbs, contexts, extra, distinct_id
 			) VALUES ($1, 'default', $2, '', '', $3, $3,
 				$4, 'BoardErr', 'boom', 'captured', 'false', 'error', '', '',
-				'', '', '', '', '', '', '', '', '')`,
+				'', '', '', '', 'null', 'null', 'null', 'null', '')`,
 			boardsRandID(), site, boardsRandID(),
 			strconv.FormatInt(tsMid+1, 10),
 		)

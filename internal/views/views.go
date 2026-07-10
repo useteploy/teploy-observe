@@ -35,7 +35,7 @@ func (s *ViewService) Create(ctx context.Context, siteID, name, viewConfig, crea
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO saved_views (view_id, tenant_id, site_id, name, view_config, created_by, created_at, version)
-		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7)`,
+		 VALUES ($1, 'default', $2, $3, NULLIF($4, ''), $5, $6, $7)`,
 		id, siteID, name, viewConfig, createdBy, now, now,
 	)
 	if err != nil {
@@ -54,7 +54,7 @@ func (s *ViewService) Delete(ctx context.Context, viewID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO saved_views (view_id, tenant_id, site_id, name, view_config, created_by, created_at, version)
-		 SELECT view_id, tenant_id, site_id, '', '', created_by, created_at, $2
+		 SELECT view_id, tenant_id, site_id, '', NULL, created_by, created_at, $2
 		 FROM saved_views WHERE view_id = $1`,
 		viewID, now)
 	return err

@@ -226,7 +226,7 @@ func (s *DashboardService) AddPanel(ctx context.Context, dashboardID string, pan
 
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO dashboard_panels (panel_id, tenant_id, dashboard_id, panel_type, title, query_type, query_config, position_x, position_y, width, height, version)
-		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		 VALUES ($1, 'default', $2, $3, $4, $5, NULLIF($6, ''), $7, $8, $9, $10, $11)`,
 		panel.PanelID, dashboardID, panel.PanelType, panel.Title, panel.QueryType,
 		panel.QueryConfig, panel.PositionX, panel.PositionY, panel.Width, panel.Height, now,
 	)
@@ -258,7 +258,7 @@ func (s *DashboardService) UpdatePanel(ctx context.Context, panel Panel) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO dashboard_panels (panel_id, tenant_id, dashboard_id, panel_type, title, query_type, query_config, position_x, position_y, width, height, version)
-		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		 VALUES ($1, 'default', $2, $3, $4, $5, NULLIF($6, ''), $7, $8, $9, $10, $11)`,
 		panel.PanelID, panel.DashboardID, panel.PanelType, panel.Title, panel.QueryType,
 		panel.QueryConfig, panel.PositionX, panel.PositionY, panel.Width, panel.Height, now,
 	)
@@ -269,7 +269,7 @@ func (s *DashboardService) DeletePanel(ctx context.Context, panelID string) erro
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO dashboard_panels (panel_id, tenant_id, dashboard_id, panel_type, title, query_type, query_config, position_x, position_y, width, height, version)
-		 SELECT panel_id, tenant_id, dashboard_id, '', '', '', '', '0', '0', '0', '0', $2
+		 SELECT panel_id, tenant_id, dashboard_id, '', '', '', NULL, '0', '0', '0', '0', $2
 		 FROM dashboard_panels WHERE panel_id = $1`,
 		panelID, now)
 	return err

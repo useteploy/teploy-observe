@@ -50,7 +50,7 @@ func (s *GroupService) Create(ctx context.Context, siteID, groupType, name strin
 
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO groups (group_id, tenant_id, site_id, group_type, name, properties, created_at, version)
-		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7)`,
+		 VALUES ($1, 'default', $2, $3, $4, NULLIF($5, ''), $6, $7)`,
 		id, siteID, groupType, name, propsJSON, now, now,
 	)
 	if err != nil {
