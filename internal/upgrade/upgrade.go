@@ -1,39 +1,41 @@
-// Package upgrade implements the `observe upgrade` subcommand: a
-// zero-downtime, zero-event-loss binary swap.
-//
-// Flow:
-//  1. Pre-flight a target binary (exists, executable, runs `observe version`,
-//     reports >= current version).
-//  2. SIGTERM the running observe (via PID file or port lookup) so it flushes
-//     ingest, fsyncs the WAL queue, and closes the DB.
-//  3. Atomically rename the new binary into the position of the old one.
-//  4. Spawn the new binary with the same env + working dir, detached.
-//  5. Poll /healthz on the same port for up to 60s.
-//  6. On any failure, restore the previous binary from a sidecar backup.
-//
-// The disk WAL queue (internal/ingest.DiskQueue) guarantees that any events
-// pushed during steps 2–4 survive the swap — they sit in
-// $OBSERVE_DATA_DIR/queue/events/current.log and get replayed by
-// Buffer.AttachQueue when the new process boots.
+// Package upgrade downloads, authenticates, and installs Observe releases.
+// The service manager remains the sole owner of the server process.
 package upgrade
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
-// Version represents a parsed semver-like version: "observe 1.2.3" -> {1,2,3}.
-// Pre-release suffixes after a hyphen ("-rc1") are preserved in Suffix and
-// compared lexically as a tie-breaker.
+const (
+	releaseRepository = "useteploy/teploy-observe"
+	// Public half of the offline Ed25519 release-signing key. Releases contain
+	// a raw signature over the exact checksums.txt bytes.
+	releasePublicKey = "HzMEb0L9K+7ea7HToYTCLAInCvIaumZ90j6pXGa5Esw="
+	maxMetadataSize  = 1 << 20
+	maxArchiveSize   = 256 << 20
+)
+
+// Version is a semantic version. Suffix excludes the leading hyphen.
 type Version struct {
 	Major  int
 	Minor  int
@@ -41,378 +43,636 @@ type Version struct {
 	Suffix string
 }
 
-// ParseVersion accepts the format `observe X.Y.Z[-suffix]` (with or without
-// the leading "observe ") and returns the parsed Version.
+func (v Version) String() string {
+	s := fmt.Sprintf("%d.%d.%d", v.Major, v.Minor, v.Patch)
+	if v.Suffix != "" {
+		s += "-" + v.Suffix
+	}
+	return s
+}
+
+// ParseVersion accepts a bare version, v-prefixed tag, or Observe version
+// command output. Build metadata does not affect ordering.
 func ParseVersion(s string) (Version, error) {
 	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "observe ")
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return Version{}, errors.New("empty version string")
+	for _, prefix := range []string{"teploy-observe ", "observe "} {
+		s = strings.TrimPrefix(s, prefix)
 	}
-	suffix := ""
+	s = strings.TrimPrefix(s, "v")
+	if i := strings.IndexByte(s, '+'); i >= 0 {
+		s = s[:i]
+	}
+
+	var suffix string
 	if i := strings.IndexByte(s, '-'); i >= 0 {
 		suffix = s[i+1:]
 		s = s[:i]
+		if err := validatePrerelease(suffix); err != nil {
+			return Version{}, err
+		}
 	}
 	parts := strings.Split(s, ".")
 	if len(parts) != 3 {
 		return Version{}, fmt.Errorf("expected X.Y.Z, got %q", s)
 	}
-	v := Version{Suffix: suffix}
-	for i, p := range parts {
-		n, err := strconv.Atoi(p)
-		if err != nil {
-			return Version{}, fmt.Errorf("version segment %d not numeric: %q", i, p)
+	values := [3]int{}
+	for i, part := range parts {
+		if part == "" || (len(part) > 1 && part[0] == '0') {
+			return Version{}, fmt.Errorf("invalid version segment %q", part)
 		}
-		switch i {
-		case 0:
-			v.Major = n
-		case 1:
-			v.Minor = n
-		case 2:
-			v.Patch = n
+		n, err := strconv.Atoi(part)
+		if err != nil || n < 0 {
+			return Version{}, fmt.Errorf("version segment %d is not numeric: %q", i, part)
 		}
+		values[i] = n
 	}
-	return v, nil
+	return Version{Major: values[0], Minor: values[1], Patch: values[2], Suffix: suffix}, nil
 }
 
-// Compare returns -1 if a<b, 0 if equal, +1 if a>b.
-// A version with a suffix is considered older than the same version without
-// one (e.g. 1.0.0-rc1 < 1.0.0), matching semver pre-release semantics.
+func validatePrerelease(s string) error {
+	if s == "" {
+		return errors.New("empty prerelease")
+	}
+	for _, identifier := range strings.Split(s, ".") {
+		if identifier == "" {
+			return errors.New("empty prerelease identifier")
+		}
+		for _, r := range identifier {
+			if (r < '0' || r > '9') && (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') && r != '-' {
+				return fmt.Errorf("invalid prerelease identifier %q", identifier)
+			}
+		}
+	}
+	return nil
+}
+
+// Compare returns -1 if a < b, 0 if a == b, and 1 if a > b.
 func Compare(a, b Version) int {
-	if a.Major != b.Major {
-		return cmpInt(a.Major, b.Major)
+	for _, pair := range [][2]int{{a.Major, b.Major}, {a.Minor, b.Minor}, {a.Patch, b.Patch}} {
+		if pair[0] < pair[1] {
+			return -1
+		}
+		if pair[0] > pair[1] {
+			return 1
+		}
 	}
-	if a.Minor != b.Minor {
-		return cmpInt(a.Minor, b.Minor)
-	}
-	if a.Patch != b.Patch {
-		return cmpInt(a.Patch, b.Patch)
-	}
-	// Pre-release < release.
 	if a.Suffix == "" && b.Suffix != "" {
 		return 1
 	}
 	if a.Suffix != "" && b.Suffix == "" {
 		return -1
 	}
-	return strings.Compare(a.Suffix, b.Suffix)
+	return comparePrerelease(a.Suffix, b.Suffix)
 }
 
-func cmpInt(a, b int) int {
-	if a < b {
+func comparePrerelease(a, b string) int {
+	ap, bp := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(ap) && i < len(bp); i++ {
+		if ap[i] == bp[i] {
+			continue
+		}
+		an, ae := strconv.ParseUint(ap[i], 10, 64)
+		bn, be := strconv.ParseUint(bp[i], 10, 64)
+		switch {
+		case ae == nil && be == nil:
+			if an < bn {
+				return -1
+			}
+			return 1
+		case ae == nil:
+			return -1
+		case be == nil:
+			return 1
+		case ap[i] < bp[i]:
+			return -1
+		default:
+			return 1
+		}
+	}
+	if len(ap) < len(bp) {
 		return -1
 	}
-	if a > b {
+	if len(ap) > len(bp) {
 		return 1
 	}
 	return 0
 }
 
-// PIDFile is the path of the PID file under the data directory.
-func PIDFile(dataDir string) string {
-	if dataDir == "" {
-		dataDir = "."
-	}
-	return filepath.Join(dataDir, "observe.pid")
+type ReleaseClient struct {
+	HTTPClient      *http.Client
+	APIURL          string
+	DownloadBaseURL string
+	PublicKey       ed25519.PublicKey
 }
 
-// EnvFile is the path of the env-snapshot file under the data directory.
-// The running observe writes the OBSERVE_* env it was started with so the
-// upgrade subcommand can hand the same env to the new binary even when the
-// upgrader was invoked from a different shell.
-func EnvFile(dataDir string) string {
-	if dataDir == "" {
-		dataDir = "."
+func NewReleaseClient() *ReleaseClient {
+	key, _ := base64.StdEncoding.DecodeString(releasePublicKey)
+	return &ReleaseClient{
+		HTTPClient:      &http.Client{Timeout: 30 * time.Second},
+		APIURL:          "https://api.github.com/repos/" + releaseRepository,
+		DownloadBaseURL: "https://github.com/" + releaseRepository + "/releases/download",
+		PublicKey:       ed25519.PublicKey(key),
 	}
-	return filepath.Join(dataDir, "observe.env")
 }
 
-// WriteEnv snapshots all OBSERVE_* environment variables to EnvFile.
-// One KEY=VALUE per line, no escaping (values are typically URLs/secrets/
-// numbers — anything containing a newline is rejected to keep the parser
-// trivial). Atomic via tmp+rename.
-func WriteEnv(dataDir string) error {
-	if dataDir == "" {
-		return errors.New("write env: empty data dir")
-	}
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return fmt.Errorf("write env: mkdir: %w", err)
-	}
-	var buf strings.Builder
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "OBSERVE_") {
-			continue
-		}
-		if strings.ContainsAny(kv, "\n\r") {
-			continue
-		}
-		buf.WriteString(kv)
-		buf.WriteByte('\n')
-	}
-	path := EnvFile(dataDir)
-	tmp := path + ".tmp"
-	// Mode 0o600 — env may contain JWT secret + admin password.
-	if err := os.WriteFile(tmp, []byte(buf.String()), 0o600); err != nil {
-		return fmt.Errorf("write env: %w", err)
-	}
-	return os.Rename(tmp, path)
+// PreparedRelease is a verified release binary in a temporary directory.
+type PreparedRelease struct {
+	Version    Version
+	BinaryPath string
+	cleanup    func()
 }
 
-// ReadEnv loads a snapshotted env file and returns it as a slice suitable
-// for exec.Cmd.Env (KEY=VALUE strings). Returns nil, os.ErrNotExist if no
-// snapshot is present — caller can fall back to os.Environ().
-func ReadEnv(dataDir string) ([]string, error) {
-	raw, err := os.ReadFile(EnvFile(dataDir))
+func (r *PreparedRelease) Close() {
+	if r != nil && r.cleanup != nil {
+		r.cleanup()
+	}
+}
+
+func (c *ReleaseClient) Prepare(ctx context.Context, requested string, current Version) (*PreparedRelease, error) {
+	tag, target, err := c.resolveVersion(ctx, requested)
 	if err != nil {
 		return nil, err
 	}
-	var out []string
-	for _, line := range strings.Split(string(raw), "\n") {
-		line = strings.TrimRight(line, "\r")
-		if line == "" {
+	if Compare(target, current) < 0 {
+		return nil, fmt.Errorf("refusing downgrade %s -> %s", current, target)
+	}
+	if Compare(target, current) == 0 {
+		return nil, fmt.Errorf("version %s is already installed", target)
+	}
+
+	asset, err := archiveName(target)
+	if err != nil {
+		return nil, err
+	}
+	base := strings.TrimRight(c.DownloadBaseURL, "/") + "/" + tag
+	checksums, err := c.getLimited(ctx, base+"/checksums.txt", maxMetadataSize)
+	if err != nil {
+		return nil, fmt.Errorf("download checksums: %w", err)
+	}
+	signature, err := c.getLimited(ctx, base+"/checksums.txt.sig", ed25519.SignatureSize+1)
+	if err != nil {
+		return nil, fmt.Errorf("download checksum signature: %w", err)
+	}
+	if err := VerifyChecksums(checksums, signature, c.PublicKey); err != nil {
+		return nil, err
+	}
+	wantHash, err := checksumFor(checksums, asset)
+	if err != nil {
+		return nil, err
+	}
+
+	dir, err := os.MkdirTemp("", "observe-update-*")
+	if err != nil {
+		return nil, err
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	archivePath := filepath.Join(dir, asset)
+	if err := c.downloadArchive(ctx, base+"/"+asset, archivePath, wantHash); err != nil {
+		cleanup()
+		return nil, err
+	}
+	binaryPath, err := extractBinary(archivePath, dir)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+	actual, err := BinaryVersion(binaryPath)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+	if Compare(actual, target) != 0 {
+		cleanup()
+		return nil, fmt.Errorf("release tag %s contains binary version %s", target, actual)
+	}
+	return &PreparedRelease{Version: target, BinaryPath: binaryPath, cleanup: cleanup}, nil
+}
+
+func (c *ReleaseClient) resolveVersion(ctx context.Context, requested string) (string, Version, error) {
+	if requested != "" && requested != "latest" {
+		v, err := ParseVersion(requested)
+		if err != nil {
+			return "", Version{}, err
+		}
+		return "v" + v.String(), v, nil
+	}
+	body, err := c.getLimited(ctx, strings.TrimRight(c.APIURL, "/")+"/releases/latest", maxMetadataSize)
+	if err != nil {
+		return "", Version{}, fmt.Errorf("resolve latest release: %w", err)
+	}
+	var response struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return "", Version{}, fmt.Errorf("decode latest release: %w", err)
+	}
+	v, err := ParseVersion(response.TagName)
+	if err != nil {
+		return "", Version{}, fmt.Errorf("invalid latest release tag %q: %w", response.TagName, err)
+	}
+	if response.TagName != "v"+v.String() {
+		return "", Version{}, fmt.Errorf("latest release tag is not canonical: %q", response.TagName)
+	}
+	return response.TagName, v, nil
+}
+
+func (c *ReleaseClient) getLimited(ctx context.Context, url string, limit int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s returned %s", url, resp.Status)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, errors.New("response exceeds size limit")
+	}
+	return data, nil
+}
+
+func VerifyChecksums(checksums, signature []byte, publicKey ed25519.PublicKey) error {
+	if len(publicKey) != ed25519.PublicKeySize {
+		return errors.New("invalid embedded release public key")
+	}
+	if len(signature) != ed25519.SignatureSize {
+		return fmt.Errorf("invalid checksum signature length: %d", len(signature))
+	}
+	if !ed25519.Verify(publicKey, checksums, signature) {
+		return errors.New("checksum signature verification failed")
+	}
+	return nil
+}
+
+func checksumFor(checksums []byte, asset string) ([sha256.Size]byte, error) {
+	var found [sha256.Size]byte
+	matches := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(checksums)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			return found, fmt.Errorf("malformed checksum line %q", line)
+		}
+		name := strings.TrimPrefix(fields[1], "*")
+		if name != asset {
 			continue
 		}
-		out = append(out, line)
+		raw, err := hex.DecodeString(fields[0])
+		if err != nil || len(raw) != sha256.Size {
+			return found, fmt.Errorf("invalid checksum for %s", asset)
+		}
+		copy(found[:], raw)
+		matches++
 	}
-	return out, nil
+	if matches != 1 {
+		return found, fmt.Errorf("expected one checksum for %s, found %d", asset, matches)
+	}
+	return found, nil
 }
 
-// WritePID writes the current process PID to the PID file. It creates the
-// data directory if needed and writes atomically via rename.
-func WritePID(dataDir string) error {
-	if dataDir == "" {
-		return errors.New("write pid: empty data dir")
+func archiveName(v Version) (string, error) {
+	osName := runtime.GOOS
+	if osName != "linux" && osName != "darwin" {
+		return "", fmt.Errorf("unsupported operating system %s", osName)
 	}
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return fmt.Errorf("write pid: mkdir: %w", err)
+	arch := runtime.GOARCH
+	if arch == "amd64" {
+		arch = "x86_64"
 	}
-	path := PIDFile(dataDir)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
-		return fmt.Errorf("write pid: %w", err)
+	if arch != "x86_64" && arch != "arm64" {
+		return "", fmt.Errorf("unsupported architecture %s", runtime.GOARCH)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("write pid rename: %w", err)
+	return fmt.Sprintf("observe_%s_%s_%s.tar.gz", v, osName, arch), nil
+}
+
+func (c *ReleaseClient) downloadArchive(ctx context.Context, url, path string, want [sha256.Size]byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("download release: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download release: %s", resp.Status)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	hash := sha256.New()
+	n, copyErr := io.Copy(io.MultiWriter(f, hash), io.LimitReader(resp.Body, maxArchiveSize+1))
+	closeErr := f.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if n > maxArchiveSize {
+		return errors.New("release archive exceeds size limit")
+	}
+	if !strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), hex.EncodeToString(want[:])) {
+		return errors.New("release archive checksum mismatch")
 	}
 	return nil
 }
 
-// ReadPID reads the PID stored in the PID file. Returns os.ErrNotExist if
-// the file is missing.
-func ReadPID(dataDir string) (int, error) {
-	raw, err := os.ReadFile(PIDFile(dataDir))
+func extractBinary(archivePath, destination string) (string, error) {
+	f, err := os.Open(archivePath)
 	if err != nil {
-		return 0, err
+		return "", err
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
 	if err != nil {
-		return 0, fmt.Errorf("read pid: parse: %w", err)
+		return "", fmt.Errorf("open release archive: %w", err)
 	}
-	if pid <= 0 {
-		return 0, fmt.Errorf("read pid: invalid pid %d", pid)
-	}
-	return pid, nil
-}
+	defer gz.Close()
 
-// RemovePID best-effort deletes the PID file. Missing-file is not an error.
-func RemovePID(dataDir string) error {
-	err := os.Remove(PIDFile(dataDir))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	return err
-}
-
-// processAlive returns true if the given PID is currently a live process.
-// On unix, kill(pid, 0) returns nil for live and ESRCH for dead.
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	if err := p.Signal(syscall.Signal(0)); err != nil {
-		return false
-	}
-	return true
-}
-
-// SignalProcess sends sig to pid. Returns os.ErrNotExist if the process is gone.
-func SignalProcess(pid int, sig os.Signal) error {
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return err
-	}
-	if err := p.Signal(sig); err != nil {
-		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrNotExist
-		}
-		return err
-	}
-	return nil
-}
-
-// WaitForExit polls until the given PID is no longer alive or timeout
-// elapses. Returns nil on exit, context.DeadlineExceeded on timeout.
-//
-// On Unix, kill(pid, 0) keeps returning "alive" for processes that have
-// exited but not yet been reaped by their parent (zombies). To avoid
-// hanging in that case, callers should prefer WaitForShutdown which also
-// checks for the absence of the PID file the running observe maintains.
-func WaitForExit(ctx context.Context, pid int, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
+	output := filepath.Join(destination, "observe")
+	found := false
+	tr := tar.NewReader(gz)
 	for {
-		if !processAlive(pid) {
-			return nil
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
 		}
-		if time.Now().After(deadline) {
-			return context.DeadlineExceeded
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-}
-
-// WaitForShutdown polls until the running observe is verifiably gone:
-// either its process is no longer alive OR its PID file (which observe
-// removes during graceful shutdown) has disappeared. Use this from the
-// upgrade orchestrator — pure WaitForExit can hang on zombie children
-// when the upgrader's invoking shell happens to be observe's parent.
-func WaitForShutdown(ctx context.Context, pid int, dataDir string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	pidPath := PIDFile(dataDir)
-	for {
-		if !processAlive(pid) {
-			return nil
-		}
-		// Graceful exit removes the PID file as the last cleanup step.
-		if _, err := os.Stat(pidPath); errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return context.DeadlineExceeded
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-}
-
-// WaitForHealthz polls the given URL until it returns 200 or timeout
-// elapses. Used to confirm the new binary is serving before declaring the
-// upgrade successful.
-func WaitForHealthz(ctx context.Context, url string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	client := &http.Client{Timeout: 2 * time.Second}
-	for {
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err != nil {
-			return err
+			return "", fmt.Errorf("read release archive: %w", err)
 		}
-		resp, err := client.Do(req)
-		if err == nil {
-			_ = resp.Body.Close()
-			if resp.StatusCode == 200 {
-				return nil
-			}
+		clean := filepath.Clean(header.Name)
+		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("unsafe archive path %q", header.Name)
 		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("healthz never returned 200 within %s", timeout)
+		if filepath.Base(clean) != "observe" {
+			continue
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+		if header.Typeflag != tar.TypeReg || found {
+			return "", errors.New("release archive must contain exactly one regular observe binary")
 		}
+		out, err := os.OpenFile(output, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
+		if err != nil {
+			return "", err
+		}
+		n, copyErr := io.Copy(out, io.LimitReader(tr, maxArchiveSize+1))
+		closeErr := out.Close()
+		if copyErr != nil {
+			return "", copyErr
+		}
+		if closeErr != nil {
+			return "", closeErr
+		}
+		if n > maxArchiveSize {
+			return "", errors.New("observe binary exceeds size limit")
+		}
+		found = true
 	}
+	if !found {
+		return "", errors.New("release archive does not contain observe")
+	}
+	return output, nil
 }
 
-// PreflightTarget validates that the target binary exists, is executable,
-// and reports a version >= currentVersion when invoked with `version`.
-// Returns the parsed target version on success.
-func PreflightTarget(targetPath, currentVersion string) (Version, error) {
-	info, err := os.Stat(targetPath)
-	if err != nil {
-		return Version{}, fmt.Errorf("preflight: stat target: %w", err)
-	}
-	if info.IsDir() {
-		return Version{}, fmt.Errorf("preflight: target is a directory: %s", targetPath)
-	}
-	if info.Mode().Perm()&0o111 == 0 {
-		return Version{}, fmt.Errorf("preflight: target not executable: %s", targetPath)
-	}
+func BinaryVersion(path string) (Version, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, targetPath, "version").Output()
+	out, err := exec.CommandContext(ctx, path, "version").Output()
 	if err != nil {
-		return Version{}, fmt.Errorf("preflight: target failed `version`: %w", err)
+		return Version{}, fmt.Errorf("candidate failed version check: %w", err)
 	}
-	targetV, err := ParseVersion(string(out))
+	v, err := ParseVersion(string(out))
 	if err != nil {
-		return Version{}, fmt.Errorf("preflight: target version parse: %w", err)
+		return Version{}, fmt.Errorf("candidate version check: %w", err)
 	}
-	currentV, err := ParseVersion(currentVersion)
-	if err != nil {
-		return Version{}, fmt.Errorf("preflight: current version parse: %w", err)
-	}
-	if Compare(targetV, currentV) < 0 {
-		return Version{}, fmt.Errorf("preflight: refusing downgrade %s -> %s", currentVersion, out)
-	}
-	return targetV, nil
+	return v, nil
 }
 
-// SwapBinary moves currentPath to currentPath+".prev" and renames newPath
-// into currentPath. Both renames are atomic when source and dest are on the
-// same filesystem. Returns the path to the saved previous binary so the
-// caller can restore on failure.
-func SwapBinary(currentPath, newPath string) (prevBackup string, err error) {
-	prevBackup = currentPath + ".prev"
-	// Remove any stale .prev from a previous failed swap.
-	_ = os.Remove(prevBackup)
-	if err := os.Rename(currentPath, prevBackup); err != nil {
-		return "", fmt.Errorf("swap: backup current: %w", err)
-	}
-	if err := os.Rename(newPath, currentPath); err != nil {
-		// Roll back the first rename so we don't end up with no binary.
-		_ = os.Rename(prevBackup, currentPath)
-		return "", fmt.Errorf("swap: install new: %w", err)
-	}
-	return prevBackup, nil
+type ServiceManager interface {
+	IsActive(context.Context) error
+	Stop(context.Context) error
+	Start(context.Context) error
 }
 
-// RestoreBinary undoes a SwapBinary by renaming the saved backup back over
-// the current path. Used by the upgrade orchestrator on healthz timeout.
-func RestoreBinary(currentPath, prevBackup string) error {
-	if prevBackup == "" {
-		return errors.New("restore: no backup path provided")
-	}
-	if _, err := os.Stat(prevBackup); err != nil {
-		return fmt.Errorf("restore: backup missing: %w", err)
-	}
-	// Move the failed new binary aside (best effort) so the rename can land.
-	failed := currentPath + ".failed"
-	_ = os.Remove(failed)
-	if err := os.Rename(currentPath, failed); err == nil {
-		// Best-effort cleanup of the failed binary.
-		defer os.Remove(failed)
-	}
-	if err := os.Rename(prevBackup, currentPath); err != nil {
-		return fmt.Errorf("restore: rename backup: %w", err)
+type SystemdManager struct {
+	Unit string
+}
+
+func (m SystemdManager) run(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, "systemctl", append(args, m.Unit)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl %s %s: %w: %s", strings.Join(args, " "), m.Unit, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
-// HealthURL converts a bind address (":3000", "0.0.0.0:3000",
-// "127.0.0.1:3000") into a healthz URL the upgrader can poll.
+func (m SystemdManager) IsActive(ctx context.Context) error {
+	return m.run(ctx, "is-active", "--quiet")
+}
+func (m SystemdManager) Stop(ctx context.Context) error  { return m.run(ctx, "stop") }
+func (m SystemdManager) Start(ctx context.Context) error { return m.run(ctx, "start") }
+
+func (m SystemdManager) VerifyExecutable(ctx context.Context, expected string) error {
+	cmd := exec.CommandContext(ctx, "systemctl", "show", "--property=MainPID", "--value", m.Unit)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("read %s MainPID: %w: %s", m.Unit, err, strings.TrimSpace(string(out)))
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || pid <= 0 {
+		return fmt.Errorf("%s has invalid MainPID %q", m.Unit, strings.TrimSpace(string(out)))
+	}
+	actual, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		return fmt.Errorf("resolve %s executable: %w", m.Unit, err)
+	}
+	expected, err = filepath.EvalSymlinks(expected)
+	if err != nil {
+		return fmt.Errorf("resolve updater executable: %w", err)
+	}
+	actual, err = filepath.EvalSymlinks(actual)
+	if err != nil {
+		return fmt.Errorf("resolve service executable: %w", err)
+	}
+	if actual != expected {
+		return fmt.Errorf("%s runs %s, not %s", m.Unit, actual, expected)
+	}
+	return nil
+}
+
+type ApplyOptions struct {
+	CurrentPath    string
+	CandidatePath  string
+	CurrentVersion Version
+	TargetVersion  Version
+	HealthURL      string
+	LockPath       string
+	Manager        ServiceManager
+	Logger         *slog.Logger
+	HealthTimeout  time.Duration
+}
+
+// Apply stops the service through its manager, atomically replaces the binary,
+// starts it, and verifies the exact running version. Any failure after the swap
+// restores and restarts the prior version.
+func Apply(ctx context.Context, options ApplyOptions) error {
+	if options.Manager == nil {
+		return errors.New("service manager is required")
+	}
+	if options.Logger == nil {
+		options.Logger = slog.Default()
+	}
+	if options.HealthTimeout == 0 {
+		options.HealthTimeout = 60 * time.Second
+	}
+	lock, err := acquireLock(options.LockPath)
+	if err != nil {
+		return err
+	}
+	defer releaseLock(lock)
+	installedVersion, err := BinaryVersion(options.CurrentPath)
+	if err != nil {
+		return fmt.Errorf("verify installed version under upgrade lock: %w", err)
+	}
+	if Compare(options.TargetVersion, installedVersion) < 0 {
+		return fmt.Errorf("refusing downgrade %s -> %s", installedVersion, options.TargetVersion)
+	}
+	if Compare(options.TargetVersion, installedVersion) == 0 {
+		return fmt.Errorf("version %s is already installed", installedVersion)
+	}
+	options.CurrentVersion = installedVersion
+	if err := options.Manager.IsActive(ctx); err != nil {
+		return fmt.Errorf("observe service must be active before upgrade: %w", err)
+	}
+	if owner, ok := options.Manager.(interface {
+		VerifyExecutable(context.Context, string) error
+	}); ok {
+		if err := owner.VerifyExecutable(ctx, options.CurrentPath); err != nil {
+			return fmt.Errorf("verify service ownership: %w", err)
+		}
+	}
+
+	stage, err := stageBinary(options.CurrentPath, options.CandidatePath)
+	if err != nil {
+		return fmt.Errorf("stage candidate: %w", err)
+	}
+	defer os.Remove(stage)
+	if err := options.Manager.Stop(ctx); err != nil {
+		return fmt.Errorf("stop observe: %w", err)
+	}
+	backup, err := SwapBinary(options.CurrentPath, stage)
+	if err != nil {
+		if startErr := options.Manager.Start(ctx); startErr != nil {
+			return fmt.Errorf("%v; restart previous version failed: %w", err, startErr)
+		}
+		return err
+	}
+	rollback := func(cause error) error {
+		if err := options.Manager.Stop(ctx); err != nil {
+			return fmt.Errorf("%v; rollback stop failed: %w", cause, err)
+		}
+		if err := RestoreBinary(options.CurrentPath, backup); err != nil {
+			return fmt.Errorf("%v; rollback restore failed: %w", cause, err)
+		}
+		if err := options.Manager.Start(ctx); err != nil {
+			return fmt.Errorf("%v; rollback restart failed: %w", cause, err)
+		}
+		if err := WaitForVersionHealth(ctx, options.HealthURL, options.CurrentVersion, options.HealthTimeout); err != nil {
+			return fmt.Errorf("%v; rollback health check failed: %w", cause, err)
+		}
+		return fmt.Errorf("%v; previous version %s restored and healthy", cause, options.CurrentVersion)
+	}
+	if err := options.Manager.Start(ctx); err != nil {
+		return rollback(fmt.Errorf("start candidate: %w", err))
+	}
+	if err := WaitForVersionHealth(ctx, options.HealthURL, options.TargetVersion, options.HealthTimeout); err != nil {
+		return rollback(fmt.Errorf("candidate health check: %w", err))
+	}
+	options.Logger.Info("upgrade: previous binary retained", "path", backup)
+	return nil
+}
+
+func stageBinary(currentPath, candidatePath string) (string, error) {
+	src, err := os.Open(candidatePath)
+	if err != nil {
+		return "", err
+	}
+	defer src.Close()
+	stage, err := os.CreateTemp(filepath.Dir(currentPath), ".observe-update-*")
+	if err != nil {
+		return "", err
+	}
+	path := stage.Name()
+	ok := false
+	defer func() {
+		_ = stage.Close()
+		if !ok {
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err := io.Copy(stage, src); err != nil {
+		return "", err
+	}
+	if err := stage.Chmod(0o755); err != nil {
+		return "", err
+	}
+	if err := stage.Sync(); err != nil {
+		return "", err
+	}
+	if err := stage.Close(); err != nil {
+		return "", err
+	}
+	ok = true
+	return path, nil
+}
+
+// SwapBinary preserves the current inode as .prev, then atomically renames the
+// staged candidate over the live path. The live path is never absent.
+func SwapBinary(currentPath, stagedPath string) (string, error) {
+	backup := currentPath + ".prev"
+	_ = os.Remove(backup)
+	if err := os.Link(currentPath, backup); err != nil {
+		return "", fmt.Errorf("backup current binary: %w", err)
+	}
+	if err := os.Rename(stagedPath, currentPath); err != nil {
+		_ = os.Remove(backup)
+		return "", fmt.Errorf("install candidate: %w", err)
+	}
+	if err := syncDir(filepath.Dir(currentPath)); err != nil {
+		_ = os.Rename(backup, currentPath)
+		return "", fmt.Errorf("sync installed candidate: %w", err)
+	}
+	return backup, nil
+}
+
+func RestoreBinary(currentPath, backupPath string) error {
+	if backupPath == "" {
+		return errors.New("restore: no backup path")
+	}
+	if err := os.Rename(backupPath, currentPath); err != nil {
+		return fmt.Errorf("restore previous binary: %w", err)
+	}
+	return syncDir(filepath.Dir(currentPath))
+}
+
+func syncDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
 func HealthURL(addr string) string {
 	if addr == "" {
 		addr = ":3000"
@@ -420,8 +680,107 @@ func HealthURL(addr string) string {
 	if strings.HasPrefix(addr, ":") {
 		return "http://127.0.0.1" + addr + "/healthz"
 	}
+	if strings.HasPrefix(addr, "0.0.0.0:") {
+		addr = "127.0.0.1:" + strings.TrimPrefix(addr, "0.0.0.0:")
+	}
+	if strings.HasPrefix(addr, "[::]:") {
+		addr = "127.0.0.1:" + strings.TrimPrefix(addr, "[::]:")
+	}
 	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
 		return strings.TrimRight(addr, "/") + "/healthz"
 	}
 	return "http://" + addr + "/healthz"
+}
+
+func WaitForVersionHealth(ctx context.Context, url string, expected Version, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{
+		Timeout:   2 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
+	consecutive := 0
+	lastErr := errors.New("health endpoint was not reached")
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			var body struct {
+				Status  string `json:"status"`
+				Version string `json:"version"`
+			}
+			decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK && decodeErr == nil && body.Status == "ok" {
+				actual, versionErr := ParseVersion(body.Version)
+				if versionErr == nil && Compare(actual, expected) == 0 {
+					consecutive++
+					if consecutive == 3 {
+						return nil
+					}
+				} else {
+					consecutive = 0
+					lastErr = fmt.Errorf("health endpoint reports version %q, expected %s", body.Version, expected)
+				}
+			} else {
+				consecutive = 0
+				lastErr = fmt.Errorf("health endpoint returned %s", resp.Status)
+			}
+		} else {
+			consecutive = 0
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("health check did not stabilize within %s: %w", timeout, lastErr)
+}
+
+func acquireLock(path string) (*os.File, error) {
+	if path == "" {
+		return nil, errors.New("upgrade lock path is required")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return nil, errors.New("another Observe upgrade is already running")
+	}
+	return f, nil
+}
+
+func releaseLock(f *os.File) {
+	if f == nil {
+		return
+	}
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = f.Close()
+}
+
+// ManagedInstall returns the external manager that owns an executable path.
+func ManagedInstall(path string) string {
+	path = filepath.ToSlash(path)
+	switch {
+	case strings.Contains(path, "/Cellar/"), strings.Contains(path, "/homebrew/"), strings.Contains(path, "/linuxbrew/"):
+		return "homebrew"
+	case fileExists("/.dockerenv"), os.Getenv("KUBERNETES_SERVICE_HOST") != "":
+		return "container"
+	default:
+		return ""
+	}
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

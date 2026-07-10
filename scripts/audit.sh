@@ -372,10 +372,10 @@ check "e2e playwright config present" \
 check "e2e has 4+ specs" \
   bash -c "[ \$(ls '/Users/tyler/Documents/proj rn/Teploy/teploy-observe/e2e/tests/'*.spec.ts | wc -l) -ge 4 ]"
 
-# ================ T043 — upgrade script ================
-echo "[T043] upgrade script"
-check "upgrade.sh present" \
-  test -x "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/scripts/upgrade.sh"
+# ================ T043 — signed updater ================
+echo "[T043] signed updater"
+check "upgrade package present" \
+  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/upgrade/upgrade.go"
 
 # ================ T044 — dogfood /meta ================
 echo "[T044] /meta self-observability"

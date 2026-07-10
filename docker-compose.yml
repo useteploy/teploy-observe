@@ -1,6 +1,6 @@
 # Observe — self-hosted analytics, errors, logs, traces, replays.
 #
-# Dev (no TLS, localhost:3000):
+# Single-host install (no TLS, localhost:3000):
 #   docker compose up
 #
 # Production (with Caddy + auto-TLS; expose 80/443, set OBSERVE_DOMAIN):
@@ -26,8 +26,9 @@ services:
       retries: 10
 
   observe:
-    build: .
+    image: ghcr.io/useteploy/teploy-observe:${OBSERVE_VERSION:-latest}
     restart: unless-stopped
+    stop_grace_period: 90s
     ports:
       # Exposed directly for the default (no-TLS) profile.
       # With the "tls" profile, Caddy handles 80/443 and observe stays internal.
@@ -35,6 +36,7 @@ services:
     environment:
       OBSERVE_ADDR: ":3000"
       OBSERVE_NUCLEUS_URL: "postgres://nucleus:5432/observe"
+      OBSERVE_DATA_DIR: "/var/lib/observe"
       OBSERVE_SITE_ID: "default"
       OBSERVE_SESSION_SALT: "${OBSERVE_SESSION_SALT:-change-me-in-production}"
       OBSERVE_BUFFER_SIZE: "100000"
@@ -46,6 +48,8 @@ services:
       OBSERVE_ADMIN_USER: "${OBSERVE_ADMIN_USER:-admin}"
       OBSERVE_ADMIN_PASSWORD: "${OBSERVE_ADMIN_PASSWORD:-observe}"
       OBSERVE_SEED_DEMO: "${OBSERVE_SEED_DEMO:-true}"
+    volumes:
+      - observe_data:/var/lib/observe
     depends_on:
       nucleus:
         condition: service_healthy
@@ -82,5 +86,6 @@ services:
 
 volumes:
   nucleus_data:
+  observe_data:
   caddy_data:
   caddy_config:

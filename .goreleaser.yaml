@@ -30,9 +30,29 @@ archives:
     # download URL in scripts/install.sh resolves: observe_<ver>_<os>_<arch>.tar.gz
     name_template: >-
       observe_{{ .Version }}_{{ .Os }}_{{- if eq .Arch "amd64" }}x86_64{{- else }}{{ .Arch }}{{ end }}
+    files:
+      - packaging/systemd/observe.service
 
 checksum:
   name_template: 'checksums.txt'
+
+# The updater verifies this Ed25519 signature before trusting any archive hash.
+# The private key exists only in the protected GitHub Actions release secret.
+signs:
+  - id: release-checksum
+    artifacts: checksum
+    signature: '${artifact}.sig'
+    cmd: openssl
+    args:
+      - pkeyutl
+      - -sign
+      - -rawin
+      - -inkey
+      - '{{ .Env.OBSERVE_SIGNING_KEY_PATH }}'
+      - -in
+      - '${artifact}'
+      - -out
+      - '${signature}'
 
 snapshot:
   version_template: '{{ incpatch .Version }}-next'
@@ -45,62 +65,30 @@ changelog:
       - '^chore:'
       - '^test:'
 
-# Docker / GHCR multi-arch images. goreleaser copies the pre-built binary
-# into Dockerfile.goreleaser's build context, so no vendor/ or Go toolchain
-# is needed at image-build time. The from-source Dockerfile stays for
-# `docker compose up` dev use.
-dockers:
-  - id: teploy-observe-amd64
-    goos: linux
-    goarch: amd64
+# Docker / GHCR multi-arch image built from the already compiled binaries.
+dockers_v2:
+  - id: teploy-observe
+    ids: [teploy-observe]
     dockerfile: Dockerfile.goreleaser
-    use: buildx
-    image_templates:
-      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-amd64'
-      - 'ghcr.io/useteploy/teploy-observe:latest-amd64'
-    build_flag_templates:
-      - '--platform=linux/amd64'
-      - '--label=org.opencontainers.image.title={{ .ProjectName }}'
-      - '--label=org.opencontainers.image.version={{ .Version }}'
-      - '--label=org.opencontainers.image.revision={{ .FullCommit }}'
-      - '--label=org.opencontainers.image.source=https://github.com/useteploy/teploy-observe'
-      - '--label=org.opencontainers.image.licenses=AGPL-3.0-or-later'
-  - id: teploy-observe-arm64
-    goos: linux
-    goarch: arm64
-    dockerfile: Dockerfile.goreleaser
-    use: buildx
-    image_templates:
-      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-arm64'
-      - 'ghcr.io/useteploy/teploy-observe:latest-arm64'
-    build_flag_templates:
-      - '--platform=linux/arm64'
-      - '--label=org.opencontainers.image.title={{ .ProjectName }}'
-      - '--label=org.opencontainers.image.version={{ .Version }}'
-      - '--label=org.opencontainers.image.revision={{ .FullCommit }}'
-      - '--label=org.opencontainers.image.source=https://github.com/useteploy/teploy-observe'
-      - '--label=org.opencontainers.image.licenses=AGPL-3.0-or-later'
+    images: [ghcr.io/useteploy/teploy-observe]
+    tags:
+      - '{{ .Version }}'
+      - latest
+    platforms: [linux/amd64, linux/arm64]
+    labels:
+      org.opencontainers.image.title: '{{ .ProjectName }}'
+      org.opencontainers.image.version: '{{ .Version }}'
+      org.opencontainers.image.revision: '{{ .FullCommit }}'
+      org.opencontainers.image.source: https://github.com/useteploy/teploy-observe
+      org.opencontainers.image.licenses: AGPL-3.0-or-later
 
-docker_manifests:
-  - name_template: 'ghcr.io/useteploy/teploy-observe:{{ .Version }}'
-    image_templates:
-      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-amd64'
-      - 'ghcr.io/useteploy/teploy-observe:{{ .Version }}-arm64'
-  - name_template: 'ghcr.io/useteploy/teploy-observe:latest'
-    image_templates:
-      - 'ghcr.io/useteploy/teploy-observe:latest-amd64'
-      - 'ghcr.io/useteploy/teploy-observe:latest-arm64'
-
-brews:
+homebrew_casks:
   - name: observe
+    ids: [teploy-observe-tar]
+    binaries: [observe]
     repository:
       owner: useteploy
       name: homebrew-tap
       token: '{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}'  # populated from secrets.HOMEBREW_TAP_TOKEN in release.yml
     homepage: 'https://github.com/useteploy/teploy-observe'
     description: 'Self-hosted, single-binary replacement for PostHog + Umami + SigNoz + Sentry'
-    license: 'AGPL-3.0-or-later'
-    install: |
-      bin.install "observe"
-    test: |
-      system "#{bin}/observe", "version"

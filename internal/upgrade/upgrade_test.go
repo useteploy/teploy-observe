@@ -1,485 +1,493 @@
 package upgrade
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/pem"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-// ─── ParseVersion / Compare ─────────────────────────────────────────────────
-
 func TestParseVersion(t *testing.T) {
-	cases := []struct {
-		in   string
-		want Version
-		err  bool
+	tests := []struct {
+		input string
+		want  Version
+		err   bool
 	}{
-		{"observe 0.1.0", Version{Major: 0, Minor: 1, Patch: 0}, false},
-		{"0.1.0", Version{Major: 0, Minor: 1, Patch: 0}, false},
-		{"observe 1.2.3-rc1", Version{Major: 1, Minor: 2, Patch: 3, Suffix: "rc1"}, false},
-		{"  observe 10.20.30  \n", Version{Major: 10, Minor: 20, Patch: 30}, false},
-		{"", Version{}, true},
-		{"observe 1.2", Version{}, true},
-		{"observe x.y.z", Version{}, true},
+		{"observe 1.2.3", Version{Major: 1, Minor: 2, Patch: 3}, false},
+		{"teploy-observe 1.2.3", Version{Major: 1, Minor: 2, Patch: 3}, false},
+		{"v1.2.3-rc.2+build.7", Version{Major: 1, Minor: 2, Patch: 3, Suffix: "rc.2"}, false},
+		{"1.2", Version{}, true},
+		{"1.02.3", Version{}, true},
+		{"dev", Version{}, true},
+		{"1.2.3-", Version{}, true},
 	}
-	for _, c := range cases {
-		got, err := ParseVersion(c.in)
-		if c.err {
+	for _, test := range tests {
+		got, err := ParseVersion(test.input)
+		if test.err {
 			if err == nil {
-				t.Errorf("ParseVersion(%q): expected error, got %+v", c.in, got)
+				t.Errorf("ParseVersion(%q) should fail", test.input)
 			}
 			continue
 		}
 		if err != nil {
-			t.Errorf("ParseVersion(%q) failed: %v", c.in, err)
-			continue
-		}
-		if got != c.want {
-			t.Errorf("ParseVersion(%q) = %+v, want %+v", c.in, got, c.want)
+			t.Errorf("ParseVersion(%q): %v", test.input, err)
+		} else if got != test.want {
+			t.Errorf("ParseVersion(%q) = %+v, want %+v", test.input, got, test.want)
 		}
 	}
 }
 
 func TestCompare(t *testing.T) {
-	cases := []struct {
+	tests := []struct {
 		a, b string
 		want int
 	}{
-		{"0.1.0", "0.1.0", 0},
-		{"0.1.0", "0.1.1", -1},
-		{"0.1.1", "0.1.0", 1},
-		{"0.2.0", "0.1.99", 1},
-		{"1.0.0", "0.99.99", 1},
-		{"1.0.0-rc1", "1.0.0", -1},
-		{"1.0.0", "1.0.0-rc1", 1},
-		{"1.0.0-rc1", "1.0.0-rc2", -1},
+		{"1.0.0", "1.0.0", 0},
+		{"1.0.0", "1.0.1", -1},
+		{"2.0.0", "1.9.9", 1},
+		{"1.0.0-rc.1", "1.0.0", -1},
+		{"1.0.0-rc.2", "1.0.0-rc.10", -1},
+		{"1.0.0-alpha", "1.0.0-1", 1},
 	}
-	for _, c := range cases {
-		va, _ := ParseVersion(c.a)
-		vb, _ := ParseVersion(c.b)
-		if got := Compare(va, vb); got != c.want {
-			t.Errorf("Compare(%q,%q) = %d, want %d", c.a, c.b, got, c.want)
+	for _, test := range tests {
+		a, _ := ParseVersion(test.a)
+		b, _ := ParseVersion(test.b)
+		if got := Compare(a, b); got != test.want {
+			t.Errorf("Compare(%s, %s) = %d, want %d", test.a, test.b, got, test.want)
 		}
 	}
 }
 
-// ─── PID-file lifecycle ─────────────────────────────────────────────────────
-
-func TestPIDFileLifecycle(t *testing.T) {
-	dir := t.TempDir()
-	if _, err := ReadPID(dir); err == nil {
-		t.Fatal("ReadPID before WritePID should fail")
-	}
-	if err := WritePID(dir); err != nil {
-		t.Fatalf("WritePID: %v", err)
-	}
-	pid, err := ReadPID(dir)
+func TestVerifyChecksums(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatalf("ReadPID after WritePID: %v", err)
+		t.Fatal(err)
 	}
-	if pid != os.Getpid() {
-		t.Errorf("ReadPID = %d, want %d", pid, os.Getpid())
+	checksums := []byte("abc  observe_1.0.0_linux_x86_64.tar.gz\n")
+	signature := ed25519.Sign(privateKey, checksums)
+	if err := VerifyChecksums(checksums, signature, publicKey); err != nil {
+		t.Fatalf("valid signature rejected: %v", err)
 	}
-	// Path is the documented "observe.pid" under the data dir.
-	if _, err := os.Stat(filepath.Join(dir, "observe.pid")); err != nil {
-		t.Errorf("PID file not at expected path: %v", err)
+	checksums[0] = 'd'
+	if err := VerifyChecksums(checksums, signature, publicKey); err == nil {
+		t.Fatal("modified checksums should fail verification")
 	}
-	if err := RemovePID(dir); err != nil {
-		t.Fatalf("RemovePID: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "observe.pid")); !os.IsNotExist(err) {
-		t.Errorf("PID file still present after RemovePID: %v", err)
-	}
-	// Removing again is a no-op.
-	if err := RemovePID(dir); err != nil {
-		t.Errorf("RemovePID idempotency: %v", err)
+	if err := VerifyChecksums([]byte("abc"), signature[:10], publicKey); err == nil {
+		t.Fatal("truncated signature should fail verification")
 	}
 }
 
-func TestWritePIDCreatesDir(t *testing.T) {
-	root := t.TempDir()
-	dir := filepath.Join(root, "nested", "data")
-	if err := WritePID(dir); err != nil {
-		t.Fatalf("WritePID nested: %v", err)
+func TestReleasePublicKeyMatchesPackagingAndInstaller(t *testing.T) {
+	publicPEM, err := os.ReadFile("../../packaging/release-signing.pub")
+	if err != nil {
+		t.Fatal(err)
 	}
-	pid, err := ReadPID(dir)
-	if err != nil || pid != os.Getpid() {
-		t.Errorf("ReadPID after nested WritePID: pid=%d err=%v", pid, err)
+	block, _ := pem.Decode(publicPEM)
+	if block == nil {
+		t.Fatal("packaged public key is not PEM")
+	}
+	parsed, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packagedKey, ok := parsed.(ed25519.PublicKey)
+	if !ok {
+		t.Fatal("packaged public key is not Ed25519")
+	}
+	clientKey := NewReleaseClient().PublicKey
+	if !bytes.Equal(packagedKey, clientKey) {
+		t.Fatal("packaged and embedded release keys differ")
+	}
+	installer, err := os.ReadFile("../../scripts/install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(installer, bytes.TrimSpace(publicPEM)) {
+		t.Fatal("installer does not contain the packaged release key")
 	}
 }
 
-func TestWritePIDEmptyDir(t *testing.T) {
-	if err := WritePID(""); err == nil {
-		t.Error("WritePID(\"\") should fail")
+func TestChecksumForRequiresOneExactEntry(t *testing.T) {
+	name := "observe_1.0.0_linux_x86_64.tar.gz"
+	hash := strings.Repeat("a", 64)
+	got, err := checksumFor([]byte(hash+"  "+name+"\n"), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(got[:]) != hash {
+		t.Fatalf("unexpected hash %x", got)
+	}
+	if _, err := checksumFor([]byte(hash+"  "+name+"\n"+hash+"  "+name+"\n"), name); err == nil {
+		t.Fatal("duplicate entries should fail")
+	}
+	if _, err := checksumFor([]byte("malformed\n"), name); err == nil {
+		t.Fatal("malformed entries should fail")
 	}
 }
 
-// ─── processAlive / WaitForExit ─────────────────────────────────────────────
-
-func TestProcessAliveSelf(t *testing.T) {
-	if !processAlive(os.Getpid()) {
-		t.Error("self process should be alive")
-	}
-	// A PID that is overwhelmingly unlikely to exist.
-	if processAlive(2_000_000_000) {
-		t.Error("PID 2e9 should not be alive")
-	}
-}
-
-func TestWaitForExit(t *testing.T) {
+func TestReleaseClientPrepare(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("signal-based PID checks are unix-only")
+		t.Skip("release does not target Windows")
 	}
-	// Spawn a short-lived child that exits in ~200ms. We must Wait() to
-	// reap it — otherwise the kernel keeps the PID as a zombie and
-	// kill(pid, 0) keeps returning success, which would hang WaitForExit.
-	cmd := exec.Command("sleep", "0.2")
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start sleep: %v", err)
-	}
-	pid := cmd.Process.Pid
-	// Reap on exit so the PID is fully released.
-	go func() { _ = cmd.Wait() }()
-
-	start := time.Now()
-	if err := WaitForExit(context.Background(), pid, 5*time.Second); err != nil {
-		t.Fatalf("WaitForExit: %v", err)
-	}
-	if d := time.Since(start); d > 3*time.Second {
-		t.Errorf("WaitForExit took too long: %s", d)
-	}
-}
-
-func TestWaitForExitTimeout(t *testing.T) {
-	// Self-PID never exits during the test → should hit the deadline quickly.
-	err := WaitForExit(context.Background(), os.Getpid(), 200*time.Millisecond)
-	if err == nil {
-		t.Fatal("expected timeout error")
-	}
-}
-
-func TestWaitForShutdownPIDFileGone(t *testing.T) {
-	// Self-PID is alive, PID file is missing — WaitForShutdown should
-	// return immediately because PID-file absence is taken as evidence
-	// of graceful exit.
-	dir := t.TempDir()
-	start := time.Now()
-	if err := WaitForShutdown(context.Background(), os.Getpid(), dir, 5*time.Second); err != nil {
-		t.Fatalf("WaitForShutdown should return when PID file missing: %v", err)
-	}
-	if d := time.Since(start); d > 500*time.Millisecond {
-		t.Errorf("WaitForShutdown took too long: %s", d)
-	}
-}
-
-func TestWaitForShutdownPIDFilePresent(t *testing.T) {
-	// PID file present + process alive → WaitForShutdown should hit the
-	// deadline.
-	dir := t.TempDir()
-	if err := WritePID(dir); err != nil {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
 		t.Fatal(err)
 	}
-	err := WaitForShutdown(context.Background(), os.Getpid(), dir, 200*time.Millisecond)
-	if err == nil {
-		t.Fatal("expected deadline exceeded with PID file still present")
-	}
-}
-
-func TestWaitForShutdownPIDFileDisappearsMidPoll(t *testing.T) {
-	dir := t.TempDir()
-	if err := WritePID(dir); err != nil {
+	target, _ := ParseVersion("1.2.3")
+	asset, err := archiveName(target)
+	if err != nil {
 		t.Fatal(err)
 	}
-	// Remove the PID file after 250ms — WaitForShutdown should detect it.
-	go func() {
-		time.Sleep(250 * time.Millisecond)
-		_ = RemovePID(dir)
-	}()
-	if err := WaitForShutdown(context.Background(), os.Getpid(), dir, 5*time.Second); err != nil {
-		t.Fatalf("WaitForShutdown: %v", err)
+	archive := testArchive(t, "observe", "#!/bin/sh\necho 'observe 1.2.3'\n", tar.TypeReg)
+	hash := sha256.Sum256(archive)
+	checksums := []byte(fmt.Sprintf("%x  %s\n", hash, asset))
+	signature := ed25519.Sign(privateKey, checksums)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/releases/latest":
+			_, _ = w.Write([]byte(`{"tag_name":"v1.2.3"}`))
+		case strings.HasSuffix(r.URL.Path, "/checksums.txt"):
+			_, _ = w.Write(checksums)
+		case strings.HasSuffix(r.URL.Path, "/checksums.txt.sig"):
+			_, _ = w.Write(signature)
+		case strings.HasSuffix(r.URL.Path, "/"+asset):
+			_, _ = w.Write(archive)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := &ReleaseClient{
+		HTTPClient:      server.Client(),
+		APIURL:          server.URL + "/api",
+		DownloadBaseURL: server.URL + "/download",
+		PublicKey:       publicKey,
+	}
+	current, _ := ParseVersion("1.0.0")
+	release, err := client.Prepare(context.Background(), "latest", current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release.Close()
+	if Compare(release.Version, target) != 0 {
+		t.Fatalf("prepared version %s, want %s", release.Version, target)
 	}
 }
 
-// ─── PreflightTarget ────────────────────────────────────────────────────────
+func TestExtractBinaryRejectsUnsafeOrLinkedEntry(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		entry    string
+		typeflag byte
+	}{
+		{"traversal", "../observe", tar.TypeReg},
+		{"symlink", "observe", tar.TypeSymlink},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			archive := filepath.Join(dir, "release.tar.gz")
+			if err := os.WriteFile(archive, testArchive(t, test.entry, "data", test.typeflag), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := extractBinary(archive, dir); err == nil {
+				t.Fatal("unsafe archive should fail")
+			}
+		})
+	}
+}
 
-// fakeBinary writes a small shell script that prints `observe <version>` for
-// `version` arg, exit 1 otherwise. Returns its absolute path.
-func fakeBinary(t *testing.T, version string) string {
+func testArchive(t *testing.T, name, contents string, typeflag byte) []byte {
 	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "observe-fake")
-	body := "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo \"observe " + version + "\"; exit 0; fi\nexit 1\n"
-	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
-		t.Fatalf("write fake binary: %v", err)
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	header := &tar.Header{Name: name, Mode: 0o755, Size: int64(len(contents)), Typeflag: typeflag}
+	if typeflag != tar.TypeReg {
+		header.Size = 0
 	}
-	return path
-}
-
-func TestPreflightTargetOK(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell-script fake binary needs /bin/sh")
-	}
-	target := fakeBinary(t, "0.2.0")
-	v, err := PreflightTarget(target, "observe 0.1.0")
-	if err != nil {
-		t.Fatalf("preflight ok case: %v", err)
-	}
-	if v.Major != 0 || v.Minor != 2 || v.Patch != 0 {
-		t.Errorf("got version %+v", v)
-	}
-}
-
-func TestPreflightTargetSameVersionOK(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell-script fake binary needs /bin/sh")
-	}
-	target := fakeBinary(t, "0.1.0")
-	if _, err := PreflightTarget(target, "observe 0.1.0"); err != nil {
-		t.Errorf("equal versions should pass: %v", err)
-	}
-}
-
-func TestPreflightTargetRefusesDowngrade(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell-script fake binary needs /bin/sh")
-	}
-	target := fakeBinary(t, "0.0.9")
-	_, err := PreflightTarget(target, "observe 0.1.0")
-	if err == nil {
-		t.Fatal("downgrade should fail")
-	}
-	if !strings.Contains(err.Error(), "downgrade") {
-		t.Errorf("error should mention downgrade: %v", err)
-	}
-}
-
-func TestPreflightTargetMissing(t *testing.T) {
-	_, err := PreflightTarget("/nonexistent/observe-binary", "observe 0.1.0")
-	if err == nil {
-		t.Fatal("missing target should fail")
-	}
-}
-
-func TestPreflightTargetNotExecutable(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("unix permissions only")
-	}
-	dir := t.TempDir()
-	path := filepath.Join(dir, "not-exec")
-	if err := os.WriteFile(path, []byte("not a binary"), 0o644); err != nil {
+	if err := tw.WriteHeader(header); err != nil {
 		t.Fatal(err)
 	}
-	_, err := PreflightTarget(path, "observe 0.1.0")
-	if err == nil {
-		t.Fatal("non-exec target should fail")
+	if typeflag == tar.TypeReg {
+		if _, err := tw.Write([]byte(contents)); err != nil {
+			t.Fatal(err)
+		}
 	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }
-
-// ─── SwapBinary / RestoreBinary ─────────────────────────────────────────────
 
 func TestSwapBinaryAndRestore(t *testing.T) {
 	dir := t.TempDir()
 	current := filepath.Join(dir, "observe")
-	newer := filepath.Join(dir, "observe-new")
-	if err := os.WriteFile(current, []byte("OLD"), 0o755); err != nil {
+	staged := filepath.Join(dir, "observe-new")
+	if err := os.WriteFile(current, []byte("old"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(newer, []byte("NEW"), 0o755); err != nil {
+	if err := os.WriteFile(staged, []byte("new"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-
-	prev, err := SwapBinary(current, newer)
+	backup, err := SwapBinary(current, staged)
 	if err != nil {
-		t.Fatalf("SwapBinary: %v", err)
-	}
-	if !strings.HasSuffix(prev, ".prev") {
-		t.Errorf("backup path should end in .prev, got %s", prev)
-	}
-
-	got, _ := os.ReadFile(current)
-	if string(got) != "NEW" {
-		t.Errorf("after swap, current = %q, want NEW", got)
-	}
-	gotPrev, _ := os.ReadFile(prev)
-	if string(gotPrev) != "OLD" {
-		t.Errorf("backup contents = %q, want OLD", gotPrev)
-	}
-	// New path must no longer exist (it was renamed in-place).
-	if _, err := os.Stat(newer); !os.IsNotExist(err) {
-		t.Errorf("new path should be gone after swap")
-	}
-
-	// Restore brings OLD back.
-	if err := RestoreBinary(current, prev); err != nil {
-		t.Fatalf("RestoreBinary: %v", err)
-	}
-	got, _ = os.ReadFile(current)
-	if string(got) != "OLD" {
-		t.Errorf("after restore, current = %q, want OLD", got)
-	}
-}
-
-func TestSwapBinaryNewMissing(t *testing.T) {
-	dir := t.TempDir()
-	current := filepath.Join(dir, "observe")
-	if err := os.WriteFile(current, []byte("OLD"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, err := SwapBinary(current, filepath.Join(dir, "does-not-exist"))
-	if err == nil {
-		t.Fatal("swap with missing new should fail")
-	}
-	// And current must be restored to its original contents.
-	got, _ := os.ReadFile(current)
-	if string(got) != "OLD" {
-		t.Errorf("after failed swap, current = %q, want OLD (rolled back)", got)
-	}
-}
-
-func TestRestoreBinaryNoBackup(t *testing.T) {
-	dir := t.TempDir()
-	current := filepath.Join(dir, "observe")
-	if err := os.WriteFile(current, []byte("NEW"), 0o755); err != nil {
+	assertFileContents(t, current, "new")
+	assertFileContents(t, backup, "old")
+	if err := RestoreBinary(current, backup); err != nil {
 		t.Fatal(err)
 	}
-	if err := RestoreBinary(current, ""); err == nil {
-		t.Error("RestoreBinary with empty backup should fail")
+	assertFileContents(t, current, "old")
+}
+
+type fakeManager struct {
+	active    bool
+	startFail int
+	stops     int
+	starts    int
+}
+
+type rejectingOwner struct {
+	*fakeManager
+}
+
+func (m rejectingOwner) VerifyExecutable(context.Context, string) error {
+	return fmt.Errorf("wrong executable")
+}
+
+func (m *fakeManager) IsActive(context.Context) error {
+	if !m.active {
+		return fmt.Errorf("inactive")
 	}
-	if err := RestoreBinary(current, filepath.Join(dir, "missing.prev")); err == nil {
-		t.Error("RestoreBinary with missing backup should fail")
+	return nil
+}
+
+func (m *fakeManager) Stop(context.Context) error {
+	m.stops++
+	m.active = false
+	return nil
+}
+
+func (m *fakeManager) Start(context.Context) error {
+	m.starts++
+	if m.startFail > 0 {
+		m.startFail--
+		return fmt.Errorf("start failed")
+	}
+	m.active = true
+	return nil
+}
+
+func TestApplySuccess(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(dir, "observe")
+	candidate := filepath.Join(dir, "candidate")
+	writeTestBinary(t, current, "1.0.0")
+	writeTestBinary(t, candidate, "1.1.0")
+	manager := &fakeManager{active: true}
+	server := versionServer(t, current, manager)
+	defer server.Close()
+
+	err := Apply(context.Background(), ApplyOptions{
+		CurrentPath: current, CandidatePath: candidate,
+		CurrentVersion: mustVersion(t, "1.0.0"), TargetVersion: mustVersion(t, "1.1.0"),
+		HealthURL: server.URL, LockPath: filepath.Join(dir, "upgrade.lock"),
+		Manager: manager, HealthTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertBinaryVersion(t, current, "1.1.0")
+	if manager.stops != 1 || manager.starts != 1 {
+		t.Fatalf("stops=%d starts=%d", manager.stops, manager.starts)
 	}
 }
 
-// ─── HealthURL / WaitForHealthz ─────────────────────────────────────────────
+func TestApplyRejectsServiceForAnotherExecutable(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(dir, "observe")
+	candidate := filepath.Join(dir, "candidate")
+	writeTestBinary(t, current, "1.0.0")
+	writeTestBinary(t, candidate, "1.1.0")
+	manager := &fakeManager{active: true}
+	err := Apply(context.Background(), ApplyOptions{
+		CurrentPath: current, CandidatePath: candidate,
+		CurrentVersion: mustVersion(t, "1.0.0"), TargetVersion: mustVersion(t, "1.1.0"),
+		HealthURL: "http://127.0.0.1:1/healthz", LockPath: filepath.Join(dir, "upgrade.lock"),
+		Manager: rejectingOwner{manager},
+	})
+	if err == nil || !strings.Contains(err.Error(), "verify service ownership") {
+		t.Fatalf("expected ownership error, got %v", err)
+	}
+	if manager.stops != 0 || manager.starts != 0 {
+		t.Fatalf("service changed before ownership verification")
+	}
+}
+
+func TestApplyRechecksInstalledVersionUnderLock(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(dir, "observe")
+	candidate := filepath.Join(dir, "candidate")
+	writeTestBinary(t, current, "1.2.0")
+	writeTestBinary(t, candidate, "1.1.0")
+	manager := &fakeManager{active: true}
+	err := Apply(context.Background(), ApplyOptions{
+		CurrentPath: current, CandidatePath: candidate,
+		CurrentVersion: mustVersion(t, "1.0.0"), TargetVersion: mustVersion(t, "1.1.0"),
+		HealthURL: "http://127.0.0.1:1/healthz", LockPath: filepath.Join(dir, "upgrade.lock"),
+		Manager: manager,
+	})
+	if err == nil || !strings.Contains(err.Error(), "refusing downgrade 1.2.0 -> 1.1.0") {
+		t.Fatalf("expected locked downgrade rejection, got %v", err)
+	}
+	if manager.stops != 0 || manager.starts != 0 {
+		t.Fatalf("service changed before locked version check")
+	}
+}
+
+func TestApplyRestoresAndRestartsOnStartFailure(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(dir, "observe")
+	candidate := filepath.Join(dir, "candidate")
+	writeTestBinary(t, current, "1.0.0")
+	writeTestBinary(t, candidate, "1.1.0")
+	manager := &fakeManager{active: true, startFail: 1}
+	server := versionServer(t, current, manager)
+	defer server.Close()
+
+	err := Apply(context.Background(), ApplyOptions{
+		CurrentPath: current, CandidatePath: candidate,
+		CurrentVersion: mustVersion(t, "1.0.0"), TargetVersion: mustVersion(t, "1.1.0"),
+		HealthURL: server.URL, LockPath: filepath.Join(dir, "upgrade.lock"),
+		Manager: manager, HealthTimeout: 2 * time.Second,
+	})
+	if err == nil || !strings.Contains(err.Error(), "restored and healthy") {
+		t.Fatalf("expected successful rollback error, got %v", err)
+	}
+	assertBinaryVersion(t, current, "1.0.0")
+	if !manager.active || manager.starts != 2 {
+		t.Fatalf("rollback did not restart service: active=%v starts=%d", manager.active, manager.starts)
+	}
+}
+
+func TestApplyRestoresAndRestartsOnWrongRunningVersion(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(dir, "observe")
+	candidate := filepath.Join(dir, "candidate")
+	writeTestBinary(t, current, "1.0.0")
+	writeTestBinary(t, candidate, "1.1.0")
+	manager := &fakeManager{active: true}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		version, _ := BinaryVersion(current)
+		reported := version.String()
+		if reported == "1.1.0" {
+			reported = "9.9.9"
+		}
+		_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`, reported)
+	}))
+	defer server.Close()
+
+	err := Apply(context.Background(), ApplyOptions{
+		CurrentPath: current, CandidatePath: candidate,
+		CurrentVersion: mustVersion(t, "1.0.0"), TargetVersion: mustVersion(t, "1.1.0"),
+		HealthURL: server.URL, LockPath: filepath.Join(dir, "upgrade.lock"),
+		Manager: manager, HealthTimeout: 1200 * time.Millisecond,
+	})
+	if err == nil || !strings.Contains(err.Error(), "restored and healthy") {
+		t.Fatalf("expected health-gated rollback, got %v", err)
+	}
+	assertBinaryVersion(t, current, "1.0.0")
+	if !manager.active || manager.starts != 2 {
+		t.Fatalf("rollback did not restart service: active=%v starts=%d", manager.active, manager.starts)
+	}
+}
 
 func TestHealthURL(t *testing.T) {
-	cases := []struct {
-		in, want string
-	}{
-		{":3000", "http://127.0.0.1:3000/healthz"},
-		{"0.0.0.0:3000", "http://0.0.0.0:3000/healthz"},
-		{"127.0.0.1:3000", "http://127.0.0.1:3000/healthz"},
-		{"http://obs.local:3000", "http://obs.local:3000/healthz"},
-		{"http://obs.local:3000/", "http://obs.local:3000/healthz"},
-		{"", "http://127.0.0.1:3000/healthz"},
+	tests := map[string]string{
+		":3000":        "http://127.0.0.1:3000/healthz",
+		"0.0.0.0:3000": "http://127.0.0.1:3000/healthz",
+		"[::]:3000":    "http://127.0.0.1:3000/healthz",
+		"127.0.0.1:9":  "http://127.0.0.1:9/healthz",
 	}
-	for _, c := range cases {
-		if got := HealthURL(c.in); got != c.want {
-			t.Errorf("HealthURL(%q) = %q, want %q", c.in, got, c.want)
+	for input, want := range tests {
+		if got := HealthURL(input); got != want {
+			t.Errorf("HealthURL(%q) = %q, want %q", input, got, want)
 		}
 	}
 }
 
-func TestWaitForHealthzOK(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-	}))
-	defer srv.Close()
-	if err := WaitForHealthz(context.Background(), srv.URL+"/healthz", 2*time.Second); err != nil {
-		t.Fatalf("WaitForHealthz OK: %v", err)
-	}
-}
-
-func TestWaitForHealthzFlapsThenOK(t *testing.T) {
-	var hits int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
-		if hits < 3 {
-			w.WriteHeader(503)
+func versionServer(t *testing.T, current string, manager *fakeManager) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !manager.active {
+			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		w.WriteHeader(200)
+		version, err := BinaryVersion(current)
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`, version.String())
 	}))
-	defer srv.Close()
-	if err := WaitForHealthz(context.Background(), srv.URL+"/healthz", 5*time.Second); err != nil {
-		t.Fatalf("WaitForHealthz flap-then-ok: %v", err)
-	}
-	if hits < 3 {
-		t.Errorf("expected at least 3 hits, got %d", hits)
-	}
 }
 
-func TestWaitForHealthzTimeout(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(503)
-	}))
-	defer srv.Close()
-	err := WaitForHealthz(context.Background(), srv.URL+"/healthz", 300*time.Millisecond)
-	if err == nil {
-		t.Fatal("expected timeout error")
-	}
-}
-
-// ─── SignalProcess ──────────────────────────────────────────────────────────
-
-func TestSignalProcessUnknownPID(t *testing.T) {
-	err := SignalProcess(2_000_000_000, os.Interrupt)
-	if err == nil {
-		t.Fatal("expected error for nonexistent PID")
-	}
-}
-
-// ─── Env snapshot ───────────────────────────────────────────────────────────
-
-func TestEnvSnapshot(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("OBSERVE_TEST_KEY", "value-with-equals=in-it")
-	t.Setenv("OBSERVE_OTHER", "second")
-	t.Setenv("UNRELATED", "should-not-appear")
-
-	if err := WriteEnv(dir); err != nil {
-		t.Fatalf("WriteEnv: %v", err)
-	}
-	snap, err := ReadEnv(dir)
-	if err != nil {
-		t.Fatalf("ReadEnv: %v", err)
-	}
-	got := map[string]string{}
-	for _, kv := range snap {
-		i := strings.IndexByte(kv, '=')
-		got[kv[:i]] = kv[i+1:]
-	}
-	if got["OBSERVE_TEST_KEY"] != "value-with-equals=in-it" {
-		t.Errorf("OBSERVE_TEST_KEY = %q", got["OBSERVE_TEST_KEY"])
-	}
-	if got["OBSERVE_OTHER"] != "second" {
-		t.Errorf("OBSERVE_OTHER = %q", got["OBSERVE_OTHER"])
-	}
-	if _, ok := got["UNRELATED"]; ok {
-		t.Errorf("UNRELATED leaked into snapshot")
-	}
-}
-
-func TestReadEnvMissing(t *testing.T) {
-	dir := t.TempDir()
-	if _, err := ReadEnv(dir); err == nil {
-		t.Error("ReadEnv on missing file should error")
-	}
-}
-
-// helper: prove WritePID writes a parseable integer.
-func TestWritePIDContents(t *testing.T) {
-	dir := t.TempDir()
-	if err := WritePID(dir); err != nil {
-		t.Fatal(err)
-	}
-	raw, err := os.ReadFile(filepath.Join(dir, "observe.pid"))
+func mustVersion(t *testing.T, value string) Version {
+	t.Helper()
+	v, err := ParseVersion(value)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil {
-		t.Fatalf("pid file not numeric: %q", raw)
+	return v
+}
+
+func writeTestBinary(t *testing.T, path, version string) {
+	t.Helper()
+	contents := "#!/bin/sh\necho 'observe " + version + "'\n"
+	if err := os.WriteFile(path, []byte(contents), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if pid != os.Getpid() {
-		t.Errorf("got pid %d, want %d", pid, os.Getpid())
+}
+
+func assertFileContents(t *testing.T, path, want string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(data)) != want {
+		t.Fatalf("%s contains %q, want %q", path, data, want)
+	}
+}
+
+func assertBinaryVersion(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := BinaryVersion(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.String() != want {
+		t.Fatalf("%s reports %s, want %s", path, got, want)
 	}
 }

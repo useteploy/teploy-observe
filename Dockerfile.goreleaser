@@ -4,7 +4,8 @@
 # The from-source Dockerfile (used by docker-compose for dev) is kept separately.
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata
-COPY observe /usr/local/bin/observe
+ARG TARGETPLATFORM
+COPY $TARGETPLATFORM/observe /usr/local/bin/observe
 
 EXPOSE 3000
 ENV OBSERVE_ADDR=:3000

@@ -1,6 +1,6 @@
 [Unit]
-Description=Observe — self-hosted analytics, errors, logs, traces, replays
-Documentation=https://github.com/teploy/observe
+Description=Observe - self-hosted observability
+Documentation=https://github.com/useteploy/teploy-observe
 After=network-online.target nucleus.service
 Wants=network-online.target nucleus.service
 
@@ -17,14 +17,15 @@ EnvironmentFile=-/etc/observe/observe.env
 Environment=OBSERVE_ADDR=:3000
 Environment=OBSERVE_NUCLEUS_URL=postgres://localhost:5432/observe
 Environment=OBSERVE_SITE_ID=default
+Environment=OBSERVE_DATA_DIR=/var/lib/observe
 
 ExecStart=/usr/local/bin/observe
-ExecReload=/bin/kill -HUP $MAINPID
 
 # Graceful shutdown — Observe flushes buffers on SIGTERM.
 KillSignal=SIGTERM
-TimeoutStopSec=30s
-Restart=always
+KillMode=control-group
+TimeoutStopSec=90s
+Restart=on-failure
 RestartSec=5s
 
 # Hardening — adjust if your setup requires wider access.
@@ -32,7 +33,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/observe /var/log/observe
+ReadWritePaths=/var/lib/observe
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

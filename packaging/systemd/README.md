@@ -36,3 +36,8 @@ sudo journalctl -u observe -f
 ```
 
 Observe will be on `http://localhost:3000`. Add a reverse proxy (Caddy, nginx) for TLS.
+
+Upgrade direct installations with `sudo observe upgrade`. The updater verifies
+the signed release, delegates stop/start to systemd, checks the exact running
+version, and automatically restores the previous binary on failure. Homebrew
+and container installations must be upgraded through their own manager.

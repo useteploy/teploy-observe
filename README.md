@@ -17,7 +17,7 @@ Two processes. ~100MB idle. Runs on a $5 VPS.
 ### Homebrew (macOS, Linux)
 
 ```bash
-brew install useteploy/tap/teploy-observe
+brew install useteploy/tap/observe
 ```
 
 ### Docker
@@ -27,6 +27,9 @@ git clone https://github.com/useteploy/teploy-observe.git
 cd teploy-observe
 docker compose up
 ```
+
+The Compose file runs the published image. To test local source changes, build
+the root `Dockerfile` explicitly.
 
 Open `http://localhost:3000`. Default login: `admin` / `observe`.
 
@@ -39,6 +42,35 @@ curl -sL https://raw.githubusercontent.com/useteploy/teploy-observe/main/scripts
 The script generates a random admin password and prints it on completion;
 it is also stored in `/etc/observe/observe.env` and rotatable from
 **Settings → Users**.
+
+The direct installer verifies the release's SHA256 through an Ed25519-signed
+`checksums.txt` before installing anything. It fails closed if the signature
+or archive hash is invalid. Set `OBSERVE_HEALTH_URL` when upgrading an existing
+direct installation that does not listen on `http://127.0.0.1:3000/healthz`.
+
+## Upgrade
+
+Use the manager that installed Observe:
+
+```bash
+# Direct Linux/systemd install
+sudo observe upgrade
+sudo observe upgrade --version v1.2.3
+
+# Homebrew
+brew upgrade useteploy/tap/observe
+
+# Docker Compose
+docker compose pull && docker compose up -d
+# Pin a release with OBSERVE_VERSION=1.2.3
+```
+
+The direct updater authenticates and stages the release while the current
+server remains online. It then asks systemd to stop Observe gracefully,
+atomically replaces the binary, and requires three healthy responses from the
+exact new version. A failed start or readiness check restores and restarts the
+previous version automatically. There is a brief restart window; telemetry
+senders should retain their normal retry policy.
 
 ### Build from source
 
@@ -101,9 +133,9 @@ the exact image and version.
 - **RBAC** enforced — JWT carries a role claim (`admin` / `editor` /
   `viewer`). Writes require editor or admin; destructive config routes
   require admin.
-- **Ingest is WAL-backed** — every event is durably written to
-  `$OBSERVE_QUEUE_DIR` before in-memory buffering. SIGKILL replays on
-  restart.
+- **Ingest is WAL-backed** — accepted events are mirrored to
+  `$OBSERVE_QUEUE_DIR` when the queue is available. Graceful shutdown fsyncs
+  the queue; crash recovery replays records since the last checkpoint.
 - **Per-site rate limiting** — each site has its own token bucket. One
   noisy site can't starve a quiet one. Admin-editable via
   `PUT /api/v1/sites/{id}/ratelimit`.
