@@ -514,7 +514,12 @@ func (q *QueryService) ListPerformanceIssues(ctx context.Context, siteID string,
 	return out, nil
 }
 
-// TraceErrors returns error events correlated with a trace by timestamp overlap.
+// TraceErrors returns error events correlated with a trace. Errors that
+// carry a trace_id (SDKs capturing inside a traced operation) match exactly;
+// errors without trace context (browser errors, older SDKs) fall back to
+// the trace's timestamp window. Errors tagged with a DIFFERENT trace are
+// excluded from the window fallback, so overlapping traces no longer
+// cross-contaminate each other's error lists once SDKs send trace_id.
 func (q *QueryService) TraceErrors(ctx context.Context, traceID, siteID string) ([]TraceErrorHit, error) {
 	type bounds struct {
 		MinT string `db:"min_t"`
@@ -535,8 +540,10 @@ func (q *QueryService) TraceErrors(ctx context.Context, traceID, siteID string) 
 			CAST(timestamp AS TEXT) AS timestamp,
 			issue_id
 		 FROM error_events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp <= $3
+		 WHERE site_id = $1
+		   AND (trace_id = $4
+		        OR (trace_id = '' AND timestamp >= $2 AND timestamp <= $3))
 		 ORDER BY timestamp ASC`,
-		siteID, b[0].MinT, b[0].MaxT,
+		siteID, b[0].MinT, b[0].MaxT, traceID,
 	)
 }

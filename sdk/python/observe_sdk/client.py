@@ -76,8 +76,20 @@ class Client:
         """Clear the active distinct_id (e.g. on logout)."""
         self._distinct_id = None
 
-    def capture_exception(self, exc: BaseException, *, release: Optional[str] = None) -> None:
-        """Submit a single exception with stack trace. Sends immediately."""
+    def capture_exception(
+        self,
+        exc: BaseException,
+        *,
+        release: Optional[str] = None,
+        trace_id: Optional[str] = None,
+        span_id: Optional[str] = None,
+    ) -> None:
+        """Submit a single exception with stack trace. Sends immediately.
+
+        ``trace_id``/``span_id`` attach the active trace context when the
+        error was captured inside a traced operation, enabling exact
+        trace<->error correlation in the trace detail view.
+        """
         payload = {
             "site_id": self.opts.site_id,
             "error_type": type(exc).__name__,
@@ -89,6 +101,10 @@ class Client:
         }
         if self._distinct_id:
             payload["distinct_id"] = self._distinct_id
+        if trace_id:
+            payload["trace_id"] = trace_id
+        if span_id:
+            payload["span_id"] = span_id
         self._post("/api/v1/errors", payload)
 
     def log(self, level: str, message: str, **fields: Any) -> None:
@@ -198,8 +214,14 @@ def reset() -> None:
     _require().reset()
 
 
-def capture_exception(exc: BaseException, *, release: Optional[str] = None) -> None:
-    _require().capture_exception(exc, release=release)
+def capture_exception(
+    exc: BaseException,
+    *,
+    release: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    span_id: Optional[str] = None,
+) -> None:
+    _require().capture_exception(exc, release=release, trace_id=trace_id, span_id=span_id)
 
 
 def log(level: str, message: str, **fields: Any) -> None:

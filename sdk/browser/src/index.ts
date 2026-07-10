@@ -62,6 +62,10 @@ export interface ErrorPayload {
   replay_id?: string;
   /** User identifier set by identify(). Hashed server-side with site salt. */
   distinct_id?: string;
+  /** Active trace context, when the error was captured inside a traced
+   * operation. Enables exact trace<->error correlation server-side. */
+  trace_id?: string;
+  span_id?: string;
 }
 
 export interface LogPayload {
@@ -213,7 +217,7 @@ export function getSessionId(): string | null {
 }
 
 /** Submit an error. Sends immediately — not buffered. */
-export function captureException(err: Error, ctx?: { mechanism?: string; release?: string; tags?: Record<string, string> }): Promise<void> {
+export function captureException(err: Error, ctx?: { mechanism?: string; release?: string; tags?: Record<string, string>; traceId?: string; spanId?: string }): Promise<void> {
   if (!client) return Promise.resolve();
   const payload: ErrorPayload = {
     site_id: client.opts.siteId,
@@ -225,6 +229,10 @@ export function captureException(err: Error, ctx?: { mechanism?: string; release
     level: "error",
     stack_trace: parseStack(err.stack),
   };
+  // Callers tracing their own operations can pass the active trace context
+  // for exact trace<->error correlation in the trace detail view.
+  if (ctx?.traceId) payload.trace_id = ctx.traceId;
+  if (ctx?.spanId) payload.span_id = ctx.spanId;
   // If observe-replay.js is on the page, attach the active replay id so the
   // Errors UI can cross-jump to the session replay.
   const replayId = activeReplayId();

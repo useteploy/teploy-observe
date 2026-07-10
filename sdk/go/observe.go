@@ -102,6 +102,8 @@ type ErrorPayload struct {
 	ReleaseTag  string       `json:"release_tag,omitempty"`
 	Environment string       `json:"environment,omitempty"`
 	Level       string       `json:"level,omitempty"`
+	TraceID     string       `json:"trace_id,omitempty"`
+	SpanID      string       `json:"span_id,omitempty"`
 }
 
 // StackFrame is a single frame in an error's stack trace.
@@ -120,6 +122,22 @@ func WithRelease(r string) ExceptionOption { return func(p *ErrorPayload) { p.Re
 
 // WithLevel overrides the level (default: "error").
 func WithLevel(l string) ExceptionOption { return func(p *ErrorPayload) { p.Level = l } }
+
+// WithSpan attaches a span's trace context to the error so the trace detail
+// view correlates it exactly instead of by timestamp overlap. Typical use:
+//
+//	client.CaptureException(err, observe.WithSpan(observe.SpanFromContext(ctx)))
+//
+// A nil span is a no-op, so callers don't need to guard the lookup.
+func WithSpan(s *Span) ExceptionOption {
+	return func(p *ErrorPayload) {
+		if s == nil {
+			return
+		}
+		p.TraceID = s.TraceID()
+		p.SpanID = s.SpanID()
+	}
+}
 
 // New constructs a Client and starts its background flush goroutine.
 // Caller must call Close() to flush pending logs and stop the goroutine.

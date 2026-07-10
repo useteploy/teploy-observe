@@ -47,6 +47,12 @@ type ErrorInput struct {
 	// selector for a RageClick auto-issue). Used by grouping for non-stack
 	// errors so multiple rage clicks on the same target collapse together.
 	Selector string `json:"selector"`
+	// TraceID/SpanID carry the active trace context when the SDK captured
+	// the error inside a traced operation. The trace detail view uses
+	// trace_id for exact error correlation; empty means "no trace context"
+	// and the row falls back to timestamp-window correlation.
+	TraceID string `json:"trace_id"`
+	SpanID  string `json:"span_id"`
 }
 
 // Breadcrumb is a user action that preceded the error.
@@ -214,12 +220,12 @@ func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (strin
 			error_id, tenant_id, site_id, session_id, replay_id, issue_id, group_hash,
 			timestamp, error_type, error_value, mechanism, handled, level,
 			release_tag, environment, url, browser, os, device,
-			stack_trace, breadcrumbs, contexts, extra, distinct_id
-		) VALUES ($1,'default',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+			stack_trace, breadcrumbs, contexts, extra, distinct_id, trace_id, span_id
+		) VALUES ($1,'default',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
 		errorID, input.SiteID, input.SessionID, input.ReplayID, issueID, groupHash,
 		now.UnixMilli(), input.ErrorType, input.ErrorValue, input.Mechanism, handled, input.Level,
 		input.ReleaseTag, input.Environment, input.URL, input.Browser, input.OS, input.Device,
-		stackJSON, breadcrumbsJSON, contextsJSON, extraJSON, distinctID,
+		stackJSON, breadcrumbsJSON, contextsJSON, extraJSON, distinctID, input.TraceID, input.SpanID,
 	)
 	if err != nil {
 		return "", fmt.Errorf("insert error event: %w", err)
