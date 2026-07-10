@@ -54,6 +54,11 @@ accessories:
       NUCLEUS_ALLOW_NO_AUTH: "1"
       NUCLEUS_ALLOW_INSECURE_CLUSTER: "1"
       NUCLEUS_ALLOW_INSECURE_REPLICATION: "1"
+      # Memory budget shared by all engine subsystems. The engine defaults to
+      # 512 MB and REJECTS WRITES at 90% RSS — far too small once a real
+      # dataset is resident (a ~5 GB observe store idles above 3 GB RSS).
+      # Size to roughly 2x resident data, below host headroom.
+      NUCLEUS_MAX_MEMORY_MB: "8192"
     volumes:
       nucleus-data: /data
 
