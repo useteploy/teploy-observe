@@ -273,6 +273,11 @@ func restoreTable(ctx context.Context, db *nucleus.Client, r io.Reader, table st
 	scanner.Buffer(make([]byte, 1<<20), 16<<20) // up to 16 MiB per row
 	sqlc := db.SQL()
 
+	jsonbCols, err := jsonbColumns(ctx, sqlc, table)
+	if err != nil {
+		return fmt.Errorf("lookup jsonb columns: %w", err)
+	}
+
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -282,14 +287,36 @@ func restoreTable(ctx context.Context, db *nucleus.Client, r io.Reader, table st
 		if err := json.Unmarshal(line, &row); err != nil {
 			return fmt.Errorf("decode row: %w", err)
 		}
-		if err := insertRow(ctx, sqlc, table, row); err != nil {
+		if err := insertRow(ctx, sqlc, table, row, jsonbCols); err != nil {
 			return err
 		}
 	}
 	return scanner.Err()
 }
 
-func insertRow(ctx context.Context, sqlc *nucleus.SQLModel, table string, row map[string]any) error {
+// jsonbColumns returns the set of JSONB-typed columns for a table, so restore
+// can normalize values the engine would reject. Archives from lenient-era
+// engines can carry empty-string JSONB values ('' used to be coerced;
+// Postgres-parity engines reject it with "invalid input syntax for type
+// json"), and those rows must restore as SQL NULL instead of failing.
+func jsonbColumns(ctx context.Context, sqlc *nucleus.SQLModel, table string) (map[string]bool, error) {
+	type colRow struct {
+		ColumnName string `db:"column_name"`
+	}
+	rows, err := nucleus.Query[colRow](ctx, sqlc,
+		`SELECT column_name FROM information_schema.columns
+		 WHERE table_name = $1 AND UPPER(data_type) = 'JSONB'`, table)
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		set[r.ColumnName] = true
+	}
+	return set, nil
+}
+
+func insertRow(ctx context.Context, sqlc *nucleus.SQLModel, table string, row map[string]any, jsonbCols map[string]bool) error {
 	cols := make([]string, 0, len(row))
 	for k := range row {
 		if !validIdent.MatchString(k) {
@@ -304,7 +331,7 @@ func insertRow(ctx context.Context, sqlc *nucleus.SQLModel, table string, row ma
 	values := make([]any, len(cols))
 	for i, c := range cols {
 		placeholders[i] = fmt.Sprintf("$%d", i+1)
-		values[i] = formatValue(row[c])
+		values[i] = formatValue(row[c], jsonbCols[c])
 	}
 
 	query := fmt.Sprintf(
@@ -317,13 +344,20 @@ func insertRow(ctx context.Context, sqlc *nucleus.SQLModel, table string, row ma
 	return err
 }
 
-func formatValue(v any) any {
+func formatValue(v any, isJSONB bool) any {
 	// Nucleus's pgwire wants text for BIGINT/JSONB columns. json.Unmarshal
 	// gives us string|float64|bool|map|slice|nil — map/slice need JSON text.
 	switch val := v.(type) {
 	case map[string]any, []any:
 		raw, _ := json.Marshal(val)
 		return string(raw)
+	case string:
+		// Lenient-era archives carry '' for JSONB columns; strict engines
+		// reject it. Restore as NULL (the modern write path's equivalent).
+		if isJSONB && val == "" {
+			return nil
+		}
+		return v
 	default:
 		return v
 	}
