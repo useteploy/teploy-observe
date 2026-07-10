@@ -14,9 +14,11 @@ import (
 )
 
 // Engine runs every registered detector across a span batch and persists the
-// resulting issues into performance_issues. Re-detections of the same
-// fingerprint extend last_seen + bump count via the replacing_mergetree merge
-// (see migration 015).
+// resulting issues into performance_issues (a replacing_mergetree keyed on
+// fingerprint, see migration 015). The replacing merge REPLACES rows — it does
+// not sum — so re-detection totals are accumulated explicitly on write via an
+// atomic KV counter; the newest row (highest last_seen) wins the merge and
+// carries the running count + earliest first_seen. See Persist.
 type Engine struct {
 	db        *nucleus.Client
 	logger    *slog.Logger
@@ -71,13 +73,50 @@ func (e *Engine) Persist(ctx context.Context, siteID string, spans []Span) {
 		return
 	}
 	sql := e.db.SQL()
+	kv := e.db.KV()
 	for _, iss := range issues {
-		// issue_id is per-detection (not per-fingerprint) so a re-fire of
-		// the same group still gets a unique row PK; the replacing
-		// mergetree dedupe collapses on (tenant_id, site_id, fingerprint)
-		// at read time.
+		// performance_issues is a replacing_mergetree keyed on
+		// (tenant_id, site_id, fingerprint) with version_column=last_seen, and
+		// Nucleus DOES apply replacing dedup on read — so every re-detection
+		// of a fingerprint collapses at read time to the single highest-
+		// last_seen row. Writing count=1 per detection therefore undercounts
+		// permanently (the surviving row always reads count=1) and pins
+		// first_seen to the LATEST detection instead of the earliest.
+		//
+		// Accumulate on write instead. The running count lives in an atomic KV
+		// counter (kv.Incr) so concurrent detector batches for the same
+		// fingerprint can't lose an increment — a plain SELECT-then-INSERT
+		// read-modify-write on the DB would race here. The new row's last_seen
+		// is the newest, so it wins the replacing merge carrying the
+		// accumulated count + earliest first_seen.
+		countKey := "perf:count:" + siteID + ":" + iss.Fingerprint
+		count, err := kv.Incr(ctx, countKey)
+		if err != nil {
+			e.logger.Warn("perf_issue: count incr failed",
+				"detector", iss.DetectorName, "fingerprint", iss.Fingerprint, "err", err)
+			count = 1 // best-effort: still record the detection
+		}
+
+		// first_seen must be the MINIMUM observed time, not the first writer's:
+		// detection batches can arrive out of order. Read-modify-write min via
+		// KV. The count above is the number that must be exact (it drives
+		// severity/sorting), so it gets the atomic counter; a rare race here
+		// only mis-pins first_seen by the gap between two near-simultaneous
+		// first detections, which is immaterial for a "first seen" display.
+		firstSeen := iss.FirstSeen
+		firstKey := "perf:first:" + siteID + ":" + iss.Fingerprint
+		if b, err := kv.Get(ctx, firstKey); err == nil && b != nil {
+			if stored, perr := strconv.ParseInt(string(b), 10, 64); perr == nil && stored < firstSeen {
+				firstSeen = stored
+			}
+		}
+		if err := kv.Set(ctx, firstKey, []byte(strconv.FormatInt(firstSeen, 10))); err != nil {
+			e.logger.Warn("perf_issue: first_seen set failed",
+				"fingerprint", iss.Fingerprint, "err", err)
+		}
+
 		issueID := genID()
-		_, err := sql.Exec(ctx,
+		_, err = sql.Exec(ctx,
 			`INSERT INTO performance_issues (
 				issue_id, tenant_id, site_id, trace_id,
 				detector_name, fingerprint, title, description,
@@ -86,8 +125,8 @@ func (e *Engine) Persist(ctx context.Context, siteID string, spans []Span) {
 			issueID, siteID, iss.TraceID,
 			iss.DetectorName, iss.Fingerprint, iss.Title, iss.Description,
 			iss.Severity,
-			"1",
-			dbutil.IntParam(iss.FirstSeen),
+			strconv.FormatInt(count, 10),
+			dbutil.IntParam(firstSeen),
 			dbutil.IntParam(iss.LastSeen),
 		)
 		if err != nil {

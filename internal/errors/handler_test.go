@@ -72,7 +72,7 @@ func TestIngestErrorEvent_InsertsAndIndexes(t *testing.T) {
 	// Sanity-call IndexError directly — surfaces vendored-SDK issues
 	// that the wrapper silently swallows. If this fails, it's a Nucleus
 	// dogfood finding, not a wrapper bug.
-	if err := searchSvc.IndexError(ctx, "explicit-test-"+uniq, "TestIngestError", "explicit "+uniq); err != nil {
+	if err := searchSvc.IndexError(ctx, "default", "explicit-test-"+uniq, "TestIngestError", "explicit "+uniq); err != nil {
 		t.Fatalf("IndexError direct call: %v", err)
 	}
 
@@ -90,7 +90,7 @@ func TestIngestErrorEvent_InsertsAndIndexes(t *testing.T) {
 	}
 
 	// (2) FTS path resolves the same event by message substring.
-	hits, err := searchSvc.Search(ctx, uniq, 10)
+	hits, err := searchSvc.Search(ctx, "default", uniq, 10)
 	if err != nil {
 		t.Fatalf("FTS search after ingest: %v", err)
 	}

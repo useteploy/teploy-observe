@@ -227,7 +227,7 @@ func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (strin
 
 	// Index in FTS for BM25 search (non-fatal — search degrades gracefully).
 	if s.searchSvc != nil {
-		if err := s.searchSvc.IndexError(ctx, errorID, input.ErrorType, input.ErrorValue); err != nil {
+		if err := s.searchSvc.IndexError(ctx, input.SiteID, errorID, input.ErrorType, input.ErrorValue); err != nil {
 			// Log but don't fail the ingestion. Operators can rebuild via
 			// `observe reindex` if FTS files are corrupted or missing.
 			_ = err

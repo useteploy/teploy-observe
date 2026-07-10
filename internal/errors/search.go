@@ -18,10 +18,11 @@ func NewSearchService(db *nucleus.Client) *SearchService {
 	return &SearchService{db: db}
 }
 
-// IndexError indexes an error event's message for full-text search.
-// Uses a KV counter for sequential FTS doc IDs, with a reverse mapping
-// from doc_id to error_id stored in KV.
-func (s *SearchService) IndexError(ctx context.Context, errorID, errorType, errorValue string) error {
+// IndexError indexes an error event's message for full-text search, tagged
+// with its site_id as a facet so Search can rank within a single site's
+// documents. Uses a KV counter for globally-sequential FTS doc IDs (unique
+// across sites), with a reverse mapping from doc_id to error_id stored in KV.
+func (s *SearchService) IndexError(ctx context.Context, siteID, errorID, errorType, errorValue string) error {
 	kv := s.db.KV()
 	fts := s.db.FTS()
 
@@ -36,9 +37,9 @@ func (s *SearchService) IndexError(ctx context.Context, errorID, errorType, erro
 		return fmt.Errorf("fts mapping set: %w", err)
 	}
 
-	// Index the searchable text
+	// Index the searchable text, partitioned by site so BM25 ranks per-site.
 	text := errorType + ": " + errorValue
-	if _, err := fts.Index(ctx, docID, text); err != nil {
+	if _, err := fts.IndexFaceted(ctx, docID, text, "site_id", siteID); err != nil {
 		return fmt.Errorf("fts index: %w", err)
 	}
 
@@ -51,15 +52,20 @@ type SearchResult struct {
 	Score   float64 `json:"score"`
 }
 
-// Search performs a BM25-ranked full-text search across error messages.
-func (s *SearchService) Search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
+// Search performs a BM25-ranked full-text search across a single site's error
+// messages. Scoping by the site_id facet keeps one busy site's hits from
+// crowding another site out of the result budget (the whole-instance index is
+// shared). Note: the site-scoped path does not fuzzy-match (the engine's
+// faceted search is exact-term) — a deliberate trade of fuzziness for
+// per-site completeness.
+func (s *SearchService) Search(ctx context.Context, siteID, query string, limit int) ([]SearchResult, error) {
 	if limit <= 0 {
 		limit = 20
 	}
 	fts := s.db.FTS()
 	kv := s.db.KV()
 
-	results, err := fts.Search(ctx, query, nucleus.WithFTSLimit(int64(limit)), nucleus.WithFuzzy(1))
+	results, err := fts.SearchFilter(ctx, query, "site_id", siteID, nucleus.WithFTSLimit(int64(limit)))
 	if err != nil {
 		return nil, fmt.Errorf("fts search: %w", err)
 	}
@@ -82,7 +88,7 @@ func (s *SearchService) Search(ctx context.Context, query string, limit int) ([]
 
 // SearchErrors performs FTS and then fetches the full error events.
 func (s *SearchService) SearchErrors(ctx context.Context, siteID, query string, limit int) ([]ErrorEvent, error) {
-	hits, err := s.Search(ctx, query, limit)
+	hits, err := s.Search(ctx, siteID, query, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +126,7 @@ func (s *SearchService) SearchErrors(ctx context.Context, siteID, query string, 
 
 // SearchIssues performs FTS and groups results by issue_id, returning matching issues.
 func (s *SearchService) SearchIssues(ctx context.Context, siteID, query string, limit int) ([]Issue, error) {
-	hits, err := s.Search(ctx, query, limit*2) // fetch more to account for grouping
+	hits, err := s.Search(ctx, siteID, query, limit*2) // fetch more to account for grouping
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +286,7 @@ func (s *SearchService) ReindexAll(
 		for _, r := range rows {
 			p.Scanned++
 			if !dryRun {
-				if err := s.IndexError(ctx, r.ErrorID, r.ErrorType, r.ErrorValue); err != nil {
+				if err := s.IndexError(ctx, r.SiteID, r.ErrorID, r.ErrorType, r.ErrorValue); err != nil {
 					return p, fmt.Errorf("reindex: index error_id=%s: %w", r.ErrorID, err)
 				}
 				p.Indexed++
