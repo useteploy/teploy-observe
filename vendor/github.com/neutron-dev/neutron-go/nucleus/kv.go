@@ -148,26 +148,16 @@ func (kv *KVModel) Incr(ctx context.Context, key string, amount ...int64) (int64
 	if err := kv.client.requireNucleus("KV.Incr"); err != nil {
 		return 0, err
 	}
-	// nucleus_dogfood #22 sibling — KV_INCR returns BIGINT but pgwire
-	// describes the column as TEXT, so pgx tries to parse the raw 8-byte
-	// big-endian payload as a decimal string and fails. Wrap in CAST AS
-	// TEXT so the server emits the digits.
-	var raw string
+	// Requires nucleus >= the #22/#23 pgwire fix (KV_INCR is described as
+	// BIGINT, so the value scans natively).
+	var val int64
 	var err error
 	if len(amount) > 0 {
-		err = kv.pool.QueryRow(ctx, "SELECT CAST(KV_INCR($1, CAST($2 AS BIGINT)) AS TEXT)",
-			key, fmt.Sprintf("%d", amount[0])).Scan(&raw)
+		err = kv.pool.QueryRow(ctx, "SELECT KV_INCR($1, $2)", key, amount[0]).Scan(&val)
 	} else {
-		err = kv.pool.QueryRow(ctx, "SELECT CAST(KV_INCR($1) AS TEXT)", key).Scan(&raw)
+		err = kv.pool.QueryRow(ctx, "SELECT KV_INCR($1)", key).Scan(&val)
 	}
-	if err != nil {
-		return 0, wrapErr("kv incr", err)
-	}
-	val, perr := strconv.ParseInt(raw, 10, 64)
-	if perr != nil {
-		return 0, wrapErr("kv incr parse", perr)
-	}
-	return val, nil
+	return val, wrapErr("kv incr", err)
 }
 
 // TTL returns the remaining TTL in seconds. -1 means no TTL, -2 means key missing.
@@ -264,7 +254,11 @@ func (kv *KVModel) LRange(ctx context.Context, key string, start, stop int64) ([
 	if raw == "" {
 		return nil, nil
 	}
-	return strings.Split(raw, ","), nil
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, wrapErr("kv lrange decode", err)
+	}
+	return out, nil
 }
 
 // LLen returns the length of a list.
@@ -343,10 +337,13 @@ func (kv *KVModel) HGetAll(ctx context.Context, key string) (map[string]string, 
 	if raw == "" {
 		return result, nil
 	}
-	for _, pair := range strings.Split(raw, ",") {
-		parts := strings.SplitN(pair, "=", 2)
-		if len(parts) == 2 {
-			result[parts[0]] = parts[1]
+	var pairs [][]string
+	if err := json.Unmarshal([]byte(raw), &pairs); err != nil {
+		return nil, wrapErr("kv hgetall decode", err)
+	}
+	for _, pair := range pairs {
+		if len(pair) == 2 {
+			result[pair[0]] = pair[1]
 		}
 	}
 	return result, nil
@@ -397,7 +394,11 @@ func (kv *KVModel) SMembers(ctx context.Context, key string) ([]string, error) {
 	if raw == "" {
 		return nil, nil
 	}
-	return strings.Split(raw, ","), nil
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, wrapErr("kv smembers decode", err)
+	}
+	return out, nil
 }
 
 // SIsMember checks if a member exists in a set.
@@ -442,10 +443,7 @@ func (kv *KVModel) ZRange(ctx context.Context, key string, start, stop int64) ([
 	if err != nil {
 		return nil, wrapErr("kv zrange", err)
 	}
-	if raw == "" {
-		return nil, nil
-	}
-	return strings.Split(raw, ","), nil
+	return decodeZMembers("kv zrange", raw)
 }
 
 // ZRangeByScore returns members with scores between min and max.
@@ -458,10 +456,47 @@ func (kv *KVModel) ZRangeByScore(ctx context.Context, key string, min, max float
 	if err != nil {
 		return nil, wrapErr("kv zrangebyscore", err)
 	}
+	return decodeZMembers("kv zrangebyscore", raw)
+}
+
+// decodeZMembers parses the engine's JSON [member, score] pair array into the
+// "member:score" string slice shape the sorted-set methods expose. An empty
+// collection ("" or "[]") yields a nil slice. Scores are rendered with the
+// minimum digits needed to represent them (strconv 'g'), matching the prior
+// integer-style "member:1" output for whole numbers.
+func decodeZMembers(op, raw string) ([]string, error) {
 	if raw == "" {
 		return nil, nil
 	}
-	return strings.Split(raw, ","), nil
+	var pairs []struct {
+		Member string
+		Score  float64
+	}
+	tuples := make([][2]json.RawMessage, 0)
+	if err := json.Unmarshal([]byte(raw), &tuples); err != nil {
+		return nil, wrapErr(op+" decode", err)
+	}
+	for _, t := range tuples {
+		var p struct {
+			Member string
+			Score  float64
+		}
+		if err := json.Unmarshal(t[0], &p.Member); err != nil {
+			return nil, wrapErr(op+" decode member", err)
+		}
+		if err := json.Unmarshal(t[1], &p.Score); err != nil {
+			return nil, wrapErr(op+" decode score", err)
+		}
+		pairs = append(pairs, p)
+	}
+	if len(pairs) == 0 {
+		return nil, nil
+	}
+	out := make([]string, len(pairs))
+	for i, p := range pairs {
+		out[i] = p.Member + ":" + strconv.FormatFloat(p.Score, 'g', -1, 64)
+	}
+	return out, nil
 }
 
 // ZRem removes a member from a sorted set.
@@ -504,6 +539,28 @@ func (kv *KVModel) PFCount(ctx context.Context, key string) (int64, error) {
 	var n int64
 	err := kv.pool.QueryRow(ctx, "SELECT KV_PFCOUNT($1)", key).Scan(&n)
 	return n, wrapErr("kv pfcount", err)
+}
+
+// PFMerge merges the source HyperLogLogs into dest (their set union). Use this
+// for a unique count across buckets — summing per-bucket PFCounts over-counts
+// elements seen in more than one bucket.
+func (kv *KVModel) PFMerge(ctx context.Context, dest string, sources ...string) error {
+	if err := kv.client.requireNucleus("KV.PFMerge"); err != nil {
+		return err
+	}
+	if len(sources) == 0 {
+		return nil
+	}
+	args := make([]any, 0, len(sources)+1)
+	args = append(args, dest)
+	placeholders := make([]string, 0, len(sources)+1)
+	placeholders = append(placeholders, "$1")
+	for i, s := range sources {
+		args = append(args, s)
+		placeholders = append(placeholders, fmt.Sprintf("$%d", i+2))
+	}
+	_, err := kv.pool.Exec(ctx, "SELECT KV_PFMERGE("+strings.Join(placeholders, ", ")+")", args...)
+	return wrapErr("kv pfmerge", err)
 }
 
 // --- helpers ---
