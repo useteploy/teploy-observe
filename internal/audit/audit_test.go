@@ -140,6 +140,60 @@ func TestRecordAndList_Integration(t *testing.T) {
 	}
 }
 
+func TestTimeFilter_Integration(t *testing.T) {
+	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
+	if dsn == "" {
+		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
+	}
+	ctx := context.Background()
+	db, err := nucleus.Connect(ctx, dsn)
+	if err != nil {
+		t.Skipf("nucleus not reachable at %s — skipping integration test", dsn)
+	}
+	defer db.Close()
+	svc := NewService(db)
+	if _, err := db.SQL().Exec(ctx, `CREATE TABLE IF NOT EXISTS audit_events (
+		audit_id TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT 'default',
+		site_id TEXT NOT NULL DEFAULT 'default', timestamp BIGINT NOT NULL,
+		actor TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT 'user',
+		action TEXT NOT NULL, target TEXT NOT NULL DEFAULT '',
+		result TEXT NOT NULL DEFAULT 'success', source_ip TEXT NOT NULL DEFAULT '',
+		user_agent TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}'
+	) WITH (engine = 'mergetree') ORDER BY (tenant_id, site_id, timestamp)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// Two events for one actor at known, far-apart timestamps. This proves the
+	// CAST(timestamp AS BIGINT) range filter works on real Nucleus (a plain
+	// BIGINT comparison would silently match wrong because Nucleus returns the
+	// column as text over the wire — the gotcha this design guards against).
+	actor := "timefilter-" + genID()
+	if err := svc.Record(ctx, AuditEvent{Actor: actor, Action: "x.old", Timestamp: 1_000}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Record(ctx, AuditEvent{Actor: actor, Action: "x.new", Timestamp: 9_000_000_000_000}); err != nil {
+		t.Fatal(err)
+	}
+
+	// from=2000 must exclude the t=1000 row and keep the recent one.
+	got, err := svc.List(ctx, Filter{Actor: actor, From: 2_000})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 || got[0].Action != "x.new" {
+		t.Fatalf("time filter wrong (CAST(BIGINT) issue?): got %+v", got)
+	}
+
+	// A [1, 5000] window must keep only the old row.
+	got, err = svc.List(ctx, Filter{Actor: actor, From: 1, To: 5_000})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 || got[0].Action != "x.old" {
+		t.Fatalf("bounded window wrong: got %+v", got)
+	}
+}
+
 func TestRecord_ActionRequired(t *testing.T) {
 	// Action validation happens before any DB call, so this needs no Nucleus.
 	svc := NewService(nil)
