@@ -62,6 +62,22 @@ accessories:
     volumes:
       nucleus-data: /data
 
+  # Self-hosted S3: the backup + restore-test target for this stack (no
+  # external object storage needed). Loopback-published so the host-side
+  # `aws` CLI that teploy backup shells out to can reach it; never exposed
+  # publicly. Console (:9001) stays network-internal.
+  minio:
+    image: minio/minio:latest
+    port: 9000
+    command: server /data --console-address :9001
+    publish:
+      - 127.0.0.1:9100:9000
+    env:
+      MINIO_ROOT_USER: teploy-backup
+      MINIO_ROOT_PASSWORD: secret:MINIO_ROOT_PASSWORD
+    volumes:
+      minio-data: /data
+
 env:
   OBSERVE_ADDR: ":3000"
   OBSERVE_NUCLEUS_URL: "postgres://observe-nucleus:5432/observe"
