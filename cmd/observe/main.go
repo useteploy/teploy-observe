@@ -30,6 +30,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/export"
 	"github.com/useteploy/teploy-observe/internal/backup"
 	"github.com/useteploy/teploy-observe/internal/aiquery"
+	"github.com/useteploy/teploy-observe/internal/audit"
 	"github.com/useteploy/teploy-observe/internal/incidents"
 	"github.com/useteploy/teploy-observe/internal/ingest"
 	"github.com/useteploy/teploy-observe/internal/jobs"
@@ -275,6 +276,7 @@ func main() {
 	aiSchema := aiquery.NewSchemaCard(db)
 	scheduledExportSvc := jobs.NewExportService(db, explorerSvc, logger)
 	incidentSvc := incidents.NewService(db)
+	auditSvc := audit.NewService(db)
 
 	// A cron check-in resolves any open missed-cron incident for that monitor.
 	cronSvc.OnCheckin = func(ctx context.Context, c monitoring.CronMonitor) {
@@ -396,7 +398,7 @@ func main() {
 	// IP-keyed rate limit on login throttles password brute-force (10/min/IP).
 	loginLimiter := ingest.NewRateLimiter(10, time.Minute, 10)
 	loginGroup := r.Group("/api/v1", ipRateLimitMW(loginLimiter))
-	neutron.Post(loginGroup, "/auth/login", loginHandler(authSvc),
+	neutron.Post(loginGroup, "/auth/login", loginHandler(authSvc, auditSvc),
 		neutron.WithTags("auth"),
 		neutron.WithSummary("Login and receive JWT token"),
 	)
@@ -804,6 +806,11 @@ func main() {
 	r.Handle("GET /api/v1/incidents", jwtMW(incidentsListHandler(incidentSvc)))
 	r.Handle("POST /api/v1/incidents", jwtMW(requireEditor(incidentsCreateHandler(incidentSvc))))
 	r.Handle("POST /api/v1/incidents/{incident_id}/close", jwtMW(requireEditor(incidentsCloseHandler(incidentSvc))))
+
+	// --- Audit log (admin-only reads — the trail can expose secrets/PII;
+	// editor+ writes so trusted producers CLI/dash/Ship can emit events) ---
+	r.Handle("GET /api/v1/audit", jwtMW(requireAdmin(auditListHandler(auditSvc))))
+	r.Handle("POST /api/v1/audit", jwtMW(requireEditor(auditRecordHandler(auditSvc))))
 
 	// --- Feature flags (JWT auth + public evaluate; editor+ writes) ---
 	flagGroup := r.Group("/api/v1/flags", jwtMW)
@@ -1530,12 +1537,26 @@ type loginResponse struct {
 	Token string `json:"token"`
 }
 
-func loginHandler(authSvc *auth.AuthService) neutron.HandlerFunc[loginInput, loginResponse] {
+func loginHandler(authSvc *auth.AuthService, auditSvc *audit.Service) neutron.HandlerFunc[loginInput, loginResponse] {
 	return func(ctx context.Context, input loginInput) (loginResponse, error) {
 		if input.Username == "" || input.Password == "" {
 			return loginResponse{}, neutron.ErrBadRequest("username and password required")
 		}
 		token, err := authSvc.Login(ctx, input.Username, input.Password)
+		// Best-effort audit: record who attempted to log in and whether it
+		// succeeded. A failed audit write must never block (or fail) a login,
+		// so the error is intentionally dropped. Source IP isn't available on
+		// this typed handler; the auth trail still captures actor/when/result.
+		result := audit.ResultSuccess
+		if err != nil {
+			result = audit.ResultFailure
+		}
+		_ = auditSvc.Record(ctx, audit.AuditEvent{
+			Actor:     input.Username,
+			ActorType: audit.ActorUser,
+			Action:    "auth.login",
+			Result:    result,
+		})
 		if err != nil {
 			return loginResponse{}, neutron.ErrUnauthorized("invalid credentials")
 		}
