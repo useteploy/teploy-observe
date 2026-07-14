@@ -16,6 +16,22 @@ import (
 type auditStore interface {
 	List(ctx context.Context, f audit.Filter) ([]audit.AuditEvent, error)
 	Record(ctx context.Context, ev audit.AuditEvent) error
+	Verify(ctx context.Context) (audit.VerifyResult, error)
+}
+
+// auditVerifyHandler walks the tamper-evidence hash chain and reports whether
+// it's intact (and where it broke, if not). Admin-only.
+func auditVerifyHandler(store auditStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		res, err := store.Verify(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			return
+		}
+		json.NewEncoder(w).Encode(res)
+	}
 }
 
 // auditListHandler serves the admin-only audit query. Filters come from the

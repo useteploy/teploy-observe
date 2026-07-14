@@ -31,6 +31,7 @@ type Config struct {
 
 	// Auth
 	JWTSecret     string
+	AuditKey      string
 	AdminUser     string
 	AdminPassword string
 
@@ -53,6 +54,7 @@ func Load() Config {
 		RateLimit:           envInt("OBSERVE_RATE_LIMIT", 1000),
 		TrustedProxies:      envOr("OBSERVE_TRUSTED_PROXIES", ""),
 		JWTSecret:           envOr("OBSERVE_JWT_SECRET", ""),
+		AuditKey:            envOr("OBSERVE_AUDIT_KEY", ""),
 		AdminUser:           envOr("OBSERVE_ADMIN_USER", "admin"),
 		AdminPassword:       envOr("OBSERVE_ADMIN_PASSWORD", ""),
 		DemoMode:            envOr("OBSERVE_DEMO_MODE", "") == "true",

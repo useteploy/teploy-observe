@@ -276,7 +276,14 @@ func main() {
 	aiSchema := aiquery.NewSchemaCard(db)
 	scheduledExportSvc := jobs.NewExportService(db, explorerSvc, logger)
 	incidentSvc := incidents.NewService(db)
-	auditSvc := audit.NewService(db)
+	// Audit chain HMAC key: prefer a dedicated OBSERVE_AUDIT_KEY, else fall back
+	// to the JWT secret so the tamper-evidence chain is keyed by default. For
+	// strongest guarantees set a separate audit key held outside the DB host.
+	auditKey := cfg.AuditKey
+	if auditKey == "" {
+		auditKey = cfg.JWTSecret
+	}
+	auditSvc := audit.NewService(db, []byte(auditKey))
 
 	// A cron check-in resolves any open missed-cron incident for that monitor.
 	cronSvc.OnCheckin = func(ctx context.Context, c monitoring.CronMonitor) {
@@ -823,6 +830,10 @@ func main() {
 	// editor+ writes so trusted producers CLI/dash/Ship can emit events) ---
 	r.Handle("GET /api/v1/audit", jwtMW(requireAdmin(auditListHandler(auditSvc))))
 	r.Handle("POST /api/v1/audit", jwtMW(requireEditor(auditRecordHandler(auditSvc))))
+	// Tamper-evidence: walk the hash chain and report whether it's intact.
+	r.Handle("GET /api/v1/audit/verify", jwtMW(requireAdmin(auditVerifyHandler(auditSvc))))
+	// Compliance control-status report (the evidence-layer surface).
+	r.Handle("GET /api/v1/compliance", jwtMW(requireAdmin(complianceHandler(auditSvc, true, cfg.DemoMode, auditKey != ""))))
 
 	// --- Feature flags (JWT auth + public evaluate; editor+ writes) ---
 	flagGroup := r.Group("/api/v1/flags", jwtMW)

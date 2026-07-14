@@ -8,11 +8,16 @@ package audit
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -34,6 +39,13 @@ type AuditEvent struct {
 	SourceIP  string `json:"source_ip" db:"source_ip"`
 	UserAgent string `json:"user_agent" db:"user_agent"`
 	Metadata  string `json:"metadata" db:"metadata"` // JSON object of extra context
+
+	// Tamper-evidence chain. Seq is a per-writer monotonic counter; Hash is
+	// HMAC(key, prev_hash || event fields); PrevHash links to the previous
+	// record. Any edit/delete/insert breaks the chain (see Verify).
+	Seq      int64  `json:"seq" db:"seq"`
+	PrevHash string `json:"prev_hash" db:"prev_hash"`
+	Hash     string `json:"hash" db:"hash"`
 }
 
 // Result constants.
@@ -58,13 +70,114 @@ const (
 
 // Service is the audit store. Construct one shared instance and hand it to
 // every producer (like the other observe services).
+//
+// It maintains a tamper-evidence hash chain: writes are serialized behind mu
+// and each record's Hash = HMAC(key, prev_hash || fields). This assumes a
+// single writer (one observe instance owns the chain). A multi-writer setup
+// would need a shared sequence — documented, not supported here.
 type Service struct {
-	db *nucleus.Client
+	db  *nucleus.Client
+	key []byte
+
+	mu       sync.Mutex
+	lastHash string
+	lastSeq  int64
+	loaded   bool
 }
 
-// NewService wires the audit store to the shared Nucleus client.
-func NewService(db *nucleus.Client) *Service {
-	return &Service{db: db}
+// NewService wires the audit store to the shared Nucleus client. key is the
+// HMAC key for the tamper-evidence chain — without it (nil), the chain still
+// links but a DB-level attacker could recompute it; with a key held outside the
+// DB, they can't forge the chain.
+func NewService(db *nucleus.Client, key []byte) *Service {
+	return &Service{db: db, key: key}
+}
+
+// computeHash is the keyed chain hash over prev_hash + the event's fields,
+// length-prefixed so no field value can be smuggled across a delimiter.
+func (s *Service) computeHash(ev AuditEvent) string {
+	mac := hmac.New(sha256.New, s.key)
+	write := func(v string) {
+		var n [8]byte
+		binary.BigEndian.PutUint64(n[:], uint64(len(v)))
+		mac.Write(n[:])
+		mac.Write([]byte(v))
+	}
+	write(ev.PrevHash)
+	write(strconv.FormatInt(ev.Seq, 10))
+	write(strconv.FormatInt(ev.Timestamp, 10))
+	write(ev.AuditID)
+	write(ev.TenantID)
+	write(ev.SiteID)
+	write(ev.Actor)
+	write(ev.ActorType)
+	write(ev.Action)
+	write(ev.Target)
+	write(ev.Result)
+	write(ev.SourceIP)
+	write(ev.UserAgent)
+	write(ev.Metadata)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// loadStateLocked reads the chain head (highest seq + its hash) so a restarted
+// process continues the same chain. Call under mu.
+func (s *Service) loadStateLocked(ctx context.Context) error {
+	rows, err := nucleus.Query[AuditEvent](ctx, s.db.SQL(),
+		"SELECT "+auditColumns+" FROM audit_events ORDER BY CAST(seq AS BIGINT) DESC LIMIT 1")
+	if err != nil {
+		return err
+	}
+	if len(rows) > 0 {
+		s.lastSeq = rows[0].Seq
+		s.lastHash = rows[0].Hash
+	}
+	s.loaded = true
+	return nil
+}
+
+// VerifyResult reports whether the audit chain is intact.
+type VerifyResult struct {
+	Intact      bool   `json:"intact"`
+	Count       int    `json:"count"`
+	BrokenAtSeq int64  `json:"broken_at_seq,omitempty"`
+	Detail      string `json:"detail,omitempty"`
+}
+
+// Verify walks the whole chain in order and recomputes each hash. It detects a
+// modified row (hash mismatch), a deleted row (sequence gap), and a relinked or
+// inserted row (prev_hash mismatch). Returns the first break, if any.
+func (s *Service) Verify(ctx context.Context) (VerifyResult, error) {
+	rows, err := nucleus.Query[AuditEvent](ctx, s.db.SQL(),
+		"SELECT "+auditColumns+" FROM audit_events ORDER BY CAST(seq AS BIGINT) ASC")
+	if err != nil {
+		return VerifyResult{}, err
+	}
+	return verifyChain(rows, s.computeHash), nil
+}
+
+// verifyChain is the pure chain-verification core (DB-less, unit-tested). Rows
+// must be in ascending seq order.
+func verifyChain(rows []AuditEvent, hashFn func(AuditEvent) string) VerifyResult {
+	prev := ""
+	var expectSeq int64 = 1
+	for _, ev := range rows {
+		if ev.Seq != expectSeq {
+			return VerifyResult{Count: len(rows), BrokenAtSeq: ev.Seq,
+				Detail: fmt.Sprintf("sequence gap: expected %d, got %d (record deleted or reordered)", expectSeq, ev.Seq)}
+		}
+		if ev.PrevHash != prev {
+			return VerifyResult{Count: len(rows), BrokenAtSeq: ev.Seq,
+				Detail: "prev_hash mismatch (record inserted or chain relinked)"}
+		}
+		if hashFn(ev) != ev.Hash {
+			return VerifyResult{Count: len(rows), BrokenAtSeq: ev.Seq,
+				Detail: "hash mismatch (record contents modified)"}
+		}
+		prev = ev.Hash
+		expectSeq++
+	}
+	return VerifyResult{Intact: true, Count: len(rows)}
 }
 
 // Filter narrows an audit query. All fields are optional; zero-value = no
@@ -79,7 +192,7 @@ type Filter struct {
 	Limit  int
 }
 
-var auditColumns = "audit_id, tenant_id, site_id, timestamp, actor, actor_type, action, target, result, source_ip, user_agent, metadata"
+var auditColumns = "audit_id, tenant_id, site_id, timestamp, actor, actor_type, action, target, result, source_ip, user_agent, metadata, seq, prev_hash, hash"
 
 // Record writes one audit event synchronously (never via the lossy ingest
 // buffer — an audit trail must be durable and immediate). Defaults are filled
@@ -110,13 +223,31 @@ func (s *Service) Record(ctx context.Context, ev AuditEvent) error {
 		ev.Metadata = "{}"
 	}
 
+	// Serialize writes to keep the hash chain linear and gap-free.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.loaded {
+		if err := s.loadStateLocked(ctx); err != nil {
+			return fmt.Errorf("audit: loading chain head: %w", err)
+		}
+	}
+	ev.Seq = s.lastSeq + 1
+	ev.PrevHash = s.lastHash
+	ev.Hash = s.computeHash(ev)
+
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO audit_events (`+auditColumns+`)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
 		ev.AuditID, ev.TenantID, ev.SiteID, dbutil.IntParam(ev.Timestamp),
 		ev.Actor, ev.ActorType, ev.Action, ev.Target, ev.Result,
-		ev.SourceIP, ev.UserAgent, ev.Metadata)
-	return err
+		ev.SourceIP, ev.UserAgent, ev.Metadata,
+		dbutil.IntParam(ev.Seq), ev.PrevHash, ev.Hash)
+	if err != nil {
+		return err
+	}
+	s.lastSeq = ev.Seq
+	s.lastHash = ev.Hash
+	return nil
 }
 
 // List returns audit events matching the filter, newest first.

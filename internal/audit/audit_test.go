@@ -106,7 +106,7 @@ func TestRecordAndList_Integration(t *testing.T) {
 	}
 	defer db.Close()
 
-	svc := NewService(db)
+	svc := NewService(db, []byte("test-audit-key"))
 	// The migration may not have run against this ad-hoc DB; create the table.
 	if _, err := db.SQL().Exec(ctx, `CREATE TABLE IF NOT EXISTS audit_events (
 		audit_id TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT 'default',
@@ -114,7 +114,8 @@ func TestRecordAndList_Integration(t *testing.T) {
 		actor TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT 'user',
 		action TEXT NOT NULL, target TEXT NOT NULL DEFAULT '',
 		result TEXT NOT NULL DEFAULT 'success', source_ip TEXT NOT NULL DEFAULT '',
-		user_agent TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}'
+		user_agent TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}',
+		seq BIGINT NOT NULL DEFAULT 0, prev_hash TEXT NOT NULL DEFAULT '', hash TEXT NOT NULL DEFAULT ''
 	) WITH (engine = 'mergetree') ORDER BY (tenant_id, site_id, timestamp)`); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
@@ -151,14 +152,15 @@ func TestTimeFilter_Integration(t *testing.T) {
 		t.Skipf("nucleus not reachable at %s — skipping integration test", dsn)
 	}
 	defer db.Close()
-	svc := NewService(db)
+	svc := NewService(db, []byte("test-audit-key"))
 	if _, err := db.SQL().Exec(ctx, `CREATE TABLE IF NOT EXISTS audit_events (
 		audit_id TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT 'default',
 		site_id TEXT NOT NULL DEFAULT 'default', timestamp BIGINT NOT NULL,
 		actor TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT 'user',
 		action TEXT NOT NULL, target TEXT NOT NULL DEFAULT '',
 		result TEXT NOT NULL DEFAULT 'success', source_ip TEXT NOT NULL DEFAULT '',
-		user_agent TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}'
+		user_agent TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}',
+		seq BIGINT NOT NULL DEFAULT 0, prev_hash TEXT NOT NULL DEFAULT '', hash TEXT NOT NULL DEFAULT ''
 	) WITH (engine = 'mergetree') ORDER BY (tenant_id, site_id, timestamp)`); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
@@ -196,7 +198,7 @@ func TestTimeFilter_Integration(t *testing.T) {
 
 func TestRecord_ActionRequired(t *testing.T) {
 	// Action validation happens before any DB call, so this needs no Nucleus.
-	svc := NewService(nil)
+	svc := NewService(nil, nil)
 	if err := svc.Record(context.Background(), AuditEvent{Actor: "x"}); err == nil {
 		t.Fatal("expected error when action is empty")
 	}
