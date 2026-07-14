@@ -386,6 +386,18 @@ func main() {
 		}),
 		neutron.WithMiddleware(ingest.RequestInfoMiddleware(ingest.ParseTrustedProxies(cfg.TrustedProxies))),
 		neutron.WithMiddleware(config.DemoModeMiddleware(cfg.DemoMode)),
+		// Record every admin mutation to the audit trail (comprehensive
+		// "who did what" coverage without wiring each handler). Runs after
+		// RequestInfo so the client IP is resolved; skips the telemetry
+		// firehose + auth (login is recorded directly). See audit_middleware.go.
+		neutron.WithMiddleware(auditMiddleware(auditSvc, func(tok string) (string, bool) {
+			claims, err := authSvc.ValidateToken(tok)
+			if err != nil {
+				return "", false
+			}
+			u, _ := claims["username"].(string)
+			return u, u != ""
+		})),
 		neutron.WithNucleusChecker(db),
 		neutron.WithOpenAPIInfo("Teploy Observe", version),
 		// /docs is reserved for the in-product docs page; Swagger UI lives at /api/docs.
