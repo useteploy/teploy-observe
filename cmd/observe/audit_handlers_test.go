@@ -33,6 +33,26 @@ func (f *fakeAuditStore) Record(_ context.Context, ev audit.AuditEvent) error {
 	return nil
 }
 
+func (f *fakeAuditStore) Verify(_ context.Context) (audit.VerifyResult, error) {
+	return audit.VerifyResult{Intact: true, Count: len(f.recorded)}, nil
+}
+
+func TestAuditVerifyHandler(t *testing.T) {
+	store := &fakeAuditStore{recorded: []audit.AuditEvent{{}, {}}}
+	w := httptest.NewRecorder()
+	auditVerifyHandler(store)(w, httptest.NewRequest("GET", "/api/v1/audit/verify", nil))
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var res audit.VerifyResult
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !res.Intact || res.Count != 2 {
+		t.Errorf("unexpected verify result: %+v", res)
+	}
+}
+
 func TestAuditListHandler_ParsesFilters(t *testing.T) {
 	store := &fakeAuditStore{listResult: []audit.AuditEvent{{AuditID: "a", Action: "auth.login"}}}
 	h := auditListHandler(store)
