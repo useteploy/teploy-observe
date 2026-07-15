@@ -2,6 +2,41 @@
 
 All notable changes to Observe are recorded here.
 
+## v0.1.7 — 2026-07-15
+
+Versions v0.1.1 through v0.1.6 shipped without a changelog entry each — not reconstructed here. This entry covers everything since v0.1.6.
+
+### Added
+
+- **Compliance/audit trail subsystem**: an append-only, admin-only audit log (`GET/POST /api/v1/audit`) covering CLI, dash, and Ship as well as Observe's own admin actions. Every mutating admin API call is recorded automatically via middleware (actor, action, target, result, source IP/UA — denied 401/403 attempts included), not just login. Each record carries a keyed HMAC hash chain (`prev_hash`/`hash`) so tampering (modification, deletion, insertion) is detectable via `GET /api/v1/audit/verify`; the signing key lives outside the database. A compliance control-status view (`GET /api/v1/compliance`) reports which controls Observe can verify (audit logging, tamper-evidence, auth, RBAC, write protection). New admin Audit UI view.
+- **Signed self-downloading upgrade**: `observe upgrade` fetches, SHA256-verifies, and Ed25519-signature-verifies a release before a health-gated swap; refuses downgrades and rolls back on a failed post-upgrade health check. Systemd-owned lifecycle where installed; Homebrew/container-managed binaries point at the right channel instead of attempting an in-place upgrade. **Load-bearing: this release must be the one downloaded by any instance still on ≤ v0.1.6, since only this and later releases carry the `checksums.txt.sig` asset the new verifier requires.**
+- **MinIO accessory** as a self-hosted backup + restore-test target — no external S3 dependency required.
+- `/api/v1/logs/batch` — batched log ingest (mirrors the existing `/events/batch` shape, capped at 200 entries, per-entry failure isolation) for real structured-logging clients that flush in batches rather than one request per line.
+- Exact trace↔error correlation via `trace_id`/`span_id` (previously a timestamp-window heuristic that could cross-contaminate overlapping traces). Go SDK gains `WithSpan()`; browser and Python SDKs gain passthrough fields.
+- Site-scoped error full-text search (each error indexed with a `site_id` facet, search scoped via Nucleus's faceted FTS) so a busy site's results no longer crowd out other sites' search hits.
+- `getSessionId()` on the browser SDK, so a separately-loaded script (e.g. the replay tracker) can correlate its recording with the analytics session instead of defaulting to an orphaned empty session ID.
+- Sourcemap upload now also accepts the site-scoped ingest API key (not just an editor JWT), so CI can upload build-time sourcemaps without a stored interactive-login credential.
+
+### Fixed
+
+- **Browser SDK events were silently dropped entirely**: Go 1.22's stricter method routing rejected the CORS preflight `OPTIONS` request before the CORS middleware ever ran, so every browser `fetch()` with an API key 405'd. Explicit `OPTIONS` handler added ahead of the routing change.
+- **Session replay could never actually send data on any site with an API key configured** (the normal state past initial setup) — `sendBeacon` can't carry custom headers and the XHR fallback never set one either, so every replay batch and rage-click report 401'd silently. Now uses `fetch(..., {keepalive:true})` with the key attached when one is configured.
+- **OTLP ingest rejected real exporters.** Tracing and metrics ingest didn't decompress gzip bodies (`@vercel/otel`, `OTEL_EXPORTER_OTLP_COMPRESSION=gzip` both 400'd) and didn't accept bare-JSON-number `intValue` attributes (only quoted-string, per a stricter spec reading than what `@vercel/otel`/Next.js actually emit) — real-world exporters couldn't land a single span or metric. Both fixed with size-bounded gzip decompression and a lenient int type.
+- **Several JSONB ingest paths silently dropped rows.** Nucleus discards an `INSERT` outright when a JSONB column receives an empty string rather than `null` or a real value — the request reported success (and rollups still wrote) but the underlying row never persisted. Fixed across event properties, errors/llm/logs/replays/surveys ingest, and span attributes/resource/events; audited and fixed at every other JSONB write site in the codebase (view/dashboard config, flags, surveys, SSO, log pipelines) so a lenient-era `''` value can no longer reach the database again. A companion backup-restore fix lands lenient-era `''` values already in old archives as `NULL` on restore against current Nucleus, which rejects them outright.
+- `events`/`events_recent` tables dropped inserts from new connections after their post-creation `ALTER TABLE ADD COLUMN` migrations, due to a Nucleus MergeTree engine bug — recreated as plain OLTP tables (data loss accepted; the rows were never actually persisting).
+- Timestamp range filters (`WHERE timestamp >= $n`) across stats/goals/funnel/retention/correlation/journeys always returned zero rows — a Go string timestamp was encoding as a quoted text literal that Nucleus can't implicitly cast to `BIGINT`. Now passed as raw `int64`.
+- Performance-issue detection counts no longer collapse to 1 on every write — persistence now accumulates via an atomic KV counter instead of relying on read-time dedup of a `replacing_mergetree`, which was overwriting the running count on every detection.
+- Cron monitor creation via the HTTP API never set the monitor's `slug` (the input struct was missing the field), so no heartbeat could ever match a monitor created that way — likely never exercised end-to-end before now.
+
+### Security
+
+- `/api/v1/llm/ingest` had no auth middleware at all despite a comment claiming otherwise — anyone could POST arbitrary usage/cost data into any site. The already-existing, correctly-authenticated handler was dead code, never wired to a route; it's wired in now.
+- A `teploy.deploy-test.yml` with real secrets inline (session salt, JWT secret, admin password) was sitting untracked in this publicly-mirrored repo. Removed, and `teploy.*.yml` (except the base file) is now gitignored.
+
+### Docs
+
+- `teploy.yml` now documents the persistent-secret pattern (`teploy secret set`) for deploy env instead of the shell-export pattern, which silently ran with empty JWT secret / session salt / admin password whenever nobody remembered to re-export the vars.
+
 ## v0.1.0-rc1 — 2026-05-10
 
 First public release candidate.
