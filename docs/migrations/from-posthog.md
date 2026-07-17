@@ -39,7 +39,7 @@ if (posthog.isFeatureEnabled("new-checkout")) { /* ... */ }
 
 **Observe:**
 ```ts
-import { init, track, identify } from "@observe/browser";
+import { init, track, identify } from "@teploy/observe-browser";
 init({ endpoint: "https://observe.example.com", siteId: "default" });
 track("signup", { plan: "pro" });
 identify(user.id, { email: user.email });
@@ -56,7 +56,7 @@ const { enabled, variant } = await r.json();
 ### Drop-in shim
 
 ```ts
-import { init, track, identify, reset } from "@observe/browser";
+import { init, track, identify, reset } from "@teploy/observe-browser";
 
 init({ endpoint: "https://observe.example.com" });
 

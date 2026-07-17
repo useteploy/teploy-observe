@@ -1,12 +1,12 @@
 /**
- * @observe/sentry-shim - drop-in replacement for `@sentry/node`, backed by
+ * @teploy/observe-sentry-shim - drop-in replacement for `@sentry/node`, backed by
  * Observe's ingest API.
  *
  * Replace your import:
  *
  *   // before:
  *   // import * as Sentry from "@sentry/node";
- *   import * as Sentry from "@observe/sentry-shim";
+ *   import * as Sentry from "@teploy/observe-sentry-shim";
  *
  *   Sentry.init({
  *     dsn: "https://observe.example.com/__observe__/default",
@@ -226,11 +226,11 @@ export function init(options: InitOptions): void {
     }
   }
   if (!endpoint) {
-    throw new Error("@observe/sentry-shim: dsn or endpoint is required");
+    throw new Error("@teploy/observe-sentry-shim: dsn or endpoint is required");
   }
   const fetchImpl = options.fetch ?? (globalThis as { fetch?: typeof fetch }).fetch;
   if (!fetchImpl) {
-    throw new Error("@observe/sentry-shim: no fetch implementation available");
+    throw new Error("@teploy/observe-sentry-shim: no fetch implementation available");
   }
   config = {
     endpoint: endpoint.replace(/\/+$/, ""),

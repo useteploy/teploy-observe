@@ -1,17 +1,17 @@
-# @observe/browser
+# @teploy/observe-browser
 
 Browser SDK for [Observe](https://github.com/useteploy/teploy-observe) — self-hosted analytics, errors, logs, sessions.
 
 ## Install
 
 ```
-npm install @observe/browser
+npm install @teploy/observe-browser
 ```
 
 ## Usage
 
 ```ts
-import { init, track, captureException } from "@observe/browser";
+import { init, track, captureException } from "@teploy/observe-browser";
 
 init({
   endpoint: "https://observe.example.com",

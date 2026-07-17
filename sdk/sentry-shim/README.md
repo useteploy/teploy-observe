@@ -1,4 +1,4 @@
-# @observe/sentry-shim
+# @teploy/observe-sentry-shim
 
 Drop-in replacement for `@sentry/node` that ships events to a self-hosted
 [Observe](https://github.com/useteploy/teploy-observe) deployment instead of
@@ -8,7 +8,7 @@ them directly to Observe's ingest endpoints.
 ## Install
 
 ```sh
-npm install @observe/sentry-shim
+npm install @teploy/observe-sentry-shim
 ```
 
 ## Use
@@ -17,7 +17,7 @@ Swap your import. Existing call sites keep working.
 
 ```diff
 - import * as Sentry from "@sentry/node";
-+ import * as Sentry from "@observe/sentry-shim";
++ import * as Sentry from "@teploy/observe-sentry-shim";
 
   Sentry.init({
 -   dsn: "https://abc@sentry.io/1234",
@@ -68,7 +68,7 @@ but do nothing:
 - `tracesSampleRate`, `profilesSampleRate` — Observe accepts every span;
   sampling lives at the OTLP exporter or ingest rate-limit layer.
 - `integrations: [...]` — Sentry's integration array is silently ignored.
-  Use Observe's official SDKs (`@observe/browser`, `observe-sdk` for Python,
+  Use Observe's official SDKs (`@teploy/observe-browser`, `observe-sdk` for Python,
   the Go SDK) for framework hooks.
 - `autoSessionTracking` / `startSession` / `endSession` — Observe derives
   release health from the `release` tag and event volume server-side.

@@ -1,5 +1,5 @@
 {
-  "name": "@observe/sentry-shim",
+  "name": "@teploy/observe-sentry-shim",
   "version": "0.1.0",
   "description": "Drop-in @sentry/node replacement that ships events to a self-hosted Observe deployment.",
   "type": "module",

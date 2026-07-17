@@ -1,5 +1,5 @@
 /**
- * Unit tests for @observe/sentry-shim.
+ * Unit tests for @teploy/observe-sentry-shim.
  *
  * These run with `node --test --import tsx tests/*.test.ts`. Tests use a
  * stub fetch passed via `init({ fetch })` so nothing leaves the process.

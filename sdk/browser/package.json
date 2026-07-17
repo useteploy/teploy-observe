@@ -1,5 +1,5 @@
 {
-  "name": "@observe/browser",
+  "name": "@teploy/observe-browser",
   "version": "0.1.0",
   "description": "Browser SDK for Observe — self-hosted analytics, errors, logs, sessions.",
   "type": "module",

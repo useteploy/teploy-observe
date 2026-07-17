@@ -1,5 +1,5 @@
 /**
- * Integration smoke for @observe/sentry-shim.
+ * Integration smoke for @teploy/observe-sentry-shim.
  *
  * Requires a running Observe stack at OBSERVE_URL (defaults to
  * http://localhost:3000) with admin/observe credentials. The test:

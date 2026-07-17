@@ -35,7 +35,7 @@ Sentry.captureException(err);
 
 **Observe:**
 ```ts
-import { init, captureException } from "@observe/browser";
+import { init, captureException } from "@teploy/observe-browser";
 init({
   endpoint: "https://observe.example.com",
   siteId: "default",
@@ -49,7 +49,7 @@ If you want to swap Sentry for Observe without touching call sites, register a
 shim on `window.Sentry`:
 
 ```ts
-import { init, captureException, track, identify } from "@observe/browser";
+import { init, captureException, track, identify } from "@teploy/observe-browser";
 
 init({ endpoint: "https://observe.example.com" });
 

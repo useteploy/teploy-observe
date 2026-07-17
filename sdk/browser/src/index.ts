@@ -1,8 +1,8 @@
 /**
- * @observe/browser — Observe's browser SDK.
+ * @teploy/observe-browser — Observe's browser SDK.
  *
  * ```ts
- * import { init } from "@observe/browser";
+ * import { init } from "@teploy/observe-browser";
  *
  * init({
  *   endpoint: "https://observe.example.com",
@@ -113,7 +113,7 @@ function post<T>(path: string, body: T, apiKey?: string): Promise<void> {
 
 /** Initialize the SDK. Idempotent — calling again replaces the active client. */
 export function init(options: InitOptions): void {
-  if (!options.endpoint) throw new Error("@observe/browser: endpoint is required");
+  if (!options.endpoint) throw new Error("@teploy/observe-browser: endpoint is required");
 
   client = {
     opts: {
