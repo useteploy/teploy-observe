@@ -10,8 +10,8 @@ export default function OnboardingGuide({ siteId }: Props) {
   const [hasData, setHasData] = useState<boolean | null>(null);
 
   useEffect(() => {
-    get<{ current: { pageviews: number } }>(`/api/v1/stats/overview?site_id=${siteId}&from=${new Date(Date.now() - 86400000).toISOString()}&to=${new Date().toISOString()}`)
-      .then(d => setHasData((d?.current?.pageviews ?? 0) > 0))
+    get<{ pageviews: number }>(`/api/v1/stats/overview?site_id=${siteId}&from=${new Date(Date.now() - 86400000).toISOString()}&to=${new Date().toISOString()}`)
+      .then(d => setHasData((d?.pageviews ?? 0) > 0))
       .catch(() => setHasData(false));
   }, [siteId]);
 
