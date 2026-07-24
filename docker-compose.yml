@@ -6,6 +6,20 @@
 # Production (with Caddy + auto-TLS; expose 80/443, set OBSERVE_DOMAIN):
 #   OBSERVE_DOMAIN=observe.example.com docker compose --profile tls up -d
 #
+# Collecting telemetry from browsers or servers OUTSIDE your network?
+# Don't publish the port below — it serves the dashboard too. Set
+# OBSERVE_INGEST_ADDR and publish only that port, which serves telemetry
+# writes and nothing else:
+#
+#   environment:  OBSERVE_INGEST_ADDR: ":3001"
+#   ports:        - "3001:3001"        # ingest.example.com — public
+#                 - "127.0.0.1:3000:3000"   # dashboard — localhost/tailnet only
+#
+# This is the split every hosted product uses (sentry.io vs
+# o123.ingest.sentry.io, us.posthog.com vs us.i.posthog.com): the public
+# hostname has no UI behind it. Backend-only telemetry over a tailnet needs
+# none of this — leave it unset and keep both on the private port.
+#
 # First login defaults: admin / observe — change immediately via /settings.
 
 services:
@@ -32,6 +46,8 @@ services:
     ports:
       # Exposed directly for the default (no-TLS) profile.
       # With the "tls" profile, Caddy handles 80/443 and observe stays internal.
+      # NOTE: this port serves the dashboard as well as ingest — see the
+      # OBSERVE_INGEST_ADDR note at the top before exposing it publicly.
       - "3000:3000"
     environment:
       OBSERVE_ADDR: ":3000"

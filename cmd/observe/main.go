@@ -354,7 +354,12 @@ func main() {
 	}
 
 	// Build app
-	app := neutron.New(
+	// Optional ingest-only listener (see ingest_listener.go). Declared up front
+	// so the lifecycle hook below can close over both — the handler is built at
+	// OnStart, once every route is registered.
+	var ingestSrv *http.Server
+	var app *neutron.App
+	app = neutron.New(
 		neutron.WithLogger(logger),
 		neutron.WithMiddleware(self.RecoverMiddleware, self.TraceMiddleware),
 		neutron.WithLifecycle(db.LifecycleHook()),
@@ -389,6 +394,30 @@ func main() {
 			OnStop: func(ctx context.Context) error {
 				scheduler.Stop()
 				return nil
+			},
+		}),
+		// Registered last so the ingest buffers above are already running
+		// before this listener accepts public traffic.
+		neutron.WithLifecycle(neutron.LifecycleHook{
+			Name: "ingest-listener",
+			OnStart: func(ctx context.Context) error {
+				if cfg.IngestAddr == "" {
+					return nil
+				}
+				ingestSrv = newIngestServer(cfg.IngestAddr, app.Handler())
+				go func() {
+					logger.Info("ingest listener starting (ingest routes only)", "addr", cfg.IngestAddr)
+					if err := ingestSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+						logger.Error("ingest listener failed", "err", err)
+					}
+				}()
+				return nil
+			},
+			OnStop: func(ctx context.Context) error {
+				if ingestSrv == nil {
+					return nil
+				}
+				return ingestSrv.Shutdown(ctx)
 			},
 		}),
 		neutron.WithMiddleware(ingest.RequestInfoMiddleware(ingest.ParseTrustedProxies(cfg.TrustedProxies))),
@@ -715,7 +744,7 @@ func main() {
 		neutron.WithTags("groups"), neutron.WithSummary("Group member + event counts"))
 
 	// --- SSO (public endpoints) ---
-	r.HandleFunc("GET /api/v1/sso/metadata", ssoMetadataHandler(ssoSvc, cfg.Addr))
+	r.HandleFunc("GET /api/v1/sso/metadata", ssoMetadataHandler(ssoSvc, cfg.PublicURL))
 	r.HandleFunc("POST /api/v1/sso/callback", ssoSvc.SAMLCallbackHandler())
 	// Admin-only: SSO configs include IdP certificates/metadata; writes are
 	// admin-only, so reads are too.
@@ -1256,7 +1285,16 @@ Reindex flags:
   --dry-run            Scan but do not write to FTS (verifies source rows)
 
 Env vars:
-  OBSERVE_ADDR                 HTTP bind address (default :3000)
+  OBSERVE_ADDR                 HTTP bind address for the dashboard, read
+                               API and admin (default :3000). Keep this on
+                               localhost/tailnet when publishing ingest.
+  OBSERVE_INGEST_ADDR          Optional second bind address serving ONLY
+                               telemetry-write endpoints (e.g. :3001).
+                               This is the port to expose publicly; the
+                               dashboard does not listen on it.
+  OBSERVE_PUBLIC_URL           External base URL (https://observe.ex.com)
+                               used for SSO metadata and generated links
+  OBSERVE_LOG_ROUTES           "1" prints the route table at startup
   OBSERVE_NUCLEUS_URL          Nucleus/Postgres DSN
   OBSERVE_DATA_DIR             Data directory (PID file, WAL queue)
   OBSERVE_JWT_SECRET           JWT signing secret (required in prod)
@@ -2190,9 +2228,15 @@ func correlationHandler(svc *query.StatsService) neutron.HandlerFunc[correlation
 
 // --- SSO handlers ---
 
-func ssoMetadataHandler(svc *sso.SSOService, addr string) http.HandlerFunc {
+func ssoMetadataHandler(svc *sso.SSOService, publicURL string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		baseURL := "http://" + r.Host
+		// OBSERVE_PUBLIC_URL wins: the Host header is client-controlled, so
+		// deriving SAML entity/ACS URLs from it lets a caller point them at
+		// a host of their choosing. Fall back only when it isn't configured.
+		baseURL := publicURL
+		if baseURL == "" {
+			baseURL = "http://" + r.Host
+		}
 		w.Header().Set("Content-Type", "application/xml")
 		w.Write([]byte(svc.GetSAMLMetadata(baseURL)))
 	}

@@ -3,11 +3,23 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
 type Config struct {
-	Addr        string
+	Addr string
+	// IngestAddr, when set, starts a second listener that serves ONLY the
+	// telemetry-write endpoints (see cmd/observe/ingest_listener.go). It is
+	// the port you publish to the internet — dashboard, read API and admin
+	// stay on Addr, which can then stay on localhost or a tailnet. Empty
+	// (default) keeps the single-listener behaviour: everything on Addr.
+	IngestAddr string
+	// PublicURL is the externally reachable base URL of this instance
+	// ("https://observe.example.com"), used for SSO metadata and generated
+	// links. Empty falls back to the request's Host header, which a client
+	// can spoof — set this whenever the instance is reachable by a name.
+	PublicURL   string
 	NucleusURL  string
 	SiteID      string
 	SessionSalt string
@@ -43,6 +55,8 @@ type Config struct {
 func Load() Config {
 	c := Config{
 		Addr:                envOr("OBSERVE_ADDR", ":3000"),
+		IngestAddr:          envOr("OBSERVE_INGEST_ADDR", ""),
+		PublicURL:           strings.TrimRight(envOr("OBSERVE_PUBLIC_URL", ""), "/"),
 		NucleusURL:          envOr("OBSERVE_NUCLEUS_URL", "postgres://localhost:5432/observe"),
 		SiteID:              envOr("OBSERVE_SITE_ID", "default"),
 		SessionSalt:         envOr("OBSERVE_SESSION_SALT", ""),

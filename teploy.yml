@@ -28,6 +28,21 @@ app: observe
 domain: observe.example.com
 server: observe.example.com
 
+# `port` is the app listener: dashboard + read API + admin. Anything Teploy
+# routes `domain` to can reach the dashboard, so point `domain` here only for
+# an instance you're happy to have a login page on (or gate it behind
+# Cloudflare Access / a tailnet).
+#
+# To collect telemetry from browsers or off-network servers, run the
+# ingest-only listener instead and give it its own hostname:
+#
+#   env:
+#     OBSERVE_INGEST_ADDR: ":3001"
+#     OBSERVE_PUBLIC_URL: "https://observe.example.com"
+#
+# then route ingest.example.com -> 3001. That port serves telemetry writes
+# and 404s everything else, so the dashboard is not merely unrouted there —
+# it isn't listening on it.
 port: 3000
 platform: linux/amd64
 
