@@ -1,4 +1,4 @@
-import { useState } from "preact/hooks";
+import { useState, useEffect } from "preact/hooks";
 import { useAuth } from "../hooks/useAuth.js";
 
 export const config = { mode: "app" };
@@ -9,6 +9,22 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [sso, setSso] = useState<{ label: string } | null>(null);
+
+  useEffect(() => {
+    // Surface an SSO failure bounced back via ?error=.
+    if (typeof window !== "undefined") {
+      const e = new URLSearchParams(window.location.search).get("error");
+      if (e) setError(e);
+    }
+    // Ask the server whether SSO is configured, to show the button.
+    fetch("/api/v1/auth/methods")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((m) => {
+        if (m && m.oidc) setSso({ label: m.oidc_label || "Single sign-on" });
+      })
+      .catch(() => {});
+  }, []);
 
   const handleSubmit = async (e: Event) => {
     e.preventDefault();
@@ -37,6 +53,13 @@ export default function LoginPage() {
         <p class="obs-login-subtitle">Sign in to your dashboard</p>
 
         {error && <div class="obs-login-error">{error}</div>}
+
+        {sso && (
+          <>
+            <a class="obs-sso-button" href="/api/v1/auth/oidc/login">{sso.label}</a>
+            <div class="obs-login-divider">or</div>
+          </>
+        )}
 
         <label class="obs-login-label">
           Username
@@ -116,6 +139,22 @@ export default function LoginPage() {
         }
         .obs-login-button:hover { background: var(--obs-accent-hover); }
         .obs-login-button:disabled { opacity: 0.6; cursor: not-allowed; }
+        .obs-sso-button {
+          display: block; width: 100%; padding: 10px; margin-bottom: 8px;
+          background: transparent; color: var(--obs-text);
+          border: 1px solid var(--obs-border); border-radius: var(--obs-radius);
+          font-size: 14px; font-weight: 600; font-family: var(--obs-font);
+          text-align: center; text-decoration: none; cursor: pointer;
+          transition: border-color var(--obs-transition);
+        }
+        .obs-sso-button:hover { border-color: var(--obs-accent); }
+        .obs-login-divider {
+          display: flex; align-items: center; gap: 10px;
+          margin: 4px 0 16px; color: var(--obs-text-muted); font-size: 12px;
+        }
+        .obs-login-divider::before, .obs-login-divider::after {
+          content: ""; flex: 1; height: 1px; background: var(--obs-border-subtle);
+        }
         .obs-login-error {
           background: var(--obs-danger-bg); color: var(--obs-danger);
           padding: 8px 12px; border-radius: var(--obs-radius);

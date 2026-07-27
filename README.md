@@ -214,6 +214,39 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 | `OBSERVE_SMTP_USER` | | SMTP username. |
 | `OBSERVE_SMTP_PASS` | | SMTP password. |
 | `OBSERVE_SMTP_FROM` | | From email address. |
+| `TEPLOY_NAV_DASH_URL` | | URL of your Teploy Dash dashboard. When set, it appears in the top-left cross-product switcher. |
+| `TEPLOY_NAV_SHIP_URL` | | URL of your Teploy Ship dashboard. When set, it appears in the top-left cross-product switcher. |
+
+### Single sign-on (OIDC)
+
+Optional. When `OBSERVE_OIDC_ISSUER` and `OBSERVE_OIDC_CLIENT_ID` are set, the
+login page offers an SSO button and Observe acts as an OpenID Connect relying
+party (authorization-code flow with PKCE), minting its normal JWT after the IdP
+authenticates the user. Password login stays available as the break-glass path.
+Register `https://<your-observe-host>/api/v1/auth/oidc/callback` as the redirect
+URI with your provider. When SSO is enabled, the first-run open-access grace
+period is disabled (authentication becomes required).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OBSERVE_OIDC_ISSUER` | | IdP issuer URL (discovery base, e.g. `https://your-org.okta.com`). Required to enable SSO. |
+| `OBSERVE_OIDC_CLIENT_ID` | | OAuth client ID. Required to enable SSO. |
+| `OBSERVE_OIDC_CLIENT_SECRET` | | OAuth client secret. Omit for a public (PKCE-only) client. |
+| `OBSERVE_OIDC_REDIRECT_URL` | (derived) | Callback URL. Derived from the request Host when unset; set explicitly behind a proxy that rewrites Host. Must end in `/api/v1/auth/oidc/callback`. |
+| `OBSERVE_OIDC_SCOPES` | `openid profile email` | Space/comma-separated scopes (`openid` always included). Add `groups` for group-based role mapping. |
+| `OBSERVE_OIDC_LABEL` | `Single sign-on` | Text on the SSO button. |
+| `OBSERVE_OIDC_USERNAME_CLAIM` | `preferred_username` | Claim used as the username (falls back to `email`, then `sub`). |
+| `OBSERVE_OIDC_ROLE_CLAIM` | `teploy_role` | Claim carrying the role directly (`admin`/`editor`/`viewer`). Checked first. |
+| `OBSERVE_OIDC_GROUPS_CLAIM` | `groups` | Claim listing the user's groups, used when no direct role claim matches. |
+| `OBSERVE_OIDC_ADMIN_GROUP` | | Group whose members become `admin`. |
+| `OBSERVE_OIDC_EDITOR_GROUP` | | Group whose members become `editor`. |
+| `OBSERVE_OIDC_VIEWER_GROUP` | | Group whose members become `viewer`. |
+| `OBSERVE_OIDC_DEFAULT_ROLE` | `viewer` | Role for an authenticated user matching no role claim or group (least privilege). |
+
+Role resolution order: a recognized `teploy_role` claim wins; otherwise groups
+are matched (admin > editor > viewer); otherwise the default role. SSO users are
+not stored in the `admin_users` table — their role comes fresh from the IdP on
+every login.
 
 ## API
 

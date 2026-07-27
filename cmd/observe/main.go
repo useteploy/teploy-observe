@@ -9,8 +9,8 @@ import (
 	"html"
 	"io"
 	"io/fs"
-	"net"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,46 +23,46 @@ import (
 	"github.com/neutron-dev/neutron-go/neutronauth"
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/useteploy/teploy-observe/internal/auth"
-	"github.com/useteploy/teploy-observe/internal/config"
-	"github.com/useteploy/teploy-observe/internal/dogfood"
-	obserrors "github.com/useteploy/teploy-observe/internal/errors"
-	"github.com/useteploy/teploy-observe/internal/export"
-	"github.com/useteploy/teploy-observe/internal/backup"
 	"github.com/useteploy/teploy-observe/internal/aiquery"
 	"github.com/useteploy/teploy-observe/internal/audit"
+	"github.com/useteploy/teploy-observe/internal/auth"
+	"github.com/useteploy/teploy-observe/internal/backup"
+	"github.com/useteploy/teploy-observe/internal/cohorts"
+	"github.com/useteploy/teploy-observe/internal/config"
+	"github.com/useteploy/teploy-observe/internal/dashboards"
+	"github.com/useteploy/teploy-observe/internal/dogfood"
+	obserrors "github.com/useteploy/teploy-observe/internal/errors"
+	"github.com/useteploy/teploy-observe/internal/experiments"
+	"github.com/useteploy/teploy-observe/internal/explorer"
+	"github.com/useteploy/teploy-observe/internal/export"
+	"github.com/useteploy/teploy-observe/internal/feedback"
+	"github.com/useteploy/teploy-observe/internal/flags"
+	"github.com/useteploy/teploy-observe/internal/groups"
+	"github.com/useteploy/teploy-observe/internal/heatmaps"
 	"github.com/useteploy/teploy-observe/internal/incidents"
+	"github.com/useteploy/teploy-observe/internal/infra"
 	"github.com/useteploy/teploy-observe/internal/ingest"
+	"github.com/useteploy/teploy-observe/internal/integrations"
 	"github.com/useteploy/teploy-observe/internal/jobs"
 	"github.com/useteploy/teploy-observe/internal/live"
+	"github.com/useteploy/teploy-observe/internal/llm"
+	"github.com/useteploy/teploy-observe/internal/logs"
 	"github.com/useteploy/teploy-observe/internal/meta"
+	"github.com/useteploy/teploy-observe/internal/metrics"
+	"github.com/useteploy/teploy-observe/internal/monitoring"
+	"github.com/useteploy/teploy-observe/internal/persons"
+	"github.com/useteploy/teploy-observe/internal/platform"
 	"github.com/useteploy/teploy-observe/internal/query"
+	"github.com/useteploy/teploy-observe/internal/replays"
+	"github.com/useteploy/teploy-observe/internal/reports"
 	"github.com/useteploy/teploy-observe/internal/seed"
 	"github.com/useteploy/teploy-observe/internal/share"
 	"github.com/useteploy/teploy-observe/internal/sites"
-	"github.com/useteploy/teploy-observe/internal/dashboards"
-	"github.com/useteploy/teploy-observe/internal/experiments"
-	"github.com/useteploy/teploy-observe/internal/explorer"
-	"github.com/useteploy/teploy-observe/internal/flags"
-	"github.com/useteploy/teploy-observe/internal/feedback"
-	"github.com/useteploy/teploy-observe/internal/infra"
-	"github.com/useteploy/teploy-observe/internal/llm"
-	"github.com/useteploy/teploy-observe/internal/groups"
-	"github.com/useteploy/teploy-observe/internal/heatmaps"
-	"github.com/useteploy/teploy-observe/internal/integrations"
-	"github.com/useteploy/teploy-observe/internal/logs"
-	"github.com/useteploy/teploy-observe/internal/monitoring"
-	"github.com/useteploy/teploy-observe/internal/platform"
-	"github.com/useteploy/teploy-observe/internal/reports"
-	"github.com/useteploy/teploy-observe/internal/replays"
 	"github.com/useteploy/teploy-observe/internal/sourcemaps"
-	"github.com/useteploy/teploy-observe/internal/cohorts"
-	"github.com/useteploy/teploy-observe/internal/metrics"
-	"github.com/useteploy/teploy-observe/internal/persons"
 	"github.com/useteploy/teploy-observe/internal/sso"
 	"github.com/useteploy/teploy-observe/internal/surveys"
-	"github.com/useteploy/teploy-observe/internal/tracking"
 	"github.com/useteploy/teploy-observe/internal/tracing"
+	"github.com/useteploy/teploy-observe/internal/tracking"
 	"github.com/useteploy/teploy-observe/internal/upgrade"
 	"github.com/useteploy/teploy-observe/internal/views"
 )
@@ -150,6 +150,11 @@ func main() {
 
 	// Auth service
 	authSvc := auth.NewAuthService(db, cfg.JWTSecret, logger)
+
+	// Optional OIDC single sign-on. When configured, it also disables the
+	// first-run grace period (auth becomes required) via SetOIDCEnabled.
+	oidcAuth := auth.NewOIDCAuth(authSvc, logger)
+	authSvc.SetOIDCEnabled(oidcAuth.Enabled())
 
 	// CLI escape hatch: OBSERVE_RESET_ADMIN_PASSWORD force-updates the admin's
 	// password hash on startup without requiring the current password. Useful
@@ -948,14 +953,23 @@ func main() {
 	r.HandleFunc("GET /api/v1/auth/setup", setupStatusHandler(authSvc))
 	r.HandleFunc("POST /api/v1/auth/setup", setupCreateHandler(authSvc))
 
+	// --- Sign-in methods + OIDC SSO (public, no auth) ---
+	// The login page reads /auth/methods to decide whether to show the SSO
+	// button. When OIDC is configured, /auth/oidc/login starts the flow and
+	// /auth/oidc/callback completes it (minting an Observe JWT).
+	r.HandleFunc("GET /api/v1/auth/methods", authMethodsHandler(oidcAuth))
+	if oidcAuth.Enabled() {
+		r.HandleFunc("GET /api/v1/auth/oidc/login", oidcAuth.HandleLogin)
+		r.HandleFunc("GET /api/v1/auth/oidc/callback", oidcAuth.HandleCallback)
+	}
+
 	// --- Public config (UI reads this to know about demo mode, etc.) ---
 	r.HandleFunc("GET /api/v1/config", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		demo := "false"
-		if cfg.DemoMode {
-			demo = "true"
-		}
-		_, _ = w.Write([]byte(`{"demo_mode":` + demo + `}`))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"demo_mode": cfg.DemoMode,
+			"nav":       teployNav("observe"),
+		})
 	})
 
 	// --- Source maps (API key OR JWT editor+ auth) ---
@@ -1542,6 +1556,43 @@ func setupStatusHandler(authSvc *auth.AuthService) http.HandlerFunc {
 	}
 }
 
+// teployNav returns the cross-product dashboard switcher entries: the current
+// app (marked, no link) plus any sibling Teploy dashboards whose URL is
+// configured via TEPLOY_NAV_{DASH,OBSERVE,SHIP}_URL. Same env convention across
+// Dash, Observe, and Ship so one set of vars drives the switcher everywhere.
+func teployNav(current string) map[string]any {
+	products := []struct{ key, label, env string }{
+		{"dash", "Dash", "TEPLOY_NAV_DASH_URL"},
+		{"observe", "Observe", "TEPLOY_NAV_OBSERVE_URL"},
+		{"ship", "Ship", "TEPLOY_NAV_SHIP_URL"},
+	}
+	apps := make([]map[string]string, 0, len(products))
+	for _, p := range products {
+		url := strings.TrimSpace(os.Getenv(p.env))
+		if p.key == current {
+			apps = append(apps, map[string]string{"key": p.key, "label": p.label, "url": ""})
+		} else if url != "" {
+			apps = append(apps, map[string]string{"key": p.key, "label": p.label, "url": url})
+		}
+	}
+	return map[string]any{"current": current, "apps": apps}
+}
+
+// authMethodsHandler reports which sign-in methods the login page should offer.
+// Password login is always available (break-glass); SSO appears only when OIDC
+// is configured.
+func authMethodsHandler(oidcAuth *auth.OIDCAuth) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		resp := map[string]any{"password": true, "oidc": oidcAuth.Enabled()}
+		if oidcAuth.Enabled() {
+			resp["oidc_label"] = oidcAuth.Label()
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
+
 type setupCreateInput struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
@@ -1741,8 +1792,8 @@ func deleteSiteHandler(siteSvc *sites.SiteService, authSvc *auth.AuthService) ne
 }
 
 type setSitePrivacyInput struct {
-	SiteID string `path:"site_id"`
-	RawOptIn bool `json:"raw_distinct_id"`
+	SiteID   string `path:"site_id"`
+	RawOptIn bool   `json:"raw_distinct_id"`
 }
 
 func setSitePrivacyHandler(siteSvc *sites.SiteService) neutron.HandlerFunc[setSitePrivacyInput, neutron.Empty] {
@@ -1762,7 +1813,7 @@ type createAPIKeyInput struct {
 }
 
 type createAPIKeyResponse struct {
-	Key  string       `json:"key"`
+	Key  string          `json:"key"`
 	Info auth.APIKeyInfo `json:"info"`
 }
 
@@ -2025,7 +2076,7 @@ type issueSessionInput struct {
 }
 
 type issueSessionResponse struct {
-	SessionID string              `json:"session_id"`
+	SessionID string               `json:"session_id"`
 	Events    []query.SessionEvent `json:"events"`
 }
 
@@ -2056,18 +2107,26 @@ func issueSessionHandler(issueSvc *obserrors.IssueService, statsSvc *query.Stats
 
 func llmIngestHandler(svc *llm.LLMService) neutron.HandlerFunc[llm.LLMInput, llm.LLMResponse] {
 	return func(ctx context.Context, input llm.LLMInput) (llm.LLMResponse, error) {
-		if input.SiteID == "" { input.SiteID = ingest.SiteIDFromContext(ctx) }
+		if input.SiteID == "" {
+			input.SiteID = ingest.SiteIDFromContext(ctx)
+		}
 		return svc.Ingest(ctx, input)
 	}
 }
 
-type llmStatsInput struct { SiteID string `query:"site_id"`; From string `query:"from"`; To string `query:"to"` }
+type llmStatsInput struct {
+	SiteID string `query:"site_id"`
+	From   string `query:"from"`
+	To     string `query:"to"`
+}
 
 func llmStatsHandler(svc *llm.LLMService) neutron.HandlerFunc[llmStatsInput, llm.LLMStats] {
 	return func(ctx context.Context, input llmStatsInput) (llm.LLMStats, error) {
 		from, to := parseTimeRange(input.From, input.To)
 		s, err := svc.Stats(ctx, input.SiteID, from, to)
-		if err != nil { return llm.LLMStats{}, err }
+		if err != nil {
+			return llm.LLMStats{}, err
+		}
 		return *s, nil
 	}
 }
@@ -2079,7 +2138,10 @@ func llmModelsHandler(svc *llm.LLMService) neutron.HandlerFunc[llmStatsInput, []
 	}
 }
 
-type llmTracesInput struct { SiteID string `query:"site_id"`; Limit int `query:"limit"` }
+type llmTracesInput struct {
+	SiteID string `query:"site_id"`
+	Limit  int    `query:"limit"`
+}
 
 func llmTracesHandler(svc *llm.LLMService) neutron.HandlerFunc[llmTracesInput, []llm.LLMTrace] {
 	return func(ctx context.Context, input llmTracesInput) ([]llm.LLMTrace, error) {
@@ -2091,14 +2153,20 @@ func llmTracesHandler(svc *llm.LLMService) neutron.HandlerFunc[llmTracesInput, [
 
 func infraReportHandler(svc *infra.InfraService) neutron.HandlerFunc[infra.MetricInput, map[string]string] {
 	return func(ctx context.Context, input infra.MetricInput) (map[string]string, error) {
-		if input.SiteID == "" { input.SiteID = ingest.SiteIDFromContext(ctx) }
+		if input.SiteID == "" {
+			input.SiteID = ingest.SiteIDFromContext(ctx)
+		}
 		err := svc.Report(ctx, input)
-		if err != nil { return nil, err }
+		if err != nil {
+			return nil, err
+		}
 		return map[string]string{"ok": "true"}, nil
 	}
 }
 
-type infraHostsInput struct { SiteID string `query:"site_id"` }
+type infraHostsInput struct {
+	SiteID string `query:"site_id"`
+}
 
 func infraHostsHandler(svc *infra.InfraService) neutron.HandlerFunc[infraHostsInput, []infra.HostSummary] {
 	return func(ctx context.Context, input infraHostsInput) ([]infra.HostSummary, error) {
@@ -2122,7 +2190,9 @@ func infraHistoryHandler(svc *infra.InfraService) neutron.HandlerFunc[infraHisto
 
 // --- Pipeline handlers ---
 
-type listPipelinesInput struct { SiteID string `query:"site_id"` }
+type listPipelinesInput struct {
+	SiteID string `query:"site_id"`
+}
 
 func listPipelinesHandler(svc *logs.PipelineService) neutron.HandlerFunc[listPipelinesInput, []logs.Pipeline] {
 	return func(ctx context.Context, input listPipelinesInput) ([]logs.Pipeline, error) {
@@ -2146,14 +2216,18 @@ func createPipelineHandler(svc *logs.PipelineService) neutron.HandlerFunc[create
 			return logs.Pipeline{}, neutron.ErrBadRequest(err.Error())
 		}
 		p, err := svc.Create(ctx, input.SiteID, input.Name, input.Rules, input.Priority)
-		if err != nil { return logs.Pipeline{}, err }
+		if err != nil {
+			return logs.Pipeline{}, err
+		}
 		return *p, nil
 	}
 }
 
 // --- Group handlers ---
 
-type listGroupsInput struct{ SiteID string `query:"site_id"` }
+type listGroupsInput struct {
+	SiteID string `query:"site_id"`
+}
 
 func listGroupsHandler(svc *groups.GroupService) neutron.HandlerFunc[listGroupsInput, []groups.Group] {
 	return func(ctx context.Context, input listGroupsInput) ([]groups.Group, error) {
@@ -2190,7 +2264,9 @@ func createGroupHandler(svc *groups.GroupService) neutron.HandlerFunc[createGrou
 			return groups.Group{}, neutron.ErrBadRequest("site_id and name required")
 		}
 		g, err := svc.Create(ctx, input.SiteID, input.GroupType, input.Name, input.Properties)
-		if err != nil { return groups.Group{}, err }
+		if err != nil {
+			return groups.Group{}, err
+		}
 		return *g, nil
 	}
 }
@@ -2221,7 +2297,9 @@ func correlationHandler(svc *query.StatsService) neutron.HandlerFunc[correlation
 	return func(ctx context.Context, input correlationInput) ([]query.Correlation, error) {
 		from, to := parseTimeRange(input.From, input.To)
 		target := input.Target
-		if target == "" { target = "signup" }
+		if target == "" {
+			target = "signup"
+		}
 		return emptyOnNil(svc.CorrelationAnalysis(ctx, input.SiteID, target, from, to))
 	}
 }
@@ -2251,10 +2329,10 @@ func listSSOHandler(svc *sso.SSOService) neutron.HandlerFunc[listSSOInput, []sso
 }
 
 type createSSOInput struct {
-	Provider    string `json:"provider"`
-	EntityID    string `json:"entity_id"`
-	SSOURL      string `json:"sso_url"`
-	Certificate string `json:"certificate"`
+	Provider     string `json:"provider"`
+	EntityID     string `json:"entity_id"`
+	SSOURL       string `json:"sso_url"`
+	Certificate  string `json:"certificate"`
 	AttributeMap string `json:"attribute_map"`
 }
 
@@ -2264,7 +2342,9 @@ func createSSOHandler(svc *sso.SSOService) neutron.HandlerFunc[createSSOInput, s
 			return sso.SSOConfig{}, neutron.ErrBadRequest("entity_id and sso_url required")
 		}
 		c, err := svc.Create(ctx, input.Provider, input.EntityID, input.SSOURL, input.Certificate, input.AttributeMap)
-		if err != nil { return sso.SSOConfig{}, err }
+		if err != nil {
+			return sso.SSOConfig{}, err
+		}
 		return *c, nil
 	}
 }
@@ -2536,7 +2616,9 @@ func explorerTablesHandler(svc *explorer.ExplorerService) http.HandlerFunc {
 
 // --- Flag handlers ---
 
-type listFlagsInput struct{ SiteID string `query:"site_id"` }
+type listFlagsInput struct {
+	SiteID string `query:"site_id"`
+}
 
 func listFlagsHandler(svc *flags.FlagService) neutron.HandlerFunc[listFlagsInput, []flags.FeatureFlag] {
 	return func(ctx context.Context, input listFlagsInput) ([]flags.FeatureFlag, error) {
@@ -2561,7 +2643,9 @@ func createFlagHandler(svc *flags.FlagService) neutron.HandlerFunc[createFlagInp
 			return flags.FeatureFlag{}, neutron.ErrBadRequest("site_id and flag_key required")
 		}
 		f, err := svc.Create(ctx, input.SiteID, input.FlagKey, input.Name, input.Description, input.FlagType, input.Variants, input.Targeting, input.RolloutPct)
-		if err != nil { return flags.FeatureFlag{}, err }
+		if err != nil {
+			return flags.FeatureFlag{}, err
+		}
 		return *f, nil
 	}
 }
@@ -2632,7 +2716,9 @@ func flagEvaluateHandler(svc *flags.FlagService, rl *ingest.RateLimiter) http.Ha
 
 // --- Experiment handlers ---
 
-type listExperimentsInput struct{ SiteID string `query:"site_id"` }
+type listExperimentsInput struct {
+	SiteID string `query:"site_id"`
+}
 
 func listExperimentsHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[listExperimentsInput, []experiments.Experiment] {
 	return func(ctx context.Context, input listExperimentsInput) ([]experiments.Experiment, error) {
@@ -2656,7 +2742,9 @@ func createExperimentHandler(svc *experiments.ExperimentService) neutron.Handler
 			return experiments.Experiment{}, neutron.ErrBadRequest("site_id and flag_key required")
 		}
 		e, err := svc.Create(ctx, input.SiteID, input.Name, input.FlagKey, input.GoalMetric, input.GoalValue, input.Variants, input.MinSample)
-		if err != nil { return experiments.Experiment{}, err }
+		if err != nil {
+			return experiments.Experiment{}, err
+		}
 		return *e, nil
 	}
 }
@@ -2692,7 +2780,9 @@ func experimentConvertHandler(svc *experiments.ExperimentService) neutron.Handle
 	}
 }
 
-type experimentIDInput struct{ ExperimentID string `path:"experiment_id"` }
+type experimentIDInput struct {
+	ExperimentID string `path:"experiment_id"`
+}
 
 func startExperimentHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[experimentIDInput, neutron.Empty] {
 	return func(ctx context.Context, input experimentIDInput) (neutron.Empty, error) {
@@ -2714,14 +2804,18 @@ type experimentResultsInput struct {
 func experimentResultsHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[experimentResultsInput, experiments.ExperimentResults] {
 	return func(ctx context.Context, input experimentResultsInput) (experiments.ExperimentResults, error) {
 		r, err := svc.Results(ctx, input.ExperimentID, input.SiteID)
-		if err != nil { return experiments.ExperimentResults{}, err }
+		if err != nil {
+			return experiments.ExperimentResults{}, err
+		}
 		return *r, nil
 	}
 }
 
 // --- Survey handlers ---
 
-type listSurveysInput struct{ SiteID string `query:"site_id"` }
+type listSurveysInput struct {
+	SiteID string `query:"site_id"`
+}
 
 func listSurveysHandler(svc *surveys.SurveyService) neutron.HandlerFunc[listSurveysInput, []surveys.Survey] {
 	return func(ctx context.Context, input listSurveysInput) ([]surveys.Survey, error) {
@@ -2743,12 +2837,16 @@ func createSurveyHandler(svc *surveys.SurveyService) neutron.HandlerFunc[createS
 			return surveys.Survey{}, neutron.ErrBadRequest("site_id and name required")
 		}
 		s, err := svc.Create(ctx, input.SiteID, input.Name, input.Questions, input.Appearance, input.Targeting)
-		if err != nil { return surveys.Survey{}, err }
+		if err != nil {
+			return surveys.Survey{}, err
+		}
 		return *s, nil
 	}
 }
 
-type surveyIDInput struct{ SurveyID string `path:"survey_id"` }
+type surveyIDInput struct {
+	SurveyID string `path:"survey_id"`
+}
 
 func activateSurveyHandler(svc *surveys.SurveyService) neutron.HandlerFunc[surveyIDInput, neutron.Empty] {
 	return func(ctx context.Context, input surveyIDInput) (neutron.Empty, error) {
@@ -2774,7 +2872,9 @@ func activeSurveysPublicHandler(svc *surveys.SurveyService) http.HandlerFunc {
 		active, _ := svc.GetActive(r.Context(), siteID)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		if active == nil { active = []surveys.Survey{} }
+		if active == nil {
+			active = []surveys.Survey{}
+		}
 		json.NewEncoder(w).Encode(active)
 	}
 }
@@ -3576,10 +3676,18 @@ func updatePanelLayoutHandler(svc *dashboards.DashboardService) neutron.HandlerF
 		if target == nil {
 			return neutron.Empty{}, neutron.ErrBadRequest("panel not found")
 		}
-		if input.PositionX != "" { target.PositionX = input.PositionX }
-		if input.PositionY != "" { target.PositionY = input.PositionY }
-		if input.Width != "" { target.Width = input.Width }
-		if input.Height != "" { target.Height = input.Height }
+		if input.PositionX != "" {
+			target.PositionX = input.PositionX
+		}
+		if input.PositionY != "" {
+			target.PositionY = input.PositionY
+		}
+		if input.Width != "" {
+			target.Width = input.Width
+		}
+		if input.Height != "" {
+			target.Height = input.Height
+		}
 		target.DashboardID = input.DashboardID
 		return neutron.Empty{}, svc.UpdatePanel(ctx, *target)
 	}
@@ -3931,8 +4039,8 @@ func deleteAlertRuleHandler(svc *platform.AlertService) neutron.HandlerFunc[dele
 }
 
 type silenceAlertRuleInput struct {
-	RuleID    string `path:"rule_id"`
-	Minutes   int    `json:"minutes"`
+	RuleID  string `path:"rule_id"`
+	Minutes int    `json:"minutes"`
 }
 type silenceAlertRuleResponse struct {
 	SilenceUntilMs int64 `json:"silence_until_ms"`

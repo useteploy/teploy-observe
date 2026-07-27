@@ -61,15 +61,16 @@ type Options struct {
 	LogFlushInterval time.Duration
 }
 
-// Client submits events, errors, logs, and traces to Observe.
+// Client submits events, errors, logs, traces, and metrics to Observe.
 type Client struct {
-	opts   Options
-	http   *http.Client
-	mu     sync.Mutex
-	logs   []LogEntry
-	spans  []pendingSpan
-	closed chan struct{}
-	done   chan struct{}
+	opts    Options
+	http    *http.Client
+	mu      sync.Mutex
+	logs    []LogEntry
+	spans   []pendingSpan
+	metrics *metricsBuf
+	closed  chan struct{}
+	done    chan struct{}
 }
 
 // Field represents a single key/value attribute on a log entry.
@@ -101,6 +102,8 @@ type ErrorPayload struct {
 	ReleaseTag  string       `json:"release_tag,omitempty"`
 	Environment string       `json:"environment,omitempty"`
 	Level       string       `json:"level,omitempty"`
+	TraceID     string       `json:"trace_id,omitempty"`
+	SpanID      string       `json:"span_id,omitempty"`
 }
 
 // StackFrame is a single frame in an error's stack trace.
@@ -119,6 +122,22 @@ func WithRelease(r string) ExceptionOption { return func(p *ErrorPayload) { p.Re
 
 // WithLevel overrides the level (default: "error").
 func WithLevel(l string) ExceptionOption { return func(p *ErrorPayload) { p.Level = l } }
+
+// WithSpan attaches a span's trace context to the error so the trace detail
+// view correlates it exactly instead of by timestamp overlap. Typical use:
+//
+//	client.CaptureException(err, observe.WithSpan(observe.SpanFromContext(ctx)))
+//
+// A nil span is a no-op, so callers don't need to guard the lookup.
+func WithSpan(s *Span) ExceptionOption {
+	return func(p *ErrorPayload) {
+		if s == nil {
+			return
+		}
+		p.TraceID = s.TraceID()
+		p.SpanID = s.SpanID()
+	}
+}
 
 // New constructs a Client and starts its background flush goroutine.
 // Caller must call Close() to flush pending logs and stop the goroutine.
@@ -158,11 +177,18 @@ func (c *Client) Close() error {
 		close(c.closed)
 	}
 	<-c.done
-	if err := c.flushSpans(context.Background()); err != nil {
-		_ = c.flushLogs(context.Background())
-		return err
+	// Drain spans, metrics, then logs. Metrics share the same best-effort
+	// shutdown semantics as logs/spans (no retry on drop).
+	spanErr := c.flushSpans(context.Background())
+	metricErr := c.FlushMetrics(context.Background())
+	logErr := c.flushLogs(context.Background())
+	if spanErr != nil {
+		return spanErr
 	}
-	return c.flushLogs(context.Background())
+	if metricErr != nil {
+		return metricErr
+	}
+	return logErr
 }
 
 func (c *Client) loop() {
@@ -176,6 +202,7 @@ func (c *Client) loop() {
 		case <-t.C:
 			_ = c.flushLogs(context.Background())
 			_ = c.flushSpans(context.Background())
+			_ = c.FlushMetrics(context.Background())
 		}
 	}
 }

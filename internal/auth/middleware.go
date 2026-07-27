@@ -44,7 +44,9 @@ func RequireRole(authSvc *AuthService, allowed ...string) neutron.Middleware {
 				neutron.WriteError(w, r, neutron.ErrInternal("auth check unavailable"))
 				return
 			}
-			if !hasAdmins {
+			// Grace period only when there is no way to authenticate yet — no
+			// local admins AND no SSO. With OIDC configured, require auth.
+			if !hasAdmins && !authSvc.OIDCEnabled() {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -92,14 +94,15 @@ func queryTokenAllowed(r *http.Request) bool {
 func JWTAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Grace period: if no admin users exist, allow unauthenticated access.
+			// Grace period: if there is no way to authenticate yet (no admin
+			// users AND no SSO), allow unauthenticated access for onboarding.
 			// Fail closed on a DB error rather than treating it as grace.
 			hasAdmins, err := authSvc.HasAdminUsers(r.Context())
 			if err != nil {
 				neutron.WriteError(w, r, neutron.ErrInternal("auth check unavailable"))
 				return
 			}
-			if !hasAdmins {
+			if !hasAdmins && !authSvc.OIDCEnabled() {
 				next.ServeHTTP(w, r)
 				return
 			}

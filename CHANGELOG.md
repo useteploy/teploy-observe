@@ -2,6 +2,13 @@
 
 All notable changes to Observe are recorded here.
 
+## [Unreleased]
+
+### Added
+
+- **Cross-product dashboard switcher.** A top-left dropdown (in the sidebar) lets you jump between the deployed Teploy dashboards — Dash, Observe, and Ship. Configure the sibling URLs with `TEPLOY_NAV_DASH_URL` and `TEPLOY_NAV_SHIP_URL` (same env convention across all three products); the switcher only appears once at least one sibling URL is set. Exposed via `/api/v1/config`.
+- **Single sign-on (OIDC).** Observe can act as an OpenID Connect relying party: delegate login to your own identity provider (Okta, Azure AD/Entra, Google Workspace, Keycloak, Authentik — "generic OIDC") or to Teploy Platform acting as the IdP for Cloud. The IdP authenticates the user; Observe verifies the signed ID token (authorization-code flow with PKCE, state, and nonce) and maps a claim to the same admin/editor/viewer roles it already uses — a `teploy_role` claim wins, otherwise a group claim is matched to configured admin/editor/viewer groups, otherwise a configurable default (viewer). It then mints Observe's normal JWT, so the SPA and every downstream check treat an SSO session identically; the role is re-read from the token on every login, keeping the IdP authoritative. Password login stays available as the break-glass path. Enable with `OBSERVE_OIDC_ISSUER` + `OBSERVE_OIDC_CLIENT_ID` (see README for the full variable list). When SSO is configured, the first-run open-access grace period is disabled (authentication becomes required). The login page shows an SSO button when it's enabled.
+
 ## v0.1.7 — 2026-07-15
 
 Versions v0.1.1 through v0.1.6 shipped without a changelog entry each — not reconstructed here. This entry covers everything since v0.1.6.

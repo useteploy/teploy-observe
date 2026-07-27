@@ -10,8 +10,8 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
 	"github.com/neutron-dev/neutron-go/neutronauth"
+	"github.com/neutron-dev/neutron-go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
@@ -19,10 +19,19 @@ import (
 // AuthService handles JWT token management, admin user authentication,
 // and API key validation.
 type AuthService struct {
-	db        *nucleus.Client
-	jwtSecret string
-	logger    *slog.Logger
+	db          *nucleus.Client
+	jwtSecret   string
+	logger      *slog.Logger
+	oidcEnabled bool
 }
+
+// SetOIDCEnabled records whether OIDC SSO is configured. When it is, the
+// first-run grace period (open access while no admin_users exist) is disabled —
+// SSO provides a way to authenticate, so the surface must not be left open.
+func (s *AuthService) SetOIDCEnabled(v bool) { s.oidcEnabled = v }
+
+// OIDCEnabled reports whether OIDC SSO is configured.
+func (s *AuthService) OIDCEnabled() bool { return s.oidcEnabled }
 
 // adminUserRow maps to the admin_users table.
 type adminUserRow struct {
