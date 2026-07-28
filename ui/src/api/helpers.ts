@@ -1,3 +1,5 @@
+import { withProgress } from "../lib/progress.js";
+
 // Shared API helpers used by all feature modules.
 
 const enc = encodeURIComponent;
@@ -61,7 +63,7 @@ export async function get<T>(path: string): Promise<T> {
   const token = localStorage.getItem("obs_token");
   const headers: Record<string, string> = {};
   if (token) headers["Authorization"] = `Bearer ${token}`;
-  const res = await fetch(withShare(path), { headers });
+  const res = await withProgress(() => fetch(withShare(path), { headers }));
   if (res.status === 401) {
     if (!isShared()) {
       localStorage.removeItem("obs_token");
@@ -77,7 +79,7 @@ export async function post<T>(path: string, body: unknown): Promise<T> {
   const token = localStorage.getItem("obs_token");
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (token) headers["Authorization"] = `Bearer ${token}`;
-  const res = await fetch(path, { method: "POST", headers, body: JSON.stringify(body) });
+  const res = await withProgress(() => fetch(path, { method: "POST", headers, body: JSON.stringify(body) }));
   if (res.status === 401) {
     if (!isShared()) {
       localStorage.removeItem("obs_token");
@@ -93,7 +95,7 @@ export async function del<T = { ok: boolean }>(path: string): Promise<T> {
   const token = localStorage.getItem("obs_token");
   const headers: Record<string, string> = {};
   if (token) headers["Authorization"] = `Bearer ${token}`;
-  const res = await fetch(path, { method: "DELETE", headers });
+  const res = await withProgress(() => fetch(path, { method: "DELETE", headers }));
   if (res.status === 401) {
     if (!isShared()) {
       localStorage.removeItem("obs_token");

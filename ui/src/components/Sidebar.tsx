@@ -94,6 +94,8 @@ export default function Sidebar() {
       <div class="obs-sidebar-header">
         <span class="obs-sidebar-logo">Teploy</span>
         <ProductSwitcher />
+        {/* Rides the header's bottom rule while requests are in flight. */}
+        <span class="obs-load-bar" id="obs-load-bar" />
       </div>
 
       <SiteSwitcher />

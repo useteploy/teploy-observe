@@ -12,6 +12,7 @@
   z-index: 100;
 }
 .obs-sidebar-header {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: flex-start;
@@ -20,6 +21,22 @@
   border-bottom: 1px solid var(--obs-border-subtle);
   min-height: 56px;
 }
+/* Loading bar: a light sweeping left to right along the header's bottom rule,
+   matching teploy-dash. Width and opacity are driven by lib/progress.ts. */
+.obs-load-bar {
+  position: absolute;
+  right: 0;
+  bottom: -1px;
+  left: 0;
+  z-index: 2;
+  width: 0;
+  height: 2px;
+  opacity: 0;
+  background: linear-gradient(90deg, transparent, var(--obs-accent) 45%, #dceaff);
+  pointer-events: none;
+  transition: width .4s cubic-bezier(.1, .75, .25, 1), opacity .25s ease;
+}
+
 .obs-sidebar-logo {
   font-weight: 700;
   font-size: 14px;
