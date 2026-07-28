@@ -565,7 +565,7 @@ function AISection() {
   const [message, setMessage] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch("/api/v1/ai/config", { headers: { Authorization: "Bearer " + localStorage.getItem("observe_token") } })
+    fetch("/api/v1/ai/config", { headers: { Authorization: "Bearer " + localStorage.getItem("obs_token") } })
       .then(r => r.json()).then(setCfg).catch(() => setCfg({ provider: "", endpoint: "", model: "", has_key: false }))
       .finally(() => setLoading(false));
   }, []);
@@ -577,7 +577,7 @@ function AISection() {
     try {
       const r = await fetch("/api/v1/ai/config", {
         method: "PUT",
-        headers: { "Content-Type": "application/json", Authorization: "Bearer " + localStorage.getItem("observe_token") },
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + localStorage.getItem("obs_token") },
         body: JSON.stringify(cfg),
       });
       const data = await r.json();
@@ -650,7 +650,7 @@ function ExportsSection() {
     setLoading(true);
     setLoadError("");
     try {
-      const r = await fetch("/api/v1/exports/scheduled", { headers: { Authorization: "Bearer " + localStorage.getItem("observe_token") } });
+      const r = await fetch("/api/v1/exports/scheduled", { headers: { Authorization: "Bearer " + localStorage.getItem("obs_token") } });
       if (!r.ok) {
         const body = await r.text();
         let msg = `Server error ${r.status}`;
@@ -681,7 +681,7 @@ function ExportsSection() {
     };
     const r = await fetch("/api/v1/exports/scheduled", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: "Bearer " + localStorage.getItem("observe_token") },
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + localStorage.getItem("obs_token") },
       body: JSON.stringify(body),
     });
     if (r.ok) {
@@ -696,7 +696,7 @@ function ExportsSection() {
   const runNow = async (id: string) => {
     await fetch(`/api/v1/exports/scheduled/${id}/run`, {
       method: "POST",
-      headers: { Authorization: "Bearer " + localStorage.getItem("observe_token") },
+      headers: { Authorization: "Bearer " + localStorage.getItem("obs_token") },
     });
     load();
   };
@@ -705,7 +705,7 @@ function ExportsSection() {
     if (!confirm("Delete this export?")) return;
     await fetch(`/api/v1/exports/scheduled/${id}`, {
       method: "DELETE",
-      headers: { Authorization: "Bearer " + localStorage.getItem("observe_token") },
+      headers: { Authorization: "Bearer " + localStorage.getItem("obs_token") },
     });
     load();
   };

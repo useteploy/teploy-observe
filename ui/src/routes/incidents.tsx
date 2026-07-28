@@ -19,7 +19,7 @@ interface Incident {
 }
 
 const token = () =>
-  typeof localStorage !== "undefined" ? localStorage.getItem("observe_token") || "" : "";
+  typeof localStorage !== "undefined" ? localStorage.getItem("obs_token") || "" : "";
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(path, {

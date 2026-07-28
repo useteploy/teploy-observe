@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -12,13 +13,53 @@ import (
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
+// servicesCacheTTL is how long a services rollup stays servable. The RED
+// aggregate scans every span in the window, which Nucleus costs at seconds on
+// a few hundred thousand rows no matter how narrow the time predicate is — so
+// without this, every visit to the Traces page pays the full scan again. A few
+// seconds of staleness on a services overview is a fair trade for a page that
+// opens instantly; per-trace views are uncached and always live.
+const servicesCacheTTL = 15 * time.Second
+
+// servicesEntry is one cached rollup, remembered per site.
+type servicesEntry struct {
+	window time.Duration
+	at     time.Time
+	result []ServiceSummary
+}
+
 // QueryService provides trace and service query methods for the dashboard.
 type QueryService struct {
 	db *nucleus.Client
+
+	// One entry per site, not per (site, from, to): the dashboard sends a
+	// rolling window whose bounds move every request, so keying on the exact
+	// bounds would never hit and would grow without limit. Keyed by site and
+	// matched on window length, the map is bounded by the number of sites.
+	servicesMu    sync.Mutex
+	servicesCache map[string]servicesEntry
 }
 
 func NewQueryService(db *nucleus.Client) *QueryService {
-	return &QueryService{db: db}
+	return &QueryService{db: db, servicesCache: map[string]servicesEntry{}}
+}
+
+// cachedServices returns a fresh-enough rollup for the same site and window
+// length, if one was computed within the TTL.
+func (q *QueryService) cachedServices(siteID string, window time.Duration) ([]ServiceSummary, bool) {
+	q.servicesMu.Lock()
+	defer q.servicesMu.Unlock()
+	e, ok := q.servicesCache[siteID]
+	if !ok || e.window != window || time.Since(e.at) > servicesCacheTTL {
+		return nil, false
+	}
+	return e.result, true
+}
+
+func (q *QueryService) storeServices(siteID string, window time.Duration, result []ServiceSummary) {
+	q.servicesMu.Lock()
+	defer q.servicesMu.Unlock()
+	q.servicesCache[siteID] = servicesEntry{window: window, at: time.Now(), result: result}
 }
 
 // ServiceSummary is a service with its RED metrics.
@@ -63,6 +104,10 @@ func apdex(durations []int64, t int64) float64 {
 
 // ListServices returns services with aggregated RED metrics for a time range.
 func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to time.Time) ([]ServiceSummary, error) {
+	window := to.Sub(from)
+	if cached, ok := q.cachedServices(siteID, window); ok {
+		return cached, nil
+	}
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
@@ -73,15 +118,26 @@ func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to
 	// ingest batches reported only the LAST batch's counts — RED metrics
 	// undercounted badly. Raw spans within retention are the source of truth,
 	// and Nucleus computes the counts + percentiles directly.
+	// Apdex is folded into this same aggregate rather than run as a second
+	// query. It used to pull every root span's duration into Go to bucket them,
+	// which meant a second scan that transferred one row per span — on a 436k-row
+	// table that was the difference between a ~5s response and a ~20s one, and it
+	// is what made the Traces page look frozen. The buckets are just counts, so
+	// the database can produce them: satisfied <= T, tolerated in (T, 4T].
 	type rawStat struct {
-		ServiceName  string `db:"service_name"`
-		RequestCount int64  `db:"request_count"`
-		ErrorCount   int64  `db:"error_count"`
-		DurationSum  int64  `db:"duration_sum"`
-		P50          int64  `db:"p50_ms"`
-		P95          int64  `db:"p95_ms"`
-		P99          int64  `db:"p99_ms"`
+		ServiceName    string `db:"service_name"`
+		RequestCount   int64  `db:"request_count"`
+		ErrorCount     int64  `db:"error_count"`
+		DurationSum    int64  `db:"duration_sum"`
+		P50            int64  `db:"p50_ms"`
+		P95            int64  `db:"p95_ms"`
+		P99            int64  `db:"p99_ms"`
+		RootCount      int64  `db:"root_count"`
+		SatisfiedCount int64  `db:"satisfied_count"`
+		ToleratedCount int64  `db:"tolerated_count"`
 	}
+	satisfiedMs := dbutil.IntParam(apdexThresholdMs)
+	toleratedMs := dbutil.IntParam(4 * apdexThresholdMs)
 	rows, err := nucleus.Query[rawStat](ctx, q.db.SQL(),
 		`SELECT service_name,
 			COUNT(*) AS request_count,
@@ -89,21 +145,17 @@ func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to
 			SUM(duration_ms) AS duration_sum,
 			CAST(percentile_cont(duration_ms, 0.50) AS BIGINT) AS p50_ms,
 			CAST(percentile_cont(duration_ms, 0.95) AS BIGINT) AS p95_ms,
-			CAST(percentile_cont(duration_ms, 0.99) AS BIGINT) AS p99_ms
+			CAST(percentile_cont(duration_ms, 0.99) AS BIGINT) AS p99_ms,
+			SUM(CASE WHEN parent_span_id = '' THEN 1 ELSE 0 END) AS root_count,
+			SUM(CASE WHEN parent_span_id = '' AND duration_ms <= $4 THEN 1 ELSE 0 END) AS satisfied_count,
+			SUM(CASE WHEN parent_span_id = '' AND duration_ms > $4 AND duration_ms <= $5 THEN 1 ELSE 0 END) AS tolerated_count
 		 FROM spans
 		 WHERE site_id = $1 AND start_time >= $2 AND start_time < $3
 		 GROUP BY service_name`,
-		siteID, fromMs, toMs,
+		siteID, fromMs, toMs, satisfiedMs, toleratedMs,
 	)
 	if err != nil {
 		return nil, err
-	}
-
-	// Apdex per service from raw root-span durations in the same window.
-	apdexByService, err := q.serviceApdex(ctx, siteID, from, to, apdexThresholdMs)
-	if err != nil {
-		// Non-fatal — Apdex is best-effort, RED metrics still ship.
-		apdexByService = map[string]float64{}
 	}
 
 	result := make([]ServiceSummary, 0, len(rows))
@@ -115,42 +167,20 @@ func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to
 		result = append(result, ServiceSummary{
 			ServiceName: r.ServiceName, RequestCount: r.RequestCount, ErrorCount: r.ErrorCount,
 			AvgDuration: avg, P50: r.P50, P95: r.P95, P99: r.P99,
-			ApdexScore: apdexByService[r.ServiceName],
+			ApdexScore: apdexFromCounts(r.SatisfiedCount, r.ToleratedCount, r.RootCount),
 		})
 	}
+	q.storeServices(siteID, window, result)
 	return result, nil
 }
 
-// serviceApdex computes per-service Apdex from raw span durations in [from, to).
-func (q *QueryService) serviceApdex(ctx context.Context, siteID string, from, to time.Time, t int64) (map[string]float64, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
-
-	type row struct {
-		ServiceName string `db:"service_name"`
-		DurationMs  string `db:"duration_ms"`
+// apdexFromCounts is apdex() over pre-bucketed counts — same formula, same
+// zero-for-empty behaviour, for when the database did the bucketing.
+func apdexFromCounts(satisfied, tolerated, total int64) float64 {
+	if total <= 0 {
+		return 0
 	}
-	rows, err := nucleus.Query[row](ctx, q.db.SQL(),
-		`SELECT service_name, CAST(duration_ms AS TEXT) AS duration_ms
-		 FROM spans
-		 WHERE site_id = $1 AND parent_span_id = ''
-		   AND start_time >= $2
-		   AND start_time < $3`,
-		siteID, fromMs, toMs,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	byService := make(map[string][]int64)
-	for _, r := range rows {
-		byService[r.ServiceName] = append(byService[r.ServiceName], parseInt(r.DurationMs))
-	}
-	out := make(map[string]float64, len(byService))
-	for name, durs := range byService {
-		out[name] = apdex(durs, t)
-	}
-	return out, nil
+	return (float64(satisfied) + float64(tolerated)/2.0) / float64(total)
 }
 
 // OperationSummary is an operation within a service with RED metrics.

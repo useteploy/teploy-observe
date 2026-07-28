@@ -87,6 +87,39 @@ func TestApdex(t *testing.T) {
 	}
 }
 
+// TestApdexFromCounts_MatchesApdex pins the SQL-side bucketing to the original
+// Go implementation: ListServices now has the database count satisfied and
+// tolerated root spans instead of pulling every duration back, so the two must
+// agree for the same input or the Traces page would quietly report a different
+// score than it used to.
+func TestApdexFromCounts_MatchesApdex(t *testing.T) {
+	const T int64 = 500
+	cases := [][]int64{
+		{},
+		{1},
+		{500, 501, 2000, 2001},
+		{100, 200, 300, 1500, 1900, 5000, 9000},
+		{2001, 2001, 2001},
+	}
+	for _, durations := range cases {
+		var satisfied, tolerated int64
+		for _, d := range durations {
+			switch {
+			case d <= T:
+				satisfied++
+			case d <= 4*T:
+				tolerated++
+			}
+		}
+		want := apdex(durations, T)
+		got := apdexFromCounts(satisfied, tolerated, int64(len(durations)))
+		if math.Abs(got-want) > 1e-9 {
+			t.Errorf("apdexFromCounts(%d,%d,%d) = %v, apdex(%v) = %v",
+				satisfied, tolerated, len(durations), got, durations, want)
+		}
+	}
+}
+
 // TestAggregateRollups_BucketingByMinute verifies spans are grouped into
 // 60-second buckets keyed by start_time/60_000.
 func TestAggregateRollups_BucketingByMinute(t *testing.T) {

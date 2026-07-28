@@ -73,17 +73,6 @@ body { margin: 0; }
 h1, h2, h3, h4 { line-height: 1.3; margin: 0; }
 p { line-height: 1.6; }
 
-/* ─── Accent Line ─── */
-.obs-accent-line {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 2px;
-  background: linear-gradient(90deg, var(--obs-accent), #a78bfa, var(--obs-accent));
-  z-index: 100;
-}
-
 /* ─── Page fade-in ─── */
 @keyframes obs-fade-in {
   from { opacity: 0; transform: translateY(4px); }

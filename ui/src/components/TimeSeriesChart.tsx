@@ -64,7 +64,7 @@ function TimeSeriesChart() {
     const fromMs = new Date(from).getTime();
     const toMs = new Date(to).getTime();
     fetch(`/api/v1/incidents?site_id=${encodeURIComponent(siteId)}&from=${fromMs}&to=${toMs}`, {
-      headers: { Authorization: "Bearer " + (typeof localStorage !== "undefined" ? localStorage.getItem("observe_token") || "" : "") },
+      headers: { Authorization: "Bearer " + (typeof localStorage !== "undefined" ? localStorage.getItem("obs_token") || "" : "") },
     })
       .then((r) => r.ok ? r.json() : [])
       .then((list) => setMarkers(Array.isArray(list) ? list.map((inc: any) => ({

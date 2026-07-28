@@ -1,7 +1,7 @@
 /* ─── Sidebar ─── */
 .obs-sidebar {
   position: fixed;
-  top: 3px; /* below accent line */
+  top: 0;
   left: 0;
   bottom: 0;
   width: 220px;

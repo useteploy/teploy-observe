@@ -48,19 +48,27 @@ type metricRow struct {
 // with their kind. The kind for a given name is taken from the most
 // recently observed point (consistent enough — kinds shouldn't churn).
 //
-// We pull rows + dedupe in Go because Nucleus rejects DISTINCT-with-multi-
-// column patterns we'd otherwise want here.
+// Grouped in the database, not in Go. Nucleus rejects DISTINCT over multiple
+// columns, but GROUP BY over the same pair works and is what this needs: the
+// result is one row per metric name, so the cost scales with how many metrics
+// a site has rather than how many points it has recorded. Deduping Go-side
+// meant dragging every point row across pgwire to produce a handful of names
+// — 644k rows for three metrics on our own instance, seconds warm and tens of
+// seconds cold, which is what made the Metrics page feel frozen.
 func (s *Service) ListMetrics(ctx context.Context, siteID string) ([]MetricInfo, error) {
 	if siteID == "" {
 		return nil, fmt.Errorf("metrics: site_id required")
 	}
 	rows, err := nucleus.Query[metricRow](ctx, s.db.SQL(),
-		`SELECT metric_name, metric_kind FROM metric_points WHERE site_id = $1`,
+		`SELECT metric_name, metric_kind FROM metric_points WHERE site_id = $1
+		 GROUP BY metric_name, metric_kind`,
 		siteID,
 	)
 	if err != nil {
 		return nil, err
 	}
+	// A name can still appear under two kinds if a producer changed kind
+	// mid-stream; last wins, matching the previous behaviour.
 	seen := make(map[string]string, len(rows))
 	for _, r := range rows {
 		seen[r.Name] = r.Kind
