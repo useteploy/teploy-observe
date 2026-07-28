@@ -75,7 +75,7 @@ export default function Sidebar() {
   return (
     <nav class={`obs-sidebar ${collapsed ? "obs-sidebar--collapsed" : ""}`}>
       <div class="obs-sidebar-header">
-        {!collapsed && <span class="obs-sidebar-logo">Observe</span>}
+        {!collapsed && <span class="obs-sidebar-logo">Teploy</span>}
         <button class="obs-sidebar-toggle" onClick={() => setCollapsed(!collapsed)}
           title={collapsed ? "Expand" : "Collapse"}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">

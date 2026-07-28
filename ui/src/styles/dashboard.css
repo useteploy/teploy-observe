@@ -2,24 +2,27 @@
 
 /* ─── Design Tokens ─── */
 :root {
-  --obs-font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-  --obs-bg: #09090b;
-  --obs-surface: #0f0f12;
-  --obs-card: #111114;
-  --obs-card-hover: #16161a;
-  --obs-elevated: #1e1e24;
-  --obs-border: #27272a;
-  --obs-border-subtle: #1e1e22;
-  --obs-text: #fafafa;
-  --obs-text-secondary: #a1a1aa;
-  --obs-text-muted: #52525b;
-  --obs-accent: #6366f1;
-  --obs-accent-hover: #818cf8;
-  --obs-success: #22c55e;
-  --obs-success-bg: rgba(34, 197, 94, 0.1);
-  --obs-danger: #ef4444;
-  --obs-danger-bg: rgba(239, 68, 68, 0.1);
-  --obs-warning: #f59e0b;
+  /* Shared Teploy suite palette — matches teploy-dash and teploy-ship so the
+     three dashboards read as one product. Only the tokens changed; component
+     styles consume them unchanged. */
+  --obs-font: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  --obs-bg: #0d1117;
+  --obs-surface: #0d1117;
+  --obs-card: #161b22;
+  --obs-card-hover: #1c2128;
+  --obs-elevated: #1c2128;
+  --obs-border: #30363d;
+  --obs-border-subtle: #21262d;
+  --obs-text: #e6edf3;
+  --obs-text-secondary: #b1bac4;
+  --obs-text-muted: #8b949e;
+  --obs-accent: #58a6ff;
+  --obs-accent-hover: #79b8ff;
+  --obs-success: #3fb950;
+  --obs-success-bg: rgba(63, 185, 80, 0.1);
+  --obs-danger: #f85149;
+  --obs-danger-bg: rgba(248, 81, 73, 0.1);
+  --obs-warning: #d29922;
   --obs-radius-sm: 4px;
   --obs-radius: 6px;
   --obs-radius-md: 8px;
@@ -31,24 +34,24 @@
 
 /* ─── Light Theme ─── */
 [data-theme="light"] {
-  --obs-bg: #f8f9fa;
-  --obs-surface: #ffffff;
-  --obs-card: #ffffff;
-  --obs-card-hover: #f3f4f6;
-  --obs-elevated: #f9fafb;
-  --obs-border: #e5e7eb;
-  --obs-border-subtle: #f0f0f2;
-  --obs-text: #111827;
-  --obs-text-secondary: #4b5563;
-  --obs-text-muted: #9ca3af;
-  --obs-accent: #4f46e5;
-  --obs-accent-hover: #6366f1;
-  --obs-success: #16a34a;
-  --obs-success-bg: rgba(22, 163, 74, 0.08);
-  --obs-danger: #dc2626;
-  --obs-danger-bg: rgba(220, 38, 38, 0.08);
-  --obs-warning: #d97706;
-  --obs-surface-hover: #f3f4f6;
+  --obs-bg: #ffffff;
+  --obs-surface: #f6f8fa;
+  --obs-card: #f6f8fa;
+  --obs-card-hover: #eef1f4;
+  --obs-elevated: #f6f8fa;
+  --obs-border: #d0d7de;
+  --obs-border-subtle: #e4e8ed;
+  --obs-text: #1f2328;
+  --obs-text-secondary: #424a53;
+  --obs-text-muted: #656d76;
+  --obs-accent: #0969da;
+  --obs-accent-hover: #0550ae;
+  --obs-success: #1a7f37;
+  --obs-success-bg: rgba(26, 127, 55, 0.08);
+  --obs-danger: #cf222e;
+  --obs-danger-bg: rgba(207, 34, 46, 0.08);
+  --obs-warning: #9a6700;
+  --obs-surface-hover: #eef1f4;
 }
 
 /* ─── Reset & Base ─── */

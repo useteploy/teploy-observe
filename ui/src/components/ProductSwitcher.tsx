@@ -40,26 +40,29 @@ export default function ProductSwitcher({ collapsed = false }: { collapsed?: boo
     return () => document.removeEventListener("mousedown", onDoc);
   }, [open]);
 
-  // Only show the switcher when there's somewhere else to switch to.
-  if (apps.filter((a) => a.url !== "").length === 0) return null;
-  const currentLabel = apps.find((a) => a.key === current)?.label ?? "Teploy";
+  // Always name the current product, so the sidebar says which dashboard you
+  // are in even before any sibling is configured; it becomes a dropdown only
+  // when there is somewhere else to go.
+  const siblings = apps.filter((a) => a.url !== "");
+  const currentLabel = apps.find((a) => a.key === current)?.label ?? "Observe";
 
   return (
     <div ref={ref} class="obs-product-switcher">
       <button
-        class="obs-product-switcher-btn"
-        onClick={() => setOpen(!open)}
-        title="Switch dashboard"
+        class={`obs-product-switcher-btn${siblings.length === 0 ? " obs-product-switcher-btn--static" : ""}`}
+        onClick={() => siblings.length > 0 && setOpen(!open)}
+        aria-haspopup={siblings.length > 0}
+        aria-expanded={open}
+        title={siblings.length > 0 ? "Switch dashboard" : undefined}
       >
-        <span class="obs-product-dot" />
         {!collapsed && <span class="obs-product-current">{currentLabel}</span>}
-        {!collapsed && (
+        {!collapsed && siblings.length > 0 && (
           <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" style={{ marginLeft: "auto", opacity: 0.6 }}>
             <path d="M7 10l5 5 5-5z" />
           </svg>
         )}
       </button>
-      {open && (
+      {open && siblings.length > 0 && (
         <div class="obs-product-menu">
           {apps.map((a) =>
             a.key === current ? (
@@ -84,8 +87,8 @@ export default function ProductSwitcher({ collapsed = false }: { collapsed?: boo
           font-size: 13px; font-weight: 600; font-family: var(--obs-font); cursor: pointer;
         }
         .obs-product-switcher-btn:hover { border-color: var(--obs-border); }
-        .obs-product-dot { width: 8px; height: 8px; border-radius: 50%;
-          background: linear-gradient(135deg, var(--obs-accent), #a78bfa); flex: none; }
+        .obs-product-switcher-btn--static { cursor: default; }
+        .obs-product-switcher-btn--static:hover { border-color: var(--obs-border-subtle); }
         .obs-product-current { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .obs-product-menu {
           position: absolute; left: 12px; right: 12px; top: 100%; z-index: 50;
