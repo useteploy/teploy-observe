@@ -11,11 +11,13 @@ import (
 	"github.com/useteploy/teploy-observe/internal/ingest"
 )
 
-// OTLPHandler returns an http.HandlerFunc that accepts OTLP traces via HTTP.
-// Supports both JSON and protobuf content types.
-// This serves as the /v1/traces endpoint compatible with OTLP HTTP exporters.
-// For gRPC exporters, use an OTLP-to-HTTP gateway or configure the exporter
-// to use HTTP transport (supported by all major OTLP exporters).
+// OTLPHandler accepts OTLP traces over HTTP at /v1/traces, in both wire
+// formats: application/x-protobuf (what OTLP exporters send by default) and
+// application/json. Protobuf is translated into the JSON-shaped request in
+// otlp_proto.go so there is only one ingest path.
+//
+// gRPC is not served here. Point an exporter at HTTP, or put a Collector in
+// front — every major exporter supports HTTP transport.
 type OTLPHandler struct {
 	svc *IngestService
 }
@@ -26,7 +28,7 @@ func NewOTLPHandler(svc *IngestService) *OTLPHandler {
 
 // ServeHTTP handles OTLP HTTP trace export requests.
 // Endpoint: POST /v1/traces
-// Content-Type: application/json (OTLP JSON) or application/x-protobuf (not yet supported)
+// Content-Type: application/x-protobuf or application/json.
 func (h *OTLPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -42,19 +44,17 @@ func (h *OTLPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Content-Type may carry parameters (`application/x-protobuf; charset=...`).
 	switch {
-	case contentType == "application/json" || contentType == "":
-		h.handleJSON(w, r, siteID)
-	case contentType == "application/x-protobuf":
-		// Protobuf support would require importing the OTLP proto definitions.
-		// For now, return a helpful error directing users to JSON transport.
-		http.Error(w, `{"error":"protobuf not supported, use JSON transport: set OTEL_EXPORTER_OTLP_PROTOCOL=http/json"}`, http.StatusUnsupportedMediaType)
+	case strings.HasPrefix(contentType, "application/x-protobuf"),
+		strings.HasPrefix(contentType, "application/protobuf"):
+		h.handle(w, r, siteID, true)
 	default:
-		h.handleJSON(w, r, siteID)
+		h.handle(w, r, siteID, false)
 	}
 }
 
-func (h *OTLPHandler) handleJSON(w http.ResponseWriter, r *http.Request, siteID string) {
+func (h *OTLPHandler) handle(w http.ResponseWriter, r *http.Request, siteID string, isProto bool) {
 	// OTLP HTTP exporters (incl. @vercel/otel and the OTel SDK with
 	// OTEL_EXPORTER_OTLP_COMPRESSION=gzip) gzip the body and set
 	// Content-Encoding: gzip. Decompress before parsing, or json.Unmarshal
@@ -79,7 +79,14 @@ func (h *OTLPHandler) handleJSON(w http.ResponseWriter, r *http.Request, siteID 
 	}
 
 	var req ExportTraceRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if isProto {
+		decoded, derr := decodeProtoTraces(body)
+		if derr != nil {
+			http.Error(w, derr.Error(), http.StatusBadRequest)
+			return
+		}
+		req = decoded
+	} else if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
 		return
 	}

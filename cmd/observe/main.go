@@ -833,6 +833,10 @@ func main() {
 	// exporters supply the key via OTEL_EXPORTER_OTLP_HEADERS=X-API-Key=...
 	otlpHandler := tracing.NewOTLPHandler(traceIngest)
 	r.Handle("POST /v1/traces", apiKeyMW(otlpHandler))
+	// The third OTLP signal. Without it an SDK or Collector exporting all three
+	// got a 405 on logs and dropped them. Records land in the same store as
+	// /api/v1/logs, so pipelines, search and the UI need no extra wiring.
+	r.Handle("POST /v1/logs", apiKeyMW(logs.NewOTLPLogsHandler(logSvc)))
 
 	// --- SQL Explorer (JWT + editor role; query tables stays read-only) ---
 	// Admin-only: the raw SQL explorer can read any table, including

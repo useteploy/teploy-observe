@@ -6,6 +6,20 @@ All notable changes to Observe are recorded here.
 
 ### Added
 
+- **OTLP protobuf ingest, and the logs signal.** `/v1/traces` and `/v1/metrics`
+  previously accepted only `application/json` and answered protobuf with a 415,
+  and there was no `/v1/logs` at all — so a stock OpenTelemetry SDK or Collector
+  pointed at Observe exported nothing unless it was reconfigured with
+  `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`, and dropped logs entirely. All three
+  signals now accept both `application/x-protobuf` (the exporters' default) and
+  JSON. Protobuf is translated into the same request the JSON path builds, so
+  ingest, validation and storage stay single-sourced. OTLP logs land in the same
+  store as `/api/v1/logs`, so pipelines, search and the UI work on them with no
+  extra wiring; severity maps to Observe's levels, and `service.name` plus the
+  resource attributes are carried onto every record. Verified end to end against
+  the real OpenTelemetry JS exporters. gRPC remains unsupported — use HTTP
+  transport or a Collector.
+
 - **Cross-product dashboard switcher.** A top-left dropdown (in the sidebar) lets you jump between the deployed Teploy dashboards — Dash, Observe, and Ship. Configure the sibling URLs with `TEPLOY_NAV_DASH_URL` and `TEPLOY_NAV_SHIP_URL` (same env convention across all three products); the switcher only appears once at least one sibling URL is set. Exposed via `/api/v1/config`.
 - **Single sign-on (OIDC).** Observe can act as an OpenID Connect relying party: delegate login to your own identity provider (Okta, Azure AD/Entra, Google Workspace, Keycloak, Authentik — "generic OIDC") or to Teploy Platform acting as the IdP for Cloud. The IdP authenticates the user; Observe verifies the signed ID token (authorization-code flow with PKCE, state, and nonce) and maps a claim to the same admin/editor/viewer roles it already uses — a `teploy_role` claim wins, otherwise a group claim is matched to configured admin/editor/viewer groups, otherwise a configurable default (viewer). It then mints Observe's normal JWT, so the SPA and every downstream check treat an SSO session identically; the role is re-read from the token on every login, keeping the IdP authoritative. Password login stays available as the break-glass path. Enable with `OBSERVE_OIDC_ISSUER` + `OBSERVE_OIDC_CLIENT_ID` (see README for the full variable list). When SSO is configured, the first-run open-access grace period is disabled (authentication becomes required). The login page shows an SSO button when it's enabled.
 

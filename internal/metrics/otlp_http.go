@@ -24,7 +24,7 @@ func NewOTLPHandler(svc *Service) *OTLPHandler {
 
 // ServeHTTP handles OTLP HTTP metrics export requests.
 // Endpoint: POST /v1/metrics
-// Content-Type: application/json (OTLP JSON) or application/x-protobuf (not supported).
+// Content-Type: application/x-protobuf or application/json.
 func (h *OTLPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -40,17 +40,17 @@ func (h *OTLPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Content-Type may carry parameters (`application/x-protobuf; charset=...`).
 	switch {
-	case contentType == "application/json" || contentType == "":
-		h.handleJSON(w, r, siteID)
-	case contentType == "application/x-protobuf":
-		http.Error(w, `{"error":"protobuf not supported, use JSON transport: set OTEL_EXPORTER_OTLP_PROTOCOL=http/json"}`, http.StatusUnsupportedMediaType)
+	case strings.HasPrefix(contentType, "application/x-protobuf"),
+		strings.HasPrefix(contentType, "application/protobuf"):
+		h.handle(w, r, siteID, true)
 	default:
-		h.handleJSON(w, r, siteID)
+		h.handle(w, r, siteID, false)
 	}
 }
 
-func (h *OTLPHandler) handleJSON(w http.ResponseWriter, r *http.Request, siteID string) {
+func (h *OTLPHandler) handle(w http.ResponseWriter, r *http.Request, siteID string, isProto bool) {
 	// OTLP HTTP exporters gzip the body and set Content-Encoding: gzip.
 	// Decompress before parsing or json.Unmarshal chokes on the gzip magic
 	// byte and 400s every export. Mirrors the tracing OTLP handler.
@@ -72,7 +72,14 @@ func (h *OTLPHandler) handleJSON(w http.ResponseWriter, r *http.Request, siteID 
 	}
 
 	var req ExportMetricsRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if isProto {
+		decoded, derr := decodeProtoMetrics(body)
+		if derr != nil {
+			http.Error(w, derr.Error(), http.StatusBadRequest)
+			return
+		}
+		req = decoded
+	} else if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
 		return
 	}

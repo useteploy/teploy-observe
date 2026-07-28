@@ -102,7 +102,10 @@ the exact image and version.
 - Error-to-session cross-correlation.
 
 ### APM / distributed tracing
-- OTLP HTTP/JSON ingest.
+- OTLP ingest over HTTP for all three signals — traces, metrics and logs — in
+  both wire formats (`application/x-protobuf`, which is what OTLP exporters send
+  by default, and `application/json`). gRPC is not served; point an exporter at
+  HTTP transport or put a Collector in front.
 - Service list with RED metrics, waterfall + flame-graph views,
   dependency map, p50/p95/p99 latency.
 
@@ -303,7 +306,9 @@ so the direct role claim is available here and takes precedence over groups.
 | POST | `/api/v1/events/batch` | Ingest batch of events. |
 | POST | `/api/v1/errors` | Ingest error event. |
 | POST | `/api/v1/logs` | Ingest log entry. |
-| POST | `/v1/traces` | OTLP trace ingestion. |
+| POST | `/v1/traces` | OTLP trace ingestion (protobuf or JSON). |
+| POST | `/v1/metrics` | OTLP metric ingestion (protobuf or JSON). |
+| POST | `/v1/logs` | OTLP log ingestion (protobuf or JSON). |
 | POST | `/api/v1/llm/ingest` | Ingest LLM trace. |
 | POST | `/api/v1/infra/report` | Host metrics. |
 | POST | `/api/v1/replays` | Session replay events. |
