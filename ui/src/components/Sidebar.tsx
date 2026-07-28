@@ -2,6 +2,17 @@ import { useState, useEffect } from "preact/hooks";
 import SiteSwitcher from "./SiteSwitcher.js";
 import ProductSwitcher from "./ProductSwitcher.js";
 
+/** The nav item owning a path. Longest href wins so "/dashboards" is not
+ *  shadowed by a shorter prefix. */
+function navKeyFor(path: string): string | null {
+  let best: { key: string; len: number } | null = null;
+  for (const item of NAV_ITEMS) {
+    const hit = item.href === "/" ? path === "/" : path === item.href || path.startsWith(item.href + "/");
+    if (hit && (best === null || item.href.length > best.len)) best = { key: item.key, len: item.href.length };
+  }
+  return best?.key ?? null;
+}
+
 const NAV_ITEMS = [
   { key: "analytics", label: "Dashboard", icon: "M3 13h4v8H3v-8zm7-4h4v12h-4V9zm7-6h4v18h-4V3z", href: "/" },
   { key: "dashboards", label: "Dashboards", icon: "M4 6h18V4H4c-1.1 0-2 .9-2 2v11H0v3h14v-3H4V6zm19 2h-6c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h6c.55 0 1-.45 1-1V9c0-.55-.45-1-1-1zm-1 9h-4v-7h4v7z", href: "/dashboards" },
@@ -40,7 +51,12 @@ function NavIcon({ d }: { d: string }) {
 }
 
 export default function Sidebar() {
-  const [active, setActive] = useState("analytics");
+  // Resolved from the URL at first render. Hardcoding a default meant every
+  // route change remounted the sidebar showing Dashboard selected for a frame
+  // before the effect corrected it — a visible flash on the wrong item.
+  const [active, setActive] = useState(() =>
+    typeof window === "undefined" ? "analytics" : navKeyFor(window.location.pathname) ?? "analytics"
+  );
   const [theme, setTheme] = useState(() => {
     if (typeof window === "undefined") return "dark";
     return localStorage.getItem("obs_theme") || "dark";
@@ -63,12 +79,12 @@ export default function Sidebar() {
     }
   }, []);
 
+  // Keep in step with back/forward and any programmatic navigation.
   useEffect(() => {
-    const path = window.location.pathname;
-    const match = NAV_ITEMS.find(item =>
-      item.href === "/" ? path === "/" : path.startsWith(item.href)
-    );
-    if (match) setActive(match.key);
+    const sync = () => setActive(navKeyFor(window.location.pathname) ?? "analytics");
+    sync();
+    window.addEventListener("popstate", sync);
+    return () => window.removeEventListener("popstate", sync);
   }, []);
 
   return (
