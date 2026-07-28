@@ -17,9 +17,13 @@
   align-items: center;
   justify-content: flex-start;
   gap: 9px;
-  padding: 12px;
+  /* 20px on the sides, not 12: dash and ship both start the wordmark at x=20
+     (their headers are `10px 20px`), so this is what makes the three read as
+     the same header rather than three near-misses. */
+  padding: 12px 20px;
   border-bottom: 1px solid var(--obs-border-subtle);
-  min-height: 56px;
+  /* 55, matching dash's and ship's navbar min-height exactly. */
+  min-height: 55px;
 }
 /* Loading bar: a light sweeping left to right along the header's bottom rule,
    matching teploy-dash. Width and opacity are driven by lib/progress.ts. */
