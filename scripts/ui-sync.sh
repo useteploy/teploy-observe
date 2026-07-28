@@ -27,6 +27,22 @@ rsync -a --delete \
   --exclude '.neutron-routes.d.ts' \
   "$OBSERVE_UI_SRC/" "$CANONICAL_SRC/"
 
+# The HTML shell also lives beside src/, so an edit to ui/index.html (e.g. the
+# favicon link) would otherwise never reach the app that actually builds.
+if [ -f "$OBSERVE_ROOT/ui/index.html" ]; then
+  log "copy ui/index.html -> $CANONICAL_APP/index.html"
+  cp "$OBSERVE_ROOT/ui/index.html" "$CANONICAL_APP/index.html"
+fi
+
+# Static assets (favicon, etc.) live beside src/, not inside it — Neutron copies
+# publicDir into the build, so it has to reach the canonical app too or the
+# built dashboard silently ships without them.
+if [ -d "$OBSERVE_ROOT/ui/public" ]; then
+  log "rsync ui/public/ -> $CANONICAL_APP/public/"
+  mkdir -p "$CANONICAL_APP/public"
+  rsync -a --delete "$OBSERVE_ROOT/ui/public/" "$CANONICAL_APP/public/"
+fi
+
 log "patching imports (neutron/client -> @neutron-build/core/client)"
 # Escape `@` in the replacement — perl interpolates `@name` as an array.
 find "$CANONICAL_SRC" -type f \( -name '*.ts' -o -name '*.tsx' \) -print0 \

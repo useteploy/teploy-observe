@@ -1107,6 +1107,11 @@ func main() {
 
 	r.Handle("GET /assets/", http.FileServer(http.FS(uiSub)))
 
+	// The tab icon sits at the build root, not under /assets/, so it needs its
+	// own route or the SPA fallback answers with index.html and the browser
+	// shows no icon. Public: the browser fetches it before anyone signs in.
+	r.Handle("GET /favicon.svg", http.FileServer(http.FS(uiSub)))
+
 	// --- Public share dashboard ---
 	r.HandleFunc("GET /share/{token}", shareViewHandler(shareSvc, uiSub))
 
