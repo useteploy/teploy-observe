@@ -5,7 +5,6 @@ import type { Site } from "../api/settings.js";
 
 interface Props {
   /** Render a compact pill suitable for the sidebar header. */
-  collapsed?: boolean;
 }
 
 /**
@@ -13,7 +12,7 @@ interface Props {
  * `useFilters().state.siteId`. Persists the choice via the reducer's
  * `SET_SITE` action — `RouteFilterProvider` handles URL + localStorage sync.
  */
-export default function SiteSwitcher({ collapsed }: Props) {
+export default function SiteSwitcher({}: Props) {
   const { state, dispatch } = useFilters();
   const [open, setOpen] = useState(false);
   const [sites, setSites] = useState<Site[]>([]);
@@ -97,8 +96,8 @@ export default function SiteSwitcher({ collapsed }: Props) {
         data-testid="site-switcher-trigger"
       >
         <span class="obs-site-switcher-dot" aria-hidden="true" />
-        {!collapsed && <span class="obs-site-switcher-label">{label}</span>}
-        {!collapsed && (
+        <span class="obs-site-switcher-label">{label}</span>
+        {(
           <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
             <path d="M7 10l5 5 5-5z" />
           </svg>

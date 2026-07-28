@@ -13,7 +13,7 @@ interface NavApp {
  * appears once at least one sibling URL is configured. Fetched on mount, so it
  * adds nothing to SSR and can't cause a hydration mismatch.
  */
-export default function ProductSwitcher({ collapsed = false }: { collapsed?: boolean }) {
+export default function ProductSwitcher() {
   const [apps, setApps] = useState<NavApp[]>([]);
   const [current, setCurrent] = useState("");
   const [open, setOpen] = useState(false);
@@ -55,8 +55,8 @@ export default function ProductSwitcher({ collapsed = false }: { collapsed?: boo
         aria-expanded={open}
         title={siblings.length > 0 ? "Switch dashboard" : undefined}
       >
-        {!collapsed && <span class="obs-product-current">{currentLabel}</span>}
-        {!collapsed && siblings.length > 0 && (
+        <span class="obs-product-current">{currentLabel}</span>
+        {siblings.length > 0 && (
           <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" style={{ marginLeft: "auto", opacity: 0.6 }}>
             <path d="M7 10l5 5 5-5z" />
           </svg>
@@ -79,10 +79,10 @@ export default function ProductSwitcher({ collapsed = false }: { collapsed?: boo
         </div>
       )}
       <style>{`
-        .obs-product-switcher { position: relative; padding: 8px 12px 4px; }
+        .obs-product-switcher { position: relative; margin-left: auto; }
         .obs-product-switcher-btn {
-          display: flex; align-items: center; gap: 8px; width: 100%;
-          padding: 7px 9px; background: var(--obs-surface); color: var(--obs-text);
+          display: flex; align-items: center; gap: 6px;
+          padding: 4px 9px; background: transparent; color: var(--obs-text);
           border: 1px solid var(--obs-border-subtle); border-radius: var(--obs-radius);
           font-size: 13px; font-weight: 600; font-family: var(--obs-font); cursor: pointer;
         }

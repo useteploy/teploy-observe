@@ -41,7 +41,6 @@ function NavIcon({ d }: { d: string }) {
 
 export default function Sidebar() {
   const [active, setActive] = useState("analytics");
-  const [collapsed, setCollapsed] = useState(false);
   const [theme, setTheme] = useState(() => {
     if (typeof window === "undefined") return "dark";
     return localStorage.getItem("obs_theme") || "dark";
@@ -73,20 +72,15 @@ export default function Sidebar() {
   }, []);
 
   return (
-    <nav class={`obs-sidebar ${collapsed ? "obs-sidebar--collapsed" : ""}`}>
+    <nav class="obs-sidebar">
+      {/* Wordmark and product switcher share the top row, matching the
+          `Teploy [Product]` header Dash and Ship use. */}
       <div class="obs-sidebar-header">
-        {!collapsed && <span class="obs-sidebar-logo">Teploy</span>}
-        <button class="obs-sidebar-toggle" onClick={() => setCollapsed(!collapsed)}
-          title={collapsed ? "Expand" : "Collapse"}>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-            <path d={collapsed ? "M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" : "M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"} />
-          </svg>
-        </button>
+        <span class="obs-sidebar-logo">Teploy</span>
+        <ProductSwitcher />
       </div>
 
-      <ProductSwitcher collapsed={collapsed} />
-
-      <SiteSwitcher collapsed={collapsed} />
+      <SiteSwitcher />
 
       <ul class="obs-sidebar-nav">
         {NAV_ITEMS.map(item => (
@@ -102,7 +96,7 @@ export default function Sidebar() {
               }}
             >
               <NavIcon d={item.icon} />
-              {!collapsed && <span>{item.label}</span>}
+              <span>{item.label}</span>
             </a>
           </li>
         ))}
@@ -117,7 +111,7 @@ export default function Sidebar() {
               : <path d="M9.37 5.51A7.35 7.35 0 0 0 9.1 7.5c0 4.08 3.32 7.4 7.4 7.4.68 0 1.35-.09 1.99-.27A7.014 7.014 0 0 1 12 19c-3.86 0-7-3.14-7-7 0-2.93 1.81-5.45 4.37-6.49zM12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z" />
             }
           </svg>
-          {!collapsed && <span>{theme === "dark" ? "Light Mode" : "Dark Mode"}</span>}
+          <span>{theme === "dark" ? "Light Mode" : "Dark Mode"}</span>
         </button>
       </div>
     </nav>
