@@ -14,8 +14,8 @@
 .obs-sidebar-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  justify-content: flex-start;
+  gap: 9px;
   padding: 12px;
   border-bottom: 1px solid var(--obs-border-subtle);
   min-height: 56px;

@@ -79,29 +79,29 @@ export default function ProductSwitcher() {
         </div>
       )}
       <style>{`
-        .obs-product-switcher { position: relative; margin-left: auto; }
+        .obs-product-switcher { position: relative; }
         .obs-product-switcher-btn {
           display: flex; align-items: center; gap: 6px;
-          padding: 4px 9px; background: transparent; color: var(--obs-text);
+          padding: 5px 10px; background: transparent; color: var(--obs-text);
           border: 1px solid var(--obs-border-subtle); border-radius: var(--obs-radius);
-          font-size: 13px; font-weight: 600; font-family: var(--obs-font); cursor: pointer;
+          font-size: 13px; font-weight: 600; line-height: 1.35; font-family: var(--obs-font); cursor: pointer;
         }
         .obs-product-switcher-btn:hover { border-color: var(--obs-border); }
         .obs-product-switcher-btn--static { cursor: default; }
         .obs-product-switcher-btn--static:hover { border-color: var(--obs-border-subtle); }
         .obs-product-current { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .obs-product-menu {
-          position: absolute; left: 12px; right: 12px; top: 100%; z-index: 50;
-          margin-top: 4px; background: var(--obs-surface);
-          border: 1px solid var(--obs-border); border-radius: var(--obs-radius);
+          position: absolute; left: 0; top: 100%; z-index: 50;
+          margin-top: 5px; min-width: 150px; background: var(--obs-card);
+          border: 1px solid var(--obs-border); border-radius: var(--obs-radius-md);
           box-shadow: 0 6px 24px rgba(0,0,0,0.35); overflow: hidden;
         }
         .obs-product-item {
-          display: flex; align-items: center; gap: 8px; padding: 9px 12px;
+          display: flex; align-items: center; gap: 8px; padding: 10px 13px;
           font-size: 13px; color: var(--obs-text); text-decoration: none; cursor: pointer;
         }
-        a.obs-product-item:hover { background: var(--obs-bg); }
-        .obs-product-item--current { color: var(--obs-text-muted); cursor: default; font-weight: 600; }
+        a.obs-product-item:hover { background: var(--obs-card-hover); }
+        .obs-product-item--current { color: var(--obs-text-muted); cursor: default; }
       `}</style>
     </div>
   );
