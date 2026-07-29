@@ -35,15 +35,8 @@ export default function SetupPage() {
   return (
     <div class="obs-login-page">
       <form class="obs-login-form" onSubmit={handleSubmit}>
-        <div style={{ display: "flex", justifyContent: "center", marginBottom: "16px" }}>
-          <div style={{
-            width: "48px", height: "48px", borderRadius: "12px",
-            background: "linear-gradient(135deg, var(--obs-accent), #a78bfa)",
-            display: "flex", alignItems: "center", justifyContent: "center",
-            fontSize: "22px", fontWeight: 800, color: "#fff",
-          }}>O</div>
-        </div>
-        <h1 class="obs-login-title">Set up Observe</h1>
+        {/* Wordmark only — see the note on the sign-in page. */}
+        <h1 class="obs-login-title">Set up Teploy Observe</h1>
         <p class="obs-login-subtitle">Create your admin account to get started</p>
 
         {error && <div class="obs-login-error">{error}</div>}

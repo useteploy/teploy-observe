@@ -41,15 +41,10 @@ export default function LoginPage() {
   return (
     <div class="obs-login-page">
       <form class="obs-login-form" onSubmit={handleSubmit}>
-        <div style={{ display: "flex", justifyContent: "center", marginBottom: "16px" }}>
-          <div style={{
-            width: "48px", height: "48px", borderRadius: "12px",
-            background: "linear-gradient(135deg, var(--obs-accent), #a78bfa)",
-            display: "flex", alignItems: "center", justifyContent: "center",
-            fontSize: "22px", fontWeight: 800, color: "#fff",
-          }}>O</div>
-        </div>
-        <h1 class="obs-login-title">Observe</h1>
+        {/* Wordmark only, matching the other two sign-in pages ("Teploy Ship",
+            "TEPLOY DASH"). The gradient letter-tile that used to sit here read
+            as a consumer app icon, which this is not. */}
+        <h1 class="obs-login-title">Teploy Observe</h1>
         <p class="obs-login-subtitle">Sign in to your dashboard</p>
 
         {error && <div class="obs-login-error">{error}</div>}
