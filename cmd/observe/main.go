@@ -510,6 +510,10 @@ func main() {
 	)
 
 	// --- OTLP Trace Ingestion (API key auth) ---
+	// Deliberately ALSO reachable at /api/v1/v1/traces (this group is prefixed
+	// /api/v1). The sentry-shim SDK posts OTLP there — see its README — so this
+	// registration is load-bearing, not a stray duplicate of the /v1/traces
+	// route registered below for standard OTLP exporters.
 	neutron.Post(ingestGroup, "/v1/traces", otlpTraceHandler(traceIngest),
 		neutron.WithTags("traces"),
 		neutron.WithSummary("Ingest OTLP traces"),
