@@ -74,6 +74,12 @@ var (
 	date    = "unknown"
 )
 
+// otlpMaxBodyBytes caps a single OTLP export request. Higher than the 2 MiB
+// analytics-event cap because a legitimate span/metric/log batch is larger,
+// and matched to the 10 MiB post-decompression ceiling the OTLP handlers
+// already enforce, so a compressed body can't slip past this and then expand.
+const otlpMaxBodyBytes = 10 << 20
+
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
@@ -213,12 +219,29 @@ func main() {
 	}
 	buf := ingest.NewBuffer(db, cfg.BufferSize, cfg.FlushSize, cfg.FlushInterval, logger)
 	maxQueueBytes := int64(64 * 1024 * 1024) // 64 MiB per WAL file before compaction
-	if eventsQ, err := ingest.NewDiskQueue(queueDir, "events", 500*time.Millisecond, maxQueueBytes, logger); err == nil {
+	// OBS-009: a WAL init/attach failure used to silently downgrade to
+	// memory-only ingestion — the project documents durable ingestion via the
+	// WAL, so this changed a stated guarantee without telling anyone.
+	// OBSERVE_REQUIRE_WAL=true refuses to start in that state (a permission
+	// error, bad path, or full disk shouldn't quietly become "your events
+	// aren't crash-safe anymore"); otherwise walDegraded is surfaced through
+	// /healthz so at least monitoring can see it instead of everything
+	// looking healthy.
+	requireWAL := strings.EqualFold(os.Getenv("OBSERVE_REQUIRE_WAL"), "true") || os.Getenv("OBSERVE_REQUIRE_WAL") == "1"
+	walDegraded := false
+	eventsQ, err := ingest.NewDiskQueue(queueDir, "events", 500*time.Millisecond, maxQueueBytes, logger)
+	if err == nil {
 		if err := buf.AttachQueue(eventsQ); err != nil {
-			logger.Warn("ingest queue: attach failed", "err", err)
+			walDegraded = true
+			logger.Warn("ingest queue: attach failed, running in-memory only", "err", err)
 		}
 	} else {
+		walDegraded = true
 		logger.Warn("ingest queue: init failed, running in-memory only", "err", err)
+	}
+	if walDegraded && requireWAL {
+		logger.Error("OBSERVE_REQUIRE_WAL is set but WAL-backed ingestion durability is unavailable — refusing to start in memory-only mode")
+		os.Exit(1)
 	}
 
 	// Stats service
@@ -289,6 +312,27 @@ func main() {
 		auditKey = cfg.JWTSecret
 	}
 	auditSvc := audit.NewService(db, []byte(auditKey))
+
+	// SSO sign-ins land in the same audit trail as password logins. Wired here
+	// rather than at construction because the audit service is built after
+	// OIDC. Best-effort: a failed audit write must never block a login.
+	oidcAuth.SetAuditFunc(func(r *http.Request, username, result, detail string) {
+		metadata := ""
+		if detail != "" {
+			if b, err := json.Marshal(map[string]string{"detail": detail}); err == nil {
+				metadata = string(b)
+			}
+		}
+		_ = auditSvc.Record(r.Context(), audit.AuditEvent{
+			Actor:     username,
+			ActorType: audit.ActorUser,
+			Action:    "auth.sso_login",
+			Result:    result,
+			SourceIP:  ingest.ClientIPFromContext(r.Context()),
+			UserAgent: ingest.UserAgentFromContext(r.Context()),
+			Metadata:  metadata,
+		})
+	})
 
 	// A cron check-in resolves any open missed-cron incident for that monitor.
 	cronSvc.OnCheckin = func(ctx context.Context, c monitoring.CronMonitor) {
@@ -363,6 +407,7 @@ func main() {
 	// so the lifecycle hook below can close over both — the handler is built at
 	// OnStart, once every route is registered.
 	var ingestSrv *http.Server
+	bgWorkers := jobs.NewWorkerGroup(logger)
 	var app *neutron.App
 	app = neutron.New(
 		neutron.WithLogger(logger),
@@ -398,6 +443,68 @@ func main() {
 			},
 			OnStop: func(ctx context.Context) error {
 				scheduler.Stop()
+				return nil
+			},
+		}),
+		// OBS-005/006: these 5 jobs used to be bare `go func(){ for {...
+		// time.Sleep(iv) } }()` loops on context.Background(), started
+		// eagerly at program startup instead of through the lifecycle system
+		// — no cancellation tied to shutdown (a job could still be mid-run,
+		// or a fresh one could start, while the DB/SMTP client it depends on
+		// was already closing), and sleep-after-completion drift (a job that
+		// takes real time on an "hourly" schedule actually runs every
+		// 1h+that-long, compounding over time). WorkerGroup fixes both —
+		// ticker-based fixed cadence, and now a real lifecycle hook like
+		// ingest-buffer/error-buffer/scheduler above, so app.Run's SIGTERM
+		// handling stops these the same bounded way it stops everything else.
+		neutron.WithLifecycle(neutron.LifecycleHook{
+			Name: "background-workers",
+			OnStart: func(ctx context.Context) error {
+				bgWorkers.Run("alert-check", 30*time.Second, 60*time.Second, alertSvc.CheckRules)
+				bgWorkers.Run("uptime-check", 15*time.Second, 30*time.Second, uptimeSvc.RunChecks)
+				// Missed-cron detection. Without this, CheckMissed was dead
+				// code and a silently-dead cron was never alerted. Each
+				// missing cron opens a deduped incident (keyed on
+				// cron:<id>); a subsequent check-in that brings it back
+				// inside its grace period auto-resolves the incident.
+				bgWorkers.Run("cron-missed-check", 45*time.Second, 60*time.Second, func(ctx context.Context) error {
+					missed, err := cronSvc.CheckMissed(ctx)
+					if err != nil {
+						return err
+					}
+					for _, c := range missed {
+						ruleKey := "cron:" + c.CronID
+						if active, _ := incidentSvc.ActiveByRule(ctx, ruleKey); len(active) > 0 {
+							continue // already open — dedup
+						}
+						_, err := incidentSvc.Create(ctx, incidents.CreateInput{
+							SiteID:      c.SiteID,
+							Title:       fmt.Sprintf("Cron missed: %s", c.Name),
+							Description: fmt.Sprintf("cron %q (slug %q) has not checked in within its %ds grace period", c.Name, c.Slug, c.GracePeriod),
+							Severity:    "warning",
+							Source:      incidents.SourceCron,
+							RuleID:      ruleKey,
+						}, "cron")
+						if err != nil {
+							logger.Warn("cron incident auto-create failed", "cron", c.CronID, "err", err)
+						}
+					}
+					return nil
+				})
+				bgWorkers.Run("scheduled-export", 10*time.Second, time.Minute, func(ctx context.Context) error {
+					scheduledExportSvc.RunDue(ctx, time.Now())
+					return nil
+				})
+				bgWorkers.Run("report-scheduler", 45*time.Second, time.Hour, func(ctx context.Context) error {
+					reportSvc.RunScheduled(ctx,
+						os.Getenv("OBSERVE_SMTP_HOST"), os.Getenv("OBSERVE_SMTP_PORT"),
+						os.Getenv("OBSERVE_SMTP_USER"), os.Getenv("OBSERVE_SMTP_PASS"), os.Getenv("OBSERVE_SMTP_FROM"))
+					return nil
+				})
+				return nil
+			},
+			OnStop: func(ctx context.Context) error {
+				bgWorkers.Stop()
 				return nil
 			},
 		}),
@@ -562,6 +669,9 @@ func main() {
 
 	// --- Issue management API (JWT auth) ---
 	issueGroup := r.Group("/api/v1/issues", jwtMW)
+	// Status mutation is editor+; a viewer must not be able to resolve, ignore,
+	// or reopen issues (was registered on the JWT-only group with no role gate).
+	issueEditor := issueGroup.Group("", requireEditor)
 	neutron.Get(issueGroup, "", listIssuesHandler(issueSvc),
 		neutron.WithTags("issues"),
 		neutron.WithSummary("List issues for a site"),
@@ -570,7 +680,7 @@ func main() {
 		neutron.WithTags("issues"),
 		neutron.WithSummary("Get issue detail"),
 	)
-	neutron.Post(issueGroup, "/{issue_id}/status", updateIssueStatusHandler(issueSvc),
+	neutron.Post(issueEditor, "/{issue_id}/status", updateIssueStatusHandler(issueSvc),
 		neutron.WithTags("issues"),
 		neutron.WithSummary("Update issue status"),
 	)
@@ -780,30 +890,27 @@ func main() {
 	neutron.Get(llmGroup, "/traces", llmTracesHandler(llmSvc),
 		neutron.WithTags("llm"), neutron.WithSummary("Recent LLM traces"))
 
-	// --- Infrastructure monitoring (public agent reports, JWT for queries) ---
-	r.HandleFunc("POST /api/v1/infra/report", func(w http.ResponseWriter, req *http.Request) {
+	// --- Infrastructure monitoring (API-key agent reports, JWT for queries) ---
+	// OBS-014: this was keyless — it validated that the caller-supplied
+	// site_id existed, but not that the caller was entitled to report for it.
+	// Anyone who knew or guessed a valid site_id could inject fake host
+	// metrics for it. The README already documented this route under
+	// "Ingestion (API key auth via X-API-Key header)" alongside every other
+	// ingest endpoint; the implementation just never actually required one.
+	// apiKeyMW resolves site_id from the validated key (never from the
+	// request body) exactly like the analytics/OTLP ingest routes do.
+	r.Handle("POST /api/v1/infra/report", apiKeyMW(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		var input infra.MetricInput
 		if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte(`{"ok":false,"error":"invalid JSON body"}`))
 			return
 		}
-		if input.SiteID == "" {
-			input.SiteID = "default"
-		}
-		// This endpoint is keyless (agent flow), so validate the site exists to
-		// stop anonymous callers creating junk sites / polluting another site's
-		// host metrics, and bound the identifier lengths.
-		if len(input.SiteID) > 64 || len(input.Hostname) > 253 {
+		input.SiteID = ingest.SiteIDFromContext(req.Context())
+		if len(input.Hostname) > 253 {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte(`{"ok":false,"error":"field too long"}`))
-			return
-		}
-		if _, err := siteSvc.Get(req.Context(), input.SiteID); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"ok":false,"error":"unknown site_id"}`))
 			return
 		}
 		if err := infraSvc.Report(req.Context(), input); err != nil {
@@ -815,7 +922,7 @@ func main() {
 			return
 		}
 		fmt.Fprintf(w, `{"ok":true}`)
-	})
+	})))
 	infraGroup := r.Group("/api/v1/infra", jwtMW)
 	neutron.Get(infraGroup, "/hosts", infraHostsHandler(infraSvc),
 		neutron.WithTags("infra"), neutron.WithSummary("List monitored hosts"))
@@ -835,12 +942,21 @@ func main() {
 	// resolves site_id into the request context, so a client cannot inject
 	// spans for another tenant via the X-Observe-Site header. Standard OTLP
 	// exporters supply the key via OTEL_EXPORTER_OTLP_HEADERS=X-API-Key=...
+	// otlpChain applies the same protections the /api/v1 ingest group gets:
+	// API-key auth (which resolves site_id, so the limiter can key on it),
+	// then the per-site/per-IP rate limiter, then a body cap. These three
+	// routes are registered on the root router rather than in ingestGroup —
+	// standard OTLP exporters require the exact /v1/<signal> path — and so
+	// previously inherited none of the group's middleware.
+	otlpChain := func(h http.Handler) http.Handler {
+		return apiKeyMW(rateLimiter.Middleware(neutron.BodyLimit(otlpMaxBodyBytes)(h)))
+	}
 	otlpHandler := tracing.NewOTLPHandler(traceIngest)
-	r.Handle("POST /v1/traces", apiKeyMW(otlpHandler))
+	r.Handle("POST /v1/traces", otlpChain(otlpHandler))
 	// The third OTLP signal. Without it an SDK or Collector exporting all three
 	// got a 405 on logs and dropped them. Records land in the same store as
 	// /api/v1/logs, so pipelines, search and the UI need no extra wiring.
-	r.Handle("POST /v1/logs", apiKeyMW(logs.NewOTLPLogsHandler(logSvc)))
+	r.Handle("POST /v1/logs", otlpChain(logs.NewOTLPLogsHandler(logSvc)))
 
 	// --- SQL Explorer (JWT + editor role; query tables stays read-only) ---
 	// Admin-only: the raw SQL explorer can read any table, including
@@ -967,8 +1083,11 @@ func main() {
 	// /auth/oidc/callback completes it (minting an Observe JWT).
 	r.HandleFunc("GET /api/v1/auth/methods", authMethodsHandler(oidcAuth))
 	if oidcAuth.Enabled() {
-		r.HandleFunc("GET /api/v1/auth/oidc/login", oidcAuth.HandleLogin)
-		r.HandleFunc("GET /api/v1/auth/oidc/callback", oidcAuth.HandleCallback)
+		// Same per-IP budget as password login (10/min) — SSO is still an auth
+		// entry point and was previously unthrottled, letting an attacker spam
+		// /oidc/login to grow the in-flight flow map or hammer the IdP.
+		r.Handle("GET /api/v1/auth/oidc/login", ipRateLimitMW(loginLimiter)(http.HandlerFunc(oidcAuth.HandleLogin)))
+		r.Handle("GET /api/v1/auth/oidc/callback", ipRateLimitMW(loginLimiter)(http.HandlerFunc(oidcAuth.HandleCallback)))
 	}
 
 	// --- Public config (UI reads this to know about demo mode, etc.) ---
@@ -1106,10 +1225,15 @@ func main() {
 			fmt.Fprintf(w, `{"status":"error","error":%q}`, err.Error())
 			return
 		}
+		durability := "wal"
+		if walDegraded {
+			durability = "memory-only"
+		}
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"status":  "ok",
-			"version": version,
-			"commit":  commit,
+			"status":     "ok",
+			"version":    version,
+			"commit":     commit,
+			"durability": durability,
 		})
 	})
 
@@ -1152,7 +1276,7 @@ func main() {
 	// main.go diff to a single line (matches the boards / attribution /
 	// funnels convention above). Placed at the END of route registrations
 	// to minimize merge conflict surface with parallel waves.
-	RegisterMetricsRoutes(r, jwtMW, apiKeyMW, metricsSvc)
+	RegisterMetricsRoutes(r, jwtMW, otlpChain, metricsSvc)
 
 	// --- Persons API ---
 	// C2 Wave 4: aggregate over events.distinct_id. Read-only; no editor
@@ -1184,84 +1308,6 @@ func main() {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write(indexHTML)
 	})
-
-	// Alert check loop (every 60s)
-	go func() {
-		time.Sleep(30 * time.Second)
-		for {
-			if err := alertSvc.CheckRules(context.Background()); err != nil {
-				logger.Error("alert check failed", "err", err)
-			}
-			time.Sleep(60 * time.Second)
-		}
-	}()
-
-	// Uptime monitor check loop (every 30s)
-	go func() {
-		time.Sleep(15 * time.Second)
-		for {
-			uptimeSvc.RunChecks(context.Background())
-			time.Sleep(30 * time.Second)
-		}
-	}()
-
-	// Missed-cron detection loop (every 60s). Without this, CheckMissed was
-	// dead code and a silently-dead cron was never alerted. Each missing cron
-	// opens a deduped incident (keyed on cron:<id>); a subsequent check-in
-	// that brings it back inside its grace period auto-resolves the incident.
-	go func() {
-		time.Sleep(45 * time.Second)
-		for {
-			ctx := context.Background()
-			missed, err := cronSvc.CheckMissed(ctx)
-			if err != nil {
-				logger.Error("cron missed-check failed", "err", err)
-			}
-			missingNow := make(map[string]bool, len(missed))
-			for _, c := range missed {
-				ruleKey := "cron:" + c.CronID
-				missingNow[ruleKey] = true
-				if active, _ := incidentSvc.ActiveByRule(ctx, ruleKey); len(active) > 0 {
-					continue // already open — dedup
-				}
-				_, err := incidentSvc.Create(ctx, incidents.CreateInput{
-					SiteID:      c.SiteID,
-					Title:       fmt.Sprintf("Cron missed: %s", c.Name),
-					Description: fmt.Sprintf("cron %q (slug %q) has not checked in within its %ds grace period", c.Name, c.Slug, c.GracePeriod),
-					Severity:    "warning",
-					Source:      incidents.SourceCron,
-					RuleID:      ruleKey,
-				}, "cron")
-				if err != nil {
-					logger.Warn("cron incident auto-create failed", "cron", c.CronID, "err", err)
-				}
-			}
-			time.Sleep(60 * time.Second)
-		}
-	}()
-
-	// Scheduled export runner (every minute)
-	go func() {
-		time.Sleep(10 * time.Second)
-		for {
-			scheduledExportSvc.RunDue(context.Background(), time.Now())
-			time.Sleep(time.Minute)
-		}
-	}()
-
-	// Report scheduler (every hour)
-	go func() {
-		time.Sleep(45 * time.Second)
-		smtpHost := os.Getenv("OBSERVE_SMTP_HOST")
-		smtpPort := os.Getenv("OBSERVE_SMTP_PORT")
-		smtpUser := os.Getenv("OBSERVE_SMTP_USER")
-		smtpPass := os.Getenv("OBSERVE_SMTP_PASS")
-		fromEmail := os.Getenv("OBSERVE_SMTP_FROM")
-		for {
-			reportSvc.RunScheduled(context.Background(), smtpHost, smtpPort, smtpUser, smtpPass, fromEmail)
-			time.Sleep(1 * time.Hour)
-		}
-	}()
 
 	if os.Getenv("OBSERVE_LOG_ROUTES") == "1" {
 		r.PrintRoutes()
@@ -1329,7 +1375,9 @@ Env vars:
                                (LLM API key, S3/R2 credentials) at rest;
                                required to configure those features
   OBSERVE_ADMIN_USER           First-boot admin username (default: admin)
-  OBSERVE_ADMIN_PASSWORD       First-boot admin password (default: observe)
+  OBSERVE_ADMIN_PASSWORD       First-boot admin password; unset means no
+                               default — the /setup wizard creates the
+                               account on first visit instead
   OBSERVE_DEMO_MODE            "true" blocks write ops for public demos
   OBSERVE_SEED_DEMO            "true" enables first-boot demo seeding
                                (off by default; also on when demo mode is set)
@@ -2621,8 +2669,13 @@ func explorerExplainHandler(svc *explorer.ExplorerService) http.HandlerFunc {
 
 func explorerTablesHandler(svc *explorer.ExplorerService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		tables, _ := svc.ListTables(r.Context())
 		w.Header().Set("Content-Type", "application/json")
+		tables, err := svc.ListTables(r.Context())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "listing tables failed"})
+			return
+		}
 		json.NewEncoder(w).Encode(tables)
 	}
 }
@@ -2879,12 +2932,24 @@ func surveyResponsesHandler(svc *surveys.SurveyService) neutron.HandlerFunc[surv
 	}
 }
 
+// publicFormMaxBodyBytes bounds the small JSON bodies public, unauthenticated
+// form-style endpoints (survey responses, feedback) accept.
+const publicFormMaxBodyBytes = 64 << 10 // 64 KiB
+
+// OBS-004: GetActive's error was discarded (`_`), so a database outage looked
+// identical to "this site genuinely has no active surveys" — both rendered as
+// 200 []. Surface the failure as a real error instead.
 func activeSurveysPublicHandler(svc *surveys.SurveyService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		siteID := r.URL.Query().Get("site_id")
-		active, _ := svc.GetActive(r.Context(), siteID)
+		active, err := svc.GetActive(r.Context(), siteID)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "active surveys temporarily unavailable"})
+			return
+		}
 		if active == nil {
 			active = []surveys.Survey{}
 		}
@@ -2892,23 +2957,51 @@ func activeSurveysPublicHandler(svc *surveys.SurveyService) http.HandlerFunc {
 	}
 }
 
+type surveyRespondInput struct {
+	SurveyID string         `json:"survey_id"`
+	SiteID   string         `json:"site_id"`
+	UserID   string         `json:"user_id"`
+	Answers  map[string]any `json:"answers"`
+}
+
+// OBS-001/002/003: the decode error was ignored (malformed/truncated/wrongly
+// typed JSON reached SubmitResponse with empty fields), a service error never
+// called WriteHeader before the body (Go defaults to 200, so failures looked
+// like success to anything checking HTTP status), and the response was built
+// with raw %s string interpolation of err.Error() — a message containing a
+// quote or backslash produced invalid JSON.
 func surveyRespondHandler(svc *surveys.SurveyService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var input struct {
-			SurveyID string         `json:"survey_id"`
-			SiteID   string         `json:"site_id"`
-			UserID   string         `json:"user_id"`
-			Answers  map[string]any `json:"answers"`
-		}
-		json.NewDecoder(r.Body).Decode(&input)
-		id, err := svc.SubmitResponse(r.Context(), input.SurveyID, input.SiteID, input.UserID, input.Answers)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		if err != nil {
-			fmt.Fprintf(w, `{"ok":false,"error":"%s"}`, err.Error())
+
+		r.Body = http.MaxBytesReader(w, r.Body, publicFormMaxBodyBytes)
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		var input surveyRespondInput
+		if err := dec.Decode(&input); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid request body"})
 			return
 		}
-		fmt.Fprintf(w, `{"ok":true,"response_id":"%s"}`, id)
+		if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "request body must contain exactly one JSON object"})
+			return
+		}
+		if input.SurveyID == "" || input.SiteID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "survey_id and site_id required"})
+			return
+		}
+
+		id, err := svc.SubmitResponse(r.Context(), input.SurveyID, input.SiteID, input.UserID, input.Answers)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "response_id": id})
 	}
 }
 
@@ -2960,9 +3053,45 @@ type listIntegrationsInput struct {
 	SiteID string `query:"site_id"`
 }
 
-func listIntegrationsHandler(svc *integrations.IntegrationService) neutron.HandlerFunc[listIntegrationsInput, []integrations.Integration] {
-	return func(ctx context.Context, input listIntegrationsInput) ([]integrations.Integration, error) {
-		return emptyOnNil(svc.List(ctx, input.SiteID))
+// integrationSummary is the API-safe view of an integration: never carries
+// the raw Config, which can hold a Jira/GitHub API token, PagerDuty routing
+// key, SMTP username/password, or Slack webhook URL. OBS-013: List sits on
+// the plain JWT-only group (any authenticated role, including viewer), and
+// used to return Config verbatim — a viewer could read credentials that work
+// outside Observe entirely.
+type integrationSummary struct {
+	IntegrationID string `json:"integration_id"`
+	SiteID        string `json:"site_id"`
+	Name          string `json:"name"`
+	IntType       string `json:"type"`
+	Configured    bool   `json:"configured"`
+	Enabled       string `json:"enabled"`
+	CreatedAt     string `json:"created_at"`
+}
+
+func redactIntegration(in integrations.Integration) integrationSummary {
+	return integrationSummary{
+		IntegrationID: in.IntegrationID,
+		SiteID:        in.SiteID,
+		Name:          in.Name,
+		IntType:       in.IntType,
+		Configured:    in.Config != "" && in.Config != "{}",
+		Enabled:       in.Enabled,
+		CreatedAt:     in.CreatedAt,
+	}
+}
+
+func listIntegrationsHandler(svc *integrations.IntegrationService) neutron.HandlerFunc[listIntegrationsInput, []integrationSummary] {
+	return func(ctx context.Context, input listIntegrationsInput) ([]integrationSummary, error) {
+		list, err := svc.List(ctx, input.SiteID)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]integrationSummary, len(list))
+		for i, in := range list {
+			out[i] = redactIntegration(in)
+		}
+		return out, nil
 	}
 }
 
@@ -2973,16 +3102,16 @@ type createIntegrationInput struct {
 	Config string `json:"config"`
 }
 
-func createIntegrationHandler(svc *integrations.IntegrationService) neutron.HandlerFunc[createIntegrationInput, integrations.Integration] {
-	return func(ctx context.Context, input createIntegrationInput) (integrations.Integration, error) {
+func createIntegrationHandler(svc *integrations.IntegrationService) neutron.HandlerFunc[createIntegrationInput, integrationSummary] {
+	return func(ctx context.Context, input createIntegrationInput) (integrationSummary, error) {
 		if input.SiteID == "" || input.Type == "" {
-			return integrations.Integration{}, neutron.ErrBadRequest("site_id and type required")
+			return integrationSummary{}, neutron.ErrBadRequest("site_id and type required")
 		}
 		i, err := svc.Create(ctx, input.SiteID, input.Name, input.Type, input.Config)
 		if err != nil {
-			return integrations.Integration{}, err
+			return integrationSummary{}, err
 		}
-		return *i, nil
+		return redactIntegration(*i), nil
 	}
 }
 
@@ -3004,13 +3133,31 @@ type testIntegrationResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
+// errBadGateway reports a downstream/provider failure (a webhook the
+// integration points at rejected or was unreachable) — 502, distinct from a
+// bug on our side (500) or a bad request (400). Neutron has no built-in
+// helper for this status; AppError's fields are all exported so it's a
+// direct literal.
+func errBadGateway(detail string) *neutron.AppError {
+	return &neutron.AppError{
+		Status: http.StatusBadGateway,
+		Code:   "https://neutron.dev/errors/bad-gateway",
+		Title:  "Bad Gateway",
+		Detail: detail,
+	}
+}
+
+// OBS-015: a failed test/replay delivery used to be returned as {ok:false} in
+// a 200 body — a caller checking only HTTP status (the CLI, automation, any
+// client following normal REST conventions) saw "success" for a delivery
+// that never went out, and never retried or alerted.
 func testIntegrationHandler(svc *integrations.IntegrationService) neutron.HandlerFunc[testIntegrationInput, testIntegrationResponse] {
 	return func(ctx context.Context, input testIntegrationInput) (testIntegrationResponse, error) {
 		if input.IntegrationID == "" {
 			return testIntegrationResponse{}, neutron.ErrBadRequest("integration_id required")
 		}
 		if err := svc.Test(ctx, input.IntegrationID); err != nil {
-			return testIntegrationResponse{OK: false, Message: err.Error()}, nil
+			return testIntegrationResponse{}, errBadGateway(err.Error())
 		}
 		return testIntegrationResponse{OK: true, Message: "Test delivered"}, nil
 	}
@@ -3047,7 +3194,7 @@ func replayDeliveryHandler(svc *integrations.IntegrationService) neutron.Handler
 			return testIntegrationResponse{}, neutron.ErrBadRequest("delivery_id required")
 		}
 		if err := svc.Replay(ctx, input.DeliveryID); err != nil {
-			return testIntegrationResponse{OK: false, Message: err.Error()}, nil
+			return testIntegrationResponse{}, errBadGateway(err.Error())
 		}
 		return testIntegrationResponse{OK: true, Message: "Replay delivered"}, nil
 	}

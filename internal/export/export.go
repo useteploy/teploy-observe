@@ -161,10 +161,10 @@ func (s *ExportService) exportEvents(ctx context.Context, w http.ResponseWriter,
 
 	if format == "csv" {
 		setCSVHeaders(w, "events")
-		streamCSV(w, rows, header, scan, toRow)
+		streamCSV(w, rows, header, scan, toRow, "events")
 	} else {
 		setJSONHeaders(w, "events")
-		streamJSON(w, rows, scan)
+		streamJSON(w, rows, scan, "events")
 	}
 }
 
@@ -204,51 +204,112 @@ func (s *ExportService) exportSessions(ctx context.Context, w http.ResponseWrite
 
 	if format == "csv" {
 		setCSVHeaders(w, "sessions")
-		streamCSV(w, rows, header, scan, toRow)
+		streamCSV(w, rows, header, scan, toRow, "sessions")
 	} else {
 		setJSONHeaders(w, "sessions")
-		streamJSON(w, rows, scan)
+		streamJSON(w, rows, scan, "sessions")
 	}
 }
 
 // streamCSV writes the header then each scanned row, sanitizing every cell
 // against CSV/formula injection, flushing periodically to bound buffering.
-func streamCSV[T any](w http.ResponseWriter, rows pgx.Rows, header []string, scan func() (T, error), toRow func(T) []string) {
+//
+// OBS-028: a scan/write/flush failure used to `break` silently — no log, no
+// error surfaced, and the response simply stopped, indistinguishable from a
+// row count that happened to end there. By the time any of this runs, HTTP
+// headers are already committed 200 OK (streaming to bound memory means we
+// can't buffer the whole export to validate it first), so the status code
+// itself can never signal a mid-stream failure — the two things that CAN
+// still signal it are logs and the data itself. On any failure this appends
+// a sentinel row a consumer can check for, and always logs what happened
+// server-side with the row count reached, so an incomplete export is
+// detectable instead of silently accepted as complete.
+func streamCSV[T any](w http.ResponseWriter, rows pgx.Rows, header []string, scan func() (T, error), toRow func(T) []string, kind string) {
 	cw := csv.NewWriter(w)
-	_ = cw.Write(header)
+	if err := cw.Write(header); err != nil {
+		slog.Error("export: writing CSV header failed", "kind", kind, "err", err)
+		return
+	}
 	n := 0
+	var failErr error
 	for rows.Next() {
 		v, err := scan()
 		if err != nil {
+			failErr = err
 			break
 		}
 		rec := toRow(v)
 		for i := range rec {
 			rec[i] = csvSafe(rec[i])
 		}
-		_ = cw.Write(rec)
-		if n++; n%1000 == 0 {
+		if err := cw.Write(rec); err != nil {
+			failErr = err
+			break
+		}
+		n++
+		if n%1000 == 0 {
 			cw.Flush()
+			if err := cw.Error(); err != nil {
+				failErr = err
+				break
+			}
 		}
 	}
+	if failErr == nil {
+		if err := rows.Err(); err != nil {
+			failErr = err
+		}
+	}
+	if failErr != nil {
+		// Grep-able sentinel: a consumer that cares about completeness can
+		// check the last row; nothing changes for one that doesn't.
+		_ = cw.Write([]string{"__export_incomplete__", "streaming failed after this row"})
+	}
 	cw.Flush()
+	if failErr != nil {
+		slog.Error("export: CSV stream failed partway through", "kind", kind, "rows_written", n, "err", failErr)
+	}
 }
 
 // streamJSON writes a JSON array incrementally so memory stays O(1) per row.
-func streamJSON[T any](w http.ResponseWriter, rows pgx.Rows, scan func() (T, error)) {
+//
+// OBS-028: on a scan failure this used to still close the array with `]`,
+// so a truncated export was syntactically valid JSON and looked complete —
+// the worst version of this bug, since nothing about the file itself hints
+// at the missing rows. Now a failure leaves the array deliberately
+// unclosed: any conforming JSON parser rejects the response outright rather
+// than silently accepting a partial result, and the failure (with the row
+// count reached) is logged server-side, matching streamCSV's contract.
+func streamJSON[T any](w http.ResponseWriter, rows pgx.Rows, scan func() (T, error), kind string) {
 	enc := json.NewEncoder(w)
 	io.WriteString(w, "[")
 	first := true
+	n := 0
+	var failErr error
 	for rows.Next() {
 		v, err := scan()
 		if err != nil {
+			failErr = err
 			break
 		}
 		if !first {
 			io.WriteString(w, ",")
 		}
 		first = false
-		_ = enc.Encode(v) // Encode appends a newline; acceptable inside the array
+		if err := enc.Encode(v); err != nil { // Encode appends a newline; acceptable inside the array
+			failErr = err
+			break
+		}
+		n++
+	}
+	if failErr == nil {
+		if err := rows.Err(); err != nil {
+			failErr = err
+		}
+	}
+	if failErr != nil {
+		slog.Error("export: JSON stream failed partway through — response left as invalid/truncated JSON on purpose", "kind", kind, "rows_written", n, "err", failErr)
+		return
 	}
 	io.WriteString(w, "]")
 }
@@ -279,4 +340,3 @@ func setJSONHeaders(w http.ResponseWriter, name string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="observe-%s.json"`, name))
 }
-

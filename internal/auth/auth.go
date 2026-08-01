@@ -40,6 +40,7 @@ type adminUserRow struct {
 	PasswordHash string `db:"password_hash"`
 	CreatedAt    string `db:"created_at"`
 	Role         string `db:"role"`
+	TokenVersion int64  `db:"token_version"`
 }
 
 // Role constants.
@@ -82,20 +83,43 @@ func NewAuthService(db *nucleus.Client, jwtSecret string, logger *slog.Logger) *
 
 // GenerateToken creates a signed JWT with a 24-hour expiry. role is stored
 // in the token so middleware can enforce RBAC without hitting the database
-// on every request.
-func (s *AuthService) GenerateToken(userID, username, role string) (string, error) {
+// on every request. tokenVersion is embedded so JWTAuthMiddleware can detect
+// revocation (OBS-011): a password change bumps the admin_users row's
+// token_version, and any token minted before that bump is rejected on its
+// next use even though it hasn't expired. Pass 0 for identities that have no
+// admin_users row to version — OIDC-issued sessions ("oidc:<subject>") are
+// the current case; see middleware.go for how that's handled on validation.
+func (s *AuthService) GenerateToken(userID, username, role string, tokenVersion int64) (string, error) {
 	claims := neutronauth.Claims{
 		"sub":      userID,
 		"username": username,
 		"role":     normalizeRole(role),
+		"tv":       tokenVersion,
 	}
 	return neutronauth.GenerateToken(claims, s.jwtSecret, 24*time.Hour)
+}
+
+// CurrentTokenVersion returns the live token_version for a local admin_users
+// row. Used by JWTAuthMiddleware to check a token's embedded "tv" claim
+// against current state on every request — the actual revocation check.
+func (s *AuthService) CurrentTokenVersion(ctx context.Context, userID string) (int64, error) {
+	row, err := nucleus.QueryOne[struct {
+		TokenVersion int64 `db:"token_version"`
+	}](ctx, s.db.SQL(), "SELECT token_version FROM admin_users WHERE id = $1", userID)
+	if err != nil {
+		return 0, err
+	}
+	return row.TokenVersion, nil
 }
 
 // ValidateToken verifies a JWT and returns the claims.
 func (s *AuthService) ValidateToken(tokenStr string) (neutronauth.Claims, error) {
 	return neutronauth.ParseToken(tokenStr, s.jwtSecret)
 }
+
+// bootstrapClaimKey is the KV key EnsureAdmin claims atomically before
+// inserting the first admin row.
+const bootstrapClaimKey = "auth:bootstrap_admin_claimed"
 
 // EnsureAdmin creates the initial admin user if the admin_users table is empty.
 // It returns true if it created one. The caller is responsible for surfacing a
@@ -111,11 +135,30 @@ func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string
 		return false, nil
 	}
 
+	// The COUNT-then-INSERT above is a classic check-then-act race: two
+	// concurrent first-run requests can both observe zero rows and both
+	// insert, creating two initial admins. KV.SetNX is the real atomicity
+	// boundary — only the request that wins the claim proceeds. Released on
+	// insert failure so a transient error doesn't permanently brick
+	// bootstrap; a hard crash between the claim and the insert (a narrow
+	// window around one fast INSERT) would leave the claim set with no row
+	// created, recoverable by deleting the "auth:bootstrap_admin_claimed" KV
+	// key by hand — rare enough for a once-ever bootstrap operation not to
+	// warrant a TTL-based auto-release, which SetNX doesn't support anyway.
+	claimed, err := s.db.KV().SetNX(ctx, bootstrapClaimKey, []byte("1"))
+	if err != nil {
+		return false, fmt.Errorf("auth: claim bootstrap: %w", err)
+	}
+	if !claimed {
+		return false, nil
+	}
+
 	id := generateID()
 	hash, err := hashPassword(password)
 	if err != nil {
 		// Never insert an empty hash — that would create an admin nobody can
 		// log into (and that fails open in any "no real hash" check).
+		s.db.KV().Delete(ctx, bootstrapClaimKey)
 		return false, err
 	}
 	now := dbutil.IntParam(time.Now().UnixMilli())
@@ -125,6 +168,7 @@ func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string
 		id, username, hash, now, RoleAdmin,
 	)
 	if err != nil {
+		s.db.KV().Delete(ctx, bootstrapClaimKey)
 		return false, fmt.Errorf("auth: create default admin: %w", err)
 	}
 
@@ -137,7 +181,7 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (str
 	sql := s.db.SQL()
 
 	user, err := nucleus.QueryOne[adminUserRow](ctx, sql,
-		"SELECT id, username, password_hash, created_at, role FROM admin_users WHERE username = $1",
+		"SELECT id, username, password_hash, created_at, role, token_version FROM admin_users WHERE username = $1",
 		username,
 	)
 	if err != nil {
@@ -151,7 +195,7 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (str
 		return "", fmt.Errorf("auth: invalid credentials")
 	}
 
-	return s.GenerateToken(user.ID, user.Username, user.Role)
+	return s.GenerateToken(user.ID, user.Username, user.Role, user.TokenVersion)
 }
 
 // HasAdminUsers reports whether at least one admin user exists. The error is
@@ -170,7 +214,7 @@ func (s *AuthService) HasAdminUsers(ctx context.Context) (bool, error) {
 // ChangePassword updates the password for the given user ID.
 func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPassword, newPassword string) error {
 	user, err := nucleus.QueryOne[adminUserRow](ctx, s.db.SQL(),
-		"SELECT id, username, password_hash, created_at, role FROM admin_users WHERE id = $1", userID,
+		"SELECT id, username, password_hash, created_at, role, token_version FROM admin_users WHERE id = $1", userID,
 	)
 	if err != nil {
 		return fmt.Errorf("user not found")
@@ -190,18 +234,36 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 	if err != nil {
 		return err
 	}
+
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("auth: change password begin: %w", err)
+	}
+	defer tx.Rollback(ctx) // no-op once Commit has succeeded
+
 	// Nucleus finding #30: UPDATE does not reliably invalidate the server-side
 	// query result cache. DELETE + INSERT ensures the next SELECT sees a fresh
-	// physical row, bypassing any stale cache entry for the old hash.
-	if _, err = s.db.SQL().Exec(ctx, "DELETE FROM admin_users WHERE id = $1", user.ID); err != nil {
+	// physical row, bypassing any stale cache entry for the old hash. Both run
+	// in one transaction — previously they were two independent statements, so
+	// an insert failure (outage, timeout, schema error) after the delete
+	// succeeded deleted the account with no way back; for the sole admin that
+	// locks out the entire instance. The transaction rolls the delete back too.
+	//
+	// token_version is incremented (OBS-011) so JWTs issued before this change
+	// stop working on their next use, even though they haven't expired yet —
+	// otherwise a compromised token, or a session that should have been cut
+	// off, remains valid for up to 24 more hours after the password changes.
+	if _, err = tx.SQL().Exec(ctx, "DELETE FROM admin_users WHERE id = $1", user.ID); err != nil {
 		return fmt.Errorf("auth: change password delete: %w", err)
 	}
 	now := dbutil.IntParam(time.Now().UnixMilli())
-	_, err = s.db.SQL().Exec(ctx,
-		"INSERT INTO admin_users (id, username, password_hash, created_at, role) VALUES ($1, $2, $3, $4, $5)",
-		user.ID, user.Username, newHash, now, user.Role,
-	)
-	return err
+	if _, err = tx.SQL().Exec(ctx,
+		"INSERT INTO admin_users (id, username, password_hash, created_at, role, token_version) VALUES ($1, $2, $3, $4, $5, $6)",
+		user.ID, user.Username, newHash, now, user.Role, user.TokenVersion+1,
+	); err != nil {
+		return fmt.Errorf("auth: change password insert: %w", err)
+	}
+	return tx.Commit(ctx)
 }
 
 // ForceResetAdminPassword replaces the first admin user's password.
@@ -224,26 +286,32 @@ func (s *AuthService) ForceResetAdminPassword(ctx context.Context, password stri
 	}
 
 	user, err := nucleus.QueryOne[adminUserRow](ctx, s.db.SQL(),
-		"SELECT id, username, password_hash, created_at, role FROM admin_users WHERE role = $1",
+		"SELECT id, username, password_hash, created_at, role, token_version FROM admin_users WHERE role = $1",
 		RoleAdmin,
 	)
 	if err != nil {
 		return fmt.Errorf("auth: no admin user found to reset: %w", err)
 	}
 
-	if _, err = s.db.SQL().Exec(ctx, "DELETE FROM admin_users WHERE id = $1", user.ID); err != nil {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("auth: force reset begin: %w", err)
+	}
+	defer tx.Rollback(ctx) // no-op once Commit has succeeded
+
+	if _, err = tx.SQL().Exec(ctx, "DELETE FROM admin_users WHERE id = $1", user.ID); err != nil {
 		return fmt.Errorf("auth: force reset delete: %w", err)
 	}
 
 	now := dbutil.IntParam(time.Now().UnixMilli())
-	_, err = s.db.SQL().Exec(ctx,
-		"INSERT INTO admin_users (id, username, password_hash, created_at, role) VALUES ($1, $2, $3, $4, $5)",
-		user.ID, user.Username, hash, now, user.Role,
-	)
-	if err != nil {
+	// token_version bumped for the same reason as ChangePassword (OBS-011).
+	if _, err = tx.SQL().Exec(ctx,
+		"INSERT INTO admin_users (id, username, password_hash, created_at, role, token_version) VALUES ($1, $2, $3, $4, $5, $6)",
+		user.ID, user.Username, hash, now, user.Role, user.TokenVersion+1,
+	); err != nil {
 		return fmt.Errorf("auth: force reset insert: %w", err)
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // maxPasswordBytes is bcrypt's hard input ceiling — GenerateFromPassword errors

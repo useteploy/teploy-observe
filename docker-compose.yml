@@ -20,7 +20,16 @@
 # hostname has no UI behind it. Backend-only telemetry over a tailnet needs
 # none of this — leave it unset and keep both on the private port.
 #
-# First login defaults: admin / observe — change immediately via /settings.
+# First login: visit the dashboard and the /setup wizard lets you create the
+# admin account interactively — there is no default password. (OBS-007: this
+# compose file used to override the application's own safe defaults —
+# OBSERVE_ADMIN_PASSWORD unset means "show the setup wizard", not a fixed
+# admin/observe login — with a publicly documented fallback password anyone
+# could use to claim a fresh, reachable instance before the operator got to
+# it. JWT_SECRET/SESSION_SALT had the same problem: unset means "generate a
+# random one", not a fixed publicly-known value anyone could use to forge a
+# valid session token. Set OBSERVE_JWT_SECRET/OBSERVE_SESSION_SALT yourself
+# only if you want sessions/visitor IDs to survive a container restart.)
 
 services:
   nucleus:
@@ -54,15 +63,15 @@ services:
       OBSERVE_NUCLEUS_URL: "postgres://nucleus:5432/observe"
       OBSERVE_DATA_DIR: "/var/lib/observe"
       OBSERVE_SITE_ID: "default"
-      OBSERVE_SESSION_SALT: "${OBSERVE_SESSION_SALT:-change-me-in-production}"
+      OBSERVE_SESSION_SALT: "${OBSERVE_SESSION_SALT:-}"
       OBSERVE_BUFFER_SIZE: "100000"
       OBSERVE_FLUSH_INTERVAL_MS: "2000"
       OBSERVE_FLUSH_SIZE: "500"
       OBSERVE_RAW_RETENTION_DAYS: "30"
       OBSERVE_HOURLY_RETENTION_DAYS: "365"
-      OBSERVE_JWT_SECRET: "${OBSERVE_JWT_SECRET:-change-me-in-production}"
+      OBSERVE_JWT_SECRET: "${OBSERVE_JWT_SECRET:-}"
       OBSERVE_ADMIN_USER: "${OBSERVE_ADMIN_USER:-admin}"
-      OBSERVE_ADMIN_PASSWORD: "${OBSERVE_ADMIN_PASSWORD:-observe}"
+      OBSERVE_ADMIN_PASSWORD: "${OBSERVE_ADMIN_PASSWORD:-}"
       OBSERVE_SEED_DEMO: "${OBSERVE_SEED_DEMO:-true}"
     volumes:
       - observe_data:/var/lib/observe

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -16,6 +17,12 @@ import (
 	"github.com/useteploy/teploy-observe/internal/heatmaps"
 	"github.com/useteploy/teploy-observe/internal/identity"
 )
+
+// ErrDedupUnavailable indicates the KV dedupe claim could not be evaluated
+// (a genuine KV error, not "already claimed by another batch"). The caller
+// should treat this as retryable rather than silently proceeding to insert —
+// see the OBS-029 fix in Ingest below.
+var ErrDedupUnavailable = errors.New("replay dedup check unavailable")
 
 // hashDistinctID is a local alias so the call site reads cleanly. The
 // real impl lives in internal/identity.
@@ -152,12 +159,20 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 		// Atomic claim: only the batch that wins SetNX inserts the session row,
 		// closing the check-then-set race that produced duplicate sessions. The
 		// dedupe key self-expires (keys are 1-byte; TTL bounds growth).
+		//
+		// A genuine KV error (as opposed to "already claimed") used to be
+		// silently ignored, leaving insertSession at its default true — so
+		// every batch received during a KV outage attempted another insert
+		// for the same replay ID (duplicate rows / PK conflicts), exactly
+		// when the dedupe guarantee was needed most. Fail the request
+		// instead; the caller should treat this as retryable (OBS-029).
 		claimed, err := kv.SetNX(ctx, key, []byte("1"))
-		if err == nil {
-			insertSession = claimed
-			if claimed {
-				_, _ = kv.Expire(ctx, key, 6*time.Hour)
-			}
+		if err != nil {
+			return "", fmt.Errorf("%w: %v", ErrDedupUnavailable, err)
+		}
+		insertSession = claimed
+		if claimed {
+			_, _ = kv.Expire(ctx, key, 6*time.Hour)
 		}
 	}
 
@@ -173,7 +188,20 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 			}
 		}
 		if salt == "" && !rawOptIn {
-			distinctID = input.DistinctID
+			// Fail closed (OBS-030): this is a privacy control, not a
+			// best-effort one — never fall through to raw storage just
+			// because no salt was available. main.go always seeds a random
+			// fallback salt at startup so this path isn't reachable through
+			// normal wiring today, but the package must not depend on the
+			// caller continuing to do that correctly.
+			//
+			// The identifier is dropped, not the whole batch: the session
+			// and its events are still real, valuable data, and rejecting
+			// the entire ingest over a hashing-config gap would lose them
+			// too. Logged loudly (not silently swallowed) so a persistent
+			// salt-configuration gap is actually visible operationally.
+			s.logger.Warn("replays: dropping distinct_id — no salt available and site has not opted into raw storage",
+				"site", input.SiteID)
 		} else {
 			distinctID = hashDistinctID(input.DistinctID, salt, rawOptIn)
 		}

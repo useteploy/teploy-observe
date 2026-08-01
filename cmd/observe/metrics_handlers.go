@@ -14,19 +14,21 @@ import (
 // RegisterMetricsRoutes wires the metrics API onto the root router. Three
 // concerns are bundled here:
 //
-//   1. OTLP HTTP ingest at POST /v1/metrics — API-key authenticated (parity
-//      with /v1/traces); site_id comes from the validated key, not the body.
-//   2. Metric-name listing at GET /api/v1/metrics/list — JWT-only read.
-//   3. Aggregated query at GET /api/v1/metrics/query — JWT-only read.
-//      Phase-2 callers can also request the per-label-set series shape via
-//      GET /api/v1/metrics/series — see metricsSeriesHandler below.
+//  1. OTLP HTTP ingest at POST /v1/metrics — API-key authenticated (parity
+//     with /v1/traces); site_id comes from the validated key, not the body.
+//  2. Metric-name listing at GET /api/v1/metrics/list — JWT-only read.
+//  3. Aggregated query at GET /api/v1/metrics/query — JWT-only read.
+//     Phase-2 callers can also request the per-label-set series shape via
+//     GET /api/v1/metrics/series — see metricsSeriesHandler below.
 //
 // Kept in its own file so the merge-conflict surface against parallel
 // agents stays a single line addition in main.go (mirrors the
 // RegisterBoardsRoutes / RegisterAttributionRoutes convention).
-func RegisterMetricsRoutes(r *neutron.Router, jwtMW, apiKeyMW neutron.Middleware, svc *metrics.Service) {
+// otlpChain is the shared ingest protection chain (API-key auth + rate limit +
+// body cap) main.go applies to every /v1/<signal> route.
+func RegisterMetricsRoutes(r *neutron.Router, jwtMW, otlpChain neutron.Middleware, svc *metrics.Service) {
 	otlpHandler := metrics.NewOTLPHandler(svc)
-	r.Handle("POST /v1/metrics", apiKeyMW(otlpHandler))
+	r.Handle("POST /v1/metrics", otlpChain(otlpHandler))
 
 	r.Handle("GET /api/v1/metrics/list", jwtMW(metricsListHandler(svc)))
 	r.Handle("GET /api/v1/metrics/query", jwtMW(metricsQueryHandler(svc)))
@@ -58,13 +60,14 @@ func metricsListHandler(svc *metrics.Service) http.HandlerFunc {
 // any embedded /metrics route logic that doesn't know about group-by.
 //
 // Parameters:
-//   site_id      (required)
-//   name         (required) metric name
-//   from         (ms epoch, optional — defaults to now-1h)
-//   to           (ms epoch, optional — defaults to now)
-//   agg          last|avg|sum|min|max|rate|p50|p95|p99 (default: last)
-//   step         15s|30s|60s|5m|1h|1d (default: 60s)
-//   label.<key>  AND-joined exact-match label filter
+//
+//	site_id      (required)
+//	name         (required) metric name
+//	from         (ms epoch, optional — defaults to now-1h)
+//	to           (ms epoch, optional — defaults to now)
+//	agg          last|avg|sum|min|max|rate|p50|p95|p99 (default: last)
+//	step         15s|30s|60s|5m|1h|1d (default: 60s)
+//	label.<key>  AND-joined exact-match label filter
 func metricsQueryHandler(svc *metrics.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		req, err := parseQueryRequest(r)
@@ -88,7 +91,7 @@ func metricsQueryHandler(svc *metrics.Service) http.HandlerFunc {
 // metricsSeriesHandler exposes /api/v1/metrics/series — the Phase-2 fan-out
 // shape. Same query parameters as /query plus:
 //
-//   group_by  comma-separated list of label keys to fan series out by
+//	group_by  comma-separated list of label keys to fan series out by
 //
 // Returns a JSON array of {labels, points} entries. With no group_by it
 // returns one entry whose labels is {} so callers can unify rendering.

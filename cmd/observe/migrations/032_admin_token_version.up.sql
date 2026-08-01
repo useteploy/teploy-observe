@@ -1,0 +1,15 @@
+-- OBS-011: JWTs embed the user's role and are valid for 24 hours, but
+-- middleware only ever checked the role CLAIM, never re-validated it against
+-- current server-side state. A password change (the only credential-mutating
+-- operation local admin accounts have today — Observe has no separate
+-- role-management API) did not revoke tokens already issued: a compromised
+-- token, or one issued to someone who should no longer have access, stayed
+-- valid for up to 24 hours after the password changed.
+--
+-- token_version is bumped by ChangePassword/ForceResetAdminPassword (in the
+-- same transaction as the password swap) and embedded in every JWT at issue
+-- time. Middleware rejects any token whose embedded version doesn't match the
+-- user's current value. Scoped to locally-authenticated admin_users rows —
+-- OIDC-issued sessions ("oidc:<subject>") have no row here to version; see
+-- the OBS-011 fix note in internal/auth/middleware.go for that limitation.
+ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS token_version BIGINT NOT NULL DEFAULT 0;

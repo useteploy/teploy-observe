@@ -7,6 +7,10 @@
 //	observe backup > out.tar           # raw tar
 //	observe backup | zstd > out.tar.zst # compressed
 //	zstdcat out.tar.zst | observe restore
+//
+// Set OBSERVE_BACKUP_ENCRYPTION_KEY (see crypto.go) to encrypt backups at
+// rest — the archive contains password hashes, API keys, and other secrets in
+// plaintext otherwise.
 package backup
 
 import (
@@ -16,7 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"regexp"
+	"os"
 	"strings"
 	"time"
 
@@ -92,6 +96,29 @@ func Dump(ctx context.Context, db *nucleus.Client, w io.Writer) error {
 // DumpWithLog is Dump plus a stream to record per-table errors for
 // diagnostics (backup-to-stdout keeps stdout for tar data).
 func DumpWithLog(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io.Writer) error {
+	return DumpWithKey(ctx, db, w, errLog, nil)
+}
+
+// DumpWithKey is DumpWithLog plus optional at-rest encryption. When key is
+// nil the archive is plaintext, identical to DumpWithLog. When key is set
+// (see LoadBackupEncryptionKey), the tar stream is wrapped in AES-256-GCM
+// chunked encryption — see crypto.go.
+func DumpWithKey(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io.Writer, key []byte) error {
+	if key != nil {
+		ew, err := newEncryptWriter(w, key)
+		if err != nil {
+			return fmt.Errorf("setting up backup encryption: %w", err)
+		}
+		if err := dumpTar(ctx, db, ew, errLog); err != nil {
+			_ = ew.Close()
+			return err
+		}
+		return ew.Close()
+	}
+	return dumpTar(ctx, db, w, errLog)
+}
+
+func dumpTar(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io.Writer) error {
 	tw := tar.NewWriter(w)
 	defer tw.Close()
 
@@ -133,6 +160,13 @@ func DumpWithLog(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io
 	return firstErr
 }
 
+// dumpTable streams one table's rows to a securely-created temp file first,
+// then copies that file into the tar entry. Nucleus's on-disk temp file (not
+// an in-memory buffer) keeps memory bounded regardless of table size — a
+// table larger than available RAM used to OOM the process because every row
+// was accumulated in one growing []byte before the tar entry was written
+// (writeEntry needs the total size upfront, which the tar format requires
+// declared in the header before any data bytes).
 func dumpTable(ctx context.Context, db *nucleus.Client, tw *tar.Writer, table string) (int64, error) {
 	// Nucleus ships everything as text via SimpleProtocol. Read raw bytes so
 	// we sidestep pgx's built-in type decoding (which chokes on Nucleus's
@@ -146,8 +180,16 @@ func dumpTable(ctx context.Context, db *nucleus.Client, tw *tar.Writer, table st
 	}
 	defer rows.Close()
 
+	tmp, err := os.CreateTemp("", "observe-backup-"+table+"-*.jsonl")
+	if err != nil {
+		return 0, fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	defer tmp.Close()
+
+	bw := bufio.NewWriter(tmp)
 	fields := rows.FieldDescriptions()
-	var buf []byte
 	var n int64
 	for rows.Next() {
 		raw := rows.RawValues()
@@ -163,14 +205,41 @@ func dumpTable(ctx context.Context, db *nucleus.Client, tw *tar.Writer, table st
 		if err != nil {
 			return 0, fmt.Errorf("marshal row: %w", err)
 		}
-		buf = append(buf, enc...)
-		buf = append(buf, '\n')
+		if _, err := bw.Write(enc); err != nil {
+			return 0, fmt.Errorf("write temp row: %w", err)
+		}
+		if err := bw.WriteByte('\n'); err != nil {
+			return 0, fmt.Errorf("write temp row: %w", err)
+		}
 		n++
 	}
 	if err := rows.Err(); err != nil {
 		return 0, fmt.Errorf("iterate: %w", err)
 	}
-	return n, writeEntry(tw, table+".jsonl", buf)
+	if err := bw.Flush(); err != nil {
+		return 0, fmt.Errorf("flush temp file: %w", err)
+	}
+
+	info, err := tmp.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("stat temp file: %w", err)
+	}
+	hdr := &tar.Header{
+		Name:    table + ".jsonl",
+		Mode:    0644,
+		Size:    info.Size(),
+		ModTime: time.Now(),
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return 0, fmt.Errorf("tar header %s: %w", table, err)
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("seek temp file: %w", err)
+	}
+	if _, err := io.Copy(tw, tmp); err != nil {
+		return 0, fmt.Errorf("tar write %s: %w", table, err)
+	}
+	return n, nil
 }
 
 func writeEntry(tw *tar.Writer, name string, data []byte) error {
@@ -187,187 +256,4 @@ func writeEntry(tw *tar.Writer, name string, data []byte) error {
 		return fmt.Errorf("tar write %s: %w", name, err)
 	}
 	return nil
-}
-
-// Restore reads a tar archive from r and inserts rows into their source tables.
-// Missing tables (not in the archive) are left untouched. Existing rows are
-// inserted via INSERT without ON CONFLICT — callers should restore into an
-// empty Nucleus instance or accept duplicates on ReplacingMergeTree tables.
-func Restore(ctx context.Context, db *nucleus.Client, r io.Reader) error {
-	tr := tar.NewReader(r)
-	var manifest *Manifest
-
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("tar next: %w", err)
-		}
-		if hdr.Name == manifestName {
-			var m Manifest
-			if err := json.NewDecoder(tr).Decode(&m); err != nil {
-				return fmt.Errorf("manifest decode: %w", err)
-			}
-			if m.Version != manifestVersion {
-				return fmt.Errorf("backup version %d not supported (expected %d)", m.Version, manifestVersion)
-			}
-			manifest = &m
-			continue
-		}
-		if hdr.Name == resultsName {
-			// The results entry is trailing, so we error AFTER restoring the
-			// present tables — but that still turns a silently-partial restore
-			// into a loud failure the operator must acknowledge (the failed
-			// tables were omitted from the archive, not restored as empty).
-			// Legacy archives without this entry are unaffected.
-			var results []TableResult
-			if err := json.NewDecoder(tr).Decode(&results); err != nil {
-				return fmt.Errorf("results decode: %w", err)
-			}
-			var failed []string
-			for _, r := range results {
-				if !r.OK {
-					failed = append(failed, r.Table)
-				}
-			}
-			if len(failed) > 0 {
-				return fmt.Errorf("backup is partial — these tables failed to dump and are missing: %s", strings.Join(failed, ", "))
-			}
-			continue
-		}
-		if !strings.HasSuffix(hdr.Name, ".jsonl") {
-			continue
-		}
-		table := strings.TrimSuffix(hdr.Name, ".jsonl")
-		if err := restoreTable(ctx, db, tr, table); err != nil {
-			return fmt.Errorf("restore %s: %w", table, err)
-		}
-	}
-	if manifest == nil {
-		return fmt.Errorf("no manifest found — is this an observe backup?")
-	}
-	return nil
-}
-
-// validIdent matches a safe SQL identifier (table or column). Restore data
-// comes from an attacker-controllable tar archive, and table/column names are
-// interpolated into INSERT statements (not bindable as params), so they MUST be
-// validated against an allowlist + charset or the archive can inject SQL.
-var validIdent = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
-
-var restorableTables = func() map[string]bool {
-	m := make(map[string]bool, len(Tables))
-	for _, t := range Tables {
-		m[t] = true
-	}
-	return m
-}()
-
-func restoreTable(ctx context.Context, db *nucleus.Client, r io.Reader, table string) error {
-	if !restorableTables[table] {
-		return fmt.Errorf("refusing to restore unknown table %q (not in the backup allowlist)", table)
-	}
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 1<<20), 16<<20) // up to 16 MiB per row
-	sqlc := db.SQL()
-
-	jsonbCols, err := jsonbColumns(ctx, sqlc, table)
-	if err != nil {
-		return fmt.Errorf("lookup jsonb columns: %w", err)
-	}
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var row map[string]any
-		if err := json.Unmarshal(line, &row); err != nil {
-			return fmt.Errorf("decode row: %w", err)
-		}
-		if err := insertRow(ctx, sqlc, table, row, jsonbCols); err != nil {
-			return err
-		}
-	}
-	return scanner.Err()
-}
-
-// jsonbColumns returns the set of JSONB-typed columns for a table, so restore
-// can normalize values the engine would reject. Archives from lenient-era
-// engines can carry empty-string JSONB values ('' used to be coerced;
-// Postgres-parity engines reject it with "invalid input syntax for type
-// json"), and those rows must restore as SQL NULL instead of failing.
-func jsonbColumns(ctx context.Context, sqlc *nucleus.SQLModel, table string) (map[string]bool, error) {
-	type colRow struct {
-		ColumnName string `db:"column_name"`
-	}
-	rows, err := nucleus.Query[colRow](ctx, sqlc,
-		`SELECT column_name FROM information_schema.columns
-		 WHERE table_name = $1 AND UPPER(data_type) = 'JSONB'`, table)
-	if err != nil {
-		return nil, err
-	}
-	set := make(map[string]bool, len(rows))
-	for _, r := range rows {
-		set[r.ColumnName] = true
-	}
-	return set, nil
-}
-
-func insertRow(ctx context.Context, sqlc *nucleus.SQLModel, table string, row map[string]any, jsonbCols map[string]bool) error {
-	cols := make([]string, 0, len(row))
-	for k := range row {
-		if !validIdent.MatchString(k) {
-			return fmt.Errorf("refusing to restore row with unsafe column name %q", k)
-		}
-		cols = append(cols, k)
-	}
-	// Stable order for reproducibility.
-	sortStrings(cols)
-
-	placeholders := make([]string, len(cols))
-	values := make([]any, len(cols))
-	for i, c := range cols {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
-		values[i] = formatValue(row[c], jsonbCols[c])
-	}
-
-	query := fmt.Sprintf(
-		"INSERT INTO %s (%s) VALUES (%s)",
-		table,
-		strings.Join(cols, ", "),
-		strings.Join(placeholders, ", "),
-	)
-	_, err := sqlc.Exec(ctx, query, values...)
-	return err
-}
-
-func formatValue(v any, isJSONB bool) any {
-	// Nucleus's pgwire wants text for BIGINT/JSONB columns. json.Unmarshal
-	// gives us string|float64|bool|map|slice|nil — map/slice need JSON text.
-	switch val := v.(type) {
-	case map[string]any, []any:
-		raw, _ := json.Marshal(val)
-		return string(raw)
-	case string:
-		// Lenient-era archives carry '' for JSONB columns; strict engines
-		// reject it. Restore as NULL (the modern write path's equivalent).
-		if isJSONB && val == "" {
-			return nil
-		}
-		return v
-	default:
-		return v
-	}
-}
-
-// sortStrings — avoid pulling the sort package into one tiny helper.
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j-1] > s[j]; j-- {
-			s[j-1], s[j] = s[j], s[j-1]
-		}
-	}
 }

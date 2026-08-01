@@ -31,12 +31,27 @@ docker compose up
 The Compose file runs the published image. To test local source changes, build
 the root `Dockerfile` explicitly.
 
-Open `http://localhost:3000`. Default login: `admin` / `observe`.
+Open `http://localhost:3000`. First visit lands on the setup wizard — there's
+no default password to change later, since none is set until you choose one
+there.
 
 ### Install script
 
+Downloads the installer from the latest release (not the mutable `main`
+branch) and verifies its SHA-256 against the release's `checksums.txt`
+before executing it — the script itself already checksum+signature-verifies
+the `observe` binary it installs, but nothing verified the script itself
+until now:
+
 ```bash
-curl -sL https://raw.githubusercontent.com/useteploy/teploy-observe/main/scripts/install.sh | sh
+(
+  set -e
+  curl -fsSLO https://github.com/useteploy/teploy-observe/releases/latest/download/install.sh
+  curl -fsSLO https://github.com/useteploy/teploy-observe/releases/latest/download/checksums.txt
+  grep " install.sh\$" checksums.txt > checksum.txt
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum -c checksum.txt || exit 1; else shasum -a 256 -c checksum.txt || exit 1; fi
+  sh install.sh
+)
 ```
 
 The script generates a random admin password and prints it on completion;

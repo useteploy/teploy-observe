@@ -126,6 +126,40 @@ func JWTAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 				neutron.WriteError(w, r, neutron.ErrUnauthorized(err.Error()))
 				return
 			}
+
+			// OBS-011: reject a token whose embedded version doesn't match the
+			// user's current token_version — this is what makes a password
+			// change actually revoke previously issued tokens instead of
+			// leaving them valid until their 24-hour expiry. OIDC-issued
+			// subjects ("oidc:<subject>") have no admin_users row to version
+			// (see oidc.go's GenerateToken call, always tv=0) and are skipped;
+			// their session freshness comes from re-authenticating with the
+			// IdP, not from this check.
+			sub, _ := claims["sub"].(string)
+			if sub != "" && !strings.HasPrefix(sub, "oidc:") {
+				tokenTV, _ := claims["tv"].(float64)
+				currentTV, err := authSvc.CurrentTokenVersion(r.Context(), sub)
+				if err != nil {
+					neutron.WriteError(w, r, neutron.ErrUnauthorized("session invalid"))
+					return
+				}
+				if int64(tokenTV) != currentTV {
+					neutron.WriteError(w, r, neutron.ErrUnauthorized("session revoked — please sign in again"))
+					return
+				}
+			}
+
+			// OBS-016: a query-string token is real bearer material and can
+			// leak via browser history, proxy/access logs, or the Referer
+			// header on any outbound link/subresource the response contains.
+			// It's only accepted at all (queryTokenAllowed, above) because
+			// EventSource/download contexts can't set a custom header — for
+			// exactly those responses, stop this page/response from
+			// propagating a Referer that would carry the token onward.
+			if token == r.URL.Query().Get("token") {
+				w.Header().Set("Referrer-Policy", "no-referrer")
+			}
+
 			// Stash role for downstream RequireRole middleware. Missing role
 			// claim defaults to RoleViewer so we fail closed on reads.
 			role, _ := claims["role"].(string)

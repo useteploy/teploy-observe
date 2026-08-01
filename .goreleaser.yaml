@@ -36,6 +36,18 @@ archives:
 checksum:
   name_template: 'checksums.txt'
 
+# OBS-027: the README's install one-liner pulls scripts/install.sh straight
+# from the mutable `main` branch with no verification — the script itself
+# already checksum+signature-verifies the BINARY it installs (see its
+# RELEASE_URL/checksums.txt.sig handling), but nothing verified the script
+# before that point. Publishing it as a release asset gets it into the same
+# checksums.txt (and Ed25519 signature) every other release artifact already
+# has, so the README can pin to a release tag and verify the script itself
+# before running it, closing the remaining gap.
+release:
+  extra_files:
+    - glob: ./scripts/install.sh
+
 # The updater verifies this Ed25519 signature before trusting any archive hash.
 # The private key exists only in the protected GitHub Actions release secret.
 signs:

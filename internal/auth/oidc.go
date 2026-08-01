@@ -59,13 +59,37 @@ type OIDCAuth struct {
 	viewerGroup   string
 	defaultRole   string
 
+	// Optional identity allowlist. Empty (the default) means every identity
+	// the IdP authenticates is allowed — fine for a single-tenant issuer the
+	// customer controls. Set either to restrict SSO to specific users, which
+	// matters for a multi-tenant issuer (e.g. plain Google) where
+	// "authenticated by the IdP" does not imply "should have access here".
+	allowedEmails  map[string]bool
+	allowedDomains []string
+
+	// audit records SSO sign-in attempts to the compliance trail, mirroring
+	// what password login does. A func rather than the audit service itself
+	// so this package stays independent of it, and because the audit service
+	// is constructed after OIDC in main.
+	audit OIDCAuditFunc
+
 	initMu   sync.Mutex
 	provider *oidc.Provider
 	verifier *oidc.IDTokenVerifier
 
 	flowMu sync.Mutex
 	flows  map[string]*oidcFlow
+	// flowOrder is insertion order. Every flow shares the same TTL, so
+	// insertion order is also expiry order — storeFlow prunes from the front
+	// instead of sweeping the whole map, and caps total size so a
+	// distributed attacker (many source IPs, each under the per-IP login
+	// rate limit) can't grow this unboundedly.
+	flowOrder []string
 }
+
+// maxOIDCFlows bounds the in-flight SSO login count. Comfortably above any
+// real concurrent-login volume, well below what would trouble memory.
+const maxOIDCFlows = 10000
 
 // oidcFlow is one in-progress login, keyed by the OAuth state parameter and
 // bound to the initiating browser by the state cookie. It carries the nonce and
@@ -85,25 +109,55 @@ func NewOIDCAuth(authSvc *AuthService, logger *slog.Logger) *OIDCAuth {
 		return nil
 	}
 	o := &OIDCAuth{
-		authSvc:       authSvc,
-		logger:        logger,
-		issuer:        issuer,
-		clientID:      clientID,
-		clientSecret:  strings.TrimSpace(os.Getenv("OBSERVE_OIDC_CLIENT_SECRET")),
-		redirectURL:   strings.TrimSpace(os.Getenv("OBSERVE_OIDC_REDIRECT_URL")),
-		scopes:        parseOIDCScopes(os.Getenv("OBSERVE_OIDC_SCOPES")),
-		label:         orDefault(strings.TrimSpace(os.Getenv("OBSERVE_OIDC_LABEL")), "Single sign-on"),
-		usernameClaim: orDefault(strings.TrimSpace(os.Getenv("OBSERVE_OIDC_USERNAME_CLAIM")), "preferred_username"),
-		roleClaim:     orDefault(strings.TrimSpace(os.Getenv("OBSERVE_OIDC_ROLE_CLAIM")), "teploy_role"),
-		groupsClaim:   orDefault(strings.TrimSpace(os.Getenv("OBSERVE_OIDC_GROUPS_CLAIM")), "groups"),
-		adminGroup:    strings.TrimSpace(os.Getenv("OBSERVE_OIDC_ADMIN_GROUP")),
-		editorGroup:   strings.TrimSpace(os.Getenv("OBSERVE_OIDC_EDITOR_GROUP")),
-		viewerGroup:   strings.TrimSpace(os.Getenv("OBSERVE_OIDC_VIEWER_GROUP")),
-		defaultRole:   normalizeRole(strings.TrimSpace(os.Getenv("OBSERVE_OIDC_DEFAULT_ROLE"))),
-		flows:         make(map[string]*oidcFlow),
+		authSvc:        authSvc,
+		logger:         logger,
+		issuer:         issuer,
+		clientID:       clientID,
+		clientSecret:   strings.TrimSpace(os.Getenv("OBSERVE_OIDC_CLIENT_SECRET")),
+		redirectURL:    strings.TrimSpace(os.Getenv("OBSERVE_OIDC_REDIRECT_URL")),
+		scopes:         parseOIDCScopes(os.Getenv("OBSERVE_OIDC_SCOPES")),
+		label:          orDefault(strings.TrimSpace(os.Getenv("OBSERVE_OIDC_LABEL")), "Single sign-on"),
+		usernameClaim:  orDefault(strings.TrimSpace(os.Getenv("OBSERVE_OIDC_USERNAME_CLAIM")), "preferred_username"),
+		roleClaim:      orDefault(strings.TrimSpace(os.Getenv("OBSERVE_OIDC_ROLE_CLAIM")), "teploy_role"),
+		groupsClaim:    orDefault(strings.TrimSpace(os.Getenv("OBSERVE_OIDC_GROUPS_CLAIM")), "groups"),
+		adminGroup:     strings.TrimSpace(os.Getenv("OBSERVE_OIDC_ADMIN_GROUP")),
+		editorGroup:    strings.TrimSpace(os.Getenv("OBSERVE_OIDC_EDITOR_GROUP")),
+		viewerGroup:    strings.TrimSpace(os.Getenv("OBSERVE_OIDC_VIEWER_GROUP")),
+		defaultRole:    normalizeRole(strings.TrimSpace(os.Getenv("OBSERVE_OIDC_DEFAULT_ROLE"))),
+		allowedEmails:  parseOIDCAllowlist(os.Getenv("OBSERVE_OIDC_ALLOWED_EMAILS")),
+		allowedDomains: parseOIDCAllowlistSlice(os.Getenv("OBSERVE_OIDC_ALLOWED_DOMAINS")),
+		flows:          make(map[string]*oidcFlow),
 	}
 	logger.Info("OIDC SSO enabled", "issuer", issuer)
 	return o
+}
+
+// Audit result vocabulary, mirroring the audit package's constants. Duplicated
+// as plain strings so this package doesn't have to depend on that one.
+const (
+	auditResultSuccess = "success"
+	auditResultFailure = "failure"
+	auditResultDenied  = "denied"
+)
+
+// OIDCAuditFunc records one SSO sign-in attempt. username is "" when the
+// identity could not be resolved; result is one of the auditResult* values.
+type OIDCAuditFunc func(r *http.Request, username, result, detail string)
+
+// SetAuditFunc installs the audit sink. Safe to call with nil (no auditing);
+// must be called before the server starts serving.
+func (o *OIDCAuth) SetAuditFunc(f OIDCAuditFunc) {
+	if o != nil {
+		o.audit = f
+	}
+}
+
+// recordAudit is a no-op when SSO is disabled or no sink is installed.
+func (o *OIDCAuth) recordAudit(r *http.Request, username, result, detail string) {
+	if o == nil || o.audit == nil {
+		return
+	}
+	o.audit(r, username, result, detail)
 }
 
 // Enabled reports whether SSO is configured.
@@ -136,6 +190,58 @@ func parseOIDCScopes(raw string) []string {
 		out = append([]string{oidc.ScopeOpenID}, out...)
 	}
 	return out
+}
+
+// parseOIDCAllowlist parses a comma/space-separated list of emails into a
+// lowercased set. Empty input yields a nil (empty) map.
+func parseOIDCAllowlist(raw string) map[string]bool {
+	out := make(map[string]bool)
+	for _, f := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ' ' }) {
+		if f = strings.ToLower(strings.TrimSpace(f)); f != "" {
+			out[f] = true
+		}
+	}
+	return out
+}
+
+// parseOIDCAllowlistSlice parses a comma/space-separated list of domains into
+// a lowercased slice.
+func parseOIDCAllowlistSlice(raw string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, f := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ' ' }) {
+		if f = strings.ToLower(strings.TrimSpace(f)); f != "" && !seen[f] {
+			seen[f] = true
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// allowed reports whether the authenticated identity may sign in. With no
+// allowlist configured it always returns true.
+func (o *OIDCAuth) allowed(claims map[string]any) bool {
+	if len(o.allowedEmails) == 0 && len(o.allowedDomains) == 0 {
+		return true
+	}
+	email := strings.ToLower(claimString(claims["email"]))
+	if email == "" {
+		return false
+	}
+	if o.allowedEmails[email] {
+		return true
+	}
+	at := strings.LastIndex(email, "@")
+	if at < 0 {
+		return false
+	}
+	domain := email[at+1:]
+	for _, d := range o.allowedDomains {
+		if domain == d {
+			return true
+		}
+	}
+	return false
 }
 
 func orDefault(v, def string) string {
@@ -176,12 +282,21 @@ func (o *OIDCAuth) storeFlow(state string, f *oidcFlow) {
 	o.flowMu.Lock()
 	defer o.flowMu.Unlock()
 	now := time.Now()
-	for k, v := range o.flows {
-		if now.After(v.exp) {
-			delete(o.flows, k)
+	for len(o.flowOrder) > 0 {
+		oldest := o.flowOrder[0]
+		if of, ok := o.flows[oldest]; !ok || now.After(of.exp) {
+			o.flowOrder = o.flowOrder[1:]
+			delete(o.flows, oldest)
+			continue
 		}
+		break
+	}
+	if len(o.flowOrder) >= maxOIDCFlows {
+		delete(o.flows, o.flowOrder[0])
+		o.flowOrder = o.flowOrder[1:]
 	}
 	o.flows[state] = f
+	o.flowOrder = append(o.flowOrder, state)
 }
 
 func (o *OIDCAuth) takeFlow(state string) (*oidcFlow, bool) {
@@ -191,6 +306,8 @@ func (o *OIDCAuth) takeFlow(state string) (*oidcFlow, bool) {
 	if !ok {
 		return nil, false
 	}
+	// flowOrder keeps the now-stale key until it reaches the front of the
+	// queue in a future storeFlow call, where the ok-check above prunes it.
 	delete(o.flows, state)
 	if time.Now().After(f.exp) {
 		return nil, false
@@ -338,7 +455,7 @@ func (o *OIDCAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	q := r.URL.Query()
 	if e := q.Get("error"); e != "" {
-		o.fail(w, r, "SSO error: "+strings.TrimSpace(e+" "+q.Get("error_description")))
+		o.failAudit(w, r, "", auditResultFailure, "idp_error", "SSO error: "+strings.TrimSpace(e+" "+q.Get("error_description")))
 		return
 	}
 
@@ -349,63 +466,83 @@ func (o *OIDCAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true, Secure: requestIsHTTPS(r), SameSite: http.SameSiteLaxMode,
 	})
 	if cookieErr != nil || state == "" || subtle.ConstantTimeCompare([]byte(state), []byte(cookie.Value)) != 1 {
-		o.fail(w, r, "SSO state mismatch — please sign in again")
+		o.failAudit(w, r, "", auditResultFailure, "state_mismatch", "SSO state mismatch — please sign in again")
 		return
 	}
 	flow, ok := o.takeFlow(state)
 	if !ok {
-		o.fail(w, r, "SSO session expired — please sign in again")
+		o.failAudit(w, r, "", auditResultFailure, "flow_expired", "SSO session expired — please sign in again")
 		return
 	}
 
 	if err := o.ensure(ctx); err != nil {
-		o.fail(w, r, "SSO provider is unavailable — try again shortly")
+		o.failAudit(w, r, "", auditResultFailure, "provider_unavailable", "SSO provider is unavailable — try again shortly")
 		return
 	}
 	cfg := o.oauthConfig(o.effectiveRedirect(r))
 	tok, err := cfg.Exchange(ctx, q.Get("code"), oauth2.VerifierOption(flow.verifier))
 	if err != nil {
 		o.logger.Error("OIDC token exchange failed", "err", err)
-		o.fail(w, r, "SSO sign-in failed — please try again")
+		o.failAudit(w, r, "", auditResultFailure, "code_exchange_failed", "SSO sign-in failed — please try again")
 		return
 	}
 	rawID, _ := tok.Extra("id_token").(string)
 	if rawID == "" {
-		o.fail(w, r, "SSO response was missing an ID token")
+		o.failAudit(w, r, "", auditResultFailure, "missing_id_token", "SSO response was missing an ID token")
 		return
 	}
 	idToken, err := o.verifier.Verify(ctx, rawID)
 	if err != nil {
 		o.logger.Error("OIDC ID-token verification failed", "err", err)
-		o.fail(w, r, "SSO sign-in failed — please try again")
+		o.failAudit(w, r, "", auditResultFailure, "id_token_invalid", "SSO sign-in failed — please try again")
 		return
 	}
 	if idToken.Nonce != flow.nonce {
-		o.fail(w, r, "SSO sign-in failed — please try again")
+		o.failAudit(w, r, "", auditResultFailure, "nonce_mismatch", "SSO sign-in failed — please try again")
 		return
 	}
 	var claims map[string]any
 	if err := idToken.Claims(&claims); err != nil {
-		o.fail(w, r, "SSO sign-in failed — please try again")
+		o.failAudit(w, r, "", auditResultFailure, "claims_unreadable", "SSO sign-in failed — please try again")
 		return
 	}
 	username := o.resolveUsername(claims)
 	if username == "" {
-		o.fail(w, r, "SSO identity has no usable username claim")
+		o.failAudit(w, r, "", auditResultFailure, "no_username_claim", "SSO identity has no usable username claim")
+		return
+	}
+	if !o.allowed(claims) {
+		o.logger.Warn("OIDC login denied by allowlist", "username", username)
+		o.failAudit(w, r, username, auditResultDenied, "not_in_allowlist", "your account is not authorized for SSO on this instance")
 		return
 	}
 	role := o.resolveRole(claims)
 
 	// Mint the same JWT password login issues. The user ID is the IdP subject,
 	// namespaced so it never collides with a local admin_users row ID.
+	// tokenVersion is 0 — OIDC-issued sessions have no admin_users row to
+	// version, so JWTAuthMiddleware skips the revocation check for them (see
+	// its "oidc:" prefix check). Re-authenticating with the IdP on next login
+	// remains the way an OIDC session's role gets refreshed; there is
+	// currently no way to proactively revoke one still-valid token before
+	// its 24-hour expiry, unlike a local admin password change.
 	userID := "oidc:" + idToken.Subject
-	jwt, err := o.authSvc.GenerateToken(userID, username, role)
+	jwt, err := o.authSvc.GenerateToken(userID, username, role, 0)
 	if err != nil {
 		o.logger.Error("OIDC token mint failed", "err", err)
-		o.fail(w, r, "SSO sign-in failed — please try again")
+		o.failAudit(w, r, username, auditResultFailure, "token_mint_failed", "SSO sign-in failed — please try again")
 		return
 	}
+	o.recordAudit(r, username, auditResultSuccess, "role="+role)
 	o.deliverToken(w, jwt)
+}
+
+// failAudit records the outcome to the audit trail, then redirects the user
+// back to the login page with a human-readable message. detail is a stable
+// machine-readable reason code; msg is the user-facing text.
+func (o *OIDCAuth) failAudit(w http.ResponseWriter, r *http.Request, username, result, detail, msg string) {
+	o.recordAudit(r, username, result, detail)
+	o.fail(w, r, msg)
 }
 
 // deliverToken renders a minimal interstitial that stores the JWT in the SPA's
