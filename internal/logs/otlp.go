@@ -2,6 +2,7 @@ package logs
 
 import (
 	"compress/gzip"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -147,7 +148,7 @@ func (h *OTLPLogsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, ierr := h.svc.IngestLogs(r.Context(), inputs)
+	result, ierr := ingestExport(r.Context(), h.svc, inputs)
 	if ierr != nil {
 		http.Error(w, ierr.Error(), http.StatusInternalServerError)
 		return
@@ -158,6 +159,33 @@ func (h *OTLPLogsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"partialSuccess": map[string]any{
 		"rejectedLogRecords": result.Rejected,
 	}})
+}
+
+// ingestExport feeds one OTLP export through IngestLogs in maxLogBatchSize
+// chunks.
+//
+// maxLogBatchSize caps a single /logs/batch API request, but an OTLP export is
+// not that request shape: a stock OTel SDK batch log processor exports 512
+// records by default and the Collector's send_batch_size defaults to 8192, so
+// handing an export straight to IngestLogs rejects the whole thing above 200.
+// That surfaces as a 500, which the OTLP spec classes as non-retryable — the
+// exporter drops the batch instead of resending, losing every record. The cap
+// stays as-is (it also bounds the multi-row INSERT); the export is split to fit.
+func ingestExport(ctx context.Context, svc *LogService, inputs []LogInput) (LogBatchResult, error) {
+	total := LogBatchResult{}
+	for start := 0; start < len(inputs); start += maxLogBatchSize {
+		end := start + maxLogBatchSize
+		if end > len(inputs) {
+			end = len(inputs)
+		}
+		res, err := svc.IngestLogs(ctx, inputs[start:end])
+		total.Accepted += res.Accepted
+		total.Rejected += res.Rejected
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
 }
 
 func jsonLogInputs(body []byte, siteID string) ([]LogInput, error) {
