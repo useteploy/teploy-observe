@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -66,31 +67,21 @@ func (s *IngestService) IngestSync(ctx context.Context, siteID string, req Expor
 
 func (s *IngestService) ingest(ctx context.Context, siteID string, req ExportTraceRequest, syncRollup bool) (IngestResponse, error) {
 	sql := s.db.SQL()
-	total := 0
 
 	// Flatten the OTLP envelope into a single slice — keeps the rollup
 	// aggregator pure and unit-testable without an OTLP request struct.
 	flat := flattenSpans(req)
 
-	for _, sp := range flat {
-		_, err := sql.Exec(ctx,
-			`INSERT INTO spans (
-				trace_id, span_id, parent_span_id, tenant_id, site_id,
-				service_name, operation_name, span_kind,
-				start_time, end_time, duration_ms,
-				status_code, status_message,
-				attributes, resource, events
-			) VALUES ($1,$2,$3,'default',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
-			sp.TraceID, sp.SpanID, sp.ParentSpanID, siteID,
-			sp.ServiceName, sp.OperationName, sp.SpanKind,
-			sp.StartMs, sp.EndMs, sp.DurationMs,
-			sp.StatusCode, sp.StatusMessage,
-			nullableJSON(sp.AttributesJSON), nullableJSON(sp.ResourceJSON), nullableJSON(sp.EventsJSON),
-		)
-		if err != nil {
-			return IngestResponse{}, fmt.Errorf("insert span: %w", err)
-		}
-		total++
+	// Batch-insert spans in chunked multi-row statements instead of one
+	// autocommit INSERT per span — an unbatched per-span loop was directly
+	// contributing to Nucleus memory pressure (each INSERT is a separate
+	// write that also invalidates the whole query-result cache) on every
+	// trace export, which for a busy exporter can be hundreds of spans per
+	// request. Mirrors the chunking approach in internal/ingest/buffer.go's
+	// insertBatch (same chunk size, same placeholder-building shape).
+	total, err := insertSpans(ctx, sql, siteID, flat)
+	if err != nil {
+		return IngestResponse{}, fmt.Errorf("insert span: %w", err)
 	}
 
 	services, deps := aggregateRollups(flat)
@@ -170,6 +161,81 @@ type flatSpan struct {
 	AttributesJSON string
 	ResourceJSON   string
 	EventsJSON     string
+}
+
+// spansCols is the number of bound parameters per row in the batch INSERT
+// below (tenant_id is bound per-row here, rather than the literal used by
+// the old single-row statement, so every row in a VALUES list has the same
+// shape).
+const spansCols = 16
+
+const spansColList = `trace_id, span_id, parent_span_id, tenant_id, site_id,
+	service_name, operation_name, span_kind,
+	start_time, end_time, duration_ms,
+	status_code, status_message,
+	attributes, resource, events`
+
+// buildSpanPlaceholders returns "($1,...,$16),($17,...,$32),..." for rows*spansCols placeholders.
+func buildSpanPlaceholders(rows int) string {
+	var b strings.Builder
+	b.Grow(rows * spansCols * 5)
+	n := 1
+	for r := 0; r < rows; r++ {
+		if r > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('(')
+		for c := 0; c < spansCols; c++ {
+			if c > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteByte('$')
+			b.WriteString(strconv.Itoa(n))
+			n++
+		}
+		b.WriteByte(')')
+	}
+	return b.String()
+}
+
+func spanArgs(dst []any, siteID string, sp *flatSpan) []any {
+	return append(dst,
+		sp.TraceID, sp.SpanID, sp.ParentSpanID, "default", siteID,
+		sp.ServiceName, sp.OperationName, sp.SpanKind,
+		sp.StartMs, sp.EndMs, sp.DurationMs,
+		sp.StatusCode, sp.StatusMessage,
+		nullableJSON(sp.AttributesJSON), nullableJSON(sp.ResourceJSON), nullableJSON(sp.EventsJSON),
+	)
+}
+
+// insertSpans batch-inserts spans in fixed-size chunks (matching
+// internal/ingest/buffer.go's insertBatch chunk size) instead of one
+// autocommit INSERT per span. Returns the number of spans successfully
+// inserted; on error that count reflects only the chunks that committed
+// before the failure, matching the old loop's "insert until first failure"
+// semantics.
+func insertSpans(ctx context.Context, sql *nucleus.SQLModel, siteID string, flat []flatSpan) (int, error) {
+	const batchSize = 50
+	total := 0
+	for start := 0; start < len(flat); start += batchSize {
+		end := start + batchSize
+		if end > len(flat) {
+			end = len(flat)
+		}
+		chunk := flat[start:end]
+
+		query := "INSERT INTO spans (" + spansColList + ") VALUES " + buildSpanPlaceholders(len(chunk))
+		args := make([]any, 0, len(chunk)*spansCols)
+		for i := range chunk {
+			args = spanArgs(args, siteID, &chunk[i])
+		}
+
+		if _, err := sql.Exec(ctx, query, args...); err != nil {
+			return total, fmt.Errorf("batch insert spans %d-%d: %w", start+1, end, err)
+		}
+		total = end
+	}
+	return total, nil
 }
 
 func flattenSpans(req ExportTraceRequest) []flatSpan {

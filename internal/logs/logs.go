@@ -6,6 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -18,10 +21,20 @@ type LogService struct {
 	db        *nucleus.Client
 	Bx        *Broadcaster
 	pipelines *PipelineService
+	logger    *slog.Logger
 }
 
 func NewLogService(db *nucleus.Client) *LogService {
-	return &LogService{db: db, Bx: NewBroadcaster()}
+	return &LogService{db: db, Bx: NewBroadcaster(), logger: slog.Default()}
+}
+
+// log returns the service logger, falling back to the default so a
+// zero-value LogService (as some tests build) can still report errors.
+func (s *LogService) log() *slog.Logger {
+	if s.logger == nil {
+		return slog.Default()
+	}
+	return s.logger
 }
 
 // SetPipelines wires the pipeline processor into the ingest path so drop/mask/
@@ -56,15 +69,31 @@ type LogInput struct {
 	Attributes  map[string]any `json:"attributes"`
 }
 
-// IngestLog inserts a single log entry into the logs table.
-func (s *LogService) IngestLog(ctx context.Context, input LogInput) (string, error) {
+// preparedLog is a log entry after pipeline processing (drop/mask/sample/
+// parse) and ID/JSON generation, ready to bind into an INSERT. Splitting
+// this out of IngestLog lets IngestLogs run pipelines + validation per entry
+// but issue one batched multi-row INSERT for the whole request, instead of
+// looping a single-row INSERT per line.
+type preparedLog struct {
+	id        string
+	input     LogInput
+	attrsJSON string
+	tsMs      string
+	now       time.Time
+}
+
+// prepareLog applies pipelines and builds the row to insert, without
+// touching the DB. Returns (nil, nil) if a pipeline rule dropped the entry —
+// that mirrors the pre-existing IngestLog contract where a drop returns
+// ("", nil), not an error.
+func (s *LogService) prepareLog(ctx context.Context, input LogInput) (*preparedLog, error) {
 	// Apply configured pipelines (drop/mask/sample/parse) before persisting.
 	// A drop/sample rule that returns keep=false skips the insert silently
 	// (no error to the client). SiteID must already be resolved by the caller.
 	if s.pipelines != nil {
 		msg, attrs, keep := s.pipelines.ProcessLog(ctx, input.SiteID, input.Message, input.Attributes)
 		if !keep {
-			return "", nil
+			return nil, nil
 		}
 		input.Message = msg
 		input.Attributes = attrs
@@ -72,38 +101,55 @@ func (s *LogService) IngestLog(ctx context.Context, input LogInput) (string, err
 
 	id, err := generateID()
 	if err != nil {
-		return "", fmt.Errorf("generate log id: %w", err)
+		return nil, fmt.Errorf("generate log id: %w", err)
 	}
 
 	attrsJSON := "null"
 	if len(input.Attributes) > 0 {
 		raw, err := json.Marshal(input.Attributes)
 		if err != nil {
-			return "", fmt.Errorf("marshal attributes: %w", err)
+			return nil, fmt.Errorf("marshal attributes: %w", err)
 		}
 		attrsJSON = string(raw)
 	}
 
 	now := time.Now().UTC()
-	nowMs := dbutil.IntParam(now.UnixMilli())
+	return &preparedLog{
+		id:        id,
+		input:     input,
+		attrsJSON: attrsJSON,
+		tsMs:      dbutil.IntParam(now.UnixMilli()),
+		now:       now,
+	}, nil
+}
+
+// IngestLog inserts a single log entry into the logs table.
+func (s *LogService) IngestLog(ctx context.Context, input LogInput) (string, error) {
+	p, err := s.prepareLog(ctx, input)
+	if err != nil {
+		return "", err
+	}
+	if p == nil {
+		return "", nil // dropped by a pipeline rule
+	}
 
 	_, err = s.db.SQL().Exec(ctx,
 		`INSERT INTO logs (
 			log_id, tenant_id, site_id, timestamp, level, message,
 			service_name, trace_id, span_id, attributes
 		) VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8, $9)`,
-		id, input.SiteID, nowMs, input.Level, input.Message,
-		input.ServiceName, input.TraceID, input.SpanID, attrsJSON,
+		p.id, p.input.SiteID, p.tsMs, p.input.Level, p.input.Message,
+		p.input.ServiceName, p.input.TraceID, p.input.SpanID, p.attrsJSON,
 	)
 	if err != nil {
 		return "", fmt.Errorf("insert log: %w", err)
 	}
 
 	if s.Bx != nil {
-		s.Bx.Publish(logToPublish(id, input, now))
+		s.Bx.Publish(logToPublish(p.id, p.input, p.now))
 	}
 
-	return id, nil
+	return p.id, nil
 }
 
 // maxLogBatchSize caps a single /logs/batch request, mirroring the events
@@ -128,14 +174,136 @@ func (s *LogService) IngestLogs(ctx context.Context, inputs []LogInput) (LogBatc
 		return LogBatchResult{}, fmt.Errorf("batch too large: %d entries (max %d)", len(inputs), maxLogBatchSize)
 	}
 	result := LogBatchResult{}
+	if len(inputs) == 0 {
+		return result, nil
+	}
+
+	// Run pipelines/validation per entry (unchanged), but collect the
+	// surviving rows and issue one batched multi-row INSERT for the whole
+	// request instead of one autocommit INSERT per line — that per-line loop
+	// was a major source of Nucleus memory pressure under load. Mirrors the
+	// chunked-INSERT pattern in internal/ingest/buffer.go's insertBatch.
+	toInsert := make([]*preparedLog, 0, len(inputs))
 	for _, input := range inputs {
-		if _, err := s.IngestLog(ctx, input); err != nil {
+		p, err := s.prepareLog(ctx, input)
+		if err != nil {
 			result.Rejected++
 			continue
 		}
-		result.Accepted++
+		if p == nil {
+			// Dropped by a pipeline rule — matches the pre-batching
+			// IngestLog contract, where a drop counted as accepted (err
+			// was nil) rather than rejected.
+			result.Accepted++
+			continue
+		}
+		toInsert = append(toInsert, p)
 	}
+
+	if len(toInsert) == 0 {
+		return result, nil
+	}
+
+	// A chunk failure isn't surfaced to the caller as a batch-level error —
+	// matches the old per-line loop, which never returned one either. The
+	// committed/toInsert count difference already flows into Rejected, and
+	// insertLogsBatch has already logged the cause of any shortfall.
+	committed, _ := s.insertLogsBatch(ctx, toInsert)
+	result.Accepted += len(committed)
+	result.Rejected += len(toInsert) - len(committed)
+
+	if s.Bx != nil {
+		for _, p := range committed {
+			s.Bx.Publish(logToPublish(p.id, p.input, p.now))
+		}
+	}
+
 	return result, nil
+}
+
+// logsCols is the number of bound parameters per row in the batch INSERT
+// below (tenant_id is bound per-row, rather than the literal used by the
+// single-row IngestLog statement, so every row in the VALUES list has the
+// same shape).
+const logsCols = 10
+
+const logsColList = `log_id, tenant_id, site_id, timestamp, level, message,
+	service_name, trace_id, span_id, attributes`
+
+// buildLogPlaceholders returns "($1,...,$10),($11,...,$20),..." for rows*logsCols placeholders.
+func buildLogPlaceholders(rows int) string {
+	var b strings.Builder
+	b.Grow(rows * logsCols * 5)
+	n := 1
+	for r := 0; r < rows; r++ {
+		if r > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('(')
+		for c := 0; c < logsCols; c++ {
+			if c > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteByte('$')
+			b.WriteString(strconv.Itoa(n))
+			n++
+		}
+		b.WriteByte(')')
+	}
+	return b.String()
+}
+
+func logArgs(dst []any, p *preparedLog) []any {
+	return append(dst,
+		p.id, "default", p.input.SiteID, p.tsMs, p.input.Level, p.input.Message,
+		p.input.ServiceName, p.input.TraceID, p.input.SpanID, p.attrsJSON,
+	)
+}
+
+// insertLogsBatch batch-inserts prepared log rows in fixed-size chunks,
+// mirroring internal/ingest/buffer.go's insertBatch chunking (same chunk
+// size, same placeholder-building shape) instead of one autocommit INSERT
+// per line.
+//
+// A failing chunk is logged and skipped, not returned on: batching already
+// costs blast radius (one bad row takes its 50 rowmates with it, where the
+// old per-line loop lost exactly one), and bailing out would compound that by
+// discarding every later chunk unattempted — the opposite of IngestLogs'
+// documented "a single malformed line must not drop the rest" contract.
+//
+// Returns the rows actually committed rather than a count, because the
+// committed set is no longer a prefix once a middle chunk can fail: the
+// caller publishes exactly these rows to subscribers.
+func (s *LogService) insertLogsBatch(ctx context.Context, batch []*preparedLog) ([]*preparedLog, error) {
+	const batchSize = 50
+	sql := s.db.SQL()
+	committed := make([]*preparedLog, 0, len(batch))
+	var firstErr error
+	for start := 0; start < len(batch); start += batchSize {
+		end := start + batchSize
+		if end > len(batch) {
+			end = len(batch)
+		}
+		chunk := batch[start:end]
+
+		query := "INSERT INTO logs (" + logsColList + ") VALUES " + buildLogPlaceholders(len(chunk))
+		args := make([]any, 0, len(chunk)*logsCols)
+		for _, p := range chunk {
+			args = logArgs(args, p)
+		}
+
+		if _, err := sql.Exec(ctx, query, args...); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("batch insert logs %d-%d: %w", start+1, end, err)
+			}
+			// Not via s.logger directly: tests construct a zero-value
+			// LogService, and a chunk failure there would nil-panic.
+			s.log().Error("log batch chunk failed", "from", start+1, "to", end, "dropped", len(chunk), "error", err)
+			continue
+		}
+		committed = append(committed, chunk...)
+	}
+	return committed, firstErr
 }
 
 // SearchLogs queries logs with optional filters.
