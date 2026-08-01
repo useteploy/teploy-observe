@@ -21,9 +21,8 @@ import (
 // opens instantly; per-trace views are uncached and always live.
 const servicesCacheTTL = 15 * time.Second
 
-// servicesEntry is one cached rollup, remembered per site.
+// servicesEntry is one cached rollup, remembered per site and window.
 type servicesEntry struct {
-	window time.Duration
 	at     time.Time
 	result []ServiceSummary
 }
@@ -32,10 +31,14 @@ type servicesEntry struct {
 type QueryService struct {
 	db *nucleus.Client
 
-	// One entry per site, not per (site, from, to): the dashboard sends a
-	// rolling window whose bounds move every request, so keying on the exact
-	// bounds would never hit and would grow without limit. Keyed by site and
-	// matched on window length, the map is bounded by the number of sites.
+	// Keyed by site AND window bounds. Keying on the window *length* alone was
+	// wrong: from/to are arbitrary caller-supplied timestamps, so a 24h
+	// historical range primed the entry the rolling 24h live view then read,
+	// and the Traces page served last January's rollup for a whole TTL. The
+	// bounds are snapped to a TTL-wide bucket before they enter the key, so the
+	// live view — whose bounds move every request — still shares a key with the
+	// requests around it. Entries the lookup would reject are swept on write,
+	// so the map stays bounded by the windows queried within one TTL.
 	servicesMu    sync.Mutex
 	servicesCache map[string]servicesEntry
 }
@@ -44,22 +47,39 @@ func NewQueryService(db *nucleus.Client) *QueryService {
 	return &QueryService{db: db, servicesCache: map[string]servicesEntry{}}
 }
 
-// cachedServices returns a fresh-enough rollup for the same site and window
-// length, if one was computed within the TTL.
-func (q *QueryService) cachedServices(siteID string, window time.Duration) ([]ServiceSummary, bool) {
+// servicesKey identifies a rollup by site and window bounds, each bound
+// truncated to a TTL-wide bucket. Truncation is what keeps the cache useful:
+// exact bounds would mint a fresh key on every rolling-window request and never
+// hit. A bucket is the TTL wide and no wider, so the bounds a hit is served for
+// are off by at most the staleness the TTL already permits, and two genuinely
+// different windows can never land on the same key.
+func servicesKey(siteID string, from, to time.Time) string {
+	return fmt.Sprintf("%s|%d|%d", siteID,
+		from.Truncate(servicesCacheTTL).UnixMilli(),
+		to.Truncate(servicesCacheTTL).UnixMilli())
+}
+
+// cachedServices returns a fresh-enough rollup for the same site and window,
+// if one was computed within the TTL.
+func (q *QueryService) cachedServices(key string) ([]ServiceSummary, bool) {
 	q.servicesMu.Lock()
 	defer q.servicesMu.Unlock()
-	e, ok := q.servicesCache[siteID]
-	if !ok || e.window != window || time.Since(e.at) > servicesCacheTTL {
+	e, ok := q.servicesCache[key]
+	if !ok || time.Since(e.at) > servicesCacheTTL {
 		return nil, false
 	}
 	return e.result, true
 }
 
-func (q *QueryService) storeServices(siteID string, window time.Duration, result []ServiceSummary) {
+func (q *QueryService) storeServices(key string, result []ServiceSummary) {
 	q.servicesMu.Lock()
 	defer q.servicesMu.Unlock()
-	q.servicesCache[siteID] = servicesEntry{window: window, at: time.Now(), result: result}
+	for k, e := range q.servicesCache {
+		if time.Since(e.at) > servicesCacheTTL {
+			delete(q.servicesCache, k)
+		}
+	}
+	q.servicesCache[key] = servicesEntry{at: time.Now(), result: result}
 }
 
 // ServiceSummary is a service with its RED metrics.
@@ -104,8 +124,8 @@ func apdex(durations []int64, t int64) float64 {
 
 // ListServices returns services with aggregated RED metrics for a time range.
 func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to time.Time) ([]ServiceSummary, error) {
-	window := to.Sub(from)
-	if cached, ok := q.cachedServices(siteID, window); ok {
+	key := servicesKey(siteID, from, to)
+	if cached, ok := q.cachedServices(key); ok {
 		return cached, nil
 	}
 	fromMs := dbutil.IntParam(from.UnixMilli())
@@ -170,7 +190,7 @@ func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to
 			ApdexScore: apdexFromCounts(r.SatisfiedCount, r.ToleratedCount, r.RootCount),
 		})
 	}
-	q.storeServices(siteID, window, result)
+	q.storeServices(key, result)
 	return result, nil
 }
 
