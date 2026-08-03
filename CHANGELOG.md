@@ -36,6 +36,17 @@ Versions v0.1.1 through v0.1.6 shipped without a changelog entry each — not re
 - Exact trace↔error correlation via `trace_id`/`span_id` (previously a timestamp-window heuristic that could cross-contaminate overlapping traces). Go SDK gains `WithSpan()`; browser and Python SDKs gain passthrough fields.
 - Site-scoped error full-text search (each error indexed with a `site_id` facet, search scoped via Nucleus's faceted FTS) so a busy site's results no longer crowd out other sites' search hits.
 - `getSessionId()` on the browser SDK, so a separately-loaded script (e.g. the replay tracker) can correlate its recording with the analytics session instead of defaulting to an orphaned empty session ID.
+- **Source maps are now retained per release instead of forever.** Every upload
+  was stored with no expiry and no delete path anywhere in the service — one
+  entry per site x release x file, up to 10 MB each. A production instance
+  accumulated 4.8 GB of them, which was enough to push its database past its
+  memory limit and make it reject writes for 32 hours. Observe now keeps the
+  10 most recently uploaded releases per site (`OBSERVE_SOURCEMAP_KEEP_RELEASES`),
+  ordered by last upload so a release stays current while it is still being
+  published to. Existing installations reclaim their space on the next upload:
+  releases predating the age index sort oldest and prune first. Not implemented
+  as a TTL on purpose — Nucleus keeps entries carrying an expiry resident in
+  memory, so a TTL would have pinned every source map in RAM until it expired.
 - Sourcemap upload now also accepts the site-scoped ingest API key (not just an editor JWT), so CI can upload build-time sourcemaps without a stored interactive-login credential.
 
 ### Fixed
