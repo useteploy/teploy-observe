@@ -49,3 +49,50 @@ func TestDecodeMappings_OutOfRange(t *testing.T) {
 		t.Fatalf("expected nil for out-of-range line, got %+v", m)
 	}
 }
+
+func TestKeepReleasesDefaultsAndOverride(t *testing.T) {
+	t.Setenv("OBSERVE_SOURCEMAP_KEEP_RELEASES", "")
+	if got := KeepReleases(); got != DefaultKeepReleases {
+		t.Fatalf("expected default %d, got %d", DefaultKeepReleases, got)
+	}
+	t.Setenv("OBSERVE_SOURCEMAP_KEEP_RELEASES", "3")
+	if got := KeepReleases(); got != 3 {
+		t.Fatalf("expected 3, got %d", got)
+	}
+	// A nonsense value must not silently disable retention.
+	for _, bad := range []string{"0", "-5", "abc"} {
+		t.Setenv("OBSERVE_SOURCEMAP_KEEP_RELEASES", bad)
+		if got := KeepReleases(); got != DefaultKeepReleases {
+			t.Fatalf("%q should fall back to the default, got %d", bad, got)
+		}
+	}
+}
+
+// Release names come from the upload request, so one can be a prefix of
+// another. Pruning "v1" must not delete the retained "v1:beta" as a side effect
+// of matching by key prefix.
+func TestPruneSkipsKeysOfLongerRetainedRelease(t *testing.T) {
+	site := "site-1"
+	retained := []string{"v1:beta", "v2"}
+
+	victim := kvKey(site, "v1", "app.js")
+	if belongsToOther(victim, site, "v1", retained) {
+		t.Fatalf("%q belongs to v1 and must be deletable", victim)
+	}
+
+	protected := kvKey(site, "v1:beta", "app.js")
+	if !belongsToOther(protected, site, "v1", retained) {
+		t.Fatalf("%q belongs to retained v1:beta and must be skipped", protected)
+	}
+}
+
+func TestReleaseKeysAreDistinctPerRelease(t *testing.T) {
+	a := kvKey("s", "v1", "app.js")
+	b := kvKey("s", "v2", "app.js")
+	if a == b {
+		t.Fatal("different releases must not share a key")
+	}
+	if releaseAgeKey("s") == releasesSetKey("s") {
+		t.Fatal("age index must not collide with the releases set")
+	}
+}

@@ -4073,6 +4073,20 @@ func srcmapUploadHandler(svc *sourcemaps.SourceMapService) http.HandlerFunc {
 			return
 		}
 		svc.TrackRelease(r.Context(), siteID, release)
+		// Retention runs on upload rather than on a timer: it is the moment a
+		// new release exists, and it needs no scheduler. Source maps were
+		// previously kept forever — one entry per site x release x file, up to
+		// 10 MB each — which is how an instance accumulated several GB and
+		// pushed its database over the memory limit.
+		//
+		// A failure here must not fail the upload: the map is already stored,
+		// and refusing the request would tell the client to retry an upload that
+		// actually succeeded.
+		if removed, err := svc.PruneReleases(r.Context(), siteID, sourcemaps.KeepReleases()); err != nil {
+			slog.Warn("source map retention failed", "site", siteID, "err", err)
+		} else if removed > 0 {
+			slog.Info("pruned old source map releases", "site", siteID, "removed", removed)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"ok":true}`))
 	}

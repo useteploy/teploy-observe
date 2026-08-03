@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -42,11 +43,153 @@ type SourceMapMeta struct {
 	Mappings string   `json:"mappings"`
 }
 
+// DefaultKeepReleases is how many releases of source maps a site retains.
+//
+// Overridable with OBSERVE_SOURCEMAP_KEEP_RELEASES.
+const DefaultKeepReleases = 10
+
 // Upload stores a source map in KV, associated with a release and filename.
+//
+// Deliberately stored without a TTL. Nucleus keeps entries that carry an expiry
+// resident in memory — its cold tier has no way to represent a deadline — so a
+// TTL here would pin every source map in RAM until it expired, which is the
+// opposite of what is wanted for multi-megabyte blobs. Without one they are
+// free to spill to disk under pressure and are bounded instead by the release
+// retention below.
 func (s *SourceMapService) Upload(ctx context.Context, siteID, release, filename string, mapData []byte) error {
 	kv := s.db.KV()
 	key := kvKey(siteID, release, filename)
-	return kv.Set(ctx, key, mapData)
+	if err := kv.Set(ctx, key, mapData); err != nil {
+		return err
+	}
+	// Record when this release was last written so retention can order them.
+	// Score is refreshed on every upload, so a release stays "recent" while it
+	// is still being published to.
+	if _, err := kv.ZAdd(ctx, releaseAgeKey(siteID), float64(time.Now().Unix()), release); err != nil {
+		return fmt.Errorf("recording release age: %w", err)
+	}
+	return nil
+}
+
+// KeepReleases resolves the retention count from the environment.
+func KeepReleases() int {
+	if raw := strings.TrimSpace(os.Getenv("OBSERVE_SOURCEMAP_KEEP_RELEASES")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	return DefaultKeepReleases
+}
+
+// releaseAgeKey is the sorted set ordering a site's releases by last upload.
+func releaseAgeKey(siteID string) string {
+	return "srcmap:relage:" + siteID
+}
+
+// PruneReleases deletes source maps for all but the `keep` most recently
+// uploaded releases of a site. Returns the number of releases removed.
+//
+// Source maps were previously kept forever: one entry per site x release x
+// file, several megabytes each, with no expiry and no delete path anywhere in
+// the service. A production instance accumulated 4.8 GB this way, which was
+// enough to push the database over its memory limit and make it refuse writes.
+//
+// Releases predating the age index have no score. They are treated as oldest
+// and pruned first, which is both correct — they are by definition older than
+// anything recorded since — and how existing installations reclaim their space.
+func (s *SourceMapService) PruneReleases(ctx context.Context, siteID string, keep int) (int, error) {
+	if keep < 1 {
+		keep = 1
+	}
+	kv := s.db.KV()
+
+	// Seed any release that predates the age index, so it can be ordered.
+	tracked, err := kv.SMembers(ctx, releasesSetKey(siteID))
+	if err != nil {
+		return 0, fmt.Errorf("listing releases: %w", err)
+	}
+	scored, err := kv.ZRange(ctx, releaseAgeKey(siteID), 0, -1)
+	if err != nil {
+		return 0, fmt.Errorf("reading release ages: %w", err)
+	}
+	known := make(map[string]struct{}, len(scored))
+	for _, r := range scored {
+		known[r] = struct{}{}
+	}
+	for _, r := range tracked {
+		if _, ok := known[r]; ok {
+			continue
+		}
+		if _, err := kv.ZAdd(ctx, releaseAgeKey(siteID), 0, r); err != nil {
+			return 0, fmt.Errorf("seeding release age: %w", err)
+		}
+	}
+
+	ordered, err := kv.ZRange(ctx, releaseAgeKey(siteID), 0, -1)
+	if err != nil {
+		return 0, fmt.Errorf("ordering releases: %w", err)
+	}
+	if len(ordered) <= keep {
+		return 0, nil
+	}
+
+	// Retained releases are needed by the delete step so it never removes their
+	// keys — see deleteRelease.
+	retained := make([]string, 0, keep)
+	retained = append(retained, ordered[len(ordered)-keep:]...)
+
+	removed := 0
+	for _, release := range ordered[:len(ordered)-keep] {
+		if err := s.deleteRelease(ctx, siteID, release, retained); err != nil {
+			return removed, err
+		}
+		removed++
+	}
+	return removed, nil
+}
+
+// deleteRelease removes every source map belonging to one release, plus its
+// index entries.
+//
+// Files are found by key prefix rather than from a stored file list, so this
+// also cleans up releases uploaded before any index existed — which is the case
+// for every release currently on disk.
+func (s *SourceMapService) deleteRelease(ctx context.Context, siteID, release string, retained []string) error {
+	kv := s.db.KV()
+	// KV_KEYS is issued directly rather than through the SDK: this repo vendors
+	// its dependencies, and the vendored SDK predates a KV.Keys helper. Adding
+	// one means re-vendoring, which currently pulls unrelated drift in the local
+	// SDK and breaks the build (neutronauth.WithClaims has since been removed
+	// upstream). Reconciling that is worth doing, and is not this change.
+	var raw string
+	if err := s.db.Pool().QueryRow(ctx, "SELECT KV_KEYS($1)",
+		kvKey(siteID, release, "")+"*").Scan(&raw); err != nil {
+		return fmt.Errorf("listing source maps for %s: %w", release, err)
+	}
+	var keys []string
+	if raw != "" {
+		if err := json.Unmarshal([]byte(raw), &keys); err != nil {
+			return fmt.Errorf("decoding source map keys for %s: %w", release, err)
+		}
+	}
+	// Release names come from the upload request, so one can be a prefix of
+	// another: deleting "v1" by prefix would also take "v1:beta" with it. Skip
+	// any key that belongs to a release being kept.
+	for _, k := range keys {
+		if belongsToOther(k, siteID, release, retained) {
+			continue
+		}
+		if _, err := kv.Delete(ctx, k); err != nil {
+			return fmt.Errorf("deleting %s: %w", k, err)
+		}
+	}
+	if _, err := kv.ZRem(ctx, releaseAgeKey(siteID), release); err != nil {
+		return fmt.Errorf("untracking release age: %w", err)
+	}
+	if _, err := kv.SRem(ctx, releasesSetKey(siteID), release); err != nil {
+		return fmt.Errorf("untracking release: %w", err)
+	}
+	return nil
 }
 
 // ListReleases returns all releases that have source maps for a site.
@@ -293,3 +436,21 @@ func genID() string {
 // unused but needed for interface compatibility
 var _ = strconv.Itoa
 var _ = time.Now
+
+// belongsToOther reports whether a key matched by `release`'s prefix in fact
+// belongs to a longer release name that is being retained.
+//
+// `srcmap:site:v1:*` matches `srcmap:site:v1:beta:app.js`, so a prefix match
+// alone would delete a retained release's maps as a side effect of pruning an
+// older one whose name happens to be a prefix of it.
+func belongsToOther(key, siteID, release string, retained []string) bool {
+	for _, other := range retained {
+		if other == release || len(other) <= len(release) {
+			continue
+		}
+		if strings.HasPrefix(key, kvKey(siteID, other, "")) {
+			return true
+		}
+	}
+	return false
+}
