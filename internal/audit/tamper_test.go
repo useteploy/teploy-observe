@@ -116,7 +116,13 @@ func TestChain_Integration(t *testing.T) {
 		t.Fatalf("create table: %v", err)
 	}
 
-	svc := NewService(db, []byte("chain-key"))
+	// Must be the key the other integration tests use. They share this table,
+	// and Verify walks every row: a chain signed with one key does not verify
+	// under another, so a second key here reports "contents modified" for
+	// records that were never touched. That is the verifier working correctly,
+	// but it makes this test fail for a reason that has nothing to do with
+	// tamper-evidence.
+	svc := NewService(db, []byte(integrationAuditKey))
 	for i := 0; i < 3; i++ {
 		if err := svc.Record(ctx, AuditEvent{Actor: "chain-test", Action: "x.do"}); err != nil {
 			t.Fatalf("record: %v", err)

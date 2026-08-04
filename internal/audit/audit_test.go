@@ -92,6 +92,14 @@ func TestGenID(t *testing.T) {
 	}
 }
 
+// integrationAuditKey is shared by every integration test in this package.
+//
+// They write into one audit_events table and Verify walks all of it, so the
+// whole chain has to be signed with one key. Two keys produce a "contents
+// modified" verdict on untouched records — the verifier behaving correctly,
+// reported as a tamper-evidence failure.
+const integrationAuditKey = "test-audit-key"
+
 // --- Integration (skips cleanly when Nucleus is unreachable) ------------------
 
 func TestRecordAndList_Integration(t *testing.T) {
@@ -106,7 +114,7 @@ func TestRecordAndList_Integration(t *testing.T) {
 	}
 	defer db.Close()
 
-	svc := NewService(db, []byte("test-audit-key"))
+	svc := NewService(db, []byte(integrationAuditKey))
 	// The migration may not have run against this ad-hoc DB; create the table.
 	if _, err := db.SQL().Exec(ctx, `CREATE TABLE IF NOT EXISTS audit_events (
 		audit_id TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT 'default',
@@ -152,7 +160,7 @@ func TestTimeFilter_Integration(t *testing.T) {
 		t.Skipf("nucleus not reachable at %s — skipping integration test", dsn)
 	}
 	defer db.Close()
-	svc := NewService(db, []byte("test-audit-key"))
+	svc := NewService(db, []byte(integrationAuditKey))
 	if _, err := db.SQL().Exec(ctx, `CREATE TABLE IF NOT EXISTS audit_events (
 		audit_id TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT 'default',
 		site_id TEXT NOT NULL DEFAULT 'default', timestamp BIGINT NOT NULL,

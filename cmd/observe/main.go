@@ -55,6 +55,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/query"
 	"github.com/useteploy/teploy-observe/internal/replays"
 	"github.com/useteploy/teploy-observe/internal/reports"
+	"github.com/useteploy/teploy-observe/internal/schema"
 	"github.com/useteploy/teploy-observe/internal/seed"
 	"github.com/useteploy/teploy-observe/internal/share"
 	"github.com/useteploy/teploy-observe/internal/sites"
@@ -79,9 +80,6 @@ var (
 // and matched to the 10 MiB post-decompression ceiling the OTLP handlers
 // already enforce, so a compressed body can't slip past this and then expand.
 const otlpMaxBodyBytes = 10 << 20
-
-//go:embed migrations/*.sql
-var migrationsFS embed.FS
 
 //go:embed all:ui/dist
 var uiFS embed.FS
@@ -137,13 +135,9 @@ func main() {
 	}
 	logger.Info("connected to nucleus")
 
-	// Run migrations
-	migrations, err := nucleus.LoadMigrations(migrationsFS)
-	if err != nil {
-		logger.Error("failed to load migrations", "err", err)
-		os.Exit(1)
-	}
-	if err := db.Migrate(ctx, migrations); err != nil {
+	// Run migrations. The schema package owns them so tests can build the
+	// same tables production runs on.
+	if err := schema.Apply(ctx, db); err != nil {
 		logger.Error("failed to run migrations", "err", err)
 		os.Exit(1)
 	}

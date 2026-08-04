@@ -6,11 +6,23 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/useteploy/teploy-observe/internal/schema"
 )
+
+// schemaOnce applies the migrations once per test binary.
+//
+// These tests need `admin_users` and `api_keys`, which no test creates — so
+// with a database present they all failed on "relation does not exist", and
+// without one they all skipped. Either way the security coverage here (token
+// revocation, the bootstrap admin race, password change) had never actually
+// executed.
+var schemaOnce sync.Once
+var schemaErr error
 
 // connect is the shared "skip if nucleus down" boilerplate for auth DB tests.
 func connect(t *testing.T) (context.Context, *nucleus.Client, func()) {
@@ -25,6 +37,16 @@ func connect(t *testing.T) (context.Context, *nucleus.Client, func()) {
 		cancel()
 		t.Skipf("nucleus not reachable at %s — skipping", dsn)
 	}
+
+	// Build the same tables production runs on, rather than an ad-hoc subset
+	// invented by whichever test ran first.
+	schemaOnce.Do(func() { schemaErr = schema.Apply(ctx, db) })
+	if schemaErr != nil {
+		db.Close()
+		cancel()
+		t.Fatalf("apply schema: %v", schemaErr)
+	}
+
 	return ctx, db, func() {
 		db.Close()
 		cancel()
