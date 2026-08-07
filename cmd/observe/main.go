@@ -4063,8 +4063,32 @@ func srcmapUploadHandler(svc *sourcemaps.SourceMapService) http.HandlerFunc {
 		}
 
 		if err := svc.Upload(r.Context(), siteID, release, filename, data); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			// Retention used to run only after a *successful* upload, which
+			// made the failure mode self-sustaining: if the store is what
+			// rejected the write, the one operation that could free space
+			// never ran, so every subsequent upload failed the same way and
+			// the instance could not recover without a human. Observed against
+			// Fylun: 449 maps, 0 uploaded, all 500s.
+			//
+			// So prune here, and retry once — but only if pruning actually
+			// removed something, since retrying against an unchanged store
+			// just doubles the work and the log noise.
+			slog.Warn("source map upload failed; attempting retention before giving up",
+				"site", siteID, "release", release, "file", filename, "err", err)
+
+			removed, perr := svc.PruneReleases(r.Context(), siteID, sourcemaps.KeepReleases())
+			if perr != nil {
+				slog.Warn("source map retention failed", "site", siteID, "err", perr)
+			} else if removed > 0 {
+				slog.Info("pruned old source map releases after a failed upload",
+					"site", siteID, "removed", removed)
+				err = svc.Upload(r.Context(), siteID, release, filename, data)
+			}
+
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 		svc.TrackRelease(r.Context(), siteID, release)
 		// Retention runs on upload rather than on a timer: it is the moment a
