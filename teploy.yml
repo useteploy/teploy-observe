@@ -61,8 +61,21 @@ stop_timeout: 30
 # reaches it at `observe-nucleus:5432` (see OBSERVE_NUCLEUS_URL below).
 accessories:
   nucleus:
-    image: ghcr.io/neutron-build/nucleus:latest
+    # Pin the engine. `:latest` is republished on every push to Nucleus's main,
+    # so with a floating tag an unrelated redeploy swaps the storage engine
+    # underneath a live database — and the tag moves between the day you test
+    # and the day you deploy. Bump this deliberately, after reading the
+    # release's migration notes.
+    image: ghcr.io/neutron-build/nucleus:v0.1.5
     port: 5432
+    # Hard cgroup cap, and the only bound the kernel enforces.
+    # NUCLEUS_MAX_MEMORY_MB below is the engine's accounting of its OWN
+    # allocations: a leak in a path it does not count sails past it. This
+    # engine once reached 30 GB RSS with that budget set to 16 GB and the host
+    # OOM killer took an unrelated service down with it. Keep this ABOVE the
+    # engine budget so graceful eviction runs first and the kernel cap is only
+    # the backstop; size both to the host.
+    memory: 10g
     env:
       # Single-node sidecar on a private network: allow no-auth SQL and the
       # cluster/replication transports to bind non-loopback without a token.
