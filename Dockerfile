@@ -31,7 +31,18 @@ ENV OBSERVE_DATA_DIR=/var/lib/observe
 
 VOLUME ["/var/lib/observe"]
 
-HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
+# /healthz is not a static 200: it runs `SELECT 1` against Nucleus, which is
+# the point (a process that cannot reach its database is not healthy). But that
+# means a probe arriving when the pool has no live connection pays the full
+# connect, and a cold connect to Nucleus was measured at ~7.8s against 0.00s
+# for every pooled hit after it. At a 3s timeout the container flapped to
+# `unhealthy` on the first probe after start and again whenever the pool had
+# gone idle, while the app was serving normally throughout.
+#
+# The timeout is sized for the cold-connect case rather than the warm one; it
+# stays under the interval, and retries=3 still requires three consecutive
+# failures before the container is called unhealthy.
+HEALTHCHECK --interval=15s --timeout=12s --start-period=30s --retries=3 \
     CMD wget -q --spider http://localhost:3000/healthz || exit 1
 
 ENTRYPOINT ["observe"]
