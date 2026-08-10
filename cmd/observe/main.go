@@ -1090,6 +1090,10 @@ func main() {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"demo_mode": cfg.DemoMode,
 			"nav":       teployNav("observe"),
+			// The dashboard may be reached on a private address while browsers
+			// must load the tracker from the public ingest host, so install
+			// snippets are built from this rather than the dashboard origin.
+			"public_url": cfg.PublicURL,
 		})
 	})
 

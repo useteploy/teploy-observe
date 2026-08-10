@@ -19,6 +19,23 @@ function formatDate(iso: string): string {
   } catch { return iso; }
 }
 
+// Share links and tracker snippets are pasted elsewhere, so they need an
+// absolute URL. The dashboard's own origin is the instance's address.
+function instanceOrigin(): string {
+  return typeof window === "undefined" ? "" : window.location.origin;
+}
+
+function shareUrl(token: string): string {
+  return `${instanceOrigin()}/share/${token}`;
+}
+
+// Browsers load the tracker from the public ingest host, which is not the
+// dashboard origin when the dashboard is bound to a private address.
+function trackerSnippet(base: string, siteId: string, apiKey: string): string {
+  const origin = base || instanceOrigin();
+  return `<script defer src="${origin}/t/observe.js"\n        data-site-id="${siteId}"\n        data-api-key="${apiKey}"></script>`;
+}
+
 function SettingsSkeleton() {
   return (
     <div class="settings-loading">
@@ -41,6 +58,7 @@ function SitesSection() {
   const [showCreate, setShowCreate] = useState(false);
   const [creating, setCreating] = useState(false);
   const [newKey, setNewKey] = useState<{ key: string; siteId: string } | null>(null);
+  const [publicUrl, setPublicUrl] = useState("");
   const [formName, setFormName] = useState("");
   const [formDomain, setFormDomain] = useState("");
   const [deletingSiteId, setDeletingSiteId] = useState<string | null>(null);
@@ -58,6 +76,10 @@ function SitesSection() {
   useEffect(() => {
     setLoading(true);
     refresh().finally(() => setLoading(false));
+    fetch("/api/v1/config")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((r) => setPublicUrl(typeof r?.public_url === "string" ? r.public_url : ""))
+      .catch(() => {});
   }, []);
 
   const handleCreate = async () => {
@@ -129,7 +151,13 @@ function SitesSection() {
             <div key={s.site_id}>
               <div class="settings-row">
                 <span class="settings-row-name">{s.name}</span>
-                <span class="settings-row-value">{s.domain || s.site_id}</span>
+                {/* The site id is what every integration needs, so show it
+                    alongside the domain rather than only when there is none. */}
+                <span class="settings-row-value">
+                  {s.domain ? `${s.domain} · ` : ""}
+                  <code style={{ fontSize: "11px" }}>{s.site_id}</code>
+                </span>
+                <button class="obs-btn obs-btn--sm" onClick={() => copyToClipboard(s.site_id)}>Copy ID</button>
                 <button class="obs-btn obs-btn--sm" onClick={() => handleGenerateKey(s.site_id)}>API Key</button>
                 <button class="obs-btn obs-btn--sm" onClick={() => handleShowShareLinks(s.site_id)}>Share</button>
                 <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => setDeletingSiteId(s.site_id)}>Delete</button>
@@ -148,8 +176,14 @@ function SitesSection() {
                   ) : (
                     shareLinks.map(l => (
                       <div key={l.token} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "4px 0", fontSize: "12px" }}>
-                        <code style={{ flex: 1, color: "var(--obs-text)", fontSize: "11px" }}>/share/{l.token}</code>
+                        <code style={{ flex: 1, color: "var(--obs-text)", fontSize: "11px", overflowWrap: "anywhere" }}>
+                          {shareUrl(l.token)}
+                        </code>
                         <span class="settings-row-date">{formatDate(l.created_at)}</span>
+                        {/* The token alone is what API clients send as
+                            X-Share-Token; the URL is for opening the dashboard. */}
+                        <button class="obs-btn obs-btn--sm" onClick={() => copyToClipboard(shareUrl(l.token))}>Copy Link</button>
+                        <button class="obs-btn obs-btn--sm" onClick={() => copyToClipboard(l.token)}>Copy Token</button>
                         <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => handleRevokeShareLink(l.token)}>Revoke</button>
                       </div>
                     ))
@@ -168,6 +202,23 @@ function SitesSection() {
             <button class="obs-btn obs-btn--sm" onClick={() => copyToClipboard(newKey.key)}>Copy</button>
           </div>
           <div class="settings-key-note">Save this key now. It will not be shown again.</div>
+          {/* A key on its own is not enough to install the tracker — it also
+              needs the site id and the right attribute names. Ship the whole
+              snippet so nobody has to reconstruct it. */}
+          <div class="settings-key-display" style={{ marginTop: "8px", alignItems: "flex-start" }}>
+            <pre class="settings-key-value" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", margin: 0 }}>
+              {trackerSnippet(publicUrl, newKey.siteId, newKey.key)}
+            </pre>
+            <button
+              class="obs-btn obs-btn--sm"
+              onClick={() => copyToClipboard(trackerSnippet(publicUrl, newKey.siteId, newKey.key))}
+            >
+              Copy Snippet
+            </button>
+          </div>
+          <div class="settings-key-note">
+            Site ID <code>{newKey.siteId}</code> — required by every integration.
+          </div>
         </>
       )}
 

@@ -7,17 +7,21 @@
   var origin = script.src ? new URL(script.src).origin : '';
   var endpoint = script.getAttribute('data-endpoint') || origin + '/api/v1/events/batch';
   var siteId = script.getAttribute('data-site-id') || '';
+  // Site-scoped write key. Required once any API key exists on the instance:
+  // the ingest middleware only falls back to the default site while the
+  // system has no keys at all, and rejects everything else with 401.
+  var apiKey = script.getAttribute('data-api-key') || '';
   var autoTrack = script.getAttribute('data-auto-track') !== 'false';
   var autoCapture = script.getAttribute('data-autocapture') !== 'false';
   var respectDNT = script.getAttribute('data-respect-dnt') !== 'false';
 
   if (respectDNT && navigator.doNotTrack === '1') return;
 
-  if (document.visibilityState === 'prerender') {
+  var prerendering = document.visibilityState === 'prerender';
+  if (prerendering) {
     document.addEventListener('visibilitychange', function() {
-      if (document.visibilityState !== 'prerender') init();
+      if (document.visibilityState !== 'prerender') start();
     }, { once: true });
-    return;
   }
 
   var queue = [];
@@ -58,14 +62,31 @@
     var events = queue.splice(0);
     var body = JSON.stringify({ events: events });
 
-    if (navigator.sendBeacon) {
+    // sendBeacon cannot set request headers, so a keyed install sends the key
+    // via fetch with keepalive — same survives-unload guarantee — and falls
+    // back to XHR where fetch is unavailable.
+    if (!apiKey && navigator.sendBeacon) {
       navigator.sendBeacon(endpoint, new Blob([body], { type: 'application/json' }));
-    } else {
-      var xhr = new XMLHttpRequest();
-      xhr.open('POST', endpoint, true);
-      xhr.setRequestHeader('Content-Type', 'application/json');
-      xhr.send(body);
+      return;
     }
+
+    if (apiKey && typeof fetch === 'function') {
+      fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+        body: body,
+        keepalive: true,
+        mode: 'cors',
+        credentials: 'omit'
+      }).catch(function() {});
+      return;
+    }
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', endpoint, true);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    if (apiKey) xhr.setRequestHeader('X-API-Key', apiKey);
+    xhr.send(body);
   }
 
   function trackPageview() {
@@ -73,6 +94,15 @@
     if (url === currentUrl) return;
     currentUrl = url;
     send('pageview');
+  }
+
+  // Auto-tracking is wired exactly once, whether it starts from the script
+  // tag, from a prerender becoming visible, or from a programmatic init().
+  var started = false;
+  function start() {
+    if (started) return;
+    started = true;
+    init();
   }
 
   function init() {
@@ -234,6 +264,25 @@
   }
 
   window.observe = {
+    /**
+     * Programmatic setup, for pages that inject the script rather than
+     * carrying data-* attributes. Accepts { endpoint, siteId, apiKey } and
+     * begins auto-tracking. Attribute-configured installs start on their own
+     * and never need this.
+     */
+    init: function(opts) {
+      var o = opts || {};
+      if (o.endpoint) {
+        // Accept either the bare origin or a full ingest URL.
+        endpoint = /\/api\/v1\/events(\/batch)?$/.test(o.endpoint)
+          ? o.endpoint
+          : String(o.endpoint).replace(/\/+$/, '') + '/api/v1/events/batch';
+      }
+      if (o.siteId) siteId = o.siteId;
+      if (o.apiKey) apiKey = o.apiKey;
+      if (!siteId) return;
+      start();
+    },
     track: function(name, props) {
       send(name || 'custom', props);
     },
@@ -267,5 +316,7 @@
     trackVitals: trackWebVitals
   };
 
-  init();
+  // Without a site id there is nothing valid to send — the server rejects an
+  // empty site_id — so an attribute-less install waits for observe.init().
+  if (siteId && !prerendering) start();
 })();
