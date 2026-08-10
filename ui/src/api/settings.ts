@@ -6,7 +6,7 @@ const BASE = "/api/v1";
 const PLATFORM = "/api/v1/platform";
 
 export interface Site {
-  site_id: string; name: string; domain: string; created_at: string;
+  site_id: string; name: string; domain: string; created_at: number;
 }
 
 export interface APIKey {
@@ -27,7 +27,9 @@ export interface User {
 }
 
 export interface ShareLink {
-  token: string; site_id: string; created_at: string;
+  // Timestamps are epoch milliseconds on the wire, not ISO strings.
+  token: string; site_id: string; created_at: number;
+  expires_at: number; revoked_at: number; last_used_at: number;
 }
 
 export const settingsApi = {
@@ -47,8 +49,8 @@ export const settingsApi = {
   // Share links
   shareLinks: (siteId: string) =>
     get<ShareLink[]>(`${BASE}/sites/${siteId}/share`),
-  createShareLink: (siteId: string) =>
-    post<ShareLink>(`${BASE}/sites/${siteId}/share`, {}),
+  createShareLink: (siteId: string, ttlDays?: number) =>
+    post<ShareLink>(`${BASE}/sites/${siteId}/share`, ttlDays ? { ttl_days: ttlDays } : {}),
   revokeShareLink: (token: string) =>
     del(`${BASE}/share/${token}`),
 

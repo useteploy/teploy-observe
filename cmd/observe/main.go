@@ -647,8 +647,13 @@ func main() {
 	// viewer to /login.
 	query.RegisterRoutes(r, statsSvc, jwtOrShareMW(jwtMW, shareSvc))
 
-	// --- Live event stream (JWT auth, registered on root router to avoid group prefix bug) ---
-	r.Handle("GET /api/v1/stats/live", jwtMW(liveSvc.Handler()))
+	// --- Live event stream (registered on root router to avoid group prefix bug) ---
+	// Same auth as every other stats read: a JWT, or a share token that pins
+	// site_id to its own site. Requiring a JWT here made the live stream the one
+	// read a shared dashboard could not render, and blocked public "who is on
+	// the site right now" displays that expose no more than the shared
+	// dashboard already does — pathname, browser, OS, country, timestamp.
+	r.Handle("GET /api/v1/stats/live", jwtOrShareMW(jwtMW, shareSvc)(liveSvc.Handler()))
 
 	// --- Data export (JWT auth) ---
 	// Raw data export is editor+; a viewer should not be able to exfiltrate the
@@ -1959,7 +1964,14 @@ func serveFeedbackWidget(w http.ResponseWriter, r *http.Request) {
 
 type createShareInput struct {
 	SiteID string `path:"site_id"`
+	// TTLDays overrides the 30-day default. A share token embedded in another
+	// site's backend is a dependency with an expiry date, and when it lapses
+	// the reads simply stop returning data — so the lifetime has to be the
+	// caller's choice, not a constant.
+	TTLDays int `json:"ttl_days"`
 }
+
+const maxShareTTLDays = 3650
 
 func createShareHandler(shareSvc *share.ShareService, siteSvc *sites.SiteService) neutron.HandlerFunc[createShareInput, share.ShareLink] {
 	return func(ctx context.Context, input createShareInput) (share.ShareLink, error) {
@@ -1970,7 +1982,13 @@ func createShareHandler(shareSvc *share.ShareService, siteSvc *sites.SiteService
 		if s, err := siteSvc.Get(ctx, input.SiteID); err != nil || s.SiteID == "" {
 			return share.ShareLink{}, neutron.ErrNotFound("site not found")
 		}
-		return shareSvc.Create(ctx, input.SiteID)
+		if input.TTLDays < 0 || input.TTLDays > maxShareTTLDays {
+			return share.ShareLink{}, neutron.ErrBadRequest("ttl_days must be between 1 and 3650")
+		}
+		if input.TTLDays == 0 {
+			return shareSvc.Create(ctx, input.SiteID)
+		}
+		return shareSvc.CreateWithTTL(ctx, input.SiteID, time.Duration(input.TTLDays)*24*time.Hour)
 	}
 }
 

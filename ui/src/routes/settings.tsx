@@ -10,13 +10,17 @@ import { copyToClipboard } from "../lib/clipboard.js";
 
 export const config = { mode: "app" };
 
-function formatDate(iso: string): string {
-  if (!iso) return "--";
+// Some endpoints send ISO strings and some send epoch milliseconds; passing a
+// number through the ISO path renders the raw value instead of a date.
+function formatDate(value: string | number): string {
+  if (!value) return "--";
   try {
-    return new Date(iso).toLocaleDateString("en-US", {
+    const d = typeof value === "number" ? new Date(value) : new Date(value);
+    if (Number.isNaN(d.getTime())) return String(value);
+    return d.toLocaleDateString("en-US", {
       month: "short", day: "numeric", year: "numeric",
     });
-  } catch { return iso; }
+  } catch { return String(value); }
 }
 
 // Share links and tracker snippets are pasted elsewhere, so they need an
@@ -59,6 +63,7 @@ function SitesSection() {
   const [creating, setCreating] = useState(false);
   const [newKey, setNewKey] = useState<{ key: string; siteId: string } | null>(null);
   const [publicUrl, setPublicUrl] = useState("");
+  const [shareTtlDays, setShareTtlDays] = useState(365);
   const [formName, setFormName] = useState("");
   const [formDomain, setFormDomain] = useState("");
   const [deletingSiteId, setDeletingSiteId] = useState<string | null>(null);
@@ -123,10 +128,20 @@ function SitesSection() {
 
   const handleCreateShareLink = async (siteId: string) => {
     try {
-      await settingsApi.createShareLink(siteId);
+      await settingsApi.createShareLink(siteId, shareTtlDays);
       const data = await settingsApi.shareLinks(siteId);
       setShareLinks(data || []);
     } catch (err) { console.error("Failed to create share link:", err); }
+  };
+
+  // A token wired into another service dies quietly when it lapses — the reads
+  // just stop returning data. Both the lifetime and the expiry date have to be
+  // visible at the point of creation.
+  const expiryLabel = (link: ShareLink): string => {
+    if (!link.expires_at) return "no expiry";
+    const days = Math.round((link.expires_at - Date.now()) / 86_400_000);
+    if (days < 0) return "expired";
+    return `expires ${formatDate(link.expires_at)} · ${days}d left`;
   };
 
   const handleRevokeShareLink = async (token: string) => {
@@ -169,7 +184,21 @@ function SitesSection() {
                     <span style={{ fontSize: "12px", fontWeight: 600, color: "var(--obs-text-secondary)" }}>
                       Share Links ({shareLinks.length})
                     </span>
-                    <button class="obs-btn obs-btn--sm" onClick={() => handleCreateShareLink(s.site_id)}>Create Link</button>
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                      <select
+                        class="obs-input"
+                        style={{ width: "auto", fontSize: "12px", padding: "2px 6px" }}
+                        value={String(shareTtlDays)}
+                        onChange={(e) => setShareTtlDays(Number((e.target as HTMLSelectElement).value))}
+                        aria-label="Share link lifetime"
+                      >
+                        <option value="30">30 days</option>
+                        <option value="90">90 days</option>
+                        <option value="365">1 year</option>
+                        <option value="3650">10 years</option>
+                      </select>
+                      <button class="obs-btn obs-btn--sm" onClick={() => handleCreateShareLink(s.site_id)}>Create Link</button>
+                    </div>
                   </div>
                   {shareLinks.length === 0 ? (
                     <div style={{ fontSize: "12px", color: "var(--obs-text-muted)" }}>No share links</div>
@@ -179,7 +208,7 @@ function SitesSection() {
                         <code style={{ flex: 1, color: "var(--obs-text)", fontSize: "11px", overflowWrap: "anywhere" }}>
                           {shareUrl(l.token)}
                         </code>
-                        <span class="settings-row-date">{formatDate(l.created_at)}</span>
+                        <span class="settings-row-date">{expiryLabel(l)}</span>
                         {/* The token alone is what API clients send as
                             X-Share-Token; the URL is for opening the dashboard. */}
                         <button class="obs-btn obs-btn--sm" onClick={() => copyToClipboard(shareUrl(l.token))}>Copy Link</button>
