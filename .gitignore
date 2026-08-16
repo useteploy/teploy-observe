@@ -59,3 +59,6 @@ teploy.home.yml
 # teploy.*.yml beyond the base teploy.yml must never be trackable.
 teploy.*.yml
 !teploy.yml
+
+# Private dev guide (internal context — never committed, cf. teploy-cli)
+CLAUDE.md
