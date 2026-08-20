@@ -702,7 +702,22 @@ func main() {
 
 	// --- Trace query API (JWT auth) ---
 	traceGroup := r.Group("/api/v1/traces", jwtMW)
-	neutron.Get(traceGroup, "/services", listServicesHandler(traceQuery),
+	// RED metrics accept a share token as well as a JWT — the same credential
+	// the stats reads take, GET-only and pinned to its own site.
+	//
+	// Narrow on purpose: this is the ONE trace read that is pure aggregate
+	// (request count, error count, latency percentiles, Apdex per service).
+	// Everything else on this group returns trace payloads — waterfalls,
+	// span attributes, search results — which can carry request paths, ids
+	// and user-supplied values, and must keep needing a session.
+	//
+	// It is also what makes a machine consumer possible at all: a worker that
+	// wants to know whether a deploy moved a service's error rate cannot hold
+	// a 24-hour user JWT, and the ingest API keys are write-scoped. teploy-ship
+	// reads exactly this endpoint to put before/after telemetry on a pull
+	// request.
+	traceShared := r.Group("/api/v1/traces", jwtOrShareMW(jwtMW, shareSvc))
+	neutron.Get(traceShared, "/services", listServicesHandler(traceQuery),
 		neutron.WithTags("traces"),
 		neutron.WithSummary("List services with RED metrics"),
 	)
