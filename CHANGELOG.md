@@ -4,6 +4,62 @@ All notable changes to Observe are recorded here.
 
 ## [Unreleased]
 
+## v0.1.8 — 2026-08-21
+
+Thirty-five commits since v0.1.7 on 2026-07-15. The three entries already
+written up below are the large ones; the rest of what shipped is recorded here.
+
+### Added
+
+- **A share token can read a service's RED metrics.** `GET
+  /api/v1/traces/services` now accepts a share token (`X-Share-Token`) as well
+  as a session JWT. This exists so a machine can read: a user JWT expires in 24
+  hours and belongs to a person, and the ingest API keys are write-scoped, so
+  before this there was no credential a worker could hold to read anything.
+  teploy-ship uses it to put a service's measured before/after on a pull
+  request.
+
+  Deliberately narrow. It is GET-only, pinned server-side to the token's own
+  site, long-lived and revocable — and it is the **only** trace route opened
+  this way. Every other one returns payloads (waterfalls, span attributes,
+  search) and still requires a session. Verified against a live engine rather
+  than a mock: site pinning, non-GET refused, and revocation honoured.
+
+- **Live stats accept a share token too**, for the same reason, and country
+  resolution now handles IPv6 rather than leaving those visitors unattributed.
+
+### Fixed
+
+- **Browser ingest was rejected** because the tracker sent no site-scoped API
+  key.
+- **The container health probe timed out on its own database connect.**
+  `/healthz` runs a real `SELECT 1`, and a cold pool connect measured ~7.8 s
+  against a 3 s timeout, so the container flapped between healthy and not. The
+  shape is worth remembering: a health endpoint that touches a dependency needs
+  a timeout sized for a cold connection, not a warm one.
+- **The traces service cache was keyed on window *length* rather than window
+  *bounds***, so two different windows of the same duration shared an answer.
+- **OTLP log exports over the batch cap were lost** instead of being split.
+- Source-map retention could not run when an upload failed.
+- Bootstrap, session, backup, explorer and worker-lifecycle security gaps.
+
+### Changed
+
+- **Ingest, span, log and metric inserts are batched** and retention deletes
+  are chunked; traces and metrics no longer drag whole tables into Go.
+- The nucleus engine is pinned by tag and its memory capped in the deploy
+  config, rather than floating on `:latest`.
+
+### Internal
+
+- **Integration tests now skip unless the engine is actually Nucleus.** Every
+  one of them resolved its DSN to `postgres://postgres@localhost:5432` by
+  default and only checked that a connection *succeeded* — so on any machine
+  running PostgreSQL the whole integration suite silently ran against the wrong
+  engine and reported failures that look like regressions ("syntax error at or
+  near ORDER" for MergeTree DDL, columns "missing" that Nucleus resolves to
+  NULL). The guard now consults the client's own `IsNucleus()`.
+
 ### Added
 
 - **OTLP protobuf ingest, and the logs signal.** `/v1/traces` and `/v1/metrics`
