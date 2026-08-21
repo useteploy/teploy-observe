@@ -3,18 +3,16 @@ package replays
 import (
 	"context"
 	"errors"
-	"os"
 	"testing"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
 func testDB(t *testing.T) *nucleus.Client {
 	t.Helper()
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	db, err := nucleus.Connect(context.Background(), dsn)
 	if err != nil {
 		t.Skipf("nucleus not reachable at %s — skipping integration test", dsn)
@@ -80,10 +78,7 @@ func TestIngest_SharedReplayIDInsertsSessionOnce(t *testing.T) {
 // pool the moment before Ingest calls KV.SetNX — the surest way to force a
 // live KV error without a mock (no KV interface exists to mock).
 func TestIngest_DedupClaimErrorFailsClosed(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	db, err := nucleus.Connect(context.Background(), dsn)
 	if err != nil {
 		t.Skipf("nucleus not reachable at %s — skipping integration test", dsn)

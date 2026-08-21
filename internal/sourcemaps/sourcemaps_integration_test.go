@@ -3,19 +3,17 @@ package sourcemaps
 import (
 	"context"
 	"fmt"
-	"os"
 	"sync"
 	"testing"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
 func testDB(t *testing.T) *nucleus.Client {
 	t.Helper()
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	db, err := nucleus.Connect(context.Background(), dsn)
 	if err != nil {
 		t.Skipf("nucleus not reachable at %s — skipping integration test", dsn)

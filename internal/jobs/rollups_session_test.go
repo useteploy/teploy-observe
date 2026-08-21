@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
 // TestRunSessionRollup_PreservesLongSessions is the regression for the HIGH
@@ -17,10 +19,7 @@ import (
 // one. Two events 45 minutes apart must yield first_ts at the earlier event,
 // 2 pageviews, and is_bounce=false.
 func TestRunSessionRollup_PreservesLongSessions(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	db, err := nucleus.Connect(ctx, dsn)
@@ -53,10 +52,10 @@ func TestRunSessionRollup_PreservesLongSessions(t *testing.T) {
 	}
 
 	type srow struct {
-		FirstTs    int64  `db:"first_ts"`
-		Pageviews  int64  `db:"pageviews"`
-		EntryURL   string `db:"entry_url"`
-		IsBounce   string `db:"is_bounce"`
+		FirstTs   int64  `db:"first_ts"`
+		Pageviews int64  `db:"pageviews"`
+		EntryURL  string `db:"entry_url"`
+		IsBounce  string `db:"is_bounce"`
 	}
 	rows, err := nucleus.Query[srow](ctx, db.SQL(),
 		`SELECT first_ts, pageviews, COALESCE(entry_url,'') AS entry_url, is_bounce

@@ -4,12 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"os"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
 // TestBoardSummary_AggregatesAcrossSites pins the C4 contract: given
@@ -19,10 +20,7 @@ import (
 // Plants data via the SQL API (not the ingest wrapper) because we need
 // exact control over site_id and timestamps.
 func TestBoardSummary_AggregatesAcrossSites(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -204,10 +202,7 @@ func TestBoardSummary_AggregatesAcrossSites(t *testing.T) {
 // empty site_ids list returns []SiteRow{} (not nil), matching the
 // emptyOnNil convention used by every list endpoint.
 func TestBoardSummary_EmptyInputReturnsEmpty(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	db, err := nucleus.Connect(ctx, dsn)
@@ -233,10 +228,7 @@ func TestBoardSummary_EmptyInputReturnsEmpty(t *testing.T) {
 // input only produces one row in the output, even under the parallel
 // fan-out.
 func TestBoardSummary_DedupesSiteIDs(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	db, err := nucleus.Connect(ctx, dsn)
@@ -263,10 +255,7 @@ func TestBoardSummary_DedupesSiteIDs(t *testing.T) {
 // lifecycle of saved boards. Uses a dedicated test name so concurrent
 // runs don't collide.
 func TestSavedBoardCRUD(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	db, err := nucleus.Connect(ctx, dsn)

@@ -4,22 +4,20 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"os"
 	"sort"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
 // connect is the shared "skip if nucleus down" boilerplate.
 func connect(t *testing.T) (context.Context, *nucleus.Client, func()) {
 	t.Helper()
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	db, err := nucleus.Connect(ctx, dsn)
 	if err != nil {
@@ -273,13 +271,13 @@ func TestCohortCRUD(t *testing.T) {
 // TestParseWindow pins the time-window parser.
 func TestParseWindow(t *testing.T) {
 	cases := map[string]time.Duration{
-		"30d":      30 * 24 * time.Hour,
-		"7d":       7 * 24 * time.Hour,
-		"24h":      24 * time.Hour,
-		"":         30 * 24 * time.Hour,
-		"garbage":  30 * 24 * time.Hour,
-		"15m":      15 * time.Minute,
-		"-5d":      30 * 24 * time.Hour,
+		"30d":     30 * 24 * time.Hour,
+		"7d":      7 * 24 * time.Hour,
+		"24h":     24 * time.Hour,
+		"":        30 * 24 * time.Hour,
+		"garbage": 30 * 24 * time.Hour,
+		"15m":     15 * time.Minute,
+		"-5d":     30 * 24 * time.Hour,
 	}
 	for in, want := range cases {
 		if got := parseWindow(in); got != want {

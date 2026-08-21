@@ -2,11 +2,12 @@ package audit
 
 import (
 	"context"
-	"os"
 	"strings"
 	"testing"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
 // --- Pure unit tests (no DB) --------------------------------------------------
@@ -103,10 +104,7 @@ const integrationAuditKey = "test-audit-key"
 // --- Integration (skips cleanly when Nucleus is unreachable) ------------------
 
 func TestRecordAndList_Integration(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx := context.Background()
 	db, err := nucleus.Connect(ctx, dsn)
 	if err != nil {
@@ -150,10 +148,7 @@ func TestRecordAndList_Integration(t *testing.T) {
 }
 
 func TestTimeFilter_Integration(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx := context.Background()
 	db, err := nucleus.Connect(ctx, dsn)
 	if err != nil {

@@ -4,12 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"os"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
 // TestReleaseHealth_ComputesCrashFreeAndAdoption pins the math from B2
@@ -20,10 +21,7 @@ import (
 // (not the ingest wrapper — we need exact control over release_tag and
 // timestamps), then calls Health() and asserts the math.
 func TestReleaseHealth_ComputesCrashFreeAndAdoption(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -152,10 +150,7 @@ func TestReleaseHealth_ComputesCrashFreeAndAdoption(t *testing.T) {
 // empty window returns []ReleaseStat{}, never nil — so the JSON wire is
 // "[]" not "null".
 func TestReleaseHealth_NoSessionsReturnsEmpty(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	db, err := nucleus.Connect(ctx, dsn)

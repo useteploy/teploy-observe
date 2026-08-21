@@ -5,11 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
 // TestTraceErrors_ExactMatchWithWindowFallback is the regression test for
@@ -20,10 +21,7 @@ import (
 // Connects to the same live-nucleus DSN as the errors-package integration
 // tests; skips cleanly when nucleus isn't running.
 func TestTraceErrors_ExactMatchWithWindowFallback(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -75,9 +73,9 @@ func TestTraceErrors_ExactMatchWithWindowFallback(t *testing.T) {
 			t.Fatalf("plant error %s: %v", errorID, err)
 		}
 	}
-	plantError("e-tagged-a", traceA, 1600)   // tagged A, inside both windows
-	plantError("e-untagged", "", 1700)       // no trace context, inside both windows
-	plantError("e-tagged-b", traceB, 1800)   // tagged B, inside both windows
+	plantError("e-tagged-a", traceA, 1600)      // tagged A, inside both windows
+	plantError("e-untagged", "", 1700)          // no trace context, inside both windows
+	plantError("e-tagged-b", traceB, 1800)      // tagged B, inside both windows
 	plantError("e-tagged-a-late", traceA, 9000) // tagged A, OUTSIDE A's window
 
 	q := NewQueryService(db)

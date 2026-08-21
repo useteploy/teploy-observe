@@ -10,6 +10,8 @@ import (
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 	"github.com/useteploy/teploy-observe/internal/share"
+
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
 // A share token is the only credential a machine can hold to READ this API: a
@@ -23,10 +25,7 @@ import (
 // before by a mock that encoded stricter semantics than Nucleus actually has.
 func shareTestDB(t *testing.T) *nucleus.Client {
 	t.Helper()
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	db, err := nucleus.Connect(context.Background(), dsn)
 	if err != nil {
 		t.Skipf("nucleus not reachable at %s — skipping integration test", dsn)

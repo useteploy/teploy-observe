@@ -2,10 +2,11 @@ package audit
 
 import (
 	"context"
-	"os"
 	"testing"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
 // --- Pure tamper-evidence tests (no DB) --------------------------------------
@@ -94,10 +95,7 @@ func TestVerifyChain_DetectsRelink(t *testing.T) {
 // --- Integration: chain persists + verifies against real Nucleus -------------
 
 func TestChain_Integration(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx := context.Background()
 	db, err := nucleus.Connect(ctx, dsn)
 	if err != nil {

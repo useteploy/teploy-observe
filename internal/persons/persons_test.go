@@ -4,12 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"os"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
 // TestListPersons_AggregatesByDistinctID pins the C2 contract: given
@@ -17,10 +18,7 @@ import (
 // returns one Person per identified id, sorted by last_seen DESC,
 // with correct first_seen / last_seen / event_count / session_count.
 func TestListPersons_AggregatesByDistinctID(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	db, err := nucleus.Connect(ctx, dsn)
@@ -129,10 +127,7 @@ func TestListPersons_AggregatesByDistinctID(t *testing.T) {
 // the most-recent value (argMax over timestamp), not the lexically-largest one
 // (the old MAX(col) bug). Values are chosen so most-recent != lexical max.
 func TestListPersons_TopCountryIsMostRecent(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	db, err := nucleus.Connect(ctx, dsn)
@@ -176,10 +171,7 @@ func TestListPersons_TopCountryIsMostRecent(t *testing.T) {
 // TestListPersons_PaginationAndCount pins limit/offset behaviour and
 // the CountPersons helper.
 func TestListPersons_PaginationAndCount(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	db, err := nucleus.Connect(ctx, dsn)
@@ -247,10 +239,7 @@ func TestListPersons_PaginationAndCount(t *testing.T) {
 // TestPersonDetail_TimelinePopulated pins that PersonDetail returns
 // the aggregate plus a non-empty timeline ordered by timestamp DESC.
 func TestPersonDetail_TimelinePopulated(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	db, err := nucleus.Connect(ctx, dsn)

@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
 // TestRestore_RejectsPartialArchive builds an archive whose results entry marks
@@ -41,10 +43,7 @@ func TestRestore_RejectsPartialArchive(t *testing.T) {
 // the metadata path; rows go back into the same instance which is fine for
 // ReplacingMergeTree / idempotent-id tables here).
 func TestDump_WritesManifestAndResults(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	db, err := nucleus.Connect(ctx, dsn)
@@ -87,15 +86,12 @@ func TestDump_WritesManifestAndResults(t *testing.T) {
 	}
 }
 
-// TestRestore_LenientEraEmptyJSONB builds an archive carrying '' for JSONB
+// TestRestore_LenientEraEmptyJSONB builds an archive carrying ” for JSONB
 // columns (what lenient-era engines coerced and stored) and asserts Restore
 // lands the row with SQL NULL instead of failing on a Postgres-parity engine
-// that rejects '' for JSON.
+// that rejects ” for JSON.
 func TestRestore_LenientEraEmptyJSONB(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	db, err := nucleus.Connect(ctx, dsn)

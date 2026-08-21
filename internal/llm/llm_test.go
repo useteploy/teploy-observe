@@ -2,11 +2,12 @@ package llm
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
 // TestStats_EmptyWindowReturnsZeros locks the contract from B1: an empty
@@ -20,10 +21,7 @@ import (
 // Connects directly to nucleus and skips when not reachable, matching the
 // other live-stack integration tests.
 func TestStats_EmptyWindowReturnsZeros(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -46,11 +44,11 @@ func TestStats_EmptyWindowReturnsZeros(t *testing.T) {
 	}
 
 	for name, got := range map[string]string{
-		"TotalCalls":    stats.TotalCalls,
-		"TotalTokens":   stats.TotalTokens,
-		"TotalCostUSD":  stats.TotalCostUSD,
-		"AvgLatencyMs":  stats.AvgLatencyMs,
-		"ErrorCount":    stats.ErrorCount,
+		"TotalCalls":   stats.TotalCalls,
+		"TotalTokens":  stats.TotalTokens,
+		"TotalCostUSD": stats.TotalCostUSD,
+		"AvgLatencyMs": stats.AvgLatencyMs,
+		"ErrorCount":   stats.ErrorCount,
 	} {
 		if got == "" {
 			t.Errorf("%s = %q (empty) — want numeric string like \"0\"", name, got)

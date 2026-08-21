@@ -2,20 +2,18 @@ package tracing
 
 import (
 	"context"
-	"os"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
 func connectDB(t *testing.T) (context.Context, *nucleus.Client, func()) {
 	t.Helper()
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	db, err := nucleus.Connect(ctx, dsn)
 	if err != nil {

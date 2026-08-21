@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
 // TestIngestErrorEvent_InsertsAndIndexes is the contract test for the
@@ -19,17 +21,14 @@ import (
 // step — search returned 500 on fresh installs.
 //
 // The test ingests a synthetic error and then confirms two things:
-//   1. the row landed in error_events (so /api/v1/issues sees it),
-//   2. it's findable via the search service (so /api/v1/issues/search
-//      doesn't 500 on the same data).
+//  1. the row landed in error_events (so /api/v1/issues sees it),
+//  2. it's findable via the search service (so /api/v1/issues/search
+//     doesn't 500 on the same data).
 //
 // The test connects directly to nucleus over the same DSN the dev stack
 // uses, so it skips cleanly when nucleus isn't running.
 func TestIngestErrorEvent_InsertsAndIndexes(t *testing.T) {
-	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres@localhost:5432/postgres?sslmode=disable"
-	}
+	dsn := nucleustest.DSN(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
