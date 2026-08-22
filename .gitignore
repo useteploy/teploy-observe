@@ -62,3 +62,12 @@ teploy.*.yml
 
 # Private dev guide (internal context — never committed, cf. teploy-cli)
 CLAUDE.md
+
+# Python bytecode. Three .pyc files were committed under sdk/python/, so every
+# checkout shipped compiled artefacts with the SDK and every working tree read
+# as dirty the moment anything imported it.
+__pycache__/
+*.py[cod]
+
+# Local compose overrides are, by definition, local.
+docker-compose.override.yml
