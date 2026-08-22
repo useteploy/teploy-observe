@@ -66,7 +66,17 @@ accessories:
     # underneath a live database — and the tag moves between the day you test
     # and the day you deploy. Bump this deliberately, after reading the
     # release's migration notes.
-    image: ghcr.io/neutron-build/nucleus:v0.1.5
+    #
+    # v0.1.8 (2026-08-21), up from v0.1.5. Verified before bumping: Observe's
+    # suite passes against it, 34 packages, same as 0.1.6 — while v0.1.5 fails
+    # auth/cohorts/errors because migration 28 cannot run on a fresh database
+    # (`events_pre028 not found in storage`). The one package that still fails
+    # on BOTH engines is `internal/cohorts`, which is Observe's own known
+    # `events_recent` gap (no `distinct_id`), order-dependent and unrelated to
+    # the engine. v0.1.6's breaking change applies: SKIP LOCKED, NOWAIT and
+    # partial CREATE INDEX ... WHERE now error rather than being ignored —
+    # checked, neither Observe nor Ship uses them.
+    image: ghcr.io/neutron-build/nucleus:v0.1.8
     port: 5432
     # Hard cgroup cap, and the only bound the kernel enforces.
     # NUCLEUS_MAX_MEMORY_MB below is the engine's accounting of its OWN
