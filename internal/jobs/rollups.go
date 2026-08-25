@@ -22,10 +22,21 @@ func NewRollupService(db *nucleus.Client, logger *slog.Logger) *RollupService {
 }
 
 // RunHourlyRollup aggregates events from the last 2 hours into stats_hourly.
-// Runs every hour. Uses a 2-hour window to catch late-arriving events.
-// The stats_hourly table uses ReplacingMergeTree with a version column,
-// so re-inserting for the same bucket key is idempotent — the merge keeps
-// the row with the highest version (most recent computation).
+// Runs every hour. Uses a 2-hour window to catch late-arriving events, so
+// every bucket is recomputed two or three times.
+//
+// The window is deleted before it is re-inserted. stats_hourly is a
+// ReplacingMergeTree, and the original design relied on the engine collapsing
+// the repeated computations of a bucket down to the highest version — but
+// Nucleus only does that when it merges the segments involved, and in practice
+// it does not: the live instance was carrying duplicate rows two months old,
+// and every dashboard read summed them. Deleting the window first keeps one
+// row per bucket regardless of whether a merge ever happens. Reads still
+// collapse by version (internal/query/replacing.go) so that a rollup written
+// by an older build is read correctly.
+//
+// A crash between the DELETE and the INSERT leaves the window empty until the
+// next tick recomputes it, which is at most one hour and is self-healing.
 func (r *RollupService) RunHourlyRollup(ctx context.Context) error {
 	now := time.Now().UTC()
 	windowStart := now.Truncate(time.Hour).Add(-2 * time.Hour)
@@ -37,6 +48,13 @@ func (r *RollupService) RunHourlyRollup(ctx context.Context) error {
 	version := now.UnixMilli()
 
 	sql := r.db.SQL()
+
+	if _, err := sql.Exec(ctx,
+		`DELETE FROM stats_hourly WHERE ts_bucket >= $1 AND ts_bucket < $2`,
+		startMs, endMs,
+	); err != nil {
+		return fmt.Errorf("hourly rollup: clear window: %w", err)
+	}
 
 	// Bucket size inlined in SQL (can't use parameter — Exec uses extended protocol
 	// which types string params as TEXT, and Nucleus can't divide BIGINT by TEXT)
@@ -73,7 +91,10 @@ func (r *RollupService) RunHourlyRollup(ctx context.Context) error {
 }
 
 // RunDailyRollup aggregates events from the last 2 days into stats_daily.
-// Runs once per day. ReplacingMergeTree deduplicates by key on merge.
+// Runs once per day over a 48-hour window, so each day bucket is recomputed
+// two or three times. The window is deleted before it is re-inserted, for the
+// reason given on RunHourlyRollup — and stats_daily has no retention policy at
+// all, so its duplicates would otherwise accumulate forever.
 func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 	now := time.Now().UTC()
 	windowStart := now.Truncate(24 * time.Hour).Add(-48 * time.Hour)
@@ -84,6 +105,13 @@ func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 	version := now.UnixMilli()
 
 	sql := r.db.SQL()
+
+	if _, err := sql.Exec(ctx,
+		`DELETE FROM stats_daily WHERE ts_bucket >= $1 AND ts_bucket < $2`,
+		startMs, endMs,
+	); err != nil {
+		return fmt.Errorf("daily rollup: clear window: %w", err)
+	}
 
 	_, err := sql.Exec(ctx, fmt.Sprintf(`
 		INSERT INTO stats_daily (
@@ -242,6 +270,32 @@ func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 		utm_source, utm_medium, utm_campaign,
 		is_bounce, version, release_tag
 	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`
+
+	// Drop the previous computation of every session we are about to rewrite.
+	// sessions is a ReplacingMergeTree, but Nucleus only collapses versions
+	// when it merges the segments holding them, which for this table it does
+	// not do in practice — a session still receiving events was accumulating
+	// one row every five minutes, and every COUNT(*) over the table counted
+	// them all. See RunHourlyRollup for the full note.
+	for i := 0; i < len(sids); i += chunk {
+		end := i + chunk
+		if end > len(sids) {
+			end = len(sids)
+		}
+		batch := sids[i:end]
+		ph := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for j, s := range batch {
+			ph[j] = fmt.Sprintf("$%d", j+1)
+			args[j] = s
+		}
+		if _, err := sql.Exec(ctx,
+			`DELETE FROM sessions WHERE session_id IN (`+strings.Join(ph, ",")+`)`,
+			args...,
+		); err != nil {
+			return fmt.Errorf("session rollup clear: %w", err)
+		}
+	}
 
 	inserted := 0
 	for _, events := range grouped {
