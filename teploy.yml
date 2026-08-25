@@ -28,6 +28,17 @@ app: observe
 domain: observe.example.com
 server: observe.example.com
 
+# Ingress + binds. The dashboard/read API (`port`) is deliberately NOT on
+# 0.0.0.0: anything reaching it gets a login page, so it is pinned to the
+# tailnet address. The INGEST listener is the opposite - it must stay on
+# 0.0.0.0 because the tunnel fronting the public ingest hostname may dial
+# either address. Losing either silently breaks a live install: without
+# `publish` nothing listens on 3001 at all and every SDK write is refused.
+ingress: host
+bind: 100.108.123.49
+publish:
+  - "0.0.0.0:3001:3001"
+
 # `port` is the app listener: dashboard + read API + admin. Anything Teploy
 # routes `domain` to can reach the dashboard, so point `domain` here only for
 # an instance you're happy to have a login page on (or gate it behind
@@ -118,6 +129,7 @@ accessories:
 
 env:
   OBSERVE_ADDR: ":3000"
+  OBSERVE_INGEST_ADDR: ":3001"
   OBSERVE_NUCLEUS_URL: "postgres://observe-nucleus:5432/observe"
   OBSERVE_SITE_ID: "default"
   OBSERVE_SESSION_SALT: "${TEPLOY_OBSERVE_SESSION_SALT}"
