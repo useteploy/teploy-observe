@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/neutron"
@@ -17,6 +19,9 @@ import (
 	"github.com/useteploy/teploy-observe/internal/session"
 	"github.com/useteploy/teploy-observe/internal/sites"
 )
+
+// maxProperties caps the custom properties carried by one event.
+const maxProperties = 50
 
 // IngestInput is the JSON body for POST /api/v1/events.
 type IngestInput struct {
@@ -38,6 +43,66 @@ type IngestInput struct {
 	// stamp release_tag on the resulting sessions row, which feeds
 	// crash-free-session computation per release.
 	Release string `json:"release,omitempty"`
+}
+
+// ingestKnownKeys are the top-level JSON keys IngestInput actually consumes.
+// Anything else in the body is a custom event property (see UnmarshalJSON).
+var ingestKnownKeys = map[string]bool{
+	"site_id": true, "event_type": true, "url": true, "referrer": true,
+	"title": true, "language": true, "screen": true, "properties": true,
+	"distinct_id": true, "release": true,
+}
+
+// UnmarshalJSON decodes the documented shape and, in addition, collects any
+// unrecognised top-level key into Properties.
+//
+// Custom event properties belong under `properties`, but several producers
+// spread them across the top level instead — sdk/browser did until it was
+// fixed, and docs/migrations/from-posthog.md still teaches a jq recipe that
+// does. Those payloads are already deployed and cannot be recalled, and the
+// alternative is that every one of their properties is stored as {}. An
+// explicitly nested `properties` entry always wins over a same-named flat key.
+func (in *IngestInput) UnmarshalJSON(data []byte) error {
+	type alias IngestInput
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*in = IngestInput(a)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	extra := make([]string, 0, len(raw))
+	for k := range raw {
+		if !ingestKnownKeys[k] {
+			extra = append(extra, k)
+		}
+	}
+	if len(extra) == 0 {
+		return nil
+	}
+	// Sorted so the cap below drops the same keys on every request rather
+	// than whichever ones Go's map iteration happened to reach first.
+	sort.Strings(extra)
+	for _, k := range extra {
+		if len(in.Properties) >= maxProperties {
+			break
+		}
+		if _, exists := in.Properties[k]; exists {
+			continue
+		}
+		var v any
+		if err := json.Unmarshal(raw[k], &v); err != nil {
+			continue
+		}
+		if in.Properties == nil {
+			in.Properties = make(map[string]any, len(extra))
+		}
+		in.Properties[k] = v
+	}
+	return nil
 }
 
 // IngestResponse is returned to the tracker.
@@ -75,7 +140,7 @@ func Handler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.Handl
 		if len(input.Referrer) > 2048 {
 			input.Referrer = input.Referrer[:2048]
 		}
-		if input.Properties != nil && len(input.Properties) > 50 {
+		if input.Properties != nil && len(input.Properties) > maxProperties {
 			return IngestResponse{}, neutron.ErrBadRequest("too many properties (max 50)")
 		}
 

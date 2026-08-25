@@ -107,8 +107,7 @@ urllib.request.urlopen(urllib.request.Request(
     data=json.dumps({
         "site_id": "default",
         "event_type": "signup",
-        "session_id": user_session_id,
-        "props": {"plan": "pro"},
+        "properties": {"plan": "pro"},
     }).encode(),
     headers={"Content-Type": "application/json", "X-API-Key": KEY},
 ))
@@ -123,17 +122,19 @@ PostHog can export events via its export API. The shape needs a small transform:
 # {
 #   "event": "signup",              # → event_type
 #   "distinct_id": "u_123",         # → session_id (or use identify)
-#   "properties": {...},            # → merge as top-level props
-#   "timestamp": "2026-04-01T..."   # → timestamp (ms since epoch)
+#   "properties": {...},            # → properties (nested, NOT top-level)
+#   "timestamp": "2026-04-01T..."   # → server-assigned on ingest
 # }
 
+# Custom properties must be nested under `properties` — the server reads no
+# other top-level key, and everything else on the body is ignored.
 jq -c '{
   site_id: "default",
   event_type: .event,
-  session_id: .distinct_id,
-  timestamp: (.timestamp | fromdate * 1000),
-  pathname: .properties["$current_url"]
-} + .properties' posthog-export.jsonl | while read event; do
+  distinct_id: .distinct_id,
+  url: .properties["$current_url"],
+  properties: .properties
+}' posthog-export.jsonl | while read event; do
   curl -s -X POST "$OBSERVE/api/v1/events" \
     -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
     -d "$event"
