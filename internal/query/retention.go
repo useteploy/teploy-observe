@@ -46,8 +46,8 @@ func (s *StatsService) Retention(ctx context.Context, siteID string, from, to ti
 	// Get all sessions with first_ts in the time range
 	rows, err := nucleus.Query[sessionFirstLast](ctx, s.db.SQL(),
 		`SELECT session_id, first_ts
-		 FROM sessions
-		 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3`,
+		 FROM `+LatestRows("sessions", []string{"first_ts"},
+			`site_id = $1 AND first_ts >= $2 AND first_ts < $3`)+` AS s`,
 		siteID, fromMs, toMs,
 	)
 	if err != nil {

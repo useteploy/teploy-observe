@@ -173,13 +173,28 @@ func (s *ExportService) exportSessions(ctx context.Context, w http.ResponseWrite
 	toMs := dbutil.IntParam(to.UnixMilli())
 
 	rows, err := s.db.Pool().Query(ctx,
+		// sessions is a ReplacingMergeTree that Nucleus does not collapse on
+		// read; without the argMax fold the export emits one row per rollup
+		// re-computation. See internal/query/replacing.go.
 		`SELECT session_id, site_id, first_ts, last_ts, pageviews,
 			COALESCE(entry_url, '') AS entry_url, COALESCE(exit_url, '') AS exit_url,
 			COALESCE(browser, '') AS browser, COALESCE(os, '') AS os,
 			COALESCE(device, '') AS device, COALESCE(country, '') AS country,
 			COALESCE(is_bounce, 'false') AS is_bounce
-		 FROM sessions
-		 WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3
+		 FROM (SELECT tenant_id, site_id, session_id,
+			argMax(first_ts, version) AS first_ts,
+			argMax(last_ts, version) AS last_ts,
+			argMax(pageviews, version) AS pageviews,
+			argMax(entry_url, version) AS entry_url,
+			argMax(exit_url, version) AS exit_url,
+			argMax(browser, version) AS browser,
+			argMax(os, version) AS os,
+			argMax(device, version) AS device,
+			argMax(country, version) AS country,
+			argMax(is_bounce, version) AS is_bounce
+		       FROM sessions
+		       WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3
+		       GROUP BY tenant_id, site_id, session_id) s
 		 ORDER BY first_ts DESC`,
 		pgx.QueryExecModeSimpleProtocol, siteID, fromMs, toMs,
 	)

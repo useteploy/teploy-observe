@@ -95,14 +95,21 @@ func (s *ReleaseHealthService) Health(ctx context.Context, siteID string, fromMs
 		LastSeen   int64  `db:"last_seen"`
 	}
 	sessRows, err := nucleus.Query[sessRow](ctx, s.db.SQL(),
+		// sessions is a ReplacingMergeTree that Nucleus does not collapse on
+		// read, so the session rollup's re-computations would each be counted
+		// as another session. Collapse to the latest version per session key
+		// first — see internal/query/replacing.go.
 		`SELECT release_tag,
 			COUNT(*) AS sessions,
 			MIN(CAST(first_ts AS BIGINT)) AS first_seen,
 			MAX(CAST(last_ts AS BIGINT)) AS last_seen
-		 FROM sessions
-		 WHERE site_id = $1
-		   AND first_ts >= $2
-		   AND first_ts < $3
+		 FROM (SELECT tenant_id, site_id, session_id,
+			argMax(release_tag, version) AS release_tag,
+			argMax(first_ts, version) AS first_ts,
+			argMax(last_ts, version) AS last_ts
+		       FROM sessions
+		       WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3
+		       GROUP BY tenant_id, site_id, session_id) s
 		 GROUP BY release_tag`,
 		siteID, strconv.FormatInt(fromMs, 10), strconv.FormatInt(toMs, 10),
 	)
@@ -207,11 +214,12 @@ func (s *ReleaseHealthService) Sparkline(ctx context.Context, siteID, releaseTag
 	sessRows, err := nucleus.Query[sessRow](ctx, s.db.SQL(),
 		`SELECT (CAST(first_ts AS BIGINT) / 86400000) * 86400000 AS bucket,
 			COUNT(*) AS sessions
-		 FROM sessions
-		 WHERE site_id = $1
-		   AND release_tag = $2
-		   AND first_ts >= $3
-		   AND first_ts < $4
+		 FROM (SELECT tenant_id, site_id, session_id,
+			argMax(first_ts, version) AS first_ts
+		       FROM sessions
+		       WHERE site_id = $1 AND release_tag = $2
+			 AND first_ts >= $3 AND first_ts < $4
+		       GROUP BY tenant_id, site_id, session_id) s
 		 GROUP BY (CAST(first_ts AS BIGINT) / 86400000) * 86400000`,
 		siteID, releaseTag, fromMs, toMs,
 	)
