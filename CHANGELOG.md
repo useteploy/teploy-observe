@@ -6,6 +6,82 @@ All notable changes to Observe are recorded here.
 
 ### Fixed
 
+- **The `issues` table was doubling in size on every error batch, and had
+  reached 16,847,389 rows on the live instance.** `bumpIssue` and
+  `UpdateStatus` were both
+
+      INSERT INTO issues (...) SELECT ... FROM issues WHERE issue_id = $1
+
+  which writes one row per row the SELECT returns. That is only harmless if
+  the engine collapses a ReplacingMergeTree's superseded versions, and Nucleus
+  does not: its read-time dedup is a process-global registry that CREATE TABLE
+  populates and a restart repopulates only for the tables listed in the data
+  directory's `engines.json` — and every table older than that file is absent
+  from it. The live instance's `engines.json` lists exactly one table, so
+  every read there returns every version, and each bump inserted as many rows
+  as already existed. Measured on a scratch Nucleus v0.1.8: 1, 2, 4, 8 … 4096
+  over twelve bumps. Both writers now read through the latest-version collapse
+  before inserting, so exactly one row is written however many versions exist.
+
+- **Every read of `issues` returned an arbitrary version.** An issue marked
+  resolved could keep reading as open, the grouphash lookup that
+  `ResolveIssue` uses on a cache miss could return a stale event count, and
+  `ORDER BY last_seen` sorted on whichever `last_seen` came back. The issue
+  list, the single-issue read, the grouphash lookup and the full-text search
+  hydration all collapse by `argMax(col, version)` now — and `status`, which
+  changes between versions, is filtered *after* the collapse rather than
+  inside it.
+
+- **Deleted alert rules, webhooks, uptime monitors, cron monitors,
+  integrations, report schedules and log pipelines kept running.** All seven
+  soft-delete by writing a new version with `enabled = 'false'`, and all seven
+  read `WHERE enabled = 'true'` against the raw table — which still matches
+  the pre-delete version. So a deleted alert rule kept evaluating and firing,
+  a deleted webhook kept receiving payloads, a deleted uptime monitor kept
+  issuing HTTP requests, a deleted cron monitor kept alerting on missed runs,
+  a deleted integration kept being delivered to, a deleted report schedule
+  kept emailing, and a deleted log pipeline kept processing (and dropping)
+  log lines. Each now collapses to the latest version per key and filters
+  `enabled` after the collapse; each soft-delete reads through the same
+  collapse so it writes one row rather than one per version.
+
+  **Security-relevant:** a cron monitor's ping token is the credential that
+  authorizes a heartbeat, and deleting the monitor is the only way to revoke
+  it. `RecordCheckinByToken` filtered `enabled` against the raw table, so a
+  deleted monitor's token kept authenticating indefinitely.
+
+  Report schedules had a second symptom from the same cause: a live schedule
+  was read once per surviving version, so one send cycle mailed every
+  recipient several times.
+
+- **Feature flags and surveys resolved an arbitrary version to the SDK.**
+  `Evaluate` took `rows[0]` of an uncollapsed read, so a flag turned off could
+  keep evaluating true for every SDK caller (and one turned on could stay
+  false). Surveys had the same shape on `GetActive` and — the one that
+  matters — on `SubmitResponse`, whose site-ownership and status check is the
+  only gate on a public, unauthenticated endpoint.
+
+- **`DeleteGoal` did not delete.** It was a literal `return nil` with a
+  comment claiming a ReplacingMergeTree cannot delete. It can: `DELETE`
+  removes the physical rows, which is what the rollup jobs already depend on.
+  It now deletes, scoped by `site_id` so a guessed goal id cannot reach across
+  sites.
+
+- **Backups captured every superseded version, and restore re-inserted them
+  all.** A backup carried the same duplicates the read path has to work
+  around, and restoring one could bring a soft-deleted webhook back alive.
+  `observe backup` now dumps a ReplacingMergeTree collapsed to one row per
+  key, discovering the column list at runtime so a column added by a later
+  migration (`cron_monitors.ping_token`, `sessions.release_tag`) is still
+  carried.
+
+- **Migration 034 collapses the duplicate `issues` rows already on disk.**
+  Same shape as 033: rename aside, recreate, copy the highest-version row per
+  key across, `issues_pre034` left in place as a recovery artifact. It runs on
+  the next start, before the listeners bind. **On an instance the size of the
+  live one this needs more memory than Nucleus allows a query by default —
+  see `docs/operations/issue-duplicate-collapse.md` before deploying.**
+
 - **The dashboard reported several times more traffic than it had.** On the
   live instance a window whose raw events prove 72 pageviews and 11 sessions
   was shown as 158 pageviews and 91 visitors. Two independent causes, both
