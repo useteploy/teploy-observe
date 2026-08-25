@@ -3,12 +3,21 @@ package replays
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
+
+// uniqueID keeps the integration tests repeatable against a persistent engine.
+// Fixed site and replay ids meant a second `go test ./...` against the same
+// Nucleus counted the previous run's rows and failed on the event count.
+func uniqueID(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
 
 func testDB(t *testing.T) *nucleus.Client {
 	t.Helper()
@@ -106,9 +115,9 @@ func TestIngest_NoSaltNoRawOptInDropsIdentifierNotBatch(t *testing.T) {
 	// fail-open scenario OBS-030 describes.
 	svc := NewReplayService(db)
 	ctx := context.Background()
-	siteID := "no-salt-test-site"
+	siteID := uniqueID("no-salt-test-site")
 
-	input := basicInput(siteID, "sess-1", "replay-no-salt")
+	input := basicInput(siteID, "sess-1", uniqueID("replay-no-salt"))
 	input.DistinctID = "user-raw-identifier@example.com"
 
 	replayID, err := svc.Ingest(ctx, input)
@@ -151,9 +160,9 @@ func TestIngest_RawOptInStillStoresRawIdentifier(t *testing.T) {
 		"",
 	)
 	ctx := context.Background()
-	siteID := "raw-optin-test-site"
+	siteID := uniqueID("raw-optin-test-site")
 
-	input := basicInput(siteID, "sess-1", "replay-raw-optin")
+	input := basicInput(siteID, "sess-1", uniqueID("replay-raw-optin"))
 	input.DistinctID = "user-raw-identifier@example.com"
 
 	replayID, err := svc.Ingest(ctx, input)
@@ -178,9 +187,9 @@ func TestIngest_SaltedHashesIdentifier(t *testing.T) {
 	db := testDB(t)
 	svc := NewReplayService(db).WithPrivacy(nil, "a-real-fallback-salt")
 	ctx := context.Background()
-	siteID := "salted-test-site"
+	siteID := uniqueID("salted-test-site")
 
-	input := basicInput(siteID, "sess-1", "replay-salted")
+	input := basicInput(siteID, "sess-1", uniqueID("replay-salted"))
 	input.DistinctID = "user-raw-identifier@example.com"
 
 	replayID, err := svc.Ingest(ctx, input)
