@@ -144,7 +144,46 @@ If the migration is rejected anyway, the transaction rolls back and the process
 exits, so the container restarts and retries — raise the budget again (double
 it) or use the by-hand procedure below. Nothing is lost either way.
 
-### If you would rather not raise the limit
+### The by-hand alternative DOES NOT WORK — attempted live 2026-08-25
+
+**Do not try this. It was attempted end to end on the live instance and every
+form of it was rejected.** Recorded here so nobody repeats it.
+
+The procedure below assumed a targeted read of one row is cheap. It is not,
+and the reason is the rename itself: `ALTER TABLE issues RENAME TO
+issues_pre034` leaves the renamed table with no engine registration, so it is a
+plain heap with no ORDER BY pruning, and Nucleus materialises **every one of
+the 16.8M rows** before it applies any predicate. Measured against the live
+instance, whose real budget is **6144 MB** (`NUCLEUS_MAX_MEMORY_MB=8192`, 75%),
+not the 10 GB container cap:
+
+| statement | result |
+| --- | --- |
+| `SELECT COUNT(*)` | works, streams |
+| `SELECT tenant_id, site_id, issue_id, MAX(version) … GROUP BY` | works, streams |
+| `SELECT …14 cols… WHERE tenant_id=… AND site_id=… AND issue_id=… AND version=… LIMIT 1` | **rejected**, working set > 6144 MB |
+| `SELECT tenant_id, site_id, issue_id, argMax(title, version) … GROUP BY` (ONE value column) | **rejected**, > 6144 MB |
+| `INSERT INTO issues … SELECT … WHERE <key> AND version=… LIMIT 1` | pinned nucleus at 9.998 GiB of its 10 GiB cap; killed before the kernel did |
+| `SELECT … WHERE version IN (29 literals)` | **crashed the server** — connection lost, container restarted, WAL replayed cleanly, no data lost |
+
+So only cheap single-column aggregates stream. Anything that returns row
+content — even one row — does not. There is no by-hand form that fits.
+
+**Rolling back is clean and is what was done:** `DROP TABLE issues;` (the empty
+recreated one) then `ALTER TABLE issues_pre034 RENAME TO issues;`. The row
+count then climbs for a few minutes as segments reload — it read 11.3M, then
+14.0M, before settling at exactly 16,847,389. Wait for it to settle before
+concluding anything. Migration bookkeeping was never touched, so the database
+was left at 32 and identical to its starting state.
+
+**Consequence: raising the memory budget is MANDATORY, not optional**, and
+**deploying this release is BLOCKED until it is done** — the deploy runs 034,
+034 exceeds the budget, the migration fails, the process exits, and the
+container crash-loops. Follow the raise-the-limit procedure above.
+
+### The original by-hand text, retained only so it is not attempted again
+
+#### If you would rather not raise the limit
 
 There are only 29 issues, so the collapse can be done by hand in a form whose
 working set is one row at a time. Against the instance's own Nucleus, with the

@@ -1,3 +1,13 @@
+-- BLOCKER (verified live 2026-08-25): on infra-home this migration CANNOT run
+-- at the current budget. The live NUCLEUS_MAX_MEMORY_MB is 8192, so a query is
+-- capped at 6144 MB, and the argMax collapse over 16.8M rows needs ~10 GB.
+-- Deploying this release without first raising the accessory's memory will
+-- fail the migration, exit the process and crash-loop the container.
+-- The by-hand alternative was attempted live and does NOT work either — after
+-- the RENAME the table is a plain heap and even a single-row SELECT with a
+-- tight filter and LIMIT 1 exceeds the budget. See
+-- docs/operations/issue-duplicate-collapse.md.
+--
 -- 034 (2026-08-25): collapse the accumulated duplicate rows in `issues`.
 --
 -- issues is a ReplacingMergeTree keyed on (tenant_id, site_id, issue_id), and
