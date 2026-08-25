@@ -1,7 +1,7 @@
 {
   "name": "@teploy/observe-browser",
   "version": "0.1.0",
-  "description": "Browser SDK for Observe — self-hosted analytics, errors, logs, sessions.",
+  "description": "Browser SDK for Observe \u2014 self-hosted analytics, errors, logs, sessions.",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -12,17 +12,34 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
-    "test": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit -p tests/tsconfig.json && node --test --import tsx tests/*.test.ts"
   },
-  "keywords": ["analytics", "observability", "errors", "sessions", "self-hosted"],
+  "keywords": [
+    "analytics",
+    "observability",
+    "errors",
+    "sessions",
+    "self-hosted"
+  ],
   "author": "Observe",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/useteploy/teploy-observe", "directory": "sdk/browser" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/useteploy/teploy-observe",
+    "directory": "sdk/browser"
+  },
   "homepage": "https://github.com/useteploy/teploy-observe",
   "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
     "typescript": "^5.4.5"
   },
   "sideEffects": false

@@ -18,8 +18,9 @@ init({
   siteId: "default",
 });
 
-// Custom event
-track("signup", { plan: "pro", referrer: "hacker_news" });
+// Custom event. Props are sent nested under `properties`, which is the only
+// place the server reads them from.
+track("signup", { plan: "pro", source: "hacker_news" });
 
 // Error capture (auto-captured from `window.onerror` / unhandledrejection too)
 try {
@@ -35,7 +36,7 @@ try {
 |----|---------|
 | `init(options)` | Initialize. Starts auto-pageview + buffered flush. |
 | `pageview(pathname?)` | Record a pageview. |
-| `track(type, props?)` | Record a custom event. Buffered. |
+| `track(type, props?)` | Record a custom event. Buffered. Props go to `properties` (max 50); the keys the server reads as fields — `url`, `referrer`, `title`, `language`, `screen`, `distinct_id`, `release` — stay top-level. |
 | `identify(userId, traits?)` | Associate user id. |
 | `reset()` | Clear user (on logout). |
 | `captureException(err, ctx?)` | Send an error with stack trace. |

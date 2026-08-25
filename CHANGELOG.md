@@ -4,6 +4,34 @@ All notable changes to Observe are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every custom event property sent by the npm browser SDK was stored as
+  `{}`.** `track()` spread the caller's props across the top level of the
+  ingest payload, and the server reads properties only from a nested
+  `properties` object — so `track("signup", { plan: "pro" })` stored an event
+  with no properties at all. The SDK now nests custom props under
+  `properties` and keeps only the keys the server actually reads as fields
+  (`url`, `referrer`, `title`, `language`, `screen`, `distinct_id`,
+  `release`) at the top level. The naive version of this fix — nesting
+  everything — would have broken pageview attribution, because `pageview()`
+  routes `url`/`referrer`/`title` through the same call; a test pins that.
+
+  `identify(userId, traits)` was the same bug: traits went top-level and were
+  discarded. They are now properties. The embedded tracker
+  (`/observe.js`, what a `<script>` install loads) always sent the correct
+  shape and was never affected, nor were the Go, Python or Sentry-shim SDKs —
+  none of them post analytics events.
+
+- **The ingest endpoint now collects unknown top-level keys into
+  `properties`.** Payloads in the old flat shape are already deployed and
+  cannot be recalled, and the `from-posthog` migration recipe taught the same
+  flat shape, so their data was being dropped on arrival. An explicitly
+  nested `properties` entry wins over a same-named flat key, and collected
+  keys are capped at the existing 50-property limit in sorted order rather
+  than pushing an otherwise-valid event over it and getting the whole event
+  rejected.
+
 ## v0.1.8 — 2026-08-21
 
 Thirty-five commits since v0.1.7 on 2026-07-15. The three entries already

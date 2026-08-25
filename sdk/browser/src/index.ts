@@ -37,7 +37,6 @@ export interface InitOptions {
 export interface EventPayload {
   site_id: string;
   event_type: string;
-  pathname?: string;
   url?: string;
   referrer?: string;
   title?: string;
@@ -45,6 +44,9 @@ export interface EventPayload {
   distinct_id?: string;
   /** Application release tag from init({ release }). Empty if not set. */
   release?: string;
+  /** Custom event properties. The server only reads properties from here —
+   * anything spread at the top level of the payload is not a field it stores. */
+  properties?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
@@ -157,25 +159,66 @@ export function init(options: InitOptions): void {
   }
 }
 
-/** Record a pageview for the current URL. */
+/**
+ * Record a pageview for the current URL.
+ *
+ * `pathname` is only carried as a property: the server derives the stored
+ * pathname from `url`, so an explicit one is an annotation, not a field.
+ */
 export function pageview(pathname?: string): void {
   if (!client) return;
-  track("pageview", {
-    pathname: pathname ?? (typeof location !== "undefined" ? location.pathname + location.search : ""),
+  const props: Record<string, unknown> = {
     url: typeof location !== "undefined" ? location.href : "",
     referrer: typeof document !== "undefined" ? document.referrer : "",
     title: typeof document !== "undefined" ? document.title : "",
-  });
+  };
+  if (pathname) props.pathname = pathname;
+  track("pageview", props);
 }
 
-/** Record a custom event. Includes distinct_id when identify() has been called. */
+/**
+ * Top-level payload keys the ingest endpoint actually reads. Anything else a
+ * caller passes to track() is a custom property and must be nested under
+ * `properties` — the server stores no other top-level field.
+ */
+const RESERVED_FIELDS = new Set([
+  "site_id",
+  "event_type",
+  "url",
+  "referrer",
+  "title",
+  "language",
+  "screen",
+  "distinct_id",
+  "release",
+]);
+
+/** Server-side cap on custom properties per event. Exceeding it is a 400. */
+const MAX_PROPERTIES = 50;
+
+/**
+ * Record a custom event. Includes distinct_id when identify() has been called.
+ *
+ * Custom props are nested under `properties`; the handful of keys the server
+ * reads as real fields (url, referrer, title, language, screen, distinct_id,
+ * release) stay at the top level. Props beyond the server's 50-property cap
+ * are dropped rather than letting the whole event be rejected.
+ */
 export function track(eventType: string, props: Record<string, unknown> = {}): void {
   if (!client) return;
   const payload: EventPayload = {
     site_id: client.opts.siteId,
     event_type: eventType,
-    ...props,
   };
+  const properties: Record<string, unknown> = {};
+  for (const key of Object.keys(props)) {
+    if (RESERVED_FIELDS.has(key)) {
+      payload[key] = props[key];
+    } else if (Object.keys(properties).length < MAX_PROPERTIES) {
+      properties[key] = props[key];
+    }
+  }
+  if (Object.keys(properties).length > 0) payload.properties = properties;
   if (client.userId) payload.distinct_id = client.userId;
   if (client.opts.release) payload.release = client.opts.release;
   client.buffer.push(payload);
@@ -186,7 +229,8 @@ export function track(eventType: string, props: Record<string, unknown> = {}): v
  * Associate subsequent events with a user id (and optional traits).
  *
  * Stores the userId locally and emits a one-shot `$identify` event so the
- * server can record the identification in the events stream. Every
+ * server can record the identification in the events stream. Traits are sent
+ * as event properties, alongside `user_id`. Every
  * subsequent track()/captureException() call includes `distinct_id` in the
  * payload — the server hashes it with the per-site `session_salt` before
  * storage, matching the existing session-id privacy pattern.
