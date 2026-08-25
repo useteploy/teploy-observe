@@ -20,8 +20,12 @@ import (
 // SUM(pageviews) reported 158 for a window whose raw events prove 72, and the
 // argMax form reported exactly 72.
 //
-// replacingKeys holds the ORDER BY key of each replacing table this package
-// reads, exactly as declared in internal/schema/migrations/001_analytics.up.sql.
+// replacingKeys holds the ORDER BY key of each replacing table read through
+// this helper, exactly as declared in internal/schema/migrations/.
+//
+// Every entry here versions on a column literally named `version`; a table that
+// versions on something else (cohorts on updated_at, performance_issues on
+// last_seen) must not be added without teaching LatestRows which column to use.
 var replacingKeys = map[string][]string{
 	"stats_hourly": {"tenant_id", "site_id", "ts_bucket", "pathname", "event_type"},
 	"stats_daily": {
@@ -30,6 +34,34 @@ var replacingKeys = map[string][]string{
 		"utm_source", "utm_medium", "utm_campaign",
 	},
 	"sessions": {"tenant_id", "site_id", "session_id"},
+
+	// 002_errors
+	"issues": {"tenant_id", "site_id", "issue_id"},
+	// 003_tracing
+	"service_stats": {"tenant_id", "site_id", "service_name", "operation_name", "ts_bucket"},
+	// 004_platform
+	"alert_rules": {"tenant_id", "site_id", "rule_id"},
+	"webhooks":    {"tenant_id", "site_id", "webhook_id"},
+	// 005_features
+	"goals":            {"tenant_id", "site_id", "goal_id"},
+	"uptime_monitors":  {"tenant_id", "site_id", "monitor_id"},
+	"cron_monitors":    {"tenant_id", "site_id", "cron_id"},
+	"dashboards":       {"tenant_id", "site_id", "dashboard_id"},
+	"dashboard_panels": {"tenant_id", "dashboard_id", "panel_id"},
+	// 006_wave1
+	"integrations":     {"tenant_id", "site_id", "integration_id"},
+	"report_schedules": {"tenant_id", "site_id", "schedule_id"},
+	// 007_wave2
+	"feature_flags": {"tenant_id", "site_id", "flag_id"},
+	"experiments":   {"tenant_id", "site_id", "experiment_id"},
+	"surveys":       {"tenant_id", "site_id", "survey_id"},
+	// 009_llm_infra
+	"log_pipelines": {"tenant_id", "site_id", "pipeline_id"},
+}
+
+// Keys returns the registered ORDER BY key of a replacing table, or nil.
+func Keys(table string) []string {
+	return replacingKeys[table]
 }
 
 // LatestRows renders a derived table that collapses table to one row per
@@ -37,14 +69,26 @@ var replacingKeys = map[string][]string{
 // The result is a parenthesised sub-select intended to replace a bare table
 // name in a FROM clause; give it an alias at the call site.
 //
-// where is applied inside the derived table, before the collapse. Every
-// column it names must exist on table, but it need not be part of the key:
-// the non-key columns of a replacing row are stable across versions in
-// practice (a session's browser does not change between rollup passes), so
-// filtering before the collapse and after it agree.
+// where is applied inside the derived table, BEFORE the collapse, so it may
+// only name columns that are stable across versions — the key itself, or a
+// value no update path rewrites (a session's browser does not change between
+// rollup passes; an issue's group_hash does not change between bumps).
+//
+// A column an update path DOES rewrite — enabled, status, last_seen — must be
+// filtered by the caller OUTSIDE the derived table, against the alias. Filtering
+// such a column inside is the exact bug this helper exists to fix: a soft-delete
+// writes enabled='false' as a new version, and `WHERE enabled = 'true'` applied
+// before the collapse still matches the superseded row and resurrects it.
 //
 // cols must not include a key column — those are selected verbatim.
 func LatestRows(table string, cols []string, where string) string {
+	return "(" + LatestSelect(table, cols, where) + ")"
+}
+
+// LatestSelect is LatestRows without the enclosing parentheses, for callers
+// that run the collapse as a statement in its own right rather than splicing it
+// into a FROM clause.
+func LatestSelect(table string, cols []string, where string) string {
 	keys, ok := replacingKeys[table]
 	if !ok {
 		panic("query: no ReplacingMergeTree key registered for table " + table)
@@ -57,6 +101,6 @@ func LatestRows(table string, cols []string, where string) string {
 	if strings.TrimSpace(where) == "" {
 		where = "1 = 1"
 	}
-	return fmt.Sprintf("(SELECT %s FROM %s WHERE %s GROUP BY %s)",
+	return fmt.Sprintf("SELECT %s FROM %s WHERE %s GROUP BY %s",
 		strings.Join(sel, ", "), table, where, strings.Join(keys, ", "))
 }

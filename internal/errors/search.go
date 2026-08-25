@@ -161,10 +161,8 @@ func (s *SearchService) SearchIssues(ctx context.Context, siteID, query string, 
 	var issues []Issue
 	for _, id := range issueIDs {
 		rows, err := nucleus.Query[Issue](ctx, s.db.SQL(),
-			`SELECT issue_id, tenant_id, site_id, group_hash, title, culprit, level, status,
-				first_seen, last_seen, event_count, user_count, release_tag, version
-			 FROM issues
-			 WHERE issue_id = $1 AND site_id = $2`,
+			`SELECT `+issueSelectCols+`
+			 FROM `+issuesLatest("issue_id = $1 AND site_id = $2"),
 			id, siteID,
 		)
 		if err == nil && len(rows) > 0 {

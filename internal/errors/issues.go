@@ -10,7 +10,38 @@ import (
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/query"
 )
+
+// issues is a ReplacingMergeTree keyed on (tenant_id, site_id, issue_id) whose
+// rows are rewritten on every error batch. Nucleus does not reliably collapse
+// the superseded versions, so both halves of every access have to be explicit:
+//
+//   - a READ collapses with argMax over version (issuesLatest) — otherwise it
+//     returns an arbitrary version, and a status set by UpdateStatus is invisible.
+//   - a WRITE reads through that same collapse before it inserts, so exactly one
+//     row is written. The previous shape was
+//     `INSERT INTO issues SELECT ... FROM issues WHERE issue_id = $1`, which
+//     inserts one row per row already present: measured on a scratch Nucleus,
+//     the physical count for a single issue went 1, 2, 4, 8 … 4096 over twelve
+//     bumps. Live, that reached 16,847,389 rows.
+var issueCols = []string{
+	"group_hash", "title", "culprit", "level", "status",
+	"first_seen", "last_seen", "event_count", "user_count",
+	"release_tag", "version",
+}
+
+// issuesLatest renders the collapsed derived table, aliased `issues` so the
+// surrounding query reads unchanged. where is applied before the collapse, so
+// pass only version-stable predicates (the key, or group_hash); status and
+// last_seen change between versions and must be filtered outside.
+func issuesLatest(where string) string {
+	return query.LatestRows("issues", issueCols, where) + " AS issues"
+}
+
+const issueSelectCols = `issue_id, tenant_id, site_id, group_hash, title, culprit, level, status,
+			first_seen, last_seen, event_count, user_count, release_tag, version`
 
 // IssueService manages error grouping, issue creation, and the grouphash-to-issue KV cache.
 type IssueService struct {
@@ -105,10 +136,8 @@ func (s *IssueService) ResolveIssue(ctx context.Context, siteID, groupHash, titl
 
 func (s *IssueService) findIssueByHash(ctx context.Context, siteID, groupHash string) (*Issue, error) {
 	rows, err := nucleus.Query[Issue](ctx, s.db.SQL(),
-		`SELECT issue_id, tenant_id, site_id, group_hash, title, culprit, level, status,
-			first_seen, last_seen, event_count, user_count, release_tag, version
-		 FROM issues
-		 WHERE site_id = $1 AND group_hash = $2`,
+		`SELECT `+issueSelectCols+`
+		 FROM `+issuesLatest("site_id = $1 AND group_hash = $2"),
 		siteID, groupHash,
 	)
 	if err != nil || len(rows) == 0 {
@@ -125,8 +154,7 @@ func (s *IssueService) bumpIssue(ctx context.Context, issueID, siteID string, la
 		`INSERT INTO issues (issue_id, tenant_id, site_id, group_hash, title, culprit, level, status, first_seen, last_seen, event_count, user_count, release_tag, version)
 		 SELECT issue_id, tenant_id, site_id, group_hash, title, culprit, level, status,
 			first_seen, $3 AS last_seen, $4 AS event_count, user_count, release_tag, $5 AS version
-		 FROM issues
-		 WHERE issue_id = $1 AND site_id = $2`,
+		 FROM `+issuesLatest("issue_id = $1 AND site_id = $2"),
 		issueID, siteID, lastSeenStr, newCountStr, now,
 	)
 	return err
@@ -139,8 +167,7 @@ func (s *IssueService) UpdateStatus(ctx context.Context, issueID, siteID, status
 		`INSERT INTO issues (issue_id, tenant_id, site_id, group_hash, title, culprit, level, status, first_seen, last_seen, event_count, user_count, release_tag, version)
 		 SELECT issue_id, tenant_id, site_id, group_hash, title, culprit, level, $3 AS status,
 			first_seen, last_seen, event_count, user_count, release_tag, $4 AS version
-		 FROM issues
-		 WHERE issue_id = $1 AND site_id = $2`,
+		 FROM `+issuesLatest("issue_id = $1 AND site_id = $2"),
 		issueID, siteID, status, now,
 	)
 	return err
@@ -154,21 +181,22 @@ func (s *IssueService) ListIssues(ctx context.Context, siteID, status string, li
 	if offset < 0 {
 		offset = 0
 	}
+	// status and last_seen are rewritten by UpdateStatus / bumpIssue, so both
+	// the filter and the sort have to run on the collapsed row: filtering
+	// status inside the derived table would match a superseded version and
+	// list an issue that has since been resolved.
 	var q string
 	var params []any
 	if status != "" {
-		q = fmt.Sprintf(`SELECT issue_id, tenant_id, site_id, group_hash, title, culprit, level, status,
-			first_seen, last_seen, event_count, user_count, release_tag, version
-		 FROM issues
-		 WHERE site_id = $1 AND status = $2
+		q = fmt.Sprintf(`SELECT `+issueSelectCols+`
+		 FROM `+issuesLatest("site_id = $1")+`
+		 WHERE status = $2
 		 ORDER BY last_seen DESC
 		 LIMIT %d OFFSET %d`, limit, offset)
 		params = []any{siteID, status}
 	} else {
-		q = fmt.Sprintf(`SELECT issue_id, tenant_id, site_id, group_hash, title, culprit, level, status,
-			first_seen, last_seen, event_count, user_count, release_tag, version
-		 FROM issues
-		 WHERE site_id = $1
+		q = fmt.Sprintf(`SELECT `+issueSelectCols+`
+		 FROM `+issuesLatest("site_id = $1")+`
 		 ORDER BY last_seen DESC
 		 LIMIT %d OFFSET %d`, limit, offset)
 		params = []any{siteID}
@@ -191,10 +219,8 @@ func (s *IssueService) ListIssues(ctx context.Context, siteID, status string, li
 // GetIssue returns a single issue by ID.
 func (s *IssueService) GetIssue(ctx context.Context, issueID, siteID string) (*Issue, error) {
 	rows, err := nucleus.Query[Issue](ctx, s.db.SQL(),
-		`SELECT issue_id, tenant_id, site_id, group_hash, title, culprit, level, status,
-			first_seen, last_seen, event_count, user_count, release_tag, version
-		 FROM issues
-		 WHERE issue_id = $1 AND site_id = $2`,
+		`SELECT `+issueSelectCols+`
+		 FROM `+issuesLatest("issue_id = $1 AND site_id = $2"),
 		issueID, siteID,
 	)
 	if err != nil {
