@@ -11,7 +11,15 @@
 -- only for tables listed in the data directory's engines.json, and every table
 -- older than that file is absent from it — so the SELECT saw every version and
 -- the physical row count DOUBLED on each bump. Measured on a scratch Nucleus
--- v0.1.8: 1, 2, 4, 8 … 4096 over twelve bumps. On the live instance `issues`
+-- v0.1.8: 1, 2, 4, 8 ... 4096 over twelve bumps. On the live instance `issues`
+--
+-- That "..." is deliberately ASCII. A non-ASCII character followed by a NUMBER
+-- inside a `--` comment panics the Nucleus v0.1.8 SQL lexer and drops the
+-- connection ("unexpected EOF"), which made this migration fail on every fresh
+-- install and would have crash-looped the next deploy of the live instance.
+-- `... 4096` is fine, `<multi-byte char> 4096` is not; the same character
+-- followed by a word is harmless, which is why 033 survives its em dashes.
+-- TestMigrationsAvoidNucleusLexerPanic pins this.
 -- reached 16,847,389 rows, essentially all of them one issue at 2^24.
 --
 -- UpdateStatus had the same shape, and every read of the table took an
@@ -37,9 +45,18 @@
 -- This runs automatically on the next start, inside one transaction, before
 -- the HTTP listeners bind: the container looks wedged while it works and
 -- nothing serves traffic until it finishes. Budget MINUTES, not seconds, on a
--- table of the live instance's size. A failure rolls the whole thing back —
--- there is no half-copied state and no data loss — but the process exits, so
--- on a container that is a restart loop rather than a broken table.
+-- table of the live instance's size. A failure exits the process, so on a
+-- container that is a restart loop.
+--
+-- It does NOT roll cleanly back. An earlier version of this note claimed it
+-- did; that is wrong and was verified wrong against Nucleus v0.1.8. DDL is not
+-- transactional there: `BEGIN; ALTER TABLE t RENAME TO t2; ROLLBACK;` leaves
+-- the table renamed. So if the copy fails, `issues` is the new EMPTY table and
+-- every row is in `issues_pre034`. No data is lost, but the errors UI reads
+-- empty until you recover, and the restart will fail differently because the
+-- rename target already exists. Recovery: DROP the empty `issues`, rename
+-- `issues_pre034` back, and re-run with more memory (or use the by-hand
+-- procedure in the runbook).
 --
 -- The collapse materialises every row it groups over, and Nucleus caps a
 -- single query's working set at 75% of server.max_memory_mb. Measured: 200,000
