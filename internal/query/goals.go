@@ -53,8 +53,23 @@ func (s *StatsService) ListGoals(ctx context.Context, siteID string) ([]Goal, er
 		 FROM goals WHERE site_id = $1 ORDER BY created_at DESC`, siteID)
 }
 
-func (s *StatsService) DeleteGoal(ctx context.Context, goalID string) error {
-	// ReplacingMergeTree: can't delete, so just let it be (or disable via a field)
+// DeleteGoal removes a goal. It used to `return nil` without touching the
+// database, on the belief that a ReplacingMergeTree cannot delete; it can —
+// DELETE removes the physical rows, which is what the rollup jobs already rely
+// on to clear a window before rewriting it. Scoped by site_id so a caller
+// cannot delete another site's goal by guessing its id.
+//
+// goals has no `enabled` column, so a soft delete is not available here and a
+// hard delete is the right shape: nothing references a goal_id, and the
+// conversion counts are computed from events, not stored against the goal.
+func (s *StatsService) DeleteGoal(ctx context.Context, siteID, goalID string) error {
+	_, err := s.db.SQL().Exec(ctx,
+		`DELETE FROM goals WHERE goal_id = $1 AND site_id = $2`,
+		goalID, siteID,
+	)
+	if err != nil {
+		return fmt.Errorf("delete goal: %w", err)
+	}
 	return nil
 }
 

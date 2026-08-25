@@ -91,7 +91,8 @@ func (s *FlagService) List(ctx context.Context, siteID string) ([]FeatureFlag, e
 	return nucleus.Query[FeatureFlag](ctx, s.db.SQL(),
 		`SELECT flag_id, tenant_id, site_id, flag_key, name, description, flag_type, enabled, rollout_pct,
 			COALESCE(variants, '') AS variants, COALESCE(targeting, '') AS targeting, created_at, version
-		 FROM feature_flags WHERE site_id = $1 ORDER BY created_at DESC`, siteID)
+		 FROM `+flagsLatest("site_id = $1")+`
+		 ORDER BY created_at DESC`, siteID)
 }
 
 // FlagHistoryEntry captures a change to a flag for the audit log.
@@ -147,7 +148,7 @@ func (s *FlagService) Toggle(ctx context.Context, flagID string, enabled bool) e
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO feature_flags (flag_id, tenant_id, site_id, flag_key, name, description, flag_type, enabled, rollout_pct, variants, targeting, created_at, version)
 		 SELECT flag_id, tenant_id, site_id, flag_key, name, description, flag_type, $2, rollout_pct, NULLIF(CAST(variants AS TEXT), ''), NULLIF(CAST(targeting AS TEXT), ''), created_at, $3
-		 FROM feature_flags WHERE flag_id = $1`,
+		 FROM `+flagsLatest("flag_id = $1"),
 		flagID, val, now)
 	if err != nil {
 		return err
@@ -234,7 +235,7 @@ func (s *FlagService) Evaluate(ctx context.Context, siteID, flagKey, userID stri
 	rows, err := nucleus.Query[FeatureFlag](ctx, s.db.SQL(),
 		`SELECT flag_id, tenant_id, site_id, flag_key, name, description, flag_type, enabled, rollout_pct,
 			COALESCE(variants, '') AS variants, COALESCE(targeting, '') AS targeting, created_at, version
-		 FROM feature_flags WHERE site_id = $1 AND flag_key = $2`, siteID, flagKey)
+		 FROM `+flagsLatest("site_id = $1 AND flag_key = $2"), siteID, flagKey)
 	if err != nil || len(rows) == 0 {
 		return &EvaluationResult{Enabled: false}, nil
 	}

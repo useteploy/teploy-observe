@@ -72,7 +72,8 @@ func (s *SurveyService) List(ctx context.Context, siteID string) ([]Survey, erro
 		`SELECT survey_id, tenant_id, site_id, name, COALESCE(questions, '') AS questions,
 			COALESCE(appearance, '') AS appearance, COALESCE(targeting, '') AS targeting,
 			status, created_at, version
-		 FROM surveys WHERE site_id = $1 ORDER BY created_at DESC`, siteID)
+		 FROM `+surveysLatest("site_id = $1")+`
+		 ORDER BY created_at DESC`, siteID)
 }
 
 func (s *SurveyService) Activate(ctx context.Context, surveyID string) error {
@@ -80,7 +81,7 @@ func (s *SurveyService) Activate(ctx context.Context, surveyID string) error {
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO surveys (survey_id, tenant_id, site_id, name, questions, appearance, targeting, status, created_at, version)
 		 SELECT survey_id, tenant_id, site_id, name, NULLIF(CAST(questions AS TEXT), ''), NULLIF(CAST(appearance AS TEXT), ''), NULLIF(CAST(targeting AS TEXT), ''), 'active', created_at, $2
-		 FROM surveys WHERE survey_id = $1`,
+		 FROM `+surveysLatest("survey_id = $1"),
 		surveyID, now)
 	return err
 }
@@ -90,7 +91,7 @@ func (s *SurveyService) Close(ctx context.Context, surveyID string) error {
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO surveys (survey_id, tenant_id, site_id, name, questions, appearance, targeting, status, created_at, version)
 		 SELECT survey_id, tenant_id, site_id, name, NULLIF(CAST(questions AS TEXT), ''), NULLIF(CAST(appearance AS TEXT), ''), NULLIF(CAST(targeting AS TEXT), ''), 'closed', created_at, $2
-		 FROM surveys WHERE survey_id = $1`,
+		 FROM `+surveysLatest("survey_id = $1"),
 		surveyID, now)
 	return err
 }
@@ -101,7 +102,8 @@ func (s *SurveyService) GetActive(ctx context.Context, siteID string) ([]Survey,
 		`SELECT survey_id, tenant_id, site_id, name, COALESCE(questions, '') AS questions,
 			COALESCE(appearance, '') AS appearance, COALESCE(targeting, '') AS targeting,
 			status, created_at, version
-		 FROM surveys WHERE site_id = $1 AND status = 'active'`, siteID)
+		 FROM `+surveysLatest("site_id = $1")+`
+		 WHERE status = 'active'`, siteID)
 }
 
 // SubmitResponse records a survey response.
@@ -114,7 +116,7 @@ func (s *SurveyService) SubmitResponse(ctx context.Context, surveyID, siteID, us
 		Status string `db:"status"`
 	}
 	sv, err := nucleus.Query[svRow](ctx, s.db.SQL(),
-		"SELECT site_id, status FROM surveys WHERE survey_id = $1", surveyID)
+		"SELECT site_id, status FROM "+surveysLatest("survey_id = $1"), surveyID)
 	if err != nil || len(sv) == 0 {
 		return "", fmt.Errorf("survey not found")
 	}
