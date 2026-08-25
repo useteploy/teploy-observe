@@ -58,7 +58,7 @@ func (r *RollupService) RunHourlyRollup(ctx context.Context) error {
 
 	// Bucket size inlined in SQL (can't use parameter — Exec uses extended protocol
 	// which types string params as TEXT, and Nucleus can't divide BIGINT by TEXT)
-	_, err := sql.Exec(ctx, fmt.Sprintf(`
+	_, err := sql.Exec(ctx, `
 		INSERT INTO stats_hourly (
 			tenant_id, site_id, ts_bucket, pathname, event_type,
 			pageviews, visitors, sessions, bounces, total_duration,
@@ -78,7 +78,7 @@ func (r *RollupService) RunHourlyRollup(ctx context.Context) error {
 			$3 AS version
 		FROM events
 		WHERE timestamp >= $1 AND timestamp < $2
-		GROUP BY tenant_id, site_id, (CAST(timestamp AS BIGINT) / 3600000) * 3600000, pathname, event_type`),
+		GROUP BY tenant_id, site_id, (CAST(timestamp AS BIGINT) / 3600000) * 3600000, pathname, event_type`,
 		startMs, endMs, version,
 	)
 	if err != nil {
@@ -113,7 +113,7 @@ func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 		return fmt.Errorf("daily rollup: clear window: %w", err)
 	}
 
-	_, err := sql.Exec(ctx, fmt.Sprintf(`
+	_, err := sql.Exec(ctx, `
 		INSERT INTO stats_daily (
 			tenant_id, site_id, ts_bucket, pathname, event_type,
 			referrer, browser, os, country, device,
@@ -145,7 +145,7 @@ func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 		WHERE timestamp >= $1 AND timestamp < $2
 		GROUP BY tenant_id, site_id, (CAST(timestamp AS BIGINT) / 86400000) * 86400000, pathname, event_type,
 		         referrer, browser, os, country, device,
-		         utm_source, utm_medium, utm_campaign`),
+		         utm_source, utm_medium, utm_campaign`,
 		startMs, endMs, version,
 	)
 	if err != nil {
