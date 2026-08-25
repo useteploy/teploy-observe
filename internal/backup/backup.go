@@ -26,6 +26,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/query"
 )
 
 // Tables is the ordered list of tables included in a full backup.
@@ -171,7 +173,17 @@ func dumpTable(ctx context.Context, db *nucleus.Client, tw *tar.Writer, table st
 	// Nucleus ships everything as text via SimpleProtocol. Read raw bytes so
 	// we sidestep pgx's built-in type decoding (which chokes on Nucleus's
 	// JSONB representation). Rows are serialized as {column: "textvalue"|null}.
-	rows, err := db.Pool().Query(ctx, "SELECT * FROM "+table, pgx.QueryExecModeSimpleProtocol)
+	//
+	// A ReplacingMergeTree is captured collapsed: `SELECT *` returns every
+	// superseded version, and restore re-inserted all of them, so a backup
+	// carried (and a restore recreated) the same duplicate rows the read path
+	// now has to work around — a soft-deleted webhook came back alive if an
+	// older enabled='true' version happened to be re-read first.
+	sel, err := latestSelect(ctx, db, table)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := db.Pool().Query(ctx, sel, pgx.QueryExecModeSimpleProtocol)
 	if err != nil {
 		if strings.Contains(err.Error(), "does not exist") || strings.Contains(err.Error(), "unknown table") {
 			return 0, nil
@@ -256,4 +268,85 @@ func writeEntry(tw *tar.Writer, name string, data []byte) error {
 		return fmt.Errorf("tar write %s: %w", name, err)
 	}
 	return nil
+}
+
+// latestSelect returns the statement that dumps one table. For a plain table
+// that is `SELECT * FROM t`. For a ReplacingMergeTree whose ORDER BY key is
+// registered in internal/query, it is the argMax collapse — one row per key,
+// carrying the highest-version value of every other column.
+//
+// The column list is discovered at runtime rather than hard-coded: several of
+// these tables gained columns in later migrations (cron_monitors.ping_token in
+// 026, sessions.release_tag in 019), and a backup that silently dropped a
+// column would be worse than one that carries duplicates. Nucleus has no
+// pg_catalog, so the lookup goes through information_schema. If the lookup
+// returns nothing — the table does not exist on this instance, or carries no
+// `version` column — the plain `SELECT *` is used and dumpTable's existing
+// missing-table handling applies.
+func latestSelect(ctx context.Context, db *nucleus.Client, table string) (string, error) {
+	keys := query.Keys(table)
+	if len(keys) == 0 {
+		return "SELECT * FROM " + table, nil
+	}
+	cols, err := tableColumns(ctx, db, table)
+	if err != nil || len(cols) == 0 {
+		// Not a hard failure: fall back to the uncollapsed dump rather than
+		// lose the table from the archive.
+		return "SELECT * FROM " + table, nil
+	}
+	isKey := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		isKey[k] = true
+	}
+	var hasVersion bool
+	var nonKey []string
+	for _, c := range cols {
+		if c == "version" {
+			hasVersion = true
+		}
+		if !isKey[c] {
+			nonKey = append(nonKey, c)
+		}
+	}
+	if !hasVersion {
+		return "SELECT * FROM " + table, nil
+	}
+	for _, k := range keys {
+		if !contains(cols, k) {
+			// The registered key does not match this instance's schema; a
+			// GROUP BY on a missing column would silently group everything
+			// into one row, so refuse the collapse rather than corrupt.
+			return "SELECT * FROM " + table, nil
+		}
+	}
+	return query.LatestSelect(table, nonKey, ""), nil
+}
+
+func contains(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+type columnRow struct {
+	ColumnName string `db:"column_name"`
+}
+
+func tableColumns(ctx context.Context, db *nucleus.Client, table string) ([]string, error) {
+	rows, err := nucleus.Query[columnRow](ctx, db.SQL(),
+		`SELECT column_name FROM information_schema.columns WHERE table_name = $1`,
+		table)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if r.ColumnName != "" {
+			out = append(out, r.ColumnName)
+		}
+	}
+	return out, nil
 }
