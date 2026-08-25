@@ -119,8 +119,9 @@ func listSavedFunnelsHandler(svc *views.ViewService) neutron.HandlerFunc[listSav
 		}
 		out := make([]SavedFunnel, 0)
 		for _, v := range all {
-			// Skip views with empty config (deletes leave a tombstone row
-			// per views.Delete's INSERT-tombstone pattern).
+			// Skip views with empty config. views.Delete hard-deletes now, but
+			// installs that ran the old INSERT-tombstone delete still carry
+			// blank rows on disk.
 			if v.Name == "" || v.ViewConfig == "" {
 				continue
 			}

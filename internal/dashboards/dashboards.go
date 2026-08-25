@@ -91,66 +91,33 @@ func (s *DashboardService) Create(ctx context.Context, siteID, name, description
 }
 
 func (s *DashboardService) List(ctx context.Context, siteID string) ([]Dashboard, error) {
-	rows, err := nucleus.Query[Dashboard](ctx, s.db.SQL(),
+	// The tombstone filter runs outside the collapse — see replacing.go.
+	return nucleus.Query[Dashboard](ctx, s.db.SQL(),
 		`SELECT dashboard_id, tenant_id, site_id, name, description, created_by, created_at, version
-		 FROM dashboards WHERE site_id = $1 ORDER BY created_at DESC`, siteID)
-	if err != nil {
-		return nil, err
-	}
-	// Nucleus ReplacingMergeTree read-time dedup is unreliable, so keep the
-	// max-version row per id in Go and drop soft-deleted tombstones (name == '').
-	latest := map[string]Dashboard{}
-	for _, d := range rows {
-		if cur, ok := latest[d.DashboardID]; !ok || versionLess(cur.Version, d.Version) {
-			latest[d.DashboardID] = d
-		}
-	}
-	out := make([]Dashboard, 0, len(latest))
-	for _, d := range rows { // preserve created_at DESC order, one entry per id
-		if l, ok := latest[d.DashboardID]; ok && d.Version == l.Version {
-			if l.Name != "" {
-				out = append(out, l)
-			}
-			delete(latest, d.DashboardID)
-		}
-	}
-	return out, nil
+		 FROM `+dashboardsLatest("site_id = $1")+`
+		 WHERE name != ''
+		 ORDER BY created_at DESC`, siteID)
 }
 
 func (s *DashboardService) Get(ctx context.Context, dashboardID string) (*Dashboard, error) {
 	rows, err := nucleus.Query[Dashboard](ctx, s.db.SQL(),
 		`SELECT dashboard_id, tenant_id, site_id, name, description, created_by, created_at, version
-		 FROM dashboards WHERE dashboard_id = $1`, dashboardID)
+		 FROM `+dashboardsLatest("dashboard_id = $1")+`
+		 WHERE name != ''`, dashboardID)
 	if err != nil || len(rows) == 0 {
 		return nil, err
 	}
-	best := rows[0]
-	for _, d := range rows[1:] {
-		if versionLess(best.Version, d.Version) {
-			best = d
-		}
-	}
-	if best.Name == "" { // soft-deleted tombstone
-		return nil, nil
-	}
-	return &best, nil
-}
-
-// versionLess reports whether numeric version a < b (versions are millisecond
-// epoch strings).
-func versionLess(a, b string) bool {
-	ai, _ := strconv.ParseInt(a, 10, 64)
-	bi, _ := strconv.ParseInt(b, 10, 64)
-	return ai < bi
+	return &rows[0], nil
 }
 
 func (s *DashboardService) Delete(ctx context.Context, dashboardID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
-	// Soft delete by setting name to empty with higher version
+	// Soft delete by setting name to empty with higher version. Reading through
+	// the collapse is what keeps this to one row per call.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO dashboards (dashboard_id, tenant_id, site_id, name, description, created_by, created_at, version)
 		 SELECT dashboard_id, tenant_id, site_id, '', description, created_by, created_at, $2
-		 FROM dashboards WHERE dashboard_id = $1`,
+		 FROM `+dashboardsLatest("dashboard_id = $1"),
 		dashboardID, now)
 	return err
 }
@@ -238,19 +205,16 @@ func (s *DashboardService) AddPanel(ctx context.Context, dashboardID string, pan
 }
 
 func (s *DashboardService) ListPanels(ctx context.Context, dashboardID string) ([]Panel, error) {
-	// dashboard_panels is ReplacingMergeTree (insert-on-update). De-dupe to the
-	// highest-version row per panel_id so edits take effect.
+	// dashboard_panels is ReplacingMergeTree (insert-on-update). Collapse to the
+	// highest-version row per panel so edits take effect. This replaces a
+	// correlated `version = (SELECT MAX(version) FROM dashboard_panels dp2 ...)`
+	// — the same collapse, expressed as a per-row subquery, and one more place a
+	// stale version could win.
 	return nucleus.Query[Panel](ctx, s.db.SQL(),
 		`SELECT panel_id, tenant_id, dashboard_id, panel_type, title, query_type,
 			COALESCE(query_config, '') AS query_config,
 			position_x, position_y, width, height, version
-		 FROM dashboard_panels
-		 WHERE dashboard_id = $1
-		   AND CAST(version AS BIGINT) = (
-		     SELECT MAX(CAST(version AS BIGINT))
-		     FROM dashboard_panels dp2
-		     WHERE dp2.panel_id = dashboard_panels.panel_id
-		   )
+		 FROM `+panelsLatest("dashboard_id = $1")+`
 		 ORDER BY CAST(position_y AS BIGINT), CAST(position_x AS BIGINT)`, dashboardID)
 }
 
@@ -270,7 +234,7 @@ func (s *DashboardService) DeletePanel(ctx context.Context, panelID string) erro
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO dashboard_panels (panel_id, tenant_id, dashboard_id, panel_type, title, query_type, query_config, position_x, position_y, width, height, version)
 		 SELECT panel_id, tenant_id, dashboard_id, '', '', '', NULL, '0', '0', '0', '0', $2
-		 FROM dashboard_panels WHERE panel_id = $1`,
+		 FROM `+panelsLatest("panel_id = $1"),
 		panelID, now)
 	return err
 }

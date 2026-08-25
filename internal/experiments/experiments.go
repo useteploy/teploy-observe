@@ -82,7 +82,7 @@ func (s *ExperimentService) List(ctx context.Context, siteID string) ([]Experime
 		`SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample,
 			COALESCE(variants, '') AS variants,
 			started_at, ended_at, created_at, version
-		 FROM experiments WHERE site_id = $1 ORDER BY created_at DESC`, siteID)
+		 FROM `+experimentsLatest("site_id = $1")+` ORDER BY created_at DESC`, siteID)
 }
 
 func (s *ExperimentService) Start(ctx context.Context, experimentID string) error {
@@ -90,7 +90,7 @@ func (s *ExperimentService) Start(ctx context.Context, experimentID string) erro
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO experiments (experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample, variants, started_at, ended_at, created_at, version)
 		 SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, 'running', min_sample, variants, $2, '0', created_at, $3
-		 FROM experiments WHERE experiment_id = $1`,
+		 FROM `+experimentsLatest("experiment_id = $1"),
 		experimentID, now, now)
 	return err
 }
@@ -100,7 +100,7 @@ func (s *ExperimentService) Stop(ctx context.Context, experimentID string) error
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO experiments (experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample, variants, started_at, ended_at, created_at, version)
 		 SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, 'completed', min_sample, variants, started_at, $2, created_at, $3
-		 FROM experiments WHERE experiment_id = $1`,
+		 FROM `+experimentsLatest("experiment_id = $1"),
 		experimentID, now, now)
 	return err
 }
@@ -150,7 +150,7 @@ func (s *ExperimentService) Results(ctx context.Context, experimentID, siteID st
 		`SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample,
 			COALESCE(variants, '') AS variants,
 			started_at, ended_at, created_at, version
-		 FROM experiments WHERE experiment_id = $1 AND site_id = $2`, experimentID, siteID)
+		 FROM `+experimentsLatest("experiment_id = $1 AND site_id = $2"), experimentID, siteID)
 	if err != nil || len(exps) == 0 {
 		return nil, fmt.Errorf("experiment not found")
 	}

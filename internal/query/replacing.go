@@ -50,11 +50,14 @@ var replacingKeys = map[string][]string{
 	"dashboard_panels": {"tenant_id", "dashboard_id", "panel_id"},
 	// 006_wave1
 	"integrations":     {"tenant_id", "site_id", "integration_id"},
+	"saved_views":      {"tenant_id", "site_id", "view_id"},
 	"report_schedules": {"tenant_id", "site_id", "schedule_id"},
 	// 007_wave2
 	"feature_flags": {"tenant_id", "site_id", "flag_id"},
 	"experiments":   {"tenant_id", "site_id", "experiment_id"},
 	"surveys":       {"tenant_id", "site_id", "survey_id"},
+	// 008_wave4 — sso_configs is instance-wide, so its key carries no site_id.
+	"sso_configs": {"tenant_id", "sso_id"},
 	// 009_llm_infra
 	"log_pipelines": {"tenant_id", "site_id", "pipeline_id"},
 }

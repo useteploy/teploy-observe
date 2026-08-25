@@ -60,7 +60,7 @@ func (s *SSOService) List(ctx context.Context) ([]SSOConfig, error) {
 	return nucleus.Query[SSOConfig](ctx, s.db.SQL(),
 		`SELECT sso_id, tenant_id, provider, entity_id, sso_url, certificate,
 			COALESCE(attribute_map, '') AS attribute_map, enabled, created_at, version
-		 FROM sso_configs ORDER BY created_at DESC`)
+		 FROM `+ssoConfigsLatest("")+` ORDER BY created_at DESC`)
 }
 
 func (s *SSOService) Enable(ctx context.Context, ssoID string) error {
@@ -68,7 +68,7 @@ func (s *SSOService) Enable(ctx context.Context, ssoID string) error {
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO sso_configs (sso_id, tenant_id, provider, entity_id, sso_url, certificate, attribute_map, enabled, created_at, version)
 		 SELECT sso_id, tenant_id, provider, entity_id, sso_url, certificate, NULLIF(CAST(attribute_map AS TEXT), ''), 'true', created_at, $2
-		 FROM sso_configs WHERE sso_id = $1`,
+		 FROM `+ssoConfigsLatest("sso_id = $1"),
 		ssoID, now)
 	return err
 }
