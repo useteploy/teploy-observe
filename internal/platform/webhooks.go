@@ -80,7 +80,9 @@ func (s *WebhookService) Create(ctx context.Context, siteID, name, webhookType, 
 func (s *WebhookService) List(ctx context.Context, siteID string) ([]Webhook, error) {
 	return nucleus.Query[Webhook](ctx, s.db.SQL(),
 		`SELECT webhook_id, tenant_id, site_id, name, webhook_type, url, secret, enabled, created_at, version
-		 FROM webhooks WHERE site_id = $1 AND enabled = 'true' ORDER BY created_at DESC`, siteID)
+		 FROM `+webhooksLatest("site_id = $1")+`
+		 WHERE enabled = 'true'
+		 ORDER BY created_at DESC`, siteID)
 }
 
 func (s *WebhookService) Delete(ctx context.Context, webhookID string) error {
@@ -88,7 +90,7 @@ func (s *WebhookService) Delete(ctx context.Context, webhookID string) error {
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO webhooks (webhook_id, tenant_id, site_id, name, webhook_type, url, secret, enabled, created_at, version)
 		 SELECT webhook_id, tenant_id, site_id, name, webhook_type, url, secret, 'false', created_at, $2
-		 FROM webhooks WHERE webhook_id = $1`,
+		 FROM `+webhooksLatest("webhook_id = $1"),
 		webhookID, now,
 	)
 	return err

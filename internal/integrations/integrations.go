@@ -90,7 +90,9 @@ func (s *IntegrationService) Create(ctx context.Context, siteID, name, intType, 
 func (s *IntegrationService) List(ctx context.Context, siteID string) ([]Integration, error) {
 	return nucleus.Query[Integration](ctx, s.db.SQL(),
 		`SELECT integration_id, tenant_id, site_id, name, int_type, COALESCE(config, '') AS config, enabled, created_at, version
-		 FROM integrations WHERE site_id = $1 AND enabled = 'true' ORDER BY created_at DESC`, siteID)
+		 FROM `+integrationsLatest("site_id = $1")+`
+		 WHERE enabled = 'true'
+		 ORDER BY created_at DESC`, siteID)
 }
 
 func (s *IntegrationService) Delete(ctx context.Context, integrationID string) error {
@@ -98,7 +100,7 @@ func (s *IntegrationService) Delete(ctx context.Context, integrationID string) e
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO integrations (integration_id, tenant_id, site_id, name, int_type, config, enabled, created_at, version)
 		 SELECT integration_id, tenant_id, site_id, name, int_type, NULLIF(CAST(config AS TEXT), ''), 'false', created_at, $2
-		 FROM integrations WHERE integration_id = $1`,
+		 FROM `+integrationsLatest("integration_id = $1"),
 		integrationID, now)
 	return err
 }
@@ -187,7 +189,8 @@ func (s *IntegrationService) Test(ctx context.Context, integrationID string) err
 	rows, err := nucleus.Query[Integration](ctx, s.db.SQL(),
 		`SELECT integration_id, tenant_id, site_id, name, int_type,
 		        COALESCE(config, '') AS config, enabled, created_at, version
-		 FROM integrations WHERE integration_id = $1`, integrationID)
+		 FROM `+integrationsLatest("integration_id = $1")+`
+		 WHERE enabled = 'true'`, integrationID)
 	if err != nil {
 		return fmt.Errorf("lookup integration: %w", err)
 	}
@@ -258,7 +261,8 @@ func (s *IntegrationService) Replay(ctx context.Context, deliveryID string) erro
 	intgs, err := nucleus.Query[Integration](ctx, s.db.SQL(),
 		`SELECT integration_id, tenant_id, site_id, name, int_type,
 		        COALESCE(config, '') AS config, enabled, created_at, version
-		 FROM integrations WHERE integration_id = $1`, rows[0].IntegrationID)
+		 FROM `+integrationsLatest("integration_id = $1")+`
+		 WHERE enabled = 'true'`, rows[0].IntegrationID)
 	if err != nil {
 		return fmt.Errorf("lookup integration: %w", err)
 	}

@@ -60,7 +60,9 @@ func (s *ReportService) Create(ctx context.Context, siteID, name, frequency, rec
 func (s *ReportService) List(ctx context.Context, siteID string) ([]ReportSchedule, error) {
 	return nucleus.Query[ReportSchedule](ctx, s.db.SQL(),
 		`SELECT schedule_id, tenant_id, site_id, name, frequency, recipients, enabled, last_sent, created_at, version
-		 FROM report_schedules WHERE site_id = $1 AND enabled = 'true' ORDER BY created_at DESC`, siteID)
+		 FROM `+reportSchedulesLatest("site_id = $1")+`
+		 WHERE enabled = 'true'
+		 ORDER BY created_at DESC`, siteID)
 }
 
 func (s *ReportService) Delete(ctx context.Context, scheduleID string) error {
@@ -68,7 +70,7 @@ func (s *ReportService) Delete(ctx context.Context, scheduleID string) error {
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO report_schedules (schedule_id, tenant_id, site_id, name, frequency, recipients, enabled, last_sent, created_at, version)
 		 SELECT schedule_id, tenant_id, site_id, name, frequency, recipients, 'false', last_sent, created_at, $2
-		 FROM report_schedules WHERE schedule_id = $1`,
+		 FROM `+reportSchedulesLatest("schedule_id = $1"),
 		scheduleID, now)
 	return err
 }
@@ -89,7 +91,8 @@ type ReportData struct {
 func (s *ReportService) RunScheduled(ctx context.Context, smtpHost, smtpPort, smtpUser, smtpPass, fromEmail string) {
 	schedules, err := nucleus.Query[ReportSchedule](ctx, s.db.SQL(),
 		`SELECT schedule_id, tenant_id, site_id, name, frequency, recipients, enabled, last_sent, created_at, version
-		 FROM report_schedules WHERE enabled = 'true'`)
+		 FROM `+reportSchedulesLatest("")+`
+		 WHERE enabled = 'true'`)
 	if err != nil {
 		s.logger.Error("report scheduler query failed", "err", err)
 		return
@@ -135,12 +138,7 @@ func (s *ReportService) RunScheduled(ctx context.Context, smtpHost, smtpPort, sm
 		}
 
 		// Update last_sent (best-effort — failure means report may re-send next cycle)
-		nowStr := strconv.FormatInt(now.UnixMilli(), 10)
-		if _, err := s.db.SQL().Exec(ctx,
-			`INSERT INTO report_schedules (schedule_id, tenant_id, site_id, name, frequency, recipients, enabled, last_sent, created_at, version)
-			 SELECT schedule_id, tenant_id, site_id, name, frequency, recipients, enabled, $2, created_at, $3
-			 FROM report_schedules WHERE schedule_id = $1`,
-			sched.ScheduleID, nowStr, nowStr); err != nil {
+		if err := s.markSent(ctx, sched.ScheduleID, now.UnixMilli()); err != nil {
 			s.logger.Error("report last_sent update failed", "schedule", sched.Name, "err", err)
 		}
 
@@ -268,4 +266,19 @@ func genID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// markSent records that a schedule was delivered at atMs. It reads through the
+// latest-version collapse, so exactly one row is written no matter how many
+// versions the schedule has already accumulated — the previous shape read the
+// raw table and wrote one row per version, doubling the schedule's row count on
+// every send.
+func (s *ReportService) markSent(ctx context.Context, scheduleID string, atMs int64) error {
+	at := strconv.FormatInt(atMs, 10)
+	_, err := s.db.SQL().Exec(ctx,
+		`INSERT INTO report_schedules (schedule_id, tenant_id, site_id, name, frequency, recipients, enabled, last_sent, created_at, version)
+		 SELECT schedule_id, tenant_id, site_id, name, frequency, recipients, enabled, $2, created_at, $3
+		 FROM `+reportSchedulesLatest("schedule_id = $1"),
+		scheduleID, at, at)
+	return err
 }

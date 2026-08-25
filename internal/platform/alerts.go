@@ -98,7 +98,9 @@ func (s *AlertService) ListRules(ctx context.Context, siteID string) ([]AlertRul
 		`SELECT rule_id, site_id, name, metric, operator, threshold,
 			window_minutes, check_interval, cooldown, enabled, created_by,
 			CAST(created_at AS TEXT) AS created_at
-		 FROM alert_rules WHERE site_id = $1 ORDER BY created_at DESC`, siteID)
+		 FROM `+alertRulesLatest("site_id = $1")+`
+		 WHERE enabled = 'true'
+		 ORDER BY created_at DESC`, siteID)
 }
 
 func (s *AlertService) DeleteRule(ctx context.Context, ruleID string) error {
@@ -108,7 +110,7 @@ func (s *AlertService) DeleteRule(ctx context.Context, ruleID string) error {
 			window_minutes, check_interval, cooldown, enabled, created_by, created_at, version)
 		 SELECT rule_id, tenant_id, site_id, name, metric, operator, threshold,
 			window_minutes, check_interval, cooldown, 'false', created_by, created_at, $2
-		 FROM alert_rules WHERE rule_id = $1`,
+		 FROM `+alertRulesLatest("rule_id = $1"),
 		ruleID, now,
 	)
 	return err
@@ -173,7 +175,8 @@ func (s *AlertService) CheckRules(ctx context.Context) error {
 		`SELECT rule_id, site_id, name, metric, operator, threshold,
 			window_minutes, check_interval, cooldown, enabled, created_by,
 			CAST(created_at AS TEXT) AS created_at
-		 FROM alert_rules WHERE enabled = 'true'`)
+		 FROM `+alertRulesLatest("")+`
+		 WHERE enabled = 'true'`)
 	if err != nil {
 		return fmt.Errorf("check rules query: %w", err)
 	}

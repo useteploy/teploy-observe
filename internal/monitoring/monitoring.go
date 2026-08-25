@@ -125,7 +125,8 @@ func (s *UptimeService) ListMonitors(ctx context.Context, siteID string) ([]Moni
 	rows, err := nucleus.Query[Monitor](ctx, s.db.SQL(),
 		`SELECT monitor_id, tenant_id, site_id, name, url, method,
 			interval_secs, expected_status, enabled, created_at, version
-		 FROM uptime_monitors WHERE site_id = $1 AND enabled = 'true'
+		 FROM `+uptimeMonitorsLatest("site_id = $1")+`
+		 WHERE enabled = 'true'
 		 ORDER BY created_at DESC`, siteID)
 	if err != nil {
 		return nil, fmt.Errorf("monitoring: list monitors: %w", err)
@@ -146,7 +147,7 @@ func (s *UptimeService) DeleteMonitor(ctx context.Context, siteID, monitorID str
 			interval_secs, expected_status, enabled, created_at, version)
 		 SELECT monitor_id, tenant_id, site_id, name, url, method,
 			interval_secs, expected_status, 'false', created_at, $3
-		 FROM uptime_monitors WHERE monitor_id = $1 AND site_id = $2`,
+		 FROM `+uptimeMonitorsLatest("monitor_id = $1 AND site_id = $2"),
 		monitorID, siteID, now,
 	)
 	if err != nil {
@@ -205,7 +206,8 @@ func (s *UptimeService) RunChecks(ctx context.Context) error {
 	monitors, err := nucleus.Query[Monitor](ctx, s.db.SQL(),
 		`SELECT monitor_id, tenant_id, site_id, name, url, method,
 			interval_secs, expected_status, enabled, created_at, version
-		 FROM uptime_monitors WHERE enabled = 'true'`)
+		 FROM `+uptimeMonitorsLatest("")+`
+		 WHERE enabled = 'true'`)
 	if err != nil {
 		return fmt.Errorf("monitoring: run checks query: %w", err)
 	}
@@ -351,7 +353,8 @@ func (s *CronService) ListCrons(ctx context.Context, siteID string) ([]CronMonit
 	rows, err := nucleus.Query[CronMonitor](ctx, s.db.SQL(),
 		`SELECT cron_id, tenant_id, site_id, name, slug, schedule,
 			grace_period, enabled, COALESCE(ping_token, '') AS ping_token, created_at, version
-		 FROM cron_monitors WHERE site_id = $1 AND enabled = 'true'
+		 FROM `+cronMonitorsLatest("site_id = $1")+`
+		 WHERE enabled = 'true'
 		 ORDER BY created_at DESC`, siteID)
 	if err != nil {
 		return nil, fmt.Errorf("monitoring: list crons: %w", err)
@@ -372,7 +375,7 @@ func (s *CronService) DeleteCron(ctx context.Context, siteID, cronID string) err
 			grace_period, enabled, ping_token, created_at, version)
 		 SELECT cron_id, tenant_id, site_id, name, slug, schedule,
 			grace_period, 'false', ping_token, created_at, $3
-		 FROM cron_monitors WHERE cron_id = $1 AND site_id = $2`,
+		 FROM `+cronMonitorsLatest("cron_id = $1 AND site_id = $2"),
 		cronID, siteID, now,
 	)
 	if err != nil {
@@ -392,7 +395,8 @@ func (s *CronService) RecordCheckinByToken(ctx context.Context, token, status st
 	crons, err := nucleus.Query[CronMonitor](ctx, s.db.SQL(),
 		`SELECT cron_id, tenant_id, site_id, name, slug, schedule,
 			grace_period, enabled, COALESCE(ping_token, '') AS ping_token, created_at, version
-		 FROM cron_monitors WHERE ping_token = $1 AND enabled = 'true'`,
+		 FROM `+cronMonitorsLatest("ping_token = $1")+`
+		 WHERE enabled = 'true'`,
 		token)
 	if err != nil {
 		return fmt.Errorf("monitoring: lookup cron by token: %w", err)
@@ -410,7 +414,8 @@ func (s *CronService) RecordCheckin(ctx context.Context, siteID, slug, status st
 	crons, err := nucleus.Query[CronMonitor](ctx, s.db.SQL(),
 		`SELECT cron_id, tenant_id, site_id, name, slug, schedule,
 			grace_period, enabled, COALESCE(ping_token, '') AS ping_token, created_at, version
-		 FROM cron_monitors WHERE site_id = $1 AND slug = $2 AND enabled = 'true'`,
+		 FROM `+cronMonitorsLatest("site_id = $1 AND slug = $2")+`
+		 WHERE enabled = 'true'`,
 		siteID, slug)
 	if err != nil {
 		// Real backend failure — surface it so the handler returns 5xx and the
@@ -454,7 +459,8 @@ func (s *CronService) CheckMissed(ctx context.Context) ([]CronMonitor, error) {
 	crons, err := nucleus.Query[CronMonitor](ctx, s.db.SQL(),
 		`SELECT cron_id, tenant_id, site_id, name, slug, schedule,
 			grace_period, enabled, COALESCE(ping_token, '') AS ping_token, created_at, version
-		 FROM cron_monitors WHERE enabled = 'true'`)
+		 FROM `+cronMonitorsLatest("")+`
+		 WHERE enabled = 'true'`)
 	if err != nil {
 		return nil, fmt.Errorf("monitoring: check missed query: %w", err)
 	}

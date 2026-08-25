@@ -106,7 +106,8 @@ func (s *PipelineService) Create(ctx context.Context, siteID, name, rules string
 func (s *PipelineService) List(ctx context.Context, siteID string) ([]Pipeline, error) {
 	rows, err := nucleus.Query[Pipeline](ctx, s.db.SQL(),
 		`SELECT pipeline_id, tenant_id, site_id, name, priority, COALESCE(rules, '') AS rules, enabled, created_at, version
-		 FROM log_pipelines WHERE site_id = $1 AND enabled = 'true'`, siteID)
+		 FROM `+pipelinesLatest("site_id = $1")+`
+		 WHERE enabled = 'true'`, siteID)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +158,7 @@ func (s *PipelineService) Delete(ctx context.Context, pipelineID string) error {
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO log_pipelines (pipeline_id, tenant_id, site_id, name, priority, rules, enabled, created_at, version)
 		 SELECT pipeline_id, tenant_id, site_id, name, priority, NULLIF(CAST(rules AS TEXT), ''), 'false', created_at, $2
-		 FROM log_pipelines WHERE pipeline_id = $1`,
+		 FROM `+pipelinesLatest("pipeline_id = $1"),
 		pipelineID, now)
 	if err == nil {
 		// Delete is keyed by pipeline_id, not site_id; clear the whole cache
