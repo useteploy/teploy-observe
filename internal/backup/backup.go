@@ -33,37 +33,101 @@ import (
 // Tables is the ordered list of tables included in a full backup.
 // Order matters for restore (dependencies first isn't strictly required because
 // there are no FKs, but we sort for reproducible snapshots).
+//
+// It must name every table the migrations create, minus ExcludedTables.
+// TestTablesMatchSchema enforces both directions against
+// internal/schema/migrations, because getting either wrong is silent: a name
+// that is not a table dumps zero rows and dumpTable's missing-table handling
+// reports success, and a table that is simply absent from this list is never
+// looked at at all. Four names here were fictional until 2026-08-25 —
+// "monitors", "crons", "share_tokens" and a duplicate "reports" — so uptime
+// monitors, cron monitors and share links had never been backed up, and 27
+// real tables (stats_daily, saved_views, sso_configs, scheduled_exports,
+// incidents, boards, cohorts, metric_points, … ) were missing outright.
 var Tables = []string{
 	"sites",
 	"admin_users",
 	"api_keys",
 	"users",
+	"groups",
+	"group_members",
+	"sso_configs",
+	"instance_settings",
+	"audit_events",
 	"events",
 	"events_recent",
 	"sessions",
 	"stats_hourly",
+	"stats_daily",
 	"error_events",
 	"issues",
+	"performance_issues",
 	"logs",
+	"log_pipelines",
 	"spans",
 	"service_stats",
+	"service_dependencies",
+	"llm_traces",
+	"metric_points",
+	"host_metrics",
 	"replay_sessions",
 	"replay_events",
+	"click_heatmaps",
 	"feature_flags",
+	"flag_evaluations",
 	"experiments",
+	"experiment_exposures",
+	"experiment_conversions",
 	"surveys",
+	"survey_responses",
+	"cohorts",
+	"feedback",
 	"alert_rules",
 	"alert_history",
+	"incidents",
 	"webhooks",
 	"integrations",
+	"integration_deliveries",
 	"dashboards",
 	"dashboard_panels",
-	"reports",
-	"monitors",
-	"crons",
+	"boards",
+	"saved_views",
+	"uptime_monitors",
+	"uptime_results",
+	"cron_monitors",
+	"cron_checkins",
 	"goals",
-	"share_tokens",
+	"tracked_links",
+	"link_clicks",
+	"share_links",
 	"report_schedules",
+	"scheduled_exports",
+}
+
+// ExcludedTables are tables the migrations create that a backup deliberately
+// skips. Everything else must be in Tables — see TestTablesMatchSchema.
+var ExcludedTables = map[string]string{
+	"_neutron_migrations": "migration bookkeeping — the migrations rebuild it, " +
+		"and restoring a stale copy would make the schema and the ledger disagree",
+}
+
+// isRenameAsideArtifact reports whether table is one of the `<name>_preNNN`
+// recovery copies a rename-aside migration leaves behind (027, 028, 033, 034).
+// They hold superseded data that the live table already supersedes, they are
+// meant to be dropped by hand once the copy is confirmed, and they are absent
+// from a fresh install that ran the migrations against an empty database — so
+// they are neither backed up nor required to appear in Tables.
+func isRenameAsideArtifact(table string) bool {
+	i := strings.LastIndex(table, "_pre")
+	if i < 0 || len(table) != i+len("_pre")+3 {
+		return false
+	}
+	for _, c := range table[i+len("_pre"):] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // Manifest is the first entry in a backup archive — a small JSON file that
