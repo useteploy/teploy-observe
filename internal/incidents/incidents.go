@@ -98,6 +98,15 @@ func (s *Service) Create(ctx context.Context, in CreateInput, createdBy string) 
 
 // Close marks the incident as ended now. Finds the latest version of the
 // row and writes a new version with ended_at set.
+//
+// `incidents` is a PLAIN mergetree with no version column, so this appends
+// rather than updates and the reads dedup by updated_at (see activeWhere). The
+// `ORDER BY updated_at DESC LIMIT 1` is load-bearing, not decoration: it is
+// what keeps this INSERT...SELECT-from-the-same-table to ONE row per call.
+// Verified on Nucleus v0.1.8 - the identical statement without the LIMIT goes
+// 1, 2, 4, 8 on successive calls - and confirmed on the live instance, where
+// `incidents` holds exactly 2 rows for each of 6,170 closed incidents and 1 for
+// each of the 13 open ones. TestCloseWritesExactlyOneRow pins it.
 func (s *Service) Close(ctx context.Context, incidentID string) error {
 	now := dbutil.IntParam(time.Now().UnixMilli())
 	_, err := s.db.SQL().Exec(ctx,

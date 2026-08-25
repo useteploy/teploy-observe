@@ -151,15 +151,23 @@ func (s *ExportService) Create(ctx context.Context, in CreateInput) (ScheduledEx
 		CreatedAt: now, UpdatedAt: now}, nil
 }
 
+// Delete removes a scheduled export and its accumulated run-history rows.
+//
+// `scheduled_exports` is a PLAIN mergetree with no version column, so there is
+// nothing to collapse by: recordRun appends one row per run and List keeps the
+// newest per export_id. The old soft delete —
+//
+//	INSERT INTO scheduled_exports (...) SELECT ..., 'false', ... FROM scheduled_exports WHERE export_id = $1
+//
+// — had no LIMIT, so it re-inserted one row per row already present, doubling
+// the physical count of an export that had been running for a while. A hard
+// DELETE is both the correct fix and the right semantics: the export is gone,
+// so its run history has no reader. It matches boards.DeleteBoard and
+// query.DeleteGoal. List still drops any legacy enabled='false' rows left by
+// the old soft delete.
 func (s *ExportService) Delete(ctx context.Context, id string) error {
-	now := dbutil.IntParam(time.Now().UnixMilli())
 	_, err := s.db.SQL().Exec(ctx,
-		`INSERT INTO scheduled_exports
-		 (export_id, tenant_id, name, sql, format, cron, destination_type, destination_cfg,
-		  enabled, last_run_at, last_status, last_error, last_rows, created_at, updated_at)
-		 SELECT export_id, tenant_id, name, sql, format, cron, destination_type, destination_cfg,
-		        'false', last_run_at, last_status, last_error, last_rows, created_at, $2
-		 FROM scheduled_exports WHERE export_id = $1`, id, now)
+		`DELETE FROM scheduled_exports WHERE export_id = $1`, id)
 	return err
 }
 
@@ -308,6 +316,11 @@ func (s *ExportService) recordRun(ctx context.Context, id string, start time.Tim
 	now := dbutil.IntParam(time.Now().UnixMilli())
 	ran := dbutil.IntParam(start.UnixMilli())
 	// Append a new row (ORDER BY updated_at DESC picks it on subsequent reads).
+	//
+	// The `ORDER BY updated_at DESC LIMIT 1` is load-bearing, not decoration:
+	// it is what keeps this INSERT…SELECT-from-the-same-table to ONE row per
+	// call. Verified on Nucleus v0.1.8 — the identical statement without the
+	// LIMIT goes 1, 2, 4, 8 … on successive calls. Do not remove it.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO scheduled_exports
 		 (export_id, tenant_id, name, sql, format, cron, destination_type, destination_cfg,

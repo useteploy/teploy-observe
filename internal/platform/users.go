@@ -79,20 +79,60 @@ func (s *UserService) Get(ctx context.Context, userID string) (*User, error) {
 	return &rows[0], nil
 }
 
+// UpdateRole changes a user's role.
+//
+// `users` is a PLAIN mergetree: it has no version column, so there is nothing
+// to collapse by and the argMax pattern the replacing tables use does not
+// apply. The previous shape —
+//
+//	INSERT INTO users (...) SELECT ..., $2, $3, ... FROM users WHERE user_id = $1
+//
+// — appended one row per row already present, so the physical count for a user
+// DOUBLED on every role change, and List/Get read the raw table with no dedup
+// at all: after one demotion the table holds both an 'admin' and a 'viewer' row
+// for the same person and whichever comes back first decides what the UI (and
+// any check reading Get) believes. That is an authorization result, not a
+// cosmetic one.
+//
+// The only shape that leaves exactly one row on a table with no version column
+// is a real replace: delete the id, then insert the new row — in one
+// transaction, so a crash between the two cannot lose the user. This also
+// collapses any duplicates an earlier UpdateRole already wrote, and preserves
+// created_at, which the old statement overwrote with the edit time.
 func (s *UserService) UpdateRole(ctx context.Context, userID, role string) error {
 	if role != "admin" && role != "editor" && role != "viewer" {
 		return fmt.Errorf("invalid role: %s", role)
 	}
-	// MergeTree can't UPDATE, so we re-insert. This works because we query
-	// by user_id which returns the latest row.
-	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
-	_, err := s.db.SQL().Exec(ctx,
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// created_at DESC picks the newest of any duplicates the old statement left.
+	rows, err := nucleus.Query[User](ctx, tx.SQL(),
+		`SELECT user_id, tenant_id, username, email, password_hash, role, created_at, invited_by
+		 FROM users WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, userID)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("user %s not found", userID)
+	}
+	u := rows[0]
+
+	if _, err := tx.SQL().Exec(ctx, `DELETE FROM users WHERE user_id = $1`, userID); err != nil {
+		return err
+	}
+	if _, err := tx.SQL().Exec(ctx,
 		`INSERT INTO users (user_id, tenant_id, username, email, password_hash, role, created_at, invited_by)
-		 SELECT user_id, tenant_id, username, email, password_hash, $2, $3, invited_by
-		 FROM users WHERE user_id = $1`,
-		userID, role, now,
-	)
-	return err
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		u.UserID, u.TenantID, u.Username, u.Email, u.PasswordHash, role,
+		strconv.FormatInt(u.CreatedAt.UnixMilli(), 10), u.InvitedBy,
+	); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func genID() string {
