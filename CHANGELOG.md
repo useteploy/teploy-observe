@@ -6,6 +6,53 @@ All notable changes to Observe are recorded here.
 
 ### Fixed
 
+- **The dashboard reported several times more traffic than it had.** On the
+  live instance a window whose raw events prove 72 pageviews and 11 sessions
+  was shown as 158 pageviews and 91 visitors. Two independent causes, both
+  fixed:
+
+  *Duplicate rollup rows were being summed.* `stats_hourly`, `stats_daily`
+  and `sessions` are ReplacingMergeTree tables and their rollup jobs
+  deliberately recompute an overlapping window on every tick, relying on the
+  engine to collapse the repeats down to the highest version. Nucleus does
+  not do that reliably — it collapses within a memtable but leaves rows
+  written into separate segments in place, has no OPTIMIZE or merge-now
+  command, and `FINAL` parses but is silently ignored. The live `stats_hourly`
+  was carrying 740 duplicated bucket keys out of 1956 rows, the oldest two
+  months old, and every read summed them. Reads now collapse by version with
+  `argMax` over the table's declared ORDER BY key, and each rollup job clears
+  the window it is about to rewrite so no duplicate key is written in the
+  first place.
+
+  *Unique counts were being summed.* `visitors` in the rollups is a
+  COUNT(DISTINCT session_id) taken per bucket and per pathname, so a session
+  spanning two hours or visiting two pages was counted once per group.
+  Summing them inflated the number even after the duplicates were gone —
+  91 became 41 rather than 11. Unique visitor and session counts now always
+  come from raw `events`, which is what the reference implementation umami
+  does and what ranges under 24h already did; the same site no longer reports
+  one figure below 24h and a three-to-eight-times larger one above it. The
+  cost is that unique counts are now bounded by raw-event retention
+  (`OBSERVE_RAW_RETENTION_DAYS`, default 30) rather than by rollup retention.
+  Pageview counts keep the rollups' longer reach.
+
+  Affected everywhere the two tables are read: the overview tiles, the
+  pageview time series, top pages, top referrers/browsers/countries/OS/
+  devices, entry and exit pages, the session list, bounce rate and average
+  duration, retention cohorts, release health and crash-free percentage, and
+  the sessions CSV/JSON export.
+
+- **Migration 033 collapses the duplicate rows already on disk.**
+  Non-destructive in the style of 027/028: rename aside, recreate, copy the
+  highest-version row per key across. `stats_hourly_pre033`,
+  `stats_daily_pre033` and `sessions_pre033` are left in place as recovery
+  artifacts — drop them by hand once the copy is confirmed. `stats_daily` has
+  no retention policy, so nothing else would ever have removed its copies.
+
+- **The replay integration tests are repeatable.** They used fixed site and
+  replay ids, so a second `go test ./...` against the same engine counted the
+  previous run's rows and failed.
+
 - **Every custom event property sent by the npm browser SDK was stored as
   `{}`.** `track()` spread the caller's props across the top level of the
   ingest payload, and the server reads properties only from a nested
