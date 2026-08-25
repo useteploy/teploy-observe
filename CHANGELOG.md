@@ -6,6 +6,69 @@ All notable changes to Observe are recorded here.
 
 ### Fixed
 
+- **Migration 034 could not run at all — on a fresh install or on the live
+  upgrade path — because of a comment.** Nucleus v0.1.8's SQL lexer panics on a
+  non-ASCII character followed by a number inside a `--` comment and drops the
+  connection; the migrator reports it as `unexpected EOF` with nothing pointing
+  at prose. `034`'s header said `1, 2, 4, 8 … 4096`, so every `schema.Apply`
+  failed at 34 and the next deploy of the live instance would have crash-looped.
+  Now ASCII. `TestMigrationsAvoidNucleusLexerPanic` rejects the shape without
+  needing a database, and `TestMigrationsApplyToFreshDatabase` runs the whole
+  chain against a scratch engine. The same character followed by a word is
+  harmless, which is why the em dashes in seventeen other migrations are fine.
+
+  034's note also claimed a failure rolls the whole migration back. It does not:
+  DDL is not transactional in Nucleus — `BEGIN; ALTER TABLE t RENAME TO t2;
+  ROLLBACK;` leaves the table renamed — so a failed copy leaves `issues` empty
+  and the data in `issues_pre034`. The corrected note carries the recovery.
+
+- **`backup` silently skipped four tables that do not exist, and 31 that do.**
+  `Tables` named `monitors`, `crons`, `share_tokens` and a second copy of the
+  report schedules as `reports`. None of those is a table, and a name that is
+  not a table dumps zero rows and is recorded as a *successful, empty* table —
+  so uptime monitors, cron monitors and share links had never been backed up.
+  In the other direction the list simply omitted 31 real tables, `stats_daily`
+  (the one rollup with no retention policy) among them. Neither failure produced
+  any output. The list is now the schema's, and `TestTablesMatchSchema` compares
+  it against `internal/schema/migrations` in both directions, so a table added by
+  a future migration fails the build unless it is backed up or explicitly
+  excluded with a reason. `restore` derives its allowlist from the same list, so
+  it was refusing to restore the tables it was never given.
+
+- **Eight more `INSERT … SELECT FROM <same table>` writers were doubling their
+  table on every call** — the `issues` shape, in `experiments` (Start/Stop),
+  `sso_configs` (Enable), `dashboards` (Delete), `dashboard_panels`
+  (DeletePanel), `saved_views` (Delete), `users` (UpdateRole) and
+  `scheduled_exports` (Delete). The five replacing tables now read through the
+  argMax collapse before inserting, and their reads collapse too: a completed
+  experiment could report as running, an enabled SSO provider as disabled, and
+  `List` returned one entry per surviving version. The two plain mergetrees have
+  no version column and so no collapse to read through, and are fixed on their
+  own terms below.
+
+  Two sites reported as doubling do **not** double and were left alone:
+  `incidents.Close` and `exports.recordRun` bound their SELECT with `ORDER BY …
+  LIMIT 1`, and Nucleus honours both inside an `INSERT … SELECT` (verified on
+  v0.1.8; the live `incidents` table holds exactly 2 rows per closed incident,
+  not 2^n). Tests now pin that, because the LIMIT reads like formatting and is
+  the only thing standing between those two and the `issues` outcome.
+
+- **A demoted admin could keep reading as an admin.** `users` is a plain
+  mergetree with no version column, and `UpdateRole` appended a new row while
+  `List` and `Get` read the raw table with no dedup at all — so after a demotion
+  both the `admin` row and the `viewer` row existed and whichever came back
+  first won. It now does a real replace (delete then insert, in one
+  transaction), which leaves exactly one row per user, collapses any duplicates
+  an earlier call wrote, and stops overwriting `created_at` with the edit time.
+
+- **A deleted saved view came back as a nameless entry.** `Delete` appended a
+  blank tombstone that `List` still returned, so the view could not be removed
+  from the UI and the row stayed on disk forever. It hard-deletes now, matching
+  `boards.DeleteBoard` and `DeleteGoal`; `List` still filters the tombstones an
+  older install left behind. `scheduled_exports.Delete` likewise hard-deletes
+  rather than appending an `enabled='false'` row, which also clears the run
+  history that nothing could read once the export was gone.
+
 - **The `issues` table was doubling in size on every error batch, and had
   reached 16,847,389 rows on the live instance.** `bumpIssue` and
   `UpdateStatus` were both
