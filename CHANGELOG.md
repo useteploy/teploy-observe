@@ -4,6 +4,8 @@ All notable changes to Observe are recorded here.
 
 ## [Unreleased]
 
+## v0.1.9 — 2026-08-26
+
 ### Added
 
 - **Conversion goals carry money.** Observe could tell you 412 people signed
