@@ -1189,6 +1189,10 @@ func main() {
 		neutron.WithTags("goals"), neutron.WithSummary("List goals with conversions"))
 	neutron.Post(goalEditor, "", createGoalHandler(statsSvc),
 		neutron.WithTags("goals"), neutron.WithSummary("Create goal"))
+	neutron.Put(goalEditor, "/{goal_id}", updateGoalHandler(statsSvc),
+		neutron.WithTags("goals"), neutron.WithSummary("Update a goal, including its conversion value"))
+	neutron.Delete(goalEditor, "/{goal_id}", deleteGoalHandler(statsSvc),
+		neutron.WithTags("goals"), neutron.WithSummary("Delete goal"))
 
 	// --- Uptime monitors (JWT auth; admin-only writes) ---
 	uptimeGroup := r.Group("/api/v1/monitors", jwtMW)
@@ -3583,11 +3587,30 @@ func listGoalsHandler(svc *query.StatsService) neutron.HandlerFunc[listGoalsInpu
 	}
 }
 
+// createGoalInput carries both the matcher (goal_value — the pathname or
+// event_type a conversion is recognised by) and the money a conversion is
+// worth (value_minor + currency). The two `value` names are unfortunately
+// close; goal_value predates the money by a year.
 type createGoalInput struct {
 	SiteID    string `json:"site_id"`
 	Name      string `json:"name"`
 	GoalType  string `json:"goal_type"`
 	GoalValue string `json:"goal_value"`
+	// ValueMinor is an integer count of Currency's ISO-4217 minor units —
+	// cents for USD, whole yen for JPY. Never a decimal: see
+	// internal/query/money.go.
+	ValueMinor    int64  `json:"value_minor"`
+	Currency      string `json:"currency"`
+	ValueSource   string `json:"value_source"`
+	ValueProperty string `json:"value_property"`
+}
+
+func (in createGoalInput) goal() query.Goal {
+	return query.Goal{
+		SiteID: in.SiteID, Name: in.Name, GoalType: in.GoalType, GoalValue: in.GoalValue,
+		ValueMinor: in.ValueMinor, Currency: in.Currency,
+		ValueSource: in.ValueSource, ValueProperty: in.ValueProperty,
+	}
 }
 
 func createGoalHandler(svc *query.StatsService) neutron.HandlerFunc[createGoalInput, query.Goal] {
@@ -3595,12 +3618,66 @@ func createGoalHandler(svc *query.StatsService) neutron.HandlerFunc[createGoalIn
 		if input.SiteID == "" || input.Name == "" || input.GoalValue == "" {
 			return query.Goal{}, neutron.ErrBadRequest("site_id, name, and goal_value required")
 		}
-		g, err := svc.CreateGoal(ctx, input.SiteID, input.Name, input.GoalType, input.GoalValue)
+		g, err := svc.CreateGoal(ctx, input.goal())
 		if err != nil {
-			return query.Goal{}, err
+			return query.Goal{}, goalValueError(err)
 		}
 		return *g, nil
 	}
+}
+
+type updateGoalInput struct {
+	GoalID string `path:"goal_id"`
+	createGoalInput
+}
+
+// updateGoalHandler exists so a goal created before goals could carry money
+// can be given a value in place. Without it the only route to a valued goal
+// would be delete-and-recreate, and the delete has no endpoint either.
+func updateGoalHandler(svc *query.StatsService) neutron.HandlerFunc[updateGoalInput, query.Goal] {
+	return func(ctx context.Context, input updateGoalInput) (query.Goal, error) {
+		if input.SiteID == "" || input.GoalID == "" {
+			return query.Goal{}, neutron.ErrBadRequest("site_id and goal_id required")
+		}
+		g, err := svc.UpdateGoal(ctx, input.SiteID, input.GoalID, input.goal())
+		if err != nil {
+			return query.Goal{}, goalValueError(err)
+		}
+		return *g, nil
+	}
+}
+
+type deleteGoalInput struct {
+	GoalID string `path:"goal_id"`
+	SiteID string `query:"site_id"`
+}
+
+func deleteGoalHandler(svc *query.StatsService) neutron.HandlerFunc[deleteGoalInput, neutron.Empty] {
+	return func(ctx context.Context, input deleteGoalInput) (neutron.Empty, error) {
+		if input.SiteID == "" || input.GoalID == "" {
+			return neutron.Empty{}, neutron.ErrBadRequest("site_id and goal_id required")
+		}
+		return neutron.Empty{}, svc.DeleteGoal(ctx, input.SiteID, input.GoalID)
+	}
+}
+
+// goalValueError turns a validation failure from query.ValidateGoalValue into
+// a 400 rather than a 500. Those messages name the offending field, so they
+// are the whole diagnosis for the caller; a bare 500 would not be.
+func goalValueError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	for _, marker := range []string{"value_source", "value_minor", "currency", "value_property", "not found"} {
+		if strings.Contains(msg, marker) {
+			if strings.Contains(msg, "not found") {
+				return neutron.ErrNotFound("goal not found")
+			}
+			return neutron.ErrBadRequest(msg)
+		}
+	}
+	return err
 }
 
 // --- Uptime monitor handlers ---

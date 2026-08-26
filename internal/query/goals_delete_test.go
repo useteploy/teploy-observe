@@ -24,13 +24,14 @@ func TestDeleteGoalActuallyDeletes(t *testing.T) {
 	}
 	svc := NewStatsService(db)
 	ctx := context.Background()
-	const site = "goalsite-delete"
+	site := goalSite("goalsite-delete")
+	otherSite := goalSite("goalsite-other")
 
-	g, err := svc.CreateGoal(ctx, site, "Signup", "event", "signup")
+	g, err := svc.CreateGoal(ctx, Goal{SiteID: site, Name: "Signup", GoalType: "event", GoalValue: "signup"})
 	if err != nil {
 		t.Fatalf("create goal: %v", err)
 	}
-	keep, err := svc.CreateGoal(ctx, site, "Purchase", "event", "purchase")
+	keep, err := svc.CreateGoal(ctx, Goal{SiteID: site, Name: "Purchase", GoalType: "event", GoalValue: "purchase"})
 	if err != nil {
 		t.Fatalf("create goal: %v", err)
 	}
@@ -60,14 +61,14 @@ func TestDeleteGoalActuallyDeletes(t *testing.T) {
 
 	// Another site's goal with the same id must be untouched — the delete is
 	// scoped by site_id precisely so a guessed id cannot reach across.
-	other, err := svc.CreateGoal(ctx, "goalsite-other", "Signup", "event", "signup")
+	other, err := svc.CreateGoal(ctx, Goal{SiteID: otherSite, Name: "Signup", GoalType: "event", GoalValue: "signup"})
 	if err != nil {
 		t.Fatalf("create other goal: %v", err)
 	}
 	if err := svc.DeleteGoal(ctx, site, other.GoalID); err != nil {
 		t.Fatalf("cross-site delete: %v", err)
 	}
-	otherGoals, err := svc.ListGoals(ctx, "goalsite-other")
+	otherGoals, err := svc.ListGoals(ctx, otherSite)
 	if err != nil {
 		t.Fatalf("list other goals: %v", err)
 	}
