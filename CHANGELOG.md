@@ -82,6 +82,44 @@ All notable changes to Observe are recorded here.
 
 ### Fixed
 
+- **The "Partial" visitor-coverage badge fired on installs that had never lost
+  anything.** It decided purely from where the selected range starts relative to
+  a retention cutoff, and never asked whether any data had actually been pruned.
+  So this install — which has been collecting since 2026-06-26 — was told, on
+  "Last 12 months", that its per-visitor data older than 90 days "has been
+  removed by retention". Nothing had been removed; the site did not exist yet. A
+  brand-new install got the same false warning on its first day, and so did an
+  empty one with no data at all.
+
+  A retention cutoff is only evidence of loss when data older than it once
+  existed. The deciding fact is the site's own earliest data, and the pageview
+  rollup is where to read it: `stats_daily` carries **no retention policy at
+  all** (`jobs.DefaultPolicies` lists `events`, `stats_hourly` and `sessions`,
+  not it), so it reaches back further than any table a unique count can come
+  from — exactly the comparison the note needs. `MIN(ts_bucket)` is a
+  single-column aggregate, the one query shape that streams on a large Nucleus
+  table instead of being rejected by the memory limiter (see
+  `docs/operations/issue-duplicate-collapse.md`); measured against the live
+  instance it returns in 10 ms.
+
+  `GET /api/v1/stats/unique-coverage` is called on every dashboard load and used
+  to run no query, so it stays cheap: the lookup happens only when retention
+  *could* have pruned something — a range sitting inside retention cannot be
+  missing anything however old the site is, and returns with no query as before
+  — and the result is memoised per site for 10 minutes (1 minute for a failed
+  lookup, which must not silence a real warning for long). A failure is logged
+  and never swallowed; unknown, failed and empty all resolve to *no warning*,
+  because an install with nothing in it must never be told its history was
+  pruned.
+
+  Where the note does fire it now means what it says. A range longer than the
+  site's history also reports the window the figures really describe — the
+  site's first day — instead of a twelve-month claim it cannot back. The same
+  correction applies to the filter-forced-to-raw-events path, where a filter on
+  `pathname` / `event_type` / `distinct_id` pins the read to raw events.
+  Which table answers a range is unchanged: retention alone decides that, and it
+  does not depend on how much data a site has.
+
 - **Ten cron monitors filled the analytics chart with a solid block of orange.**
   `incidents` held 12,398 rows — 6,192 closed incidents at two rows each plus 14
   open, every one severity `warning` and source `cron`, from ten distinct

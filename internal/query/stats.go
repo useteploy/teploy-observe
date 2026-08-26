@@ -24,6 +24,9 @@ type StatsService struct {
 	// retention decides which table can answer a unique count for a given
 	// range, and whether it covers all of it. See coverage.go.
 	retention RetentionWindows
+	// earliest memoises the per-site earliest-data instant the coverage note
+	// is decided against, so the dashboard's load-time call is not a scan.
+	earliest earliestCache
 }
 
 func NewStatsService(db *nucleus.Client) *StatsService {
@@ -213,7 +216,7 @@ func (s *StatsService) PageviewTimeSeries(ctx context.Context, siteID string, fr
 			bucketMs = 86400000
 		}
 		visitors, err := s.uniqueVisitorsByBucket(ctx, siteID, fromMs, toMs, bucketMs, filters,
-			s.coverage(from, to, filters).Source)
+			s.sourceFor(from, filters))
 		if err != nil {
 			return nil, err
 		}
@@ -529,7 +532,7 @@ func (s *StatsService) TopChannels(ctx context.Context, siteID string, from, to 
 	toMs := to.UnixMilli()
 	var q string
 	var allParams []any
-	if s.coverage(from, to, filters).Source == SourceSessions {
+	if s.sourceFor(from, filters) == SourceSessions {
 		// Past raw retention. The sessions table carries referrer and the UTM
 		// pair already collapsed to one row per session, which is exactly the
 		// grain this classification wants.
@@ -643,7 +646,7 @@ func (s *StatsService) Overview(ctx context.Context, siteID string, from, to tim
 		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		   AND event_type = 'pageview'%s`, fSQL)
 		uniqParams := allParams
-		if s.coverage(from, to, filters).Source == SourceSessions {
+		if s.sourceFor(from, filters) == SourceSessions {
 			// Past raw retention. One row per session makes the count exact.
 			// The visit-grain figure raw events give for `sessions`
 			// (COUNT(DISTINCT visit_id), a visit being one clock hour) has no

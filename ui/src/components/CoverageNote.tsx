@@ -14,7 +14,12 @@ import { useFilters } from "../hooks/useFilters.js";
  * months" or "All time" and the two halves of the same screen therefore
  * describe different windows. Returning the smaller number without saying so
  * is the bug this replaces; the server decides the tier and hands back the
- * sentence (GET /api/v1/stats/unique-coverage), which runs no query.
+ * sentence (GET /api/v1/stats/unique-coverage).
+ *
+ * Nothing renders unless data older than the covered window really existed. A
+ * range longer than the site's own history is fully covered — an install two
+ * months old, or one hour old, is not missing eleven months of visitors, and
+ * saying it is was a second bug on top of the first.
  */
 function CoverageNote() {
   const { state } = useFilters();

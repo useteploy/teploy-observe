@@ -1,8 +1,14 @@
 package query
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
+	"strconv"
+	"sync"
 	"time"
+
+	"github.com/neutron-dev/neutron-go/nucleus"
 )
 
 // Which table can answer a unique (visitor / session) count, and how much of
@@ -55,9 +61,16 @@ func DefaultRetentionWindows() RetentionWindows {
 // the figure is real, but it describes a shorter window than the one asked for.
 type UniqueCoverage struct {
 	Source UniqueSource `json:"source"`
-	// Exact reports whether the source covers the whole requested range.
+	// Exact reports whether the source covers everything in the requested
+	// range — which is not the same as covering the whole calendar range. A
+	// range reaching back further than the site has ever had data is exact:
+	// there is nothing older to be missing.
 	Exact bool `json:"exact"`
-	// RangeFrom / CoveredFrom are epoch milliseconds. They are equal when Exact.
+	// RangeFrom / CoveredFrom are epoch milliseconds. CoveredFrom is the oldest
+	// instant the figures actually describe. It equals RangeFrom in the normal
+	// case; when a retention cutoff bit, it is that cutoff; when the site is
+	// younger than the range it is the site's first data, and Exact stays true
+	// because nothing was lost.
 	RangeFrom   int64 `json:"range_from"`
 	CoveredFrom int64 `json:"covered_from"`
 	// CoveredDays is the retention window backing the answer, 0 when Exact.
@@ -75,62 +88,94 @@ func cutoff(days int, now time.Time) (time.Time, bool) {
 	return now.Add(-time.Duration(days) * 24 * time.Hour), true
 }
 
-// Coverage tiers a range by where its `from` sits relative to each retention
-// window. The boundary is the range's start, not its length: a 7-day window
-// sitting a year back is just as far outside raw retention as a 12-month one,
-// and tiering on duration would route it to the exact source and return almost
-// nothing.
-func (w RetentionWindows) Coverage(from, to, now time.Time) UniqueCoverage {
+// bound tiers a range by where its `from` sits relative to each retention
+// window: which source answers it, and which cutoff — if any — limits how far
+// back that source reaches. The boundary is the range's start, not its length:
+// a 7-day window sitting a year back is just as far outside raw retention as a
+// 12-month one, and tiering on duration would route it to the exact source and
+// return almost nothing.
+//
+// forcedRaw is the case where an active filter names a column only the events
+// table carries, so the read cannot fall through to sessions.
+func (w RetentionWindows) bound(from, now time.Time, forcedRaw bool) (src UniqueSource, cut time.Time, days int, bounded bool) {
+	rawCut, rawBounded := cutoff(w.RawDays, now)
+	if !rawBounded || !from.Before(rawCut) {
+		// The whole range sits inside raw retention.
+		return SourceEvents, time.Time{}, 0, false
+	}
+	if forcedRaw {
+		return SourceEvents, rawCut, w.RawDays, true
+	}
+	// Past raw retention: the sessions table still holds one row per session.
+	sessCut, sessBounded := cutoff(w.SessionsDays, now)
+	if !sessBounded || !from.Before(sessCut) {
+		return SourceSessions, time.Time{}, 0, false
+	}
+	return SourceSessions, sessCut, w.SessionsDays, true
+}
+
+// coverage turns a tier plus the site's earliest data into what can honestly be
+// claimed for the range.
+//
+// The calendar alone is not evidence of loss. A range that starts before a
+// retention cutoff is only short-changed if data older than that cutoff ever
+// existed — otherwise the cutoff pruned nothing and the count is complete.
+// Deciding on the cutoff alone told a two-month-old install that a 12-month
+// range had "been removed by retention", and told a brand-new one the same on
+// its first day. So `earliest` is the deciding evidence: the oldest instant the
+// site has any data for, taken from the pageview rollup, which outlives every
+// unique-capable table. A zero `earliest` means unknown, or no data at all;
+// both must fail toward claiming nothing was removed.
+func (w RetentionWindows) coverage(from, now time.Time, forcedRaw bool, earliest time.Time) UniqueCoverage {
+	src, cut, days, bounded := w.bound(from, now, forcedRaw)
 	cov := UniqueCoverage{
-		Source:      SourceEvents,
+		Source:      src,
 		Exact:       true,
 		RangeFrom:   from.UnixMilli(),
 		CoveredFrom: from.UnixMilli(),
 	}
-
-	rawCut, rawBounded := cutoff(w.RawDays, now)
-	if !rawBounded || !from.Before(rawCut) {
+	if !bounded {
+		return cov
+	}
+	if earliest.IsZero() || !earliest.Before(cut) {
+		// Nothing older than the covered window was ever here, so nothing is
+		// missing. Report the window the figures really describe: the site's
+		// own start, when that is later than the range's.
+		if !earliest.IsZero() && earliest.After(from) {
+			cov.CoveredFrom = earliest.UnixMilli()
+		}
 		return cov
 	}
 
-	// Past raw retention: the sessions table still holds one row per session.
-	cov.Source = SourceSessions
-	sessCut, sessBounded := cutoff(w.SessionsDays, now)
-	if !sessBounded || !from.Before(sessCut) {
-		return cov
-	}
-
-	// Past both. Report what the sessions table supports and say so.
+	// Data genuinely predates what the source still holds. Report what survives
+	// and say so.
 	cov.Exact = false
-	cov.CoveredFrom = sessCut.UnixMilli()
-	cov.CoveredDays = w.SessionsDays
-	cov.Note = fmt.Sprintf(
-		"Visitor counts cover the last %d days of this range, not all of it — per-visitor data older than that has been removed by retention. Pageviews still cover the whole range.",
-		w.SessionsDays)
+	cov.CoveredFrom = cut.UnixMilli()
+	cov.CoveredDays = days
+	if forcedRaw {
+		cov.Note = fmt.Sprintf(
+			"Visitor counts cover the last %d days of this range, not all of it — the active filter can only be applied to raw events, which retention keeps for that long.",
+			days)
+	} else {
+		cov.Note = fmt.Sprintf(
+			"Visitor counts cover the last %d days of this range, not all of it — per-visitor data older than that has been removed by retention. Pageviews still cover the whole range.",
+			days)
+	}
 	return cov
+}
+
+// Coverage is the coverage for a range answered by whichever table retention
+// leaves able to answer it. `earliest` is the oldest instant the site has data
+// for; the zero time means unknown or empty, which never warns.
+func (w RetentionWindows) Coverage(from, to, now, earliest time.Time) UniqueCoverage {
+	return w.coverage(from, now, false, earliest)
 }
 
 // rawOnly is the coverage for a read that has to use raw events even though the
 // range reaches past raw retention, because the active filter names a column
 // only the events table carries.
-func (w RetentionWindows) rawOnly(from, now time.Time) UniqueCoverage {
-	cov := UniqueCoverage{
-		Source:      SourceEvents,
-		Exact:       true,
-		RangeFrom:   from.UnixMilli(),
-		CoveredFrom: from.UnixMilli(),
-	}
-	rawCut, rawBounded := cutoff(w.RawDays, now)
-	if !rawBounded || !from.Before(rawCut) {
-		return cov
-	}
-	cov.Exact = false
-	cov.CoveredFrom = rawCut.UnixMilli()
-	cov.CoveredDays = w.RawDays
-	cov.Note = fmt.Sprintf(
-		"Visitor counts cover the last %d days of this range, not all of it — the active filter can only be applied to raw events, which retention keeps for that long.",
-		w.RawDays)
-	return cov
+func (w RetentionWindows) rawOnly(from, now, earliest time.Time) UniqueCoverage {
+	return w.coverage(from, now, true, earliest)
 }
 
 // WithRetention wires the running retention configuration. Returns the receiver
@@ -140,24 +185,149 @@ func (s *StatsService) WithRetention(w RetentionWindows) *StatsService {
 	return s
 }
 
-// coverage picks the unique source for a range and describes what it covers.
-//
-// A filter on pathname / event_type / distinct_id cannot be applied to the
-// sessions table at all, so such a read stays on raw events and loses the
-// longer reach — which rawOnly marks rather than hides.
-func (s *StatsService) coverage(from, to time.Time, filters *FilterBuilder) UniqueCoverage {
+// forcedRaw reports whether a read has to stay on raw events even though the
+// range reaches past raw retention: a filter on pathname / event_type /
+// distinct_id cannot be applied to the sessions table at all.
+func (s *StatsService) forcedRaw(from time.Time, now time.Time, filters *FilterBuilder) bool {
+	src, _, _, _ := s.retention.bound(from, now, false)
+	return src == SourceSessions && filters.ReferencesColumnsOutside(sessionsFilterColumns)
+}
+
+// sourceFor picks the table a range's unique counts are read from. Retention
+// alone decides it, and it needs no evidence about the site: which table still
+// holds rows for the range's start does not depend on how much data the site
+// has. Only the honesty of the answer — Exact / Note — depends on that, and
+// that lives in UniqueCoverageFor.
+func (s *StatsService) sourceFor(from time.Time, filters *FilterBuilder) UniqueSource {
 	now := time.Now().UTC()
-	cov := s.retention.Coverage(from, to, now)
-	if cov.Source == SourceSessions && filters.ReferencesColumnsOutside(sessionsFilterColumns) {
-		return s.retention.rawOnly(from, now)
+	if s.forcedRaw(from, now, filters) {
+		return SourceEvents
 	}
-	return cov
+	src, _, _, _ := s.retention.bound(from, now, false)
+	return src
 }
 
 // UniqueCoverageFor is the coverage the dashboard reads to label its visitor
-// panels. It runs no query.
-func (s *StatsService) UniqueCoverageFor(from, to time.Time, filters *FilterBuilder) UniqueCoverage {
-	return s.coverage(from, to, filters)
+// panels.
+//
+// It runs at most one query, and only when it could change the answer: a range
+// that sits entirely inside retention cannot be missing anything however old
+// the site is, so the common case still costs nothing. When retention could
+// have pruned something, the site's earliest data decides whether it actually
+// did — and that lookup is cached per site (see earliestData).
+func (s *StatsService) UniqueCoverageFor(ctx context.Context, siteID string, from, to time.Time, filters *FilterBuilder) UniqueCoverage {
+	now := time.Now().UTC()
+	forced := s.forcedRaw(from, now, filters)
+	if _, _, _, bounded := s.retention.bound(from, now, forced); !bounded {
+		return s.retention.coverage(from, now, forced, time.Time{})
+	}
+	return s.retention.coverage(from, now, forced, s.earliestData(ctx, siteID))
+}
+
+// How long a per-site earliest-data instant is reused. The value only ever
+// moves forward, and only when a site is deleted or the pageview rollup is
+// pruned — neither is minute-to-minute news — so a few stale minutes cost
+// nothing and keep a dashboard-load route off the table. A failed lookup is
+// cached for much less: it resolves to "no warning", and a transient failure
+// must not silence a real one for ten minutes.
+const (
+	earliestDataTTL      = 10 * time.Minute
+	earliestDataErrTTL   = time.Minute
+	earliestDataCacheMax = 1024
+)
+
+type earliestEntry struct {
+	// at is the zero time when the site has no data, or when the lookup failed.
+	at    time.Time
+	until time.Time
+}
+
+// earliestCache memoises the per-site earliest-data instant. Zero value ready.
+type earliestCache struct {
+	mu      sync.Mutex
+	entries map[string]earliestEntry
+}
+
+// earliestData is the oldest instant this site has any data for, or the zero
+// time when that cannot be determined — no data yet, no database wired, or a
+// failed query. Every one of those resolves to "do not claim retention removed
+// anything", which is the safe direction: an empty site must not be told its
+// history was pruned.
+func (s *StatsService) earliestData(ctx context.Context, siteID string) time.Time {
+	if s == nil || s.db == nil || siteID == "" {
+		return time.Time{}
+	}
+	now := time.Now()
+
+	s.earliest.mu.Lock()
+	e, ok := s.earliest.entries[siteID]
+	s.earliest.mu.Unlock()
+	if ok && now.Before(e.until) {
+		return e.at
+	}
+
+	at, err := s.queryEarliestData(ctx, siteID)
+	ttl := earliestDataTTL
+	if err != nil {
+		// Do not swallow this. An unknown earliest instant suppresses the
+		// coverage note, so a silent failure is indistinguishable from a site
+		// that genuinely lost nothing.
+		slog.Warn("earliest-data lookup failed; unique coverage will not claim retention removed anything",
+			"site", siteID, "err", err)
+		at, ttl = time.Time{}, earliestDataErrTTL
+	}
+
+	s.earliest.mu.Lock()
+	if s.earliest.entries == nil {
+		s.earliest.entries = make(map[string]earliestEntry, 8)
+	}
+	if len(s.earliest.entries) >= earliestDataCacheMax {
+		for k, v := range s.earliest.entries {
+			if !now.Before(v.until) {
+				delete(s.earliest.entries, k)
+			}
+		}
+	}
+	s.earliest.entries[siteID] = earliestEntry{at: at, until: now.Add(ttl)}
+	s.earliest.mu.Unlock()
+	return at
+}
+
+// queryEarliestData reads the site's first pageview bucket.
+//
+// stats_daily is the right table for it: it carries no retention policy at all
+// (jobs.DefaultPolicies lists events, stats_hourly and sessions, not it), so it
+// reaches back further than anything a unique count can be taken from, which is
+// exactly the comparison the coverage note needs.
+//
+// The shape is a single-column aggregate, cast to text and parsed here. That is
+// the one form that reliably streams on a large Nucleus table instead of
+// materialising it — see docs/operations/issue-duplicate-collapse.md, where
+// every row-returning form over a big table was rejected by the memory limiter
+// and the aggregates were not. The cast also avoids scanning a NULL (an empty
+// table's MIN) into an integer.
+func (s *StatsService) queryEarliestData(ctx context.Context, siteID string) (time.Time, error) {
+	type earliestRow struct {
+		Earliest string `db:"earliest"`
+	}
+	rows, err := nucleus.Query[earliestRow](ctx, s.db.SQL(),
+		`SELECT CAST(COALESCE(MIN(ts_bucket), 0) AS TEXT) AS earliest
+		 FROM stats_daily WHERE site_id = $1`, siteID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if len(rows) == 0 {
+		return time.Time{}, nil
+	}
+	ms, err := strconv.ParseInt(rows[0].Earliest, 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("earliest bucket %q: %w", rows[0].Earliest, err)
+	}
+	if ms <= 0 {
+		// No rows for this site: MIN was NULL and COALESCE made it 0.
+		return time.Time{}, nil
+	}
+	return time.UnixMilli(ms).UTC(), nil
 }
 
 // sessionUniqueSQL renders the session-grain equivalent of a raw-events
@@ -211,7 +381,7 @@ type breakdown struct {
 func (s *StatsService) breakdownSQL(siteID string, from, to time.Time, b breakdown, limit int, filters *FilterBuilder) (string, []any) {
 	fromMs, toMs := from.UnixMilli(), to.UnixMilli()
 
-	if s.coverage(from, to, filters).Source == SourceSessions {
+	if s.sourceFor(from, filters) == SourceSessions {
 		sessFilters := filters.Subset(sessionsFilterColumns)
 		sessSQL, _ := filterSQL(sessFilters)
 		return sessionUniqueSQL(b.Expr, b.Alias, b.Cols, sessionWhere(b.Where, sessSQL), limit),
