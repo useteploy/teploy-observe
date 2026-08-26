@@ -39,7 +39,7 @@ interface BoardPayload {
 
 const WINDOWS: Array<{ key: string; label: string; ms: number }> = [
   { key: "1h", label: "Last hour", ms: 3600_000 },
-  { key: "24h", label: "Last 24h", ms: 86_400_000 },
+  { key: "24h", label: "Last 24 hours", ms: 86_400_000 },
   { key: "7d", label: "Last 7 days", ms: 7 * 86_400_000 },
   { key: "30d", label: "Last 30 days", ms: 30 * 86_400_000 },
 ];

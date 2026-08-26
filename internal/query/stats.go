@@ -317,7 +317,7 @@ func (s *StatsService) TopPages(ctx context.Context, siteID string, from, to tim
 		 WHERE site_id = $1 AND %s >= $2 AND %s < $3
 		   AND event_type = 'pageview'%s
 		 GROUP BY pathname
-		 ORDER BY pageviews DESC
+		 ORDER BY pageviews DESC, pathname ASC
 		 LIMIT %d`, ts, ts, fSQL, limit)
 	} else {
 		where := fmt.Sprintf(`site_id = $1 AND %s >= $2 AND %s < $3 AND event_type = 'pageview'%s`, ts, ts, fSQL)
@@ -326,7 +326,7 @@ func (s *StatsService) TopPages(ctx context.Context, siteID string, from, to tim
 		        0 AS visitors
 		 FROM %s AS r
 		 GROUP BY pathname
-		 ORDER BY pageviews DESC
+		 ORDER BY pageviews DESC, pathname ASC
 		 LIMIT %d`, LatestRows(table, []string{"pageviews"}, where), limit)
 	}
 
@@ -371,7 +371,7 @@ func (s *StatsService) TopReferrers(ctx context.Context, siteID string, from, to
 	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 	   AND referrer != '' AND event_type = 'pageview'%s
 	 GROUP BY referrer
-	 ORDER BY visitors DESC
+	 ORDER BY visitors DESC, referrer ASC
 	 LIMIT %d`, fSQL, limit)
 
 	rows, err := nucleus.Query[TopReferrer](ctx, s.db.SQL(), q, allParams...)
@@ -404,7 +404,7 @@ func (s *StatsService) TopBrowsers(ctx context.Context, siteID string, from, to 
 	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 	   AND browser != ''%s
 	 GROUP BY browser
-	 ORDER BY visitors DESC
+	 ORDER BY visitors DESC, browser ASC
 	 LIMIT %d`, fSQL, limit)
 
 
@@ -438,7 +438,7 @@ func (s *StatsService) TopCountries(ctx context.Context, siteID string, from, to
 	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 	   AND country != ''%s
 	 GROUP BY country
-	 ORDER BY visitors DESC
+	 ORDER BY visitors DESC, country ASC
 	 LIMIT %d`, fSQL, limit)
 
 
@@ -472,7 +472,7 @@ func (s *StatsService) TopOS(ctx context.Context, siteID string, from, to time.T
 	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 	   AND os != ''%s
 	 GROUP BY os
-	 ORDER BY visitors DESC
+	 ORDER BY visitors DESC, os ASC
 	 LIMIT %d`, fSQL, limit)
 
 
@@ -506,7 +506,7 @@ func (s *StatsService) TopDevices(ctx context.Context, siteID string, from, to t
 	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 	   AND device != ''%s
 	 GROUP BY device
-	 ORDER BY visitors DESC
+	 ORDER BY visitors DESC, device ASC
 	 LIMIT %d`, fSQL, limit)
 
 
@@ -531,7 +531,31 @@ type channelRow struct {
 	SessionID string `db:"session_id"`
 }
 
-func (s *StatsService) TopChannels(ctx context.Context, siteID string, from, to time.Time, filters *FilterBuilder) ([]ChannelStat, error) {
+// rankChannels turns the per-channel tally into the ordered top-N.
+//
+// Ties are the normal case here — there are only six channels, and on a small
+// site several of them sit on the same count — so the order has to be fully
+// determined or the panel reshuffles between two identical loads. Ranging over
+// a map and sorting on the count alone leaves tied entries in Go's randomised
+// map order, which is exactly that. Channel name breaks the tie.
+func rankChannels(counts map[string]int64, limit int) []ChannelStat {
+	result := make([]ChannelStat, 0, len(counts))
+	for ch, n := range counts {
+		result = append(result, ChannelStat{Channel: ch, Visitors: n})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Visitors != result[j].Visitors {
+			return result[i].Visitors > result[j].Visitors
+		}
+		return result[i].Channel < result[j].Channel
+	})
+	if limit > 0 && len(result) > limit {
+		result = result[:limit]
+	}
+	return result
+}
+
+func (s *StatsService) TopChannels(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]ChannelStat, error) {
 	fromMs := from.UnixMilli()
 	toMs := to.UnixMilli()
 	fSQL, _ := filterSQL(filters)
@@ -556,19 +580,7 @@ func (s *StatsService) TopChannels(ctx context.Context, siteID string, from, to 
 		counts[ch]++
 	}
 
-	// Sort by count descending
-	result := make([]ChannelStat, 0, len(counts))
-	for ch, n := range counts {
-		result = append(result, ChannelStat{Channel: ch, Visitors: n})
-	}
-	// Simple insertion sort — always <10 channels
-	for i := 1; i < len(result); i++ {
-		for j := i; j > 0 && result[j].Visitors > result[j-1].Visitors; j-- {
-			result[j], result[j-1] = result[j-1], result[j]
-		}
-	}
-
-	return result, nil
+	return rankChannels(counts, limit), nil
 }
 
 // OverviewStats provides summary stats for the dashboard header.
@@ -730,7 +742,7 @@ func (s *StatsService) TopLanguages(ctx context.Context, siteID string, from, to
 	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 	   AND language != ''%s
 	 GROUP BY language
-	 ORDER BY visitors DESC
+	 ORDER BY visitors DESC, language ASC
 	 LIMIT %d`, fSQL, limit)
 
 	rows, err := nucleus.Query[LanguageStat](ctx, s.db.SQL(), q, allParams...)
@@ -761,7 +773,7 @@ func (s *StatsService) TopScreens(ctx context.Context, siteID string, from, to t
 	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 	   AND CAST(screen_width AS INTEGER) > 0%s
 	 GROUP BY CAST(screen_width AS TEXT) || 'x' || CAST(screen_height AS TEXT)
-	 ORDER BY visitors DESC
+	 ORDER BY visitors DESC, screen ASC
 	 LIMIT %d`, fSQL, limit)
 
 	rows, err := nucleus.Query[ScreenStat](ctx, s.db.SQL(), q, allParams...)
@@ -800,7 +812,7 @@ func (s *StatsService) TopUTM(ctx context.Context, siteID string, from, to time.
 	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 	   AND %s != ''%s
 	 GROUP BY %s
-	 ORDER BY visitors DESC
+	 ORDER BY visitors DESC, value ASC
 	 LIMIT %d`, col, col, fSQL, col, limit)
 
 	rows, err := nucleus.Query[UTMStat](ctx, s.db.SQL(), q, allParams...)
@@ -829,7 +841,7 @@ func (s *StatsService) TopEntryPages(ctx context.Context, siteID string, from, t
 	        COUNT(*) AS visitors
 	 FROM %s AS s
 	 GROUP BY entry_url
-	 ORDER BY visitors DESC
+	 ORDER BY visitors DESC, pathname ASC
 	 LIMIT %d`, LatestRows("sessions", []string{"entry_url"},
 		fmt.Sprintf(`site_id = $1 AND first_ts >= $2 AND first_ts < $3 AND entry_url != ''%s`, fSQL)), limit)
 
@@ -859,7 +871,7 @@ func (s *StatsService) TopExitPages(ctx context.Context, siteID string, from, to
 	        COUNT(*) AS visitors
 	 FROM %s AS s
 	 GROUP BY exit_url
-	 ORDER BY visitors DESC
+	 ORDER BY visitors DESC, pathname ASC
 	 LIMIT %d`, LatestRows("sessions", []string{"exit_url"},
 		fmt.Sprintf(`site_id = $1 AND first_ts >= $2 AND first_ts < $3 AND exit_url != ''%s`, fSQL)), limit)
 
@@ -893,7 +905,7 @@ func (s *StatsService) CustomEvents(ctx context.Context, siteID string, from, to
 	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 	   AND event_type != 'pageview'%s
 	 GROUP BY event_type
-	 ORDER BY count DESC
+	 ORDER BY count DESC, event_type ASC
 	 LIMIT %d`, fSQL, limit)
 
 	rows, err := nucleus.Query[CustomEventStat](ctx, s.db.SQL(), q, allParams...)
@@ -1135,7 +1147,7 @@ func (s *StatsService) EventPropertyValues(ctx context.Context, siteID, eventNam
 	   AND event_type = $4
 	   AND properties ->> '%s' IS NOT NULL
 	 GROUP BY properties ->> '%s'
-	 ORDER BY count DESC
+	 ORDER BY count DESC, value ASC
 	 LIMIT 20`, propKey, propKey, propKey)
 
 	rows, err := nucleus.Query[PropertyValueStat](ctx, s.db.SQL(), q,

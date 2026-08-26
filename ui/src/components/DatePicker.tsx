@@ -10,20 +10,18 @@ function startOfDay(d: Date): Date {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate());
 }
 
-function startOfWeek(d: Date): Date {
-  const day = d.getDay();
-  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
-  return new Date(d.getFullYear(), d.getMonth(), diff);
-}
+/** Label the dropdown shows while a hand-picked range is active. */
+export const CUSTOM_LABEL = "Custom";
 
-function startOfMonth(d: Date): Date {
-  return new Date(d.getFullYear(), d.getMonth(), 1);
-}
-
-function startOfYear(d: Date): Date {
-  return new Date(d.getFullYear(), 0, 1);
-}
-
+// One rolling window per row of magnitude, the set Plausible and Fathom
+// settled on. The calendar-to-date twins this used to carry alongside them
+// ("This week" next to "Last 7 days", "This month" next to "Last 30 days",
+// "This year" next to "Last 12 months") named almost the same window as their
+// neighbour, so the menu asked for a choice that did not change the answer.
+// Custom covers the case a to-date window was actually wanted.
+//
+// Nothing persists the label — it lives only in the in-memory dashboard
+// state — so no saved view, board or scheduled report can hold a removed one.
 const PRESETS: RangePreset[] = [
   {
     label: "Today",
@@ -40,23 +38,9 @@ const PRESETS: RangePreset[] = [
     }),
   },
   {
-    label: "This week",
-    getRange: () => ({
-      from: startOfWeek(new Date()).toISOString(),
-      to: new Date().toISOString(),
-    }),
-  },
-  {
     label: "Last 7 days",
     getRange: () => ({
       from: new Date(Date.now() - 7 * 86400000).toISOString(),
-      to: new Date().toISOString(),
-    }),
-  },
-  {
-    label: "This month",
-    getRange: () => ({
-      from: startOfMonth(new Date()).toISOString(),
       to: new Date().toISOString(),
     }),
   },
@@ -71,20 +55,6 @@ const PRESETS: RangePreset[] = [
     label: "Last 90 days",
     getRange: () => ({
       from: new Date(Date.now() - 90 * 86400000).toISOString(),
-      to: new Date().toISOString(),
-    }),
-  },
-  {
-    label: "This year",
-    getRange: () => ({
-      from: startOfYear(new Date()).toISOString(),
-      to: new Date().toISOString(),
-    }),
-  },
-  {
-    label: "Last 6 months",
-    getRange: () => ({
-      from: new Date(Date.now() - 180 * 86400000).toISOString(),
       to: new Date().toISOString(),
     }),
   },
@@ -108,15 +78,27 @@ function getRangeDurationMs(from: string, to: string): number {
   return new Date(to).getTime() - new Date(from).getTime();
 }
 
+/** ISO instant to the `yyyy-mm-dd` an <input type="date"> expects, in local time. */
+function toDateInput(iso: string): string {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 function DatePicker() {
   const { state, dispatch } = useFilters();
   const [open, setOpen] = useState(false);
+  const [customOpen, setCustomOpen] = useState(false);
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
   const dropdownRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     function handleClickOutside(e: MouseEvent) {
       if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
         setOpen(false);
+        setCustomOpen(false);
       }
     }
     document.addEventListener("mousedown", handleClickOutside);
@@ -126,6 +108,30 @@ function DatePicker() {
   function selectPreset(preset: RangePreset) {
     const { from, to } = preset.getRange();
     dispatch({ type: "SET_RANGE", from, to, label: preset.label });
+    setCustomOpen(false);
+    setOpen(false);
+  }
+
+  function openCustom() {
+    setCustomFrom(toDateInput(state.from));
+    setCustomTo(toDateInput(state.to));
+    setCustomOpen(true);
+  }
+
+  function applyCustom() {
+    if (!customFrom || !customTo) return;
+    const from = new Date(`${customFrom}T00:00:00`);
+    // Inclusive of the chosen end day: the query range is half-open.
+    const to = new Date(`${customTo}T00:00:00`);
+    to.setDate(to.getDate() + 1);
+    if (isNaN(from.getTime()) || isNaN(to.getTime()) || to <= from) return;
+    dispatch({
+      type: "SET_RANGE",
+      from: from.toISOString(),
+      to: to.toISOString(),
+      label: CUSTOM_LABEL,
+    });
+    setCustomOpen(false);
     setOpen(false);
   }
 
@@ -173,6 +179,31 @@ function DatePicker() {
                 {preset.label}
               </button>
             ))}
+            <button
+              class={`obs-dropdown-item ${state.rangeLabel === CUSTOM_LABEL ? "obs-dropdown-item-active" : ""}`}
+              onClick={openCustom}
+            >
+              {CUSTOM_LABEL}
+            </button>
+            {customOpen && (
+              <div style="display:flex;flex-direction:column;gap:6px;padding:8px 12px;">
+                <input
+                  class="obs-input"
+                  type="date"
+                  value={customFrom}
+                  onInput={(e) => setCustomFrom((e.target as HTMLInputElement).value)}
+                  aria-label="Start date"
+                />
+                <input
+                  class="obs-input"
+                  type="date"
+                  value={customTo}
+                  onInput={(e) => setCustomTo((e.target as HTMLInputElement).value)}
+                  aria-label="End date"
+                />
+                <button class="obs-btn obs-btn--sm" onClick={applyCustom}>Apply</button>
+              </div>
+            )}
             <div class="obs-compare-section">
               <div class="obs-compare-toggle" onClick={toggleCompare}>
                 <div class={`obs-toggle-track ${state.compare ? "active" : ""}`}>

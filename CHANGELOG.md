@@ -4,7 +4,67 @@ All notable changes to Observe are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- **The date range menu carried three pairs of buttons that meant the same
+  thing.** "This week" sat next to "Last 7 days", "This month" next to "Last 30
+  days", "This year" next to "Last 12 months" — eleven entries asking for a
+  choice that barely changed the answer. It is now the rolling-window set
+  Plausible and Fathom settled on: Today, Last 24 hours, Last 7 days, Last 30
+  days, Last 90 days, Last 12 months, All time, plus **Custom**, which is what
+  actually covers a to-date or arbitrary window and is why the calendar-to-date
+  entries could go. "Last 6 months" went with them — 90 days and 12 months
+  bracket it. Nothing persists the range label (it lives only in the in-memory
+  dashboard state, never in a saved view, board or scheduled report), so no
+  stored object can reference a removed preset. The boards page keeps its own
+  window list because its keys are persisted per board; only its "Last 24h"
+  label was aligned to read "Last 24 hours".
+
 ### Fixed
+
+- **The sort control on the breakdown panels did nothing on a small site, and
+  the ten rows it showed were not the top ten.** Nothing decided the order of
+  rows that tie, and on a low-traffic site nearly every browser, country and
+  referrer sits at one or two visitors.
+
+  Nucleus emits `GROUP BY` results in hash order, so `ORDER BY visitors DESC`
+  by itself left the tied group unordered — verified on v0.1.8 with six paths
+  tied at one view each, where `LIMIT 3` returned zebra/pear/fig and `LIMIT 10`
+  returned pear/apple/fig/kiwi/zebra/mango. The truncated read was therefore an
+  arbitrary three of the six rather than a prefix of the full list, which is
+  what made "View all" reshuffle the rows already on screen instead of adding
+  to them. Every breakdown now carries a label tie-break.
+
+  One trap inside that fix, now in CLAUDE.md: Nucleus resolves `ORDER BY`
+  against the select list's *output* names and silently ignores a term it
+  cannot resolve. Screens, UTM and entry/exit pages all project their label
+  under a different name than the source column, so the obvious tie-break there
+  parses, runs, returns rows and does not sort.
+
+  `TopChannels` had the same problem in Go: it built its result by ranging over
+  a map — randomised order — and sorted on the count alone, so tied channels
+  came back differently on every request. It also ignored the `limit` argument
+  entirely. Both fixed, and the handler now passes the limit through.
+
+  The dashboard half: the panel rendered the server's array verbatim for the
+  default descending direction and only sorted on the ascending click. `Array.
+  sort` is stable, so once every value tied, the ascending pass reproduced the
+  order it was handed and the arrow appeared to do nothing at all. It now sorts
+  both directions on the same value-then-label order, and the button says which
+  metric it ranks on — the panels rank on pageviews or on visitors depending on
+  which one they are, and an unlabelled arrow gave no way to tell.
+
+  **Not caused by the replacing-rollup work below** — the tie order was
+  undefined before it and the sort control had never sorted its default
+  direction. That work did leave a separate, real gap: unique counts now come
+  from raw `events` (`OBSERVE_RAW_RETENTION_DAYS`, 30 days) while pageviews
+  keep the rollups' reach and entry/exit pages come from `sessions` (90 days).
+  On "Last 90 days" and longer the pageview panel therefore covers the whole
+  window and every visitor panel covers only the last 30 days, so the two
+  disagree and the visitor rankings describe a shorter window than the header
+  claims. Closing that needs a product decision about the source for long-range
+  uniques (sessions at 90 days, longer raw retention, or a distinct sketch in
+  Nucleus) and is deliberately not changed here.
 
 - **Migration 034 could not run at all — on a fresh install or on the live
   upgrade path — because of a comment.** Nucleus v0.1.8's SQL lexer panics on a

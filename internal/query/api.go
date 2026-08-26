@@ -334,7 +334,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 
 	neutron.Get(api, "/channels", func(ctx context.Context, input StatsInput) ([]ChannelStat, error) {
 		from, to := input.TimeRange()
-		result, err := svc.TopChannels(ctx, input.SiteID, from, to, input.resolveFilters(ctx, svc))
+		result, err := svc.TopChannels(ctx, input.SiteID, from, to, input.Limit, input.resolveFilters(ctx, svc))
 		if err != nil {
 			slog.Error("channels query failed", "err", err, "site", input.SiteID, "from", from, "to", to)
 		}

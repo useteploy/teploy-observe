@@ -1,6 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { useFilters } from "../hooks/useFilters.js";
 import { formatNumber } from "../utils/format.js";
+import { sortRows, metricLabel } from "../utils/sortRows.js";
 
 interface Props {
   fetchFn: (siteId: string, from: string, to: string, limit?: number, filters?: Record<string, string>) => Promise<Record<string, any>[]>;
@@ -40,8 +41,9 @@ function BreakdownTable({ fetchFn, labelKey, valueKey, filterKey, limit: initial
     }).catch(() => setLoading(false));
   }, [siteId, from, to, limit, JSON.stringify(filters)]);
 
-  const sorted = sortAsc ? [...data].sort((a, b) => (Number(a[valueKey]) || 0) - (Number(b[valueKey]) || 0)) : data;
+  const sorted = sortRows(data, valueKey, labelKey, sortAsc);
   const total = data.reduce((sum, r) => sum + (Number(r[valueKey]) || 0), 0);
+  const metric = metricLabel(valueKey);
 
   function handleRowClick(row: Record<string, any>) {
     const value = String(row[labelKey] || "");
@@ -73,9 +75,9 @@ function BreakdownTable({ fetchFn, labelKey, valueKey, filterKey, limit: initial
         <button
           class="obs-sort-btn"
           onClick={() => setSortAsc(!sortAsc)}
-          title="Toggle sort order"
+          title={`Sorted by ${metric.toLowerCase()}, ${sortAsc ? "lowest" : "highest"} first. Click to reverse.`}
         >
-          {sortAsc ? "\u2191" : "\u2193"}
+          {metric} {sortAsc ? "\u2191" : "\u2193"}
         </button>
       </div>
       <div class="obs-scrollable">
