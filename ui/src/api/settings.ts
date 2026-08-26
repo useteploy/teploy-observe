@@ -26,6 +26,13 @@ export interface User {
   user_id: string; username: string; email: string; role: string; created_at: string;
 }
 
+// An MCP access token. The secret itself is returned exactly once, by
+// createMCPToken; nothing else ever carries it.
+export interface MCPToken {
+  id: string; name: string; role: string;
+  created_at: number; last_used_at: number; revoked_at: number;
+}
+
 export interface ShareLink {
   // Timestamps are epoch milliseconds on the wire, not ISO strings.
   token: string; site_id: string; created_at: number;
@@ -68,4 +75,11 @@ export const settingsApi = {
     post<User>(`${PLATFORM}/users`, data),
   updateRole: (userId: string, role: string) =>
     post<{ ok: boolean }>(`${PLATFORM}/users/${userId}/role`, { role }),
+
+  // MCP tokens
+  mcpTokens: () => get<MCPToken[]>(`${BASE}/mcp/tokens`),
+  createMCPToken: (data: { name: string; role: string }) =>
+    post<{ token: string; record: MCPToken }>(`${BASE}/mcp/tokens`, data),
+  revokeMCPToken: (tokenId: string) =>
+    del(`${BASE}/mcp/tokens/${tokenId}`),
 };

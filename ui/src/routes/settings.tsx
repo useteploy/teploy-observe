@@ -1,6 +1,6 @@
 import { useState, useEffect } from "preact/hooks";
 import { settingsApi } from "../api/settings.js";
-import type { Site, Webhook, User, ShareLink, APIKeyInfo } from "../api/settings.js";
+import type { Site, Webhook, User, ShareLink, APIKeyInfo, MCPToken } from "../api/settings.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
 import ConfirmDialog from "../components/shared/ConfirmDialog.js";
@@ -564,6 +564,149 @@ function APIKeysSection() {
   );
 }
 
+// ─── MCP ───
+
+// Mirrors Dash's MCP settings panel: create, revoke, show the secret once.
+// What is different is the boundary note — Observe holds personal data and Dash
+// does not, so the panel has to say what a token can actually reach before
+// somebody hands one to an agent.
+function MCPSection() {
+  const [tokens, setTokens] = useState<MCPToken[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showCreate, setShowCreate] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [formName, setFormName] = useState("");
+  const [formRole, setFormRole] = useState("viewer");
+  const [newToken, setNewToken] = useState<string | null>(null);
+  const [revokingId, setRevokingId] = useState<string | null>(null);
+  const [revokeLoading, setRevokeLoading] = useState(false);
+
+  const refresh = async () => {
+    const data = await settingsApi.mcpTokens();
+    setTokens(data || []);
+  };
+
+  useEffect(() => {
+    setLoading(true);
+    refresh().catch(() => setTokens([])).finally(() => setLoading(false));
+  }, []);
+
+  const handleCreate = async () => {
+    if (!formName.trim()) return;
+    setCreating(true);
+    try {
+      const result = await settingsApi.createMCPToken({ name: formName.trim(), role: formRole });
+      setNewToken(result.token);
+      setShowCreate(false);
+      setFormName("");
+      await refresh();
+    } catch (err) { console.error("Failed to create MCP token:", err); }
+    finally { setCreating(false); }
+  };
+
+  const handleRevoke = async () => {
+    if (!revokingId) return;
+    setRevokeLoading(true);
+    try {
+      await settingsApi.revokeMCPToken(revokingId);
+      setTokens(prev => prev.map(t => t.id === revokingId ? { ...t, revoked_at: Date.now() } : t));
+      setRevokingId(null);
+    } catch (err) { console.error("Failed to revoke MCP token:", err); }
+    finally { setRevokeLoading(false); }
+  };
+
+  const endpoint = `${instanceOrigin()}/api/mcp`;
+
+  return (
+    <div class="settings-section">
+      <div class="settings-section-header">
+        <h2 class="settings-section-title">MCP Tokens</h2>
+        <button class="obs-btn obs-btn--primary obs-btn--sm" onClick={() => setShowCreate(true)}>Create Token</button>
+      </div>
+
+      <div class="settings-key-note" style={{ marginBottom: "12px" }}>
+        An MCP client authenticates to <code>{endpoint}</code> with one of these tokens as a bearer
+        token. Tools reach analytics aggregates only: rollups, error issues, service metrics,
+        incidents, flags and monitor configuration. Raw events, sessions, session replays, heatmaps,
+        cohort membership and LLM prompts are not reachable through any token. Every call is recorded
+        in the audit log against the token that made it. See docs/mcp.md.
+      </div>
+
+      {newToken && (
+        <>
+          <div class="settings-key-display">
+            <span class="settings-key-value">{newToken}</span>
+            <button class="obs-btn obs-btn--sm" onClick={() => copyToClipboard(newToken)}>Copy</button>
+          </div>
+          <div class="settings-key-note">Save this token now. It will not be shown again.</div>
+        </>
+      )}
+
+      {loading ? <SettingsSkeleton /> : tokens.length === 0 ? (
+        <div class="obs-empty-state">No MCP tokens</div>
+      ) : (
+        <div class="settings-list">
+          {tokens.map(t => (
+            <div key={t.id} class="settings-row">
+              <StatusBadge status={t.revoked_at ? "disabled" : "enabled"} size="sm" />
+              <span class="settings-row-name">{t.name}</span>
+              <span class="settings-row-value">
+                {t.role} · <code style={{ fontSize: "11px" }}>{t.id}</code>
+              </span>
+              <span class="settings-row-date">
+                {t.last_used_at ? `last used ${formatDate(t.last_used_at)}` : "never used"}
+              </span>
+              <span class="settings-row-date">{formatDate(t.created_at)}</span>
+              {!t.revoked_at && (
+                <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => setRevokingId(t.id)}>
+                  Revoke
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <Modal open={showCreate} onClose={() => setShowCreate(false)} title="Create MCP Token">
+        <div class="obs-form-group">
+          <label class="obs-label">Name</label>
+          <input class="obs-input" placeholder="claude-code" value={formName}
+            onInput={(e) => setFormName((e.target as HTMLInputElement).value)} />
+        </div>
+        <div class="obs-form-group">
+          <label class="obs-label">Role</label>
+          <select class="obs-input" value={formRole}
+            onChange={(e) => setFormRole((e.target as HTMLSelectElement).value)}>
+            <option value="viewer">Viewer — read-only</option>
+            <option value="editor">Editor — may also use mutating tools</option>
+          </select>
+          {/* Read-only is about mutation, not sensitivity. Saying so here stops
+              anyone reading "editor" as "sees more data" — it does not. */}
+          <div class="settings-key-note" style={{ marginTop: "6px" }}>
+            The role governs mutation only. Neither role reaches personal data.
+          </div>
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "8px" }}>
+          <button class="obs-btn" onClick={() => setShowCreate(false)}>Cancel</button>
+          <button class="obs-btn obs-btn--primary" onClick={handleCreate} disabled={creating || !formName.trim()}>
+            {creating ? "Creating..." : "Create"}
+          </button>
+        </div>
+      </Modal>
+
+      <ConfirmDialog
+        open={!!revokingId}
+        onClose={() => setRevokingId(null)}
+        onConfirm={handleRevoke}
+        title="Revoke MCP Token"
+        message="This token will immediately stop working. Any MCP client using it will lose access."
+        confirmLabel="Revoke"
+        loading={revokeLoading}
+      />
+    </div>
+  );
+}
+
 function PasswordSection() {
   const [currentPw, setCurrentPw] = useState("");
   const [newPw, setNewPw] = useState("");
@@ -881,6 +1024,7 @@ export default function SettingsPage() {
     { key: "webhooks", label: "Webhooks" },
     { key: "users", label: "Users" },
     { key: "keys", label: "API Keys" },
+    { key: "mcp", label: "MCP" },
     { key: "password", label: "Password" },
     { key: "ai", label: "AI" },
     { key: "exports", label: "Exports" },
@@ -906,6 +1050,7 @@ export default function SettingsPage() {
       {tab === "webhooks" && <WebhooksSection />}
       {tab === "users" && <UsersSection />}
       {tab === "keys" && <APIKeysSection />}
+      {tab === "mcp" && <MCPSection />}
       {tab === "password" && <PasswordSection />}
       {tab === "ai" && <AISection />}
       {tab === "exports" && <ExportsSection />}

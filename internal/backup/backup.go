@@ -102,6 +102,7 @@ var Tables = []string{
 	"share_links",
 	"report_schedules",
 	"scheduled_exports",
+	"mcp_tokens",
 }
 
 // ExcludedTables are tables the migrations create that a backup deliberately

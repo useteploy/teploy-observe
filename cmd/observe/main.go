@@ -47,6 +47,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/live"
 	"github.com/useteploy/teploy-observe/internal/llm"
 	"github.com/useteploy/teploy-observe/internal/logs"
+	"github.com/useteploy/teploy-observe/internal/mcp"
 	"github.com/useteploy/teploy-observe/internal/meta"
 	"github.com/useteploy/teploy-observe/internal/metrics"
 	"github.com/useteploy/teploy-observe/internal/monitoring"
@@ -993,6 +994,40 @@ func main() {
 	r.Handle("GET /api/v1/ai/config", jwtMW(requireAdmin(aiConfigGetHandler(aiSvc))))
 	r.Handle("PUT /api/v1/ai/config", jwtMW(requireAdmin(aiConfigPutHandler(aiSvc))))
 	r.Handle("POST /api/v1/ai/query", jwtMW(requireEditor(aiQueryHandler(aiSvc, aiSchema, llmSvc))))
+
+	// --- MCP server (bearer token, NOT the dashboard session) ---
+	//
+	// /api/mcp is deliberately outside /api/v1: it authenticates with its own
+	// token store rather than a JWT, so it must not sit behind the JWT
+	// middleware, and it audits per tool call rather than per HTTP request
+	// (the /api/v1 audit middleware would record "mcp.create" with no actor).
+	//
+	// The tools reach analytics AGGREGATES ONLY — see internal/mcp/allowlist.go.
+	// That boundary is enforced server-side in one function that both
+	// observe_query and observe_ask's generated SQL pass through; it is not a
+	// prompt, a convention, or a filter applied to results.
+	mcpStore := mcp.NewTokenStore(db)
+	mcpBack := &mcpBackend{
+		explorer:  explorerSvc,
+		ai:        aiSvc,
+		incidents: incidentSvc,
+		stats:     statsSvc,
+		flags:     flagSvc,
+	}
+	mcpHandler := mcp.NewHandler(mcpStore, mcp.Tools(mcpBack), version, auditSvc).
+		WithClientIP(func(r *http.Request) string { return ingest.ClientIPFromContext(r.Context()) })
+	// Registered per method, not as a bare path: a methodless pattern conflicts
+	// with the SPA's `GET /` under Go 1.22 routing ("matches fewer methods but
+	// has a more general path") and panics at startup. GET is registered so the
+	// handler can answer 405 rather than letting the SPA serve HTML to an MCP
+	// client that guessed the verb.
+	r.Handle("POST /api/mcp", mcpHandler)
+	r.Handle("GET /api/mcp", mcpHandler)
+	// Minting and revoking a credential is admin work (RBAC contract rule 1).
+	// These live under /api/v1 so the audit middleware records the mutations.
+	r.Handle("GET /api/v1/mcp/tokens", jwtMW(requireAdmin(mcpTokensListHandler(mcpStore))))
+	r.Handle("POST /api/v1/mcp/tokens", jwtMW(requireAdmin(mcpTokensCreateHandler(mcpStore))))
+	r.Handle("DELETE /api/v1/mcp/tokens/{token_id}", jwtMW(requireAdmin(mcpTokensRevokeHandler(mcpStore))))
 
 	// --- Scheduled SQL exports (admin only: writes data externally) ---
 	r.Handle("GET /api/v1/exports/scheduled", jwtMW(requireAdmin(exportsListHandler(scheduledExportSvc))))

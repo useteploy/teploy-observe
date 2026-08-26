@@ -6,6 +6,33 @@ All notable changes to Observe are recorded here.
 
 ### Added
 
+- **An MCP server, at `POST /api/mcp`.** Observe had comparable capability
+  behind `/api/v1/*` but no discoverable typed interface, so an agent had to be
+  hand-told every route and payload shape. Seven read-only tools —
+  `observe_tables`, `observe_query`, `observe_explain`, `observe_ask`,
+  `observe_list_incidents`, `observe_live_stats`, `observe_list_flags` — each
+  wrapping a service method the dashboard already calls, so there is no second
+  source of truth. Tokens (`tpo_` prefix, SHA-256 at rest, viewer/editor role)
+  are minted and revoked in Settings → MCP. The JSON-RPC plumbing is a port of
+  teploy-dash's, which had already been written and tested. See `docs/mcp.md`.
+- **MCP reaches analytics aggregates only, by allowlist.** Observe holds
+  personal data, and a raw query tool over an analytics warehouse is an
+  exfiltration primitive. Every table named after FROM or JOIN — at any nesting
+  depth — and every column must be on an explicit allowlist; `SELECT *` and
+  schema-qualified references are refused; person-level tables, session replays,
+  heatmaps, cohort membership and LLM prompts are unreachable through any tool
+  or any token. An allowlist rather than a denylist because the failure mode has
+  to be a refusal when a migration adds a table, not a leak when nobody
+  remembers. `observe_ask`'s generated SQL passes through the *same* gate a
+  hand-written query does — the model is shown the allowlist as its schema, and
+  what it produces is then checked anyway, because a prompt is not a control.
+  Read-only is a separate axis from sensitivity: the role governs mutation, and
+  v1 ships no PII-enabled token of any kind.
+- **Every MCP call lands in the audit trail** with the token id, the tool, the
+  arguments as given and the reason for any refusal — denials and rejected
+  credentials included, not just successes. (Dash's MCP has no equivalent: it
+  logs a line to stdout and that product has no audit package at all.)
+
 - **An "AI Assistant" traffic channel.** Referrals from ChatGPT, Claude, Grok,
   Perplexity, Gemini, Copilot, DeepSeek, Mistral, Meta AI and friends were all
   falling through to "Referral", alongside any random blog. They are now their
