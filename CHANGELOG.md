@@ -6,6 +6,31 @@ All notable changes to Observe are recorded here.
 
 ### Added
 
+- **Conversion goals carry money.** Observe could tell you 412 people signed
+  up; Plausible and Fathom could tell you what those signups were worth, and
+  that was the one place conversions were behind. A goal now takes a value and
+  an ISO-4217 currency, and `GET /api/v1/goals` returns `total_value_minor`
+  alongside the count. Two sources: a **fixed amount per conversion**, and
+  **an amount sent with each event** (`value_source: "event"`, read from a
+  property — `revenue` by default), so a $12 order and a $400 order are not
+  averaged into a fiction. Both shipped; per-event was cheap once the fixed
+  path existed, because it is the same query with a `SUM` on it.
+  - Money is an **integer count of minor units** end to end — `value_minor`,
+    `total_value_minor` — and becomes a decimal exactly once, in the browser.
+    A float64 cannot hold 0.1, so a running total of order values drifts, and
+    a revenue figure that disagrees with Stripe by two cents is worse than no
+    figure. Per-event totals are summed in Nucleus as `BIGINT`s, each event
+    scaled and rounded *before* it enters the `SUM`.
+  - "Minor unit", not "cents": ISO-4217 gives JPY an exponent of 0 and the
+    Gulf dinars 3, so ¥5,000 is 5000 units, not 500,000. The exponent table is
+    mirrored in Go and TypeScript.
+  - **Nothing defaults to USD.** A value with no currency is rejected at the
+    API rather than stamped with a guess, and the UI prints no money for a
+    goal that has none. A self-hosted tool does not get to assume its operator
+    bills in dollars.
+  - Goals gained `PUT` and `DELETE` endpoints. Every goal that exists today
+    predates the money, and without an edit path the only way to value one
+    would be to delete it and lose the id conversions are reported against.
 - **An MCP server, at `POST /api/mcp`.** Observe had comparable capability
   behind `/api/v1/*` but no discoverable typed interface, so an agent had to be
   hand-told every route and payload shape. Seven read-only tools —
@@ -41,8 +66,27 @@ All notable changes to Observe are recorded here.
   since AI surfaces often strip the referrer header. `bing.com/chat` is
   deliberately absent — it cannot be told apart from Bing search by referrer.
 
+### Changed
+
+- **The sidebar entry for `/insights` is now "Funnels & Goals".** Funnels,
+  goal conversions, conversion correlations, retention and journeys all live
+  behind it, and "Insights" named none of them — it is a category, not a thing
+  anyone looks for, and someone hunting for funnels scanned twenty-six nav
+  items without recognising one. The route is unchanged, so every existing
+  link, including the cohort deep-link from `/cohorts`, still works. The
+  command palette entry now matches "conversion", "funnel", "goal", "revenue"
+  and "drop-off" as well, and each of the five panels opens with a heading and
+  a line saying what it answers, plus an empty state that says what to do —
+  which for goal conversions is "create a goal", since the panel is empty by
+  definition until one exists.
+
 ### Fixed
 
+- **The goals panel threw on every site that had a goal.** `GoalConversion`
+  embedded `Goal`, so `encoding/json` flattened it and the dashboard's
+  `g.goal.name` read a key that was not there — the exact failure
+  `docs/api-shape-convention.md` forbids embedding to prevent. It is a named
+  field now, matching the shape the client has always expected.
 - **Channel classification matched substrings, not hosts.** `sandbox.company`
   contains `x.com` and was reported as Social; `kaolin.io` contains `aol` and
   was reported as Organic Search. Matching is now host-aware: a dotted entry
