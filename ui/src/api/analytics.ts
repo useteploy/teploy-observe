@@ -25,6 +25,21 @@ export interface ExitPageStat { pathname: string; visitors: number; }
 export interface CustomEventStat { event_type: string; count: number; visitors: number; }
 export interface RealtimeResult { active_visitors: number; }
 
+// How much of the selected range the visitor figures actually describe.
+// Pageviews come from the rollups (a year, then indefinitely) while a unique
+// count has to be counted from a table holding one row per thing counted —
+// raw events, or the session-grain sessions table — and those are pruned
+// sooner. `exact: false` means the number is real but covers a shorter window
+// than the one picked, and `note` is the sentence to show.
+export interface UniqueCoverage {
+  source: "events" | "sessions";
+  exact: boolean;
+  range_from: number;
+  covered_from: number;
+  covered_days: number;
+  note: string;
+}
+
 // Advanced analytics types
 export interface FunnelStep { type: string; value: string; }
 export interface FunnelResult {
@@ -67,6 +82,8 @@ export interface AttributionRow {
 export const analyticsApi = {
   realtime: (siteId: string, minutes = 5) =>
     get<RealtimeResult>(`${BASE}/realtime?site_id=${siteId}&minutes=${minutes}`),
+  uniqueCoverage: (siteId: string, from: string, to: string, filters?: Record<string, string>) =>
+    get<UniqueCoverage>(`${BASE}/unique-coverage?${qs(siteId, from, to, { filters })}`),
   overview: (siteId: string, from: string, to: string, compare?: string | null, filters?: Record<string, string>) =>
     get<OverviewResponse | OverviewStats>(
       `${BASE}/overview?${qs(siteId, from, to, { compare: compare || undefined, filters })}`

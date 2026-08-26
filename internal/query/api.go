@@ -252,6 +252,16 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 		return RealtimeResult{ActiveVisitors: count}, nil
 	}, neutron.WithTags("stats"))
 
+	// What the visitor panels can honestly claim for this range. Runs no
+	// query: the answer is the retention configuration plus the range's start.
+	// The dashboard reads it to label the panels when the unique counts cover
+	// a shorter window than the one the user picked.
+	neutron.Get(api, "/unique-coverage", func(ctx context.Context, input StatsInput) (UniqueCoverage, error) {
+		from, to := input.TimeRange()
+		return svc.UniqueCoverageFor(from, to, input.resolveFilters(ctx, svc)), nil
+	}, neutron.WithTags("stats"),
+		neutron.WithSummary("Which table answers this range's unique counts, and how much of it they cover"))
+
 	neutron.Get(api, "/overview", func(ctx context.Context, input StatsInput) (any, error) {
 		from, to := input.TimeRange()
 		filters := input.resolveFilters(ctx, svc)

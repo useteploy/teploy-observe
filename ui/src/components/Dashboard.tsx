@@ -7,6 +7,7 @@ import FilterBar from "./FilterBar.js";
 import TabbedBreakdownPanel from "./TabbedBreakdownPanel.js";
 import CustomEventsPanel from "./CustomEventsPanel.js";
 import OnboardingGuide from "./OnboardingGuide.js";
+import CoverageNote from "./CoverageNote.js";
 import WorldMapPanel from "./WorldMapPanel.js";
 import "../styles/dashboard.css";
 
@@ -43,6 +44,8 @@ function DashboardInner() {
       <FilterBar />
 
       <OnboardingGuide siteId={state.siteId} />
+
+      <CoverageNote />
 
       <StatsCards />
 

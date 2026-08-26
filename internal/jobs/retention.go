@@ -50,6 +50,19 @@ func DefaultPolicies(rawDays, hourlyDays int) []RetentionPolicy {
 	}
 }
 
+// PolicyDays returns the retention window configured for a table, in days, or
+// 0 if the table has no policy (0 also being "prunes nothing", which is what an
+// unlisted table gets). The analytics read path uses it to decide which table
+// can still answer a unique count for a given range.
+func PolicyDays(policies []RetentionPolicy, table string) int {
+	for _, p := range policies {
+		if p.Table == table {
+			return p.Days
+		}
+	}
+	return 0
+}
+
 // NewRetentionService keeps the old two-arg constructor for backwards compat.
 func NewRetentionService(db *nucleus.Client, logger *slog.Logger, rawDays, hourlyDays int) *RetentionService {
 	return NewRetentionServiceWithPolicies(db, logger, DefaultPolicies(rawDays, hourlyDays))

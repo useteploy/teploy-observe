@@ -224,7 +224,7 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 | `OBSERVE_FLUSH_INTERVAL_MS` | `2000` | Flush threshold (time). |
 | `OBSERVE_DATA_DIR` | `./data` | Root dir for WAL, queue, local state. |
 | `OBSERVE_QUEUE_DIR` | `$OBSERVE_DATA_DIR/queue` | Ingest WAL directory. |
-| `OBSERVE_RAW_RETENTION_DAYS` | `30` | Raw event retention. |
+| `OBSERVE_RAW_RETENTION_DAYS` | `30` | Raw event retention. Also the window over which visitor counts are exact from raw events; past it they are counted from the `sessions` table (90 days), and past both the dashboard says which window the figure covers. |
 | `OBSERVE_HOURLY_RETENTION_DAYS` | `365` | Hourly rollup retention. |
 | `OBSERVE_LOG_ROUTES` | `0` | Set to `1` to print route table at boot. |
 | `OBSERVE_SMTP_HOST` | | SMTP server for email reports. |

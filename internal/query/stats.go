@@ -21,10 +21,13 @@ type CohortResolver func(ctx context.Context, siteID, cohortID string) ([]string
 type StatsService struct {
 	db             *nucleus.Client
 	cohortResolver CohortResolver
+	// retention decides which table can answer a unique count for a given
+	// range, and whether it covers all of it. See coverage.go.
+	retention RetentionWindows
 }
 
 func NewStatsService(db *nucleus.Client) *StatsService {
-	return &StatsService{db: db}
+	return &StatsService{db: db, retention: DefaultRetentionWindows()}
 }
 
 // WithCohortResolver attaches a cohort lookup so the api layer can apply
@@ -209,7 +212,8 @@ func (s *StatsService) PageviewTimeSeries(ctx context.Context, siteID string, fr
 		if table == "stats_daily" {
 			bucketMs = 86400000
 		}
-		visitors, err := s.uniqueVisitorsByBucket(ctx, siteID, fromMs, toMs, bucketMs, filters)
+		visitors, err := s.uniqueVisitorsByBucket(ctx, siteID, fromMs, toMs, bucketMs, filters,
+			s.coverage(from, to, filters).Source)
 		if err != nil {
 			return nil, err
 		}
@@ -238,23 +242,44 @@ func (s *StatsService) PageviewTimeSeries(ctx context.Context, siteID string, fr
 // same site previously reported one figure below 24h (raw events) and a
 // three-to-eight-times larger one above it (summed rollups).
 //
-// The cost is that unique counts are bounded by raw-event retention
-// (OBSERVE_RAW_RETENTION_DAYS, default 30) rather than by rollup retention.
-// Pageview counts keep the rollups' longer reach.
-func (s *StatsService) uniqueVisitorsByBucket(ctx context.Context, siteID string, fromMs, toMs, bucketMs int64, filters *FilterBuilder) (map[int64]int64, error) {
-	fSQL, _ := filterSQL(filters)
-	q := fmt.Sprintf(`SELECT (CAST(timestamp AS BIGINT) / %d) * %d AS bucket,
-	        COUNT(DISTINCT session_id) AS visitors
-	 FROM events
-	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-	   AND event_type = 'pageview'%s
-	 GROUP BY (CAST(timestamp AS BIGINT) / %d) * %d`, bucketMs, bucketMs, fSQL, bucketMs, bucketMs)
+// Raw events do not reach as far back as the rollups, so the source is tiered
+// by where the range starts (see coverage.go): inside raw retention the count
+// comes from events, past it from the session-grain sessions table, and past
+// both it comes from whatever sessions still holds plus an explicit marker that
+// the figure covers a shorter window than the range. Under-reporting silently
+// is the failure this replaces.
+func (s *StatsService) uniqueVisitorsByBucket(ctx context.Context, siteID string, fromMs, toMs, bucketMs int64, filters *FilterBuilder, src UniqueSource) (map[int64]int64, error) {
+	var q string
+	var params []any
+	if src == SourceSessions {
+		sessFilters := filters.Subset(sessionsFilterColumns)
+		sessSQL, _ := filterSQL(sessFilters)
+		params = baseParams(siteID, fromMs, toMs, sessFilters)
+		// A session is attributed to the bucket it started in — the same
+		// first_ts grain the entry/exit-page panels already use.
+		q = fmt.Sprintf(`SELECT (CAST(first_ts AS BIGINT) / %d) * %d AS bucket,
+		        COUNT(*) AS visitors
+		 FROM %s AS s
+		 GROUP BY (CAST(first_ts AS BIGINT) / %d) * %d`,
+			bucketMs, bucketMs,
+			LatestRows("sessions", []string{"first_ts"}, sessionWhere("", sessSQL)),
+			bucketMs, bucketMs)
+	} else {
+		fSQL, _ := filterSQL(filters)
+		params = baseParams(siteID, fromMs, toMs, filters)
+		q = fmt.Sprintf(`SELECT (CAST(timestamp AS BIGINT) / %d) * %d AS bucket,
+		        COUNT(DISTINCT session_id) AS visitors
+		 FROM events
+		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+		   AND event_type = 'pageview'%s
+		 GROUP BY (CAST(timestamp AS BIGINT) / %d) * %d`, bucketMs, bucketMs, fSQL, bucketMs, bucketMs)
+	}
 
 	type bucketRow struct {
 		Bucket   int64 `db:"bucket"`
 		Visitors int64 `db:"visitors"`
 	}
-	rows, err := nucleus.Query[bucketRow](ctx, s.db.SQL(), q, baseParams(siteID, fromMs, toMs, filters)...)
+	rows, err := nucleus.Query[bucketRow](ctx, s.db.SQL(), q, params...)
 	if err != nil {
 		return nil, fmt.Errorf("pageview timeseries visitors: %w", err)
 	}
@@ -354,25 +379,17 @@ type TopReferrer struct {
 }
 
 func (s *StatsService) TopReferrers(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]TopReferrer, error) {
-	fromMs := from.UnixMilli()
-	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
-	fSQL, _ := filterSQL(filters)
-	allParams := baseParams(siteID, fromMs, toMs, filters)
-
-	// Always raw events: `visitors` is a unique count, which cannot be summed
-	// out of stats_daily (see uniqueVisitorsByBucket). stats_hourly has no
-	// referrer column and already fell back here.
-	q := fmt.Sprintf(`SELECT referrer,
-	        COUNT(DISTINCT session_id) AS visitors
-	 FROM events
-	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-	   AND referrer != '' AND event_type = 'pageview'%s
-	 GROUP BY referrer
-	 ORDER BY visitors DESC, referrer ASC
-	 LIMIT %d`, fSQL, limit)
+	// Never a rollup: `visitors` is a unique count, which cannot be summed out
+	// of stats_daily (see uniqueVisitorsByBucket). Which of the two
+	// unique-capable tables answers depends on where the range starts — see
+	// coverage.go.
+	q, allParams := s.breakdownSQL(siteID, from, to, breakdown{
+		Expr: "referrer", Alias: "referrer", Where: "referrer != ''",
+		EventsExtra: "event_type = 'pageview'", Cols: []string{"referrer"},
+	}, limit, filters)
 
 	rows, err := nucleus.Query[TopReferrer](ctx, s.db.SQL(), q, allParams...)
 	if err != nil {
@@ -388,25 +405,13 @@ type BrowserStat struct {
 }
 
 func (s *StatsService) TopBrowsers(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]BrowserStat, error) {
-	fromMs := from.UnixMilli()
-	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
-	fSQL, _ := filterSQL(filters)
-	allParams := baseParams(siteID, fromMs, toMs, filters)
-
-	// Always raw events: `visitors` is a unique count and cannot be summed
-	// out of stats_daily (see uniqueVisitorsByBucket).
-	q := fmt.Sprintf(`SELECT browser,
-	        COUNT(DISTINCT session_id) AS visitors
-	 FROM events
-	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-	   AND browser != ''%s
-	 GROUP BY browser
-	 ORDER BY visitors DESC, browser ASC
-	 LIMIT %d`, fSQL, limit)
-
+	q, allParams := s.breakdownSQL(siteID, from, to, breakdown{
+		Expr: "browser", Alias: "browser", Where: "browser != ''",
+		Cols: []string{"browser"},
+	}, limit, filters)
 
 	rows, err := nucleus.Query[BrowserStat](ctx, s.db.SQL(), q, allParams...)
 	if err != nil {
@@ -422,25 +427,13 @@ type CountryStat struct {
 }
 
 func (s *StatsService) TopCountries(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]CountryStat, error) {
-	fromMs := from.UnixMilli()
-	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
-	fSQL, _ := filterSQL(filters)
-	allParams := baseParams(siteID, fromMs, toMs, filters)
-
-	// Always raw events: `visitors` is a unique count and cannot be summed
-	// out of stats_daily (see uniqueVisitorsByBucket).
-	q := fmt.Sprintf(`SELECT country,
-	        COUNT(DISTINCT session_id) AS visitors
-	 FROM events
-	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-	   AND country != ''%s
-	 GROUP BY country
-	 ORDER BY visitors DESC, country ASC
-	 LIMIT %d`, fSQL, limit)
-
+	q, allParams := s.breakdownSQL(siteID, from, to, breakdown{
+		Expr: "country", Alias: "country", Where: "country != ''",
+		Cols: []string{"country"},
+	}, limit, filters)
 
 	rows, err := nucleus.Query[CountryStat](ctx, s.db.SQL(), q, allParams...)
 	if err != nil {
@@ -456,25 +449,13 @@ type OSStat struct {
 }
 
 func (s *StatsService) TopOS(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]OSStat, error) {
-	fromMs := from.UnixMilli()
-	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
-	fSQL, _ := filterSQL(filters)
-	allParams := baseParams(siteID, fromMs, toMs, filters)
-
-	// Always raw events: `visitors` is a unique count and cannot be summed
-	// out of stats_daily (see uniqueVisitorsByBucket).
-	q := fmt.Sprintf(`SELECT os,
-	        COUNT(DISTINCT session_id) AS visitors
-	 FROM events
-	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-	   AND os != ''%s
-	 GROUP BY os
-	 ORDER BY visitors DESC, os ASC
-	 LIMIT %d`, fSQL, limit)
-
+	q, allParams := s.breakdownSQL(siteID, from, to, breakdown{
+		Expr: "os", Alias: "os", Where: "os != ''",
+		Cols: []string{"os"},
+	}, limit, filters)
 
 	rows, err := nucleus.Query[OSStat](ctx, s.db.SQL(), q, allParams...)
 	if err != nil {
@@ -490,25 +471,13 @@ type DeviceStat struct {
 }
 
 func (s *StatsService) TopDevices(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]DeviceStat, error) {
-	fromMs := from.UnixMilli()
-	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
-	fSQL, _ := filterSQL(filters)
-	allParams := baseParams(siteID, fromMs, toMs, filters)
-
-	// Always raw events: `visitors` is a unique count and cannot be summed
-	// out of stats_daily (see uniqueVisitorsByBucket).
-	q := fmt.Sprintf(`SELECT device,
-	        COUNT(DISTINCT session_id) AS visitors
-	 FROM events
-	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-	   AND device != ''%s
-	 GROUP BY device
-	 ORDER BY visitors DESC, device ASC
-	 LIMIT %d`, fSQL, limit)
-
+	q, allParams := s.breakdownSQL(siteID, from, to, breakdown{
+		Expr: "device", Alias: "device", Where: "device != ''",
+		Cols: []string{"device"},
+	}, limit, filters)
 
 	rows, err := nucleus.Query[DeviceStat](ctx, s.db.SQL(), q, allParams...)
 	if err != nil {
@@ -558,15 +527,32 @@ func rankChannels(counts map[string]int64, limit int) []ChannelStat {
 func (s *StatsService) TopChannels(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]ChannelStat, error) {
 	fromMs := from.UnixMilli()
 	toMs := to.UnixMilli()
-	fSQL, _ := filterSQL(filters)
-	allParams := baseParams(siteID, fromMs, toMs, filters)
-
-	q := fmt.Sprintf(`SELECT DISTINCT session_id,
+	var q string
+	var allParams []any
+	if s.coverage(from, to, filters).Source == SourceSessions {
+		// Past raw retention. The sessions table carries referrer and the UTM
+		// pair already collapsed to one row per session, which is exactly the
+		// grain this classification wants.
+		sessFilters := filters.Subset(sessionsFilterColumns)
+		sessSQL, _ := filterSQL(sessFilters)
+		allParams = baseParams(siteID, fromMs, toMs, sessFilters)
+		q = fmt.Sprintf(`SELECT session_id,
 		        COALESCE(referrer, '') AS referrer,
 		        COALESCE(utm_source, '') AS utm_source,
 		        COALESCE(utm_medium, '') AS utm_medium
-		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3%s`, fSQL)
+		 FROM %s AS s`, LatestRows("sessions",
+			[]string{"referrer", "utm_source", "utm_medium"},
+			sessionWhere("", sessSQL)))
+	} else {
+		fSQL, _ := filterSQL(filters)
+		allParams = baseParams(siteID, fromMs, toMs, filters)
+		q = fmt.Sprintf(`SELECT DISTINCT session_id,
+			        COALESCE(referrer, '') AS referrer,
+			        COALESCE(utm_source, '') AS utm_source,
+			        COALESCE(utm_medium, '') AS utm_medium
+			 FROM events
+			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3%s`, fSQL)
+	}
 
 	rows, err := nucleus.Query[channelRow](ctx, s.db.SQL(), q, allParams...)
 	if err != nil {
@@ -656,7 +642,22 @@ func (s *StatsService) Overview(ctx context.Context, siteID string, from, to tim
 		 FROM events
 		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		   AND event_type = 'pageview'%s`, fSQL)
-		uniqRows, err := nucleus.Query[rawStats](ctx, s.db.SQL(), uniqQ, allParams...)
+		uniqParams := allParams
+		if s.coverage(from, to, filters).Source == SourceSessions {
+			// Past raw retention. One row per session makes the count exact.
+			// The visit-grain figure raw events give for `sessions`
+			// (COUNT(DISTINCT visit_id), a visit being one clock hour) has no
+			// session-grain equivalent, so both tiles report the session grain
+			// the bounce rate and duration already use.
+			sessFilters := filters.Subset(sessionsFilterColumns)
+			sessSQL, _ := filterSQL(sessFilters)
+			uniqParams = baseParams(siteID, fromMs, toMs, sessFilters)
+			uniqQ = fmt.Sprintf(`SELECT 0 AS pageviews,
+			        COUNT(*) AS visitors,
+			        COUNT(*) AS sessions
+			 FROM %s AS s`, LatestRows("sessions", nil, sessionWhere("", sessSQL)))
+		}
+		uniqRows, err := nucleus.Query[rawStats](ctx, s.db.SQL(), uniqQ, uniqParams...)
 		if err != nil {
 			return OverviewStats{}, fmt.Errorf("overview uniques: %w", err)
 		}
@@ -728,22 +729,13 @@ type LanguageStat struct {
 }
 
 func (s *StatsService) TopLanguages(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]LanguageStat, error) {
-	fromMs := from.UnixMilli()
-	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
-	fSQL, _ := filterSQL(filters)
-	allParams := baseParams(siteID, fromMs, toMs, filters)
-
-	q := fmt.Sprintf(`SELECT language,
-	        COUNT(DISTINCT session_id) AS visitors
-	 FROM events
-	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-	   AND language != ''%s
-	 GROUP BY language
-	 ORDER BY visitors DESC, language ASC
-	 LIMIT %d`, fSQL, limit)
+	q, allParams := s.breakdownSQL(siteID, from, to, breakdown{
+		Expr: "language", Alias: "language", Where: "language != ''",
+		Cols: []string{"language"},
+	}, limit, filters)
 
 	rows, err := nucleus.Query[LanguageStat](ctx, s.db.SQL(), q, allParams...)
 	if err != nil {
@@ -759,22 +751,15 @@ type ScreenStat struct {
 }
 
 func (s *StatsService) TopScreens(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]ScreenStat, error) {
-	fromMs := from.UnixMilli()
-	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
-	fSQL, _ := filterSQL(filters)
-	allParams := baseParams(siteID, fromMs, toMs, filters)
-
-	q := fmt.Sprintf(`SELECT CAST(screen_width AS TEXT) || 'x' || CAST(screen_height AS TEXT) AS screen,
-	        COUNT(DISTINCT session_id) AS visitors
-	 FROM events
-	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-	   AND CAST(screen_width AS INTEGER) > 0%s
-	 GROUP BY CAST(screen_width AS TEXT) || 'x' || CAST(screen_height AS TEXT)
-	 ORDER BY visitors DESC, screen ASC
-	 LIMIT %d`, fSQL, limit)
+	q, allParams := s.breakdownSQL(siteID, from, to, breakdown{
+		Expr:  "CAST(screen_width AS TEXT) || 'x' || CAST(screen_height AS TEXT)",
+		Alias: "screen",
+		Where: "CAST(screen_width AS INTEGER) > 0",
+		Cols:  []string{"screen_width", "screen_height"},
+	}, limit, filters)
 
 	rows, err := nucleus.Query[ScreenStat](ctx, s.db.SQL(), q, allParams...)
 	if err != nil {
@@ -790,13 +775,9 @@ type UTMStat struct {
 }
 
 func (s *StatsService) TopUTM(ctx context.Context, siteID string, from, to time.Time, utmType string, limit int, filters *FilterBuilder) ([]UTMStat, error) {
-	fromMs := from.UnixMilli()
-	toMs := to.UnixMilli()
 	if limit <= 0 {
 		limit = 10
 	}
-	fSQL, _ := filterSQL(filters)
-	allParams := baseParams(siteID, fromMs, toMs, filters)
 
 	col := "utm_source"
 	switch utmType {
@@ -806,14 +787,10 @@ func (s *StatsService) TopUTM(ctx context.Context, siteID string, from, to time.
 		col = "utm_campaign"
 	}
 
-	q := fmt.Sprintf(`SELECT %s AS value,
-	        COUNT(DISTINCT session_id) AS visitors
-	 FROM events
-	 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-	   AND %s != ''%s
-	 GROUP BY %s
-	 ORDER BY visitors DESC, value ASC
-	 LIMIT %d`, col, col, fSQL, col, limit)
+	q, allParams := s.breakdownSQL(siteID, from, to, breakdown{
+		Expr: col, Alias: "value", Where: col + " != ''",
+		Cols: []string{col},
+	}, limit, filters)
 
 	rows, err := nucleus.Query[UTMStat](ctx, s.db.SQL(), q, allParams...)
 	if err != nil {

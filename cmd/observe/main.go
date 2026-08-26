@@ -238,8 +238,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Retention policies are the single source for both the cleanup job and
+	// the analytics read path: a unique count can only be answered by a table
+	// that still holds the rows, so the query layer tiers its source off the
+	// same numbers rather than a constant of its own.
+	retentionPolicies := jobs.DefaultPolicies(cfg.RawRetentionDays, cfg.HourlyRetentionDays)
+
 	// Stats service
-	statsSvc := query.NewStatsService(db)
+	statsSvc := query.NewStatsService(db).WithRetention(query.RetentionWindows{
+		RawDays:      jobs.PolicyDays(retentionPolicies, "events"),
+		SessionsDays: jobs.PolicyDays(retentionPolicies, "sessions"),
+	})
 
 	// Live event stream service
 	liveSvc := live.NewLiveService(db, logger)
@@ -372,7 +381,7 @@ func main() {
 
 	// Background jobs: rollups + retention
 	rollups := jobs.NewRollupService(db, logger)
-	retention := jobs.NewRetentionService(db, logger, cfg.RawRetentionDays, cfg.HourlyRetentionDays)
+	retention := jobs.NewRetentionServiceWithPolicies(db, logger, retentionPolicies)
 	scheduler := jobs.NewScheduler(rollups, retention, logger)
 
 	// Self-observability service

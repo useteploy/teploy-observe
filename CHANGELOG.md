@@ -56,15 +56,51 @@ All notable changes to Observe are recorded here.
 
   **Not caused by the replacing-rollup work below** — the tie order was
   undefined before it and the sort control had never sorted its default
-  direction. That work did leave a separate, real gap: unique counts now come
-  from raw `events` (`OBSERVE_RAW_RETENTION_DAYS`, 30 days) while pageviews
-  keep the rollups' reach and entry/exit pages come from `sessions` (90 days).
-  On "Last 90 days" and longer the pageview panel therefore covers the whole
-  window and every visitor panel covers only the last 30 days, so the two
-  disagree and the visitor rankings describe a shorter window than the header
-  claims. Closing that needs a product decision about the source for long-range
-  uniques (sessions at 90 days, longer raw retention, or a distinct sketch in
-  Nucleus) and is deliberately not changed here.
+  direction. The separate gap that work left is closed in the entry below.
+
+- **Visitor figures were silently under-reported on any range longer than raw
+  retention.** Moving unique counts off the non-additive rollup column and onto
+  raw `events` fixed a 3-8x over-count but left the panels reading different
+  windows: pageviews come from `stats_hourly` / `stats_daily`
+  (`OBSERVE_HOURLY_RETENTION_DAYS`, 365, then daily indefinitely), uniques came
+  from `events` (`OBSERVE_RAW_RETENTION_DAYS`, 30), and entry/exit pages from
+  `sessions` (90). The date picker offers Last 90 days, Last 12 months and All
+  time, so picking any of them put a full-range pageview number beside visitor
+  numbers covering only the last 30 days, with nothing saying so.
+
+  The source is now tiered by what can answer the range **exactly**, and the
+  tier is decided by the range's `from`, not its length — a one-week window
+  sitting a year back is outside raw retention just as much as a twelve-month
+  one.
+
+  1. Inside raw retention: `COUNT(DISTINCT session_id)` over `events`, as
+     before.
+  2. Past raw retention, inside session retention: the session-grain `sessions`
+     table, which holds one row per session and therefore counts exactly and
+     cheaply. This extends accurate uniques to 90 days at no cost. It covers
+     the overview tiles, the visitor series, and the referrer, channel,
+     browser, OS, device, screen, country, language and UTM breakdowns; entry
+     and exit pages already read `sessions` and now agree with the rest.
+  3. Past both: the figure the surviving data supports, plus an explicit marker
+     that it covers a shorter window than the range. Returning the smaller
+     number in silence was the bug.
+
+  Both windows are read from the running retention policy rather than a
+  constant, so raising `OBSERVE_RAW_RETENTION_DAYS` widens the exact tier with
+  no code change, and a policy of 0 days (prunes nothing) never downgrades
+  anything. `GET /api/v1/stats/unique-coverage` returns the tier, the window
+  actually covered and the sentence to show; it runs no query. The dashboard
+  renders it as a "Partial" note above the tiles whenever the answer is not
+  exact.
+
+  Two consequences worth knowing. A filter on `pathname`, `event_type` or a
+  cohort's `distinct_id` names a column `sessions` does not carry, so such a
+  read stays on raw events past raw retention — and gets the same marker
+  naming the 30-day window rather than a quietly smaller number. And in the
+  sessions tier the Sessions tile reports the session grain the bounce rate and
+  average duration already use; the visit grain raw events give it
+  (`COUNT(DISTINCT visit_id)`, a visit being one clock hour) has no
+  session-grain equivalent.
 
 - **Migration 034 could not run at all — on a fresh install or on the live
   upgrade path — because of a comment.** Nucleus v0.1.8's SQL lexer panics on a

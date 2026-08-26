@@ -897,3 +897,34 @@ p { line-height: 1.6; }
     font-size: 22px;
   }
 }
+
+/* ─── Unique-coverage note ───
+   Shown above the tiles when the visitor figures cover a shorter window than
+   the selected range: pageviews come from the rollups, uniques from raw events
+   or the sessions table, and those are pruned sooner. See CoverageNote.tsx. */
+.obs-coverage-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--obs-border);
+  border-left: 3px solid var(--obs-warning);
+  border-radius: var(--obs-radius);
+  background: var(--obs-card);
+  color: var(--obs-text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.obs-coverage-badge {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: var(--obs-radius-full);
+  background: var(--obs-warning);
+  color: var(--obs-bg);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
