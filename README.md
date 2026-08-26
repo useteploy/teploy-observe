@@ -60,8 +60,11 @@ it is also stored in `/etc/observe/observe.env` and rotatable from
 
 The direct installer verifies the release's SHA256 through an Ed25519-signed
 `checksums.txt` before installing anything. It fails closed if the signature
-or archive hash is invalid. Set `OBSERVE_HEALTH_URL` when upgrading an existing
-direct installation that does not listen on `http://127.0.0.1:3000/healthz`.
+or archive hash is invalid. `OBSERVE_HEALTH_URL` is read by the install script
+only, for the health poll it runs after restarting the existing service
+(default `http://127.0.0.1:3000/healthz`). It does not configure
+`observe upgrade`, which derives its readiness URL from `OBSERVE_ADDR`; pass
+`--health-url` instead for a non-default endpoint.
 
 ## Upgrade
 
@@ -71,6 +74,9 @@ Use the manager that installed Observe:
 # Direct Linux/systemd install
 sudo observe upgrade
 sudo observe upgrade --version v1.2.3
+# --service <unit>     systemd unit name (default: observe.service)
+# --health-url <url>   readiness URL for custom service configuration,
+#                      derived from OBSERVE_ADDR by default
 
 # Homebrew
 brew upgrade useteploy/tap/observe
@@ -212,18 +218,25 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OBSERVE_ADDR` | `:3000` | Listen address. |
+| `OBSERVE_ADDR` | `:3000` | Listen address. Keep on localhost/tailnet when publishing ingest. |
+| `OBSERVE_INGEST_ADDR` | (unset) | Optional second bind address serving ONLY telemetry-write endpoints (e.g. `:3001`). This is the port to expose publicly; the dashboard does not listen on it. |
+| `OBSERVE_PUBLIC_URL` | (unset) | External base URL (`https://observe.example.com`) used for SSO metadata and generated links. Falls back to the request's Host header, which a client can spoof — set it whenever the instance is reachable by a name. |
 | `OBSERVE_NUCLEUS_URL` | `postgres://localhost:5432/observe` | Nucleus connection. |
 | `OBSERVE_JWT_SECRET` | (random) | JWT signing secret — set in prod to persist sessions across restarts. |
+| `OBSERVE_SECRET_KEY` | (unset) | Master key for encrypting stored secrets (LLM API key, S3/R2 credentials) at rest; required to configure those features. |
 | `OBSERVE_ADMIN_USER` | `admin` | Bootstrap admin username. |
-| `OBSERVE_ADMIN_PASSWORD` | `observe` | Bootstrap admin password. Change on first login. |
-| `OBSERVE_SESSION_SALT` | `observe-default-salt` | Session-ID hashing salt. |
+| `OBSERVE_ADMIN_PASSWORD` | (unset) | Bootstrap admin password; unset means no default — the `/setup` wizard creates the account on first visit. |
+| `OBSERVE_SESSION_SALT` | (random) | Session-ID hashing salt — set it to keep session/visitor IDs stable across restarts. |
+| `OBSERVE_DEMO_MODE` | (unset) | Set to `true` to lock the deployment to a read-only public demo (write ops on `/api/v1/*` return 403). |
+| `OBSERVE_SEED_DEMO` | (unset) | Set to `true` for first-boot demo seeding (off by default; also on when demo mode is set). |
 | `OBSERVE_RATE_LIMIT` | `1000` | Default per-site events/sec. Per-site overrides via API. |
+| `OBSERVE_TRUSTED_PROXIES` | (unset) | Comma-separated CIDRs/IPs whose `X-Forwarded-For` / `X-Real-Ip` are trusted for client-IP extraction. Empty trusts none (peer address) so clients can't spoof their IP to evade per-IP rate limiting. |
 | `OBSERVE_BUFFER_SIZE` | `100000` | Max buffered events in memory. |
 | `OBSERVE_FLUSH_SIZE` | `500` | Flush threshold (events). |
 | `OBSERVE_FLUSH_INTERVAL_MS` | `2000` | Flush threshold (time). |
 | `OBSERVE_DATA_DIR` | `./data` | Root dir for WAL, queue, local state. |
 | `OBSERVE_QUEUE_DIR` | `$OBSERVE_DATA_DIR/queue` | Ingest WAL directory. |
+| `OBSERVE_REQUIRE_WAL` | (unset) | Set to `true` (or `1`) to refuse to start when WAL-backed ingestion durability is unavailable, instead of degrading to memory-only. |
 | `OBSERVE_RAW_RETENTION_DAYS` | `30` | Raw event retention. Also the window over which visitor counts are exact from raw events; past it they are counted from the `sessions` table (90 days), and past both the dashboard says which window the figure covers. |
 | `OBSERVE_HOURLY_RETENTION_DAYS` | `365` | Hourly rollup retention. |
 | `OBSERVE_LOG_ROUTES` | `0` | Set to `1` to print route table at boot. |
