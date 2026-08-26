@@ -1,7 +1,9 @@
 package errors
 
 import (
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestGroupHash_InAppFrames(t *testing.T) {
@@ -134,5 +136,33 @@ func TestIssueTitle(t *testing.T) {
 	title = IssueTitle("Error", "")
 	if title != "Error" {
 		t.Errorf("unexpected title: %s", title)
+	}
+}
+
+func TestTruncate(t *testing.T) {
+	// ASCII input longer than max: exact byte-length truncation, "..." suffix.
+	if out := truncate(strings.Repeat("a", 200), 120); len(out) != 120 || !strings.HasSuffix(out, "...") {
+		t.Errorf("expected 120 bytes ending in '...', got %d bytes: %q", len(out), out)
+	}
+
+	// Multi-byte input: the cut must not split a rune, so the result stays
+	// valid UTF-8 and within the byte budget. 100 runes of 'é' = 200 bytes,
+	// so a naive s[:117] would land mid-rune.
+	out := truncate(strings.Repeat("é", 100), 120)
+	if !utf8.ValidString(out) {
+		t.Errorf("expected valid UTF-8, got %q", out)
+	}
+	if len(out) > 120 {
+		t.Errorf("expected at most 120 bytes, got %d", len(out))
+	}
+
+	// max < 3 must not panic on a negative slice index.
+	if out := truncate("abcdef", 2); out != "" {
+		t.Errorf("expected empty string for max < 3, got %q", out)
+	}
+
+	// Short input is returned unchanged.
+	if out := truncate("short", 120); out != "short" {
+		t.Errorf("expected unchanged input, got %q", out)
 	}
 }
