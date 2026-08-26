@@ -9,6 +9,7 @@ import {
   lookupCountry,
   normalizeCode,
   stepFor,
+  RAMP_FLOOR,
 } from "./worldMap.ts";
 import { WORLD_MARKERS, WORLD_SHAPES, WORLD_VIEWBOX } from "../data/world110m.ts";
 
@@ -117,13 +118,41 @@ test("a long tail stays on the ramp without flattening the leaders", () => {
   assert.equal(stepFor(2, max), 1); // and the tail must not read as no data
 });
 
+test("a sparse map does not paint one visitor as saturation", () => {
+  // The bug Tyler caught: with a 1-visitor maximum a relative-only scale
+  // divides the leader by itself and paints it at 100% accent.
+  assert.equal(stepFor(1, 1), 1, "a lone visitor must render at the faintest step");
+  assert.equal(stepFor(1, 2), 1);
+  assert.equal(stepFor(2, 2), 1, "the leader of a 2-visitor site is still barely traffic");
+  assert.ok(stepFor(2, 2) < RAMP_MIX.length, "a sparse leader must not reach the top of the ramp");
+  // The ramp opens up as real traffic arrives.
+  assert.ok(stepFor(RAMP_FLOOR, RAMP_FLOOR) > stepFor(1, 1));
+});
+
+test("the floor hands over to the relative scale once traffic is real", () => {
+  // At and above the floor the maximum lands on the last step exactly, so the
+  // handover does not dim a busy map.
+  assert.equal(stepFor(RAMP_FLOOR, RAMP_FLOOR), RAMP_MIX.length);
+  assert.equal(stepFor(900, 900), RAMP_MIX.length);
+  // and the scale never runs backwards across the handover
+  let prev = 0;
+  for (const max of [1, 5, 10, 24, 25, 26, 100, 900]) {
+    const step = stepFor(max, max);
+    assert.ok(step >= prev, `leader step fell from ${prev} to ${step} at max=${max}`);
+    prev = step;
+  }
+});
+
 test("degenerate scales do not produce a fill", () => {
   assert.equal(stepFor(5, 0), 0);
   assert.equal(stepFor(Number.NaN, 100), 0);
   assert.equal(stepFor(5, Number.NaN), 0);
   assert.equal(stepFor(-3, 100), 0);
-  // A single country with a single visitor is still the maximum.
-  assert.equal(stepFor(1, 1), RAMP_MIX.length);
+  // A single country with a single visitor IS the maximum, but being the
+  // maximum of nothing is not intensity: it renders at the faintest step, not
+  // the loudest. This assertion used to read RAMP_MIX.length and was pinning
+  // the bug in place.
+  assert.equal(stepFor(1, 1), 1);
 });
 
 test("a country with no row renders as land, not as a zero highlight", () => {

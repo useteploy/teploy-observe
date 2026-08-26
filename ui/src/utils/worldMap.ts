@@ -79,6 +79,13 @@ export const MARKER_RADIUS = 1.1;
 export const RAMP_MIX = [30, 47, 64, 82, 100] as const;
 
 /** Land with no data. Both ends of the ramp are built from suite tokens. */
+/**
+ * Visitor count below which the ramp refuses to stretch. Under this, intensity
+ * is measured against the floor rather than against the maximum, so one visit
+ * cannot look like saturation.
+ */
+export const RAMP_FLOOR = 25;
+
 export const NEUTRAL_FILL = "var(--obs-border)";
 
 /** Normalises whatever the API handed us into an ISO alpha-2 shaped key. */
@@ -109,6 +116,15 @@ export function lookupCountry(raw: unknown): { code: string; name: string; kind:
 export function stepFor(visitors: number, max: number): number {
   if (!Number.isFinite(visitors) || visitors <= 0) return 0;
   if (!Number.isFinite(max) || max <= 0) return 0;
+  if (max < RAMP_FLOOR) {
+    // Sparse data. A purely relative scale divides the leader by itself and
+    // paints it at full intensity, so a site with a single visitor in one
+    // country renders that country exactly as loudly as a site with fifty
+    // thousand. Scale against the floor instead, linearly: small counts read
+    // small, and the map stays honest until there is enough traffic to rank.
+    const step = Math.ceil((Math.min(visitors, RAMP_FLOOR) / RAMP_FLOOR) * RAMP_MIX.length);
+    return Math.min(RAMP_MIX.length, Math.max(1, step));
+  }
   const ratio = Math.cbrt(Math.min(visitors, max) / max);
   const step = Math.ceil(ratio * RAMP_MIX.length);
   return Math.min(RAMP_MIX.length, Math.max(1, step));
