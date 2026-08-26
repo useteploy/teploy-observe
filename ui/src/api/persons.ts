@@ -4,7 +4,7 @@
 // behavioural rule definitions evaluated at query time. Backend lives
 // in cmd/observe/persons_handlers.go and cohorts_handlers.go.
 
-import { get, post, del } from "./helpers.js";
+import { get, post, put, del } from "./helpers.js";
 
 const BASE = "/api/v1";
 
@@ -127,11 +127,7 @@ export const cohortsApi = {
   create: (data: { site_id: string; name: string; description?: string; rule: CohortDefinition }) =>
     post<Cohort>(`${BASE}/cohorts`, data),
   update: (cohortId: string, data: { site_id: string; name: string; description?: string; rule: CohortDefinition }) =>
-    fetch(`${BASE}/cohorts/${cohortId}`, {
-      method: "PUT",
-      headers: putHeaders(),
-      body: JSON.stringify(data),
-    }).then(handlePut<Cohort>),
+    put<Cohort>(`${BASE}/cohorts/${cohortId}`, data),
   delete: (cohortId: string, siteId: string) =>
     del(`${BASE}/cohorts/${cohortId}?site_id=${encodeURIComponent(siteId)}`),
   refresh: (cohortId: string, siteId: string) =>
@@ -146,21 +142,3 @@ export const cohortsApi = {
   },
 };
 
-// PUT helpers — helpers.ts only exports get/post/del. Keep this local
-// rather than expanding the shared helper surface for one method.
-function putHeaders(): Record<string, string> {
-  const token = localStorage.getItem("obs_token");
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  return headers;
-}
-
-async function handlePut<T>(res: Response): Promise<T> {
-  if (res.status === 401) {
-    localStorage.removeItem("obs_token");
-    window.location.href = "/login";
-    throw new Error("Unauthorized");
-  }
-  if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
-  return res.json();
-}

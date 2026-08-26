@@ -81,19 +81,37 @@
 .journey-path-arrow { flex-shrink: 0; margin: 0 2px; }
 .journey-path-count { margin-left: auto; color: var(--obs-text-secondary); font-variant-numeric: tabular-nums; flex-shrink: 0; }
 
+/* Panel headings — five different analyses share this page, so each one says
+   what it answers rather than relying on its tab label alone. */
+.insights-panel-heading { margin-bottom: 16px; }
+.insights-panel-title {
+  font-size: 15px; font-weight: 600; color: var(--obs-text); margin: 0;
+}
+.insights-panel-desc {
+  font-size: 12px; line-height: 1.55; color: var(--obs-text-secondary);
+  margin: 4px 0 0; max-width: 62ch;
+}
+
 /* Goals */
 .goals-list { display: flex; flex-direction: column; gap: 8px; }
 .goal-card {
   display: flex; align-items: center; gap: 16px; padding: 14px 16px;
   background: var(--obs-surface); border-radius: var(--obs-radius-md);
+  flex-wrap: wrap;
 }
-.goal-card-info { flex: 1; }
+.goal-card-info { flex: 1; min-width: 180px; }
 .goal-card-name { font-size: 13px; font-weight: 500; color: var(--obs-text); }
 .goal-card-desc { font-size: 12px; color: var(--obs-text-secondary); margin-top: 2px; }
 .goal-card-rate {
   font-size: 18px; font-weight: 700; color: var(--obs-accent); font-variant-numeric: tabular-nums;
 }
 .goal-card-stats { font-size: 12px; color: var(--obs-text-muted); text-align: right; }
+.goal-card-value {
+  font-size: 15px; font-weight: 600; color: var(--obs-text);
+  font-variant-numeric: tabular-nums; text-align: right; min-width: 96px;
+}
+.goal-card-value--unset { font-size: 12px; font-weight: 400; color: var(--obs-text-muted); }
+.goal-card-actions { display: flex; gap: 6px; }
 
 /* Correlations */
 .correlation-row {

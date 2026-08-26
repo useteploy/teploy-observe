@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { copyToClipboard } from "../lib/clipboard.js";
+import { ROUTES, fuzzyScore, routeKeywords } from "../lib/paletteRoutes.js";
 
 interface PaletteItem {
   label: string;
@@ -7,48 +8,6 @@ interface PaletteItem {
   action: () => void;
   keywords?: string;
   group: string;
-}
-
-const ROUTES: Array<{ label: string; path: string; description?: string }> = [
-  { label: "Dashboard", path: "/", description: "Site overview" },
-  { label: "Get started", path: "/onboard", description: "Onboarding wizard" },
-  { label: "Dashboards", path: "/dashboards", description: "Custom panels" },
-  { label: "Events", path: "/events" },
-  { label: "Campaigns", path: "/campaigns", description: "UTM breakdown" },
-  { label: "Insights", path: "/insights", description: "Funnels, retention, journeys" },
-  { label: "Errors", path: "/errors" },
-  { label: "Releases", path: "/releases", description: "Error health per release" },
-  { label: "Traces", path: "/traces", description: "APM / distributed tracing" },
-  { label: "Logs", path: "/logs" },
-  { label: "Flags", path: "/flags", description: "Feature flags" },
-  { label: "Experiments", path: "/experiments" },
-  { label: "Sessions", path: "/sessions", description: "Replay player" },
-  { label: "Monitoring", path: "/monitoring", description: "Uptime & infra" },
-  { label: "Alerts", path: "/alerts" },
-  { label: "LLM", path: "/llm" },
-  { label: "Surveys", path: "/surveys" },
-  { label: "Integrations", path: "/integrations" },
-  { label: "Reports", path: "/reports" },
-  { label: "Explorer", path: "/explorer", description: "SQL console" },
-  { label: "Docs", path: "/docs" },
-  { label: "API reference", path: "/api/docs", description: "OpenAPI / Swagger UI" },
-  { label: "Settings", path: "/settings" },
-];
-
-function fuzzyScore(query: string, text: string): number {
-  if (!query) return 1;
-  const q = query.toLowerCase();
-  const t = text.toLowerCase();
-  if (t === q) return 100;
-  if (t.startsWith(q)) return 50;
-  if (t.includes(q)) return 25;
-  // fallback: subsequence match
-  let qi = 0;
-  for (let ti = 0; ti < t.length && qi < q.length; ti++) {
-    if (t[ti] === q[qi]) qi++;
-  }
-  if (qi === q.length) return 10;
-  return 0;
 }
 
 export default function CommandPalette() {
@@ -85,7 +44,7 @@ export default function CommandPalette() {
       label: r.label,
       description: r.description,
       group: "Navigate",
-      keywords: r.label + " " + (r.description || "") + " " + r.path,
+      keywords: routeKeywords(r),
       action: () => {
         window.history.pushState(null, "", r.path);
         window.dispatchEvent(new PopStateEvent("popstate"));

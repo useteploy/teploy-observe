@@ -91,6 +91,22 @@ export async function post<T>(path: string, body: unknown): Promise<T> {
   return res.json();
 }
 
+export async function put<T>(path: string, body: unknown): Promise<T> {
+  const token = localStorage.getItem("obs_token");
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  const res = await withProgress(() => fetch(path, { method: "PUT", headers, body: JSON.stringify(body) }));
+  if (res.status === 401) {
+    if (!isShared()) {
+      localStorage.removeItem("obs_token");
+      window.location.href = "/login";
+    }
+    throw new Error("Unauthorized");
+  }
+  if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
+  return res.json();
+}
+
 export async function del<T = { ok: boolean }>(path: string): Promise<T> {
   const token = localStorage.getItem("obs_token");
   const headers: Record<string, string> = {};

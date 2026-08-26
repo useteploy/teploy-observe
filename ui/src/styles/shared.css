@@ -210,6 +210,25 @@
   color: var(--obs-text-secondary); margin-bottom: 6px;
 }
 .obs-form-group { margin-bottom: 16px; }
+.obs-form-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--obs-text-muted);
+}
+.obs-form-hint code {
+  background: var(--obs-bg-card, rgba(0, 0, 0, 0.04));
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+  word-break: break-all;
+}
+.obs-form-error {
+  margin-bottom: 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--obs-danger, #ef4444);
+}
 
 /* Pagination */
 .obs-pagination {

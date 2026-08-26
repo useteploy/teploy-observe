@@ -1,14 +1,30 @@
+import type { ComponentChildren } from "preact";
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { analyticsApi } from "../api/analytics.js";
-import type { FunnelStep, FunnelResult, RetentionCohort, JourneyResult, GoalConversion, Correlation } from "../api/analytics.js";
+import type { FunnelStep, FunnelResult, RetentionCohort, JourneyResult, Goal, GoalConversion, Correlation } from "../api/analytics.js";
 import { cohortsApi } from "../api/persons.js";
 import type { Cohort } from "../api/persons.js";
 import Modal from "../components/shared/Modal.js";
 import Tabs from "../components/shared/Tabs.js";
+import EmptyState from "../components/shared/EmptyState.js";
+import { formatMinor, toMinorUnits, fromMinorUnits } from "../utils/money.js";
 import "../styles/insights.css";
 import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
+
+// Five different analyses share this page and a tab label is all that ever
+// distinguished them. Each panel now opens with its own heading and a line
+// saying what it answers, because "Journeys" alone does not tell anyone
+// whether it is the thing they came for.
+function PanelHeading({ title, children }: { title: string; children: ComponentChildren }) {
+  return (
+    <div class="insights-panel-heading">
+      <h2 class="insights-panel-title">{title}</h2>
+      <p class="insights-panel-desc">{children}</p>
+    </div>
+  );
+}
 
 function InsightsSkeleton() {
   return (
@@ -73,6 +89,11 @@ function FunnelsPanel({ siteId, from, to }: { siteId: string; from: string; to: 
 
   return (
     <div>
+      <PanelHeading title="Conversion funnels">
+        Where visitors drop out of a sequence of pages or events. Add two or
+        more steps, then Analyze — nothing is stored, so a funnel can be
+        rebuilt any time.
+      </PanelHeading>
       <div class="funnel-builder">
         {steps.map((step, i) => (
           <div class="funnel-builder-row" key={i}>
@@ -140,7 +161,12 @@ function FunnelsPanel({ siteId, from, to }: { siteId: string; from: string; to: 
           })}
         </div>
       ) : analyzed && results.length === 0 && breakdownResults.length === 0 ? (
-        <div class="obs-empty-state">No data for this funnel</div>
+        <EmptyState
+          icon="layers"
+          title="No visitors matched these steps"
+          description="Every step has to match something already in your events. Check the paths against Dashboard's top pages, and the event names against the Events page — a funnel step is an exact match, not a prefix."
+          actions={[{ label: "See top pages", href: "/" }, { label: "See events", href: "/events" }]}
+        />
       ) : results.length > 0 ? (
         <div>
           {/* SVG funnel shape */}
@@ -201,7 +227,20 @@ function RetentionPanel({ siteId, from, to }: { siteId: string; from: string; to
   }, [siteId, from, to]);
 
   if (loading) return <InsightsSkeleton />;
-  if (!cohorts.length) return <div class="obs-empty-state">Not enough data for retention analysis</div>;
+  if (!cohorts.length) {
+    return (
+      <div>
+        <PanelHeading title="Retention">
+          How many of each day's new visitors come back on the days after.
+        </PanelHeading>
+        <EmptyState
+          icon="signal"
+          title="Not enough history yet"
+          description="Retention compares a cohort's first visit against later ones, so it needs visitors who arrived on one day and returned on another. Keep collecting for a few days and this fills in on its own."
+        />
+      </div>
+    );
+  }
 
   const maxPeriods = Math.max(...cohorts.map(c => c.periods.length));
 
@@ -216,6 +255,10 @@ function RetentionPanel({ siteId, from, to }: { siteId: string; from: string; to
 
   return (
     <div>
+      <PanelHeading title="Retention">
+        How many of each day's new visitors come back on the days after. Each
+        row is a cohort; P0 is the day they arrived.
+      </PanelHeading>
       <div class="retention-view-toggle">
         <button
           class={`retention-view-btn ${view === "heatmap" ? "retention-view-btn--active" : ""}`}
@@ -326,13 +369,31 @@ function JourneysPanel({ siteId, from, to }: { siteId: string; from: string; to:
       .finally(() => setLoading(false));
   }, [siteId, from, to]);
 
+  const heading = (
+    <PanelHeading title="User journeys">
+      The routes visitors actually take through the site: which page follows
+      which, and the most common whole paths.
+    </PanelHeading>
+  );
+
   if (loading) return <InsightsSkeleton />;
   if (!data || (!data.transitions?.length && !data.top_paths?.length)) {
-    return <div class="obs-empty-state">Not enough data for journey analysis</div>;
+    return (
+      <div>
+        {heading}
+        <EmptyState
+          icon="layers"
+          title="No multi-page sessions yet"
+          description="A journey needs a session that viewed more than one page. If every visit is a single pageview — or the tracking snippet is only on one page — there is nothing to join up yet."
+          actions={[{ label: "Check your install", href: "/onboard" }]}
+        />
+      </div>
+    );
   }
 
   return (
     <div>
+      {heading}
       {data.transitions?.length > 0 && (
         <div>
           <h3 style={{ fontSize: "13px", fontWeight: 600, color: "var(--obs-text)", marginBottom: "8px" }}>
@@ -381,65 +442,197 @@ function JourneysPanel({ siteId, from, to }: { siteId: string; from: string; to:
 
 // ─── Goals ───
 
+// Currencies offered in the picker. Not a complete ISO-4217 list — any code
+// the API accepts works, this is just the shortlist that saves most people
+// typing. There is deliberately no default selection: Observe never guesses
+// that its operator bills in dollars.
+const CURRENCY_CHOICES = [
+  "USD", "EUR", "GBP", "CAD", "AUD", "NZD", "CHF", "SEK", "NOK", "DKK",
+  "PLN", "CZK", "JPY", "CNY", "HKD", "SGD", "INR", "KRW", "BRL", "MXN",
+  "ZAR", "AED", "ILS", "TRY",
+];
+
 function GoalsPanel({ siteId, from, to }: { siteId: string; from: string; to: string }) {
   const [goals, setGoals] = useState<GoalConversion[]>([]);
   const [loading, setLoading] = useState(true);
-  const [showCreate, setShowCreate] = useState(false);
-  const [creating, setCreating] = useState(false);
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState<Goal | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
   const [formName, setFormName] = useState("");
   const [formType, setFormType] = useState("page");
   const [formValue, setFormValue] = useState("");
+  // The form holds a major-unit decimal because that is what a person types;
+  // it is converted to minor units once, on submit.
+  const [formAmount, setFormAmount] = useState("");
+  const [formCurrency, setFormCurrency] = useState("");
+  const [formSource, setFormSource] = useState("fixed");
+  const [formProperty, setFormProperty] = useState("revenue");
 
-  const fetch = useCallback(async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await analyticsApi.goals(siteId);
+      const data = await analyticsApi.goals(siteId, from, to);
       setGoals(data || []);
     } catch { setGoals([]); }
     finally { setLoading(false); }
-  }, [siteId]);
+  }, [siteId, from, to]);
 
-  useEffect(() => { fetch(); }, [fetch]);
+  useEffect(() => { load(); }, [load]);
 
-  const handleCreate = async () => {
-    if (!formName.trim() || !formValue.trim()) return;
-    setCreating(true);
-    try {
-      await analyticsApi.createGoal({ site_id: siteId, name: formName.trim(), goal_type: formType, goal_value: formValue.trim() });
-      setShowCreate(false);
-      setFormName(""); setFormValue(""); setFormType("page");
-      fetch();
-    } catch (err) { console.error("Failed to create goal:", err); }
-    finally { setCreating(false); }
+  const openCreate = () => {
+    setEditing(null);
+    setFormName(""); setFormType("page"); setFormValue("");
+    setFormAmount(""); setFormCurrency(""); setFormSource("fixed"); setFormProperty("revenue");
+    setError("");
+    setShowForm(true);
   };
+
+  const openEdit = (g: Goal) => {
+    setEditing(g);
+    setFormName(g.name); setFormType(g.goal_type); setFormValue(g.goal_value);
+    setFormCurrency(g.currency || "");
+    setFormSource(g.value_source || "fixed");
+    setFormProperty(g.value_property || "revenue");
+    setFormAmount(g.value_minor && g.currency ? fromMinorUnits(g.value_minor, g.currency) : "");
+    setError("");
+    setShowForm(true);
+  };
+
+  const handleSave = async () => {
+    if (!formName.trim() || !formValue.trim()) return;
+    // Money is only sent when a currency was chosen. An amount with no
+    // currency is a number nobody can read, and the API rejects it.
+    let valueMinor = 0;
+    if (formCurrency && formSource === "fixed" && formAmount.trim()) {
+      const minor = toMinorUnits(formAmount, formCurrency);
+      if (minor === null) {
+        setError("Value must be an amount like 49.99.");
+        return;
+      }
+      valueMinor = minor;
+    }
+    if (formSource === "event" && !formCurrency) {
+      setError("Per-event values need a currency so the total can be shown.");
+      return;
+    }
+    const payload = {
+      site_id: siteId,
+      name: formName.trim(),
+      goal_type: formType,
+      goal_value: formValue.trim(),
+      value_minor: valueMinor,
+      currency: formCurrency,
+      value_source: formCurrency ? formSource : "fixed",
+      value_property: formSource === "event" ? formProperty.trim() : "",
+    };
+    setSaving(true);
+    setError("");
+    try {
+      if (editing) {
+        await analyticsApi.updateGoal(editing.goal_id, payload);
+      } else {
+        await analyticsApi.createGoal(payload);
+      }
+      setShowForm(false);
+      load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save the goal.");
+    } finally { setSaving(false); }
+  };
+
+  const handleDelete = async (g: Goal) => {
+    if (!confirm(`Delete goal "${g.name}"? Conversions are computed from events, so nothing else is lost.`)) return;
+    try {
+      await analyticsApi.deleteGoal(g.goal_id, siteId);
+      load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not delete the goal.");
+    }
+  };
+
+  const valued = goals.filter(g => g.goal.currency && g.total_value_minor > 0);
+  // A period total is only meaningful per currency — adding dollars to yen
+  // would be a number that is wrong in every currency at once.
+  const totalsByCurrency = new Map<string, number>();
+  for (const g of valued) {
+    totalsByCurrency.set(g.goal.currency, (totalsByCurrency.get(g.goal.currency) ?? 0) + g.total_value_minor);
+  }
 
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
-        <span style={{ fontSize: "13px", color: "var(--obs-text-secondary)" }}>{goals.length} goal{goals.length !== 1 ? "s" : ""}</span>
-        <button class="obs-btn obs-btn--primary obs-btn--sm" onClick={() => setShowCreate(true)}>Create Goal</button>
+      <PanelHeading title="Goal conversions">
+        Named outcomes — a page reached or an event fired — counted over the
+        period, and what they were worth if you give them a value.
+      </PanelHeading>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px", gap: "12px", flexWrap: "wrap" }}>
+        <span style={{ fontSize: "13px", color: "var(--obs-text-secondary)" }}>
+          {goals.length} goal{goals.length !== 1 ? "s" : ""}
+          {totalsByCurrency.size > 0 && (
+            <>
+              {" · "}
+              {Array.from(totalsByCurrency.entries())
+                .map(([code, minor]) => formatMinor(minor, code))
+                .join(" + ")}
+              {" in this period"}
+            </>
+          )}
+        </span>
+        <button class="obs-btn obs-btn--primary obs-btn--sm" onClick={openCreate}>Create goal</button>
       </div>
 
+      {error && !showForm && (
+        <div class="obs-form-error" role="alert" style={{ marginBottom: "12px" }}>{error}</div>
+      )}
+
       {loading ? <InsightsSkeleton /> : goals.length === 0 ? (
-        <div class="obs-empty-state">No goals configured. Create one to track conversions.</div>
+        <EmptyState
+          icon="package"
+          title="No goals yet"
+          description="A goal is the outcome you care about — a visit to /thank-you, or a purchase event. Nothing appears here until one exists, and conversions are counted from the events you have already collected, so a new goal is populated immediately rather than starting from zero."
+          actions={[{ label: "Create goal", onClick: openCreate, primary: true }]}
+        />
       ) : (
         <div class="goals-list">
           {goals.map(g => (
             <div class="goal-card" key={g.goal.goal_id}>
               <div class="goal-card-info">
                 <div class="goal-card-name">{g.goal.name}</div>
-                <div class="goal-card-desc">{g.goal.goal_type}: {g.goal.goal_value}</div>
+                <div class="goal-card-desc">
+                  {g.goal.goal_type}: {g.goal.goal_value}
+                  {g.goal.currency && (
+                    <>
+                      {" · "}
+                      {g.goal.value_source === "event"
+                        ? `value from event property "${g.goal.value_property}"`
+                        : `${formatMinor(g.goal.value_minor, g.goal.currency)} per conversion`}
+                    </>
+                  )}
+                </div>
               </div>
               <div class="goal-card-stats">
-                {g.conversions.toLocaleString()} / {g.visitors.toLocaleString()}
+                <div>{g.conversions.toLocaleString()} / {g.visitors.toLocaleString()}</div>
+                {g.conversion_events !== g.conversions && (
+                  <div>{g.conversion_events.toLocaleString()} events</div>
+                )}
+              </div>
+              <div class="goal-card-value">
+                {g.goal.currency
+                  ? formatMinor(g.total_value_minor, g.goal.currency)
+                  : <span class="goal-card-value--unset">no value</span>}
               </div>
               <div class="goal-card-rate">{g.rate.toFixed(1)}%</div>
+              <div class="goal-card-actions">
+                <button class="obs-btn obs-btn--sm" onClick={() => openEdit(g.goal)}>Edit</button>
+                <button class="obs-btn obs-btn--sm" onClick={() => handleDelete(g.goal)}>Delete</button>
+              </div>
             </div>
           ))}
         </div>
       )}
 
-      <Modal open={showCreate} onClose={() => setShowCreate(false)} title="Create Goal">
+      <Modal open={showForm} onClose={() => setShowForm(false)} title={editing ? "Edit goal" : "Create goal"}>
         <div class="obs-form-group">
           <label class="obs-label">Name</label>
           <input class="obs-input" placeholder="Signup completion" value={formName}
@@ -457,12 +650,59 @@ function GoalsPanel({ siteId, from, to }: { siteId: string; from: string; to: st
           <label class="obs-label">{formType === "page" ? "Path" : "Event name"}</label>
           <input class="obs-input" placeholder={formType === "page" ? "/thank-you" : "purchase"}
             value={formValue} onInput={(e) => setFormValue((e.target as HTMLInputElement).value)} />
+          <div class="obs-form-hint">
+            What a conversion is matched on. Not a monetary value — that is below.
+          </div>
         </div>
+
+        <div class="obs-form-group">
+          <label class="obs-label">Currency</label>
+          <select class="obs-select" value={formCurrency}
+            onChange={(e) => setFormCurrency((e.target as HTMLSelectElement).value)}>
+            <option value="">No value — count conversions only</option>
+            {CURRENCY_CHOICES.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </div>
+
+        {formCurrency && (
+          <>
+            <div class="obs-form-group">
+              <label class="obs-label">Where the value comes from</label>
+              <select class="obs-select" value={formSource}
+                onChange={(e) => setFormSource((e.target as HTMLSelectElement).value)}>
+                <option value="fixed">A fixed amount per conversion</option>
+                <option value="event">An amount sent with each event</option>
+              </select>
+            </div>
+            {formSource === "fixed" ? (
+              <div class="obs-form-group">
+                <label class="obs-label">Value per conversion ({formCurrency})</label>
+                <input class="obs-input" inputMode="decimal" placeholder="49.99" value={formAmount}
+                  onInput={(e) => setFormAmount((e.target as HTMLInputElement).value)} />
+              </div>
+            ) : (
+              <div class="obs-form-group">
+                <label class="obs-label">Event property holding the amount</label>
+                <input class="obs-input" placeholder="revenue" value={formProperty}
+                  onInput={(e) => setFormProperty((e.target as HTMLInputElement).value)} />
+                <div class="obs-form-hint">
+                  Send it with the event, in whole {formCurrency}:
+                  {" "}<code>observe.track("{formValue || "purchase"}", {"{ " + (formProperty || "revenue") + ": 49.99 }"})</code>.
+                  Events without a readable number still count as conversions,
+                  they just add nothing to the total.
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        {error && <div class="obs-form-error" role="alert">{error}</div>}
+
         <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "8px" }}>
-          <button class="obs-btn" onClick={() => setShowCreate(false)}>Cancel</button>
-          <button class="obs-btn obs-btn--primary" onClick={handleCreate}
-            disabled={creating || !formName.trim() || !formValue.trim()}>
-            {creating ? "Creating..." : "Create"}
+          <button class="obs-btn" onClick={() => setShowForm(false)}>Cancel</button>
+          <button class="obs-btn obs-btn--primary" onClick={handleSave}
+            disabled={saving || !formName.trim() || !formValue.trim()}>
+            {saving ? "Saving..." : editing ? "Save" : "Create"}
           </button>
         </div>
       </Modal>
@@ -484,11 +724,30 @@ function CorrelationsPanel({ siteId, from, to }: { siteId: string; from: string;
       .finally(() => setLoading(false));
   }, [siteId, from, to]);
 
+  const heading = (
+    <PanelHeading title="Conversion correlations">
+      Which visitor properties — browser, country, campaign — go with a higher
+      or lower conversion rate than the site average.
+    </PanelHeading>
+  );
+
   if (loading) return <InsightsSkeleton />;
-  if (!data.length) return <div class="obs-empty-state">Not enough data for correlation analysis</div>;
+  if (!data.length) {
+    return (
+      <div>
+        {heading}
+        <EmptyState
+          icon="signal"
+          title="Nothing to correlate yet"
+          description="This compares converting sessions against the rest, so it needs both: enough traffic to be significant, and a goal that some of it converted on. Create a goal first, then come back once the period covers a few hundred sessions."
+        />
+      </div>
+    );
+  }
 
   return (
     <div>
+      {heading}
       <div style={{ fontSize: "12px", color: "var(--obs-text-muted)", marginBottom: "12px" }}>
         Baseline conversion: {data[0]?.baseline_rate?.toFixed(1)}%. Properties with statistically significant impact:
       </div>
@@ -632,8 +891,18 @@ export default function InsightsPage() {
 
   return (
     <div>
-      <div class="obs-page-header" style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-        <h1 class="obs-page-title">Insights</h1>
+      {/* The route stays /insights — cohorts.tsx deep-links to it with query
+          params — but the page no longer calls itself that. "Insights" is a
+          category; what is actually here is conversion analysis. */}
+      <div class="obs-page-header" style={{ display: "flex", alignItems: "flex-start", gap: "12px" }}>
+        <div>
+          <h1 class="obs-page-title">Funnels &amp; Goals</h1>
+          <p class="insights-panel-desc" style={{ marginTop: "4px" }}>
+            Conversion analysis: where visitors drop out, which goals they
+            reach and what those are worth, who comes back, and the routes
+            they take.
+          </p>
+        </div>
         <div style={{ marginLeft: "auto" }}>
           <CohortFilterChip siteId={siteId} />
         </div>
@@ -646,6 +915,11 @@ export default function InsightsPage() {
           content: <FunnelsPanel siteId={siteId} from={from} to={to} />,
         },
         {
+          key: "goals",
+          label: "Goal conversions",
+          content: <GoalsPanel siteId={siteId} from={from} to={to} />,
+        },
+        {
           key: "retention",
           label: "Retention",
           content: <RetentionPanel siteId={siteId} from={from} to={to} />,
@@ -654,11 +928,6 @@ export default function InsightsPage() {
           key: "journeys",
           label: "Journeys",
           content: <JourneysPanel siteId={siteId} from={from} to={to} />,
-        },
-        {
-          key: "goals",
-          label: "Goals",
-          content: <GoalsPanel siteId={siteId} from={from} to={to} />,
         },
         {
           key: "correlations",

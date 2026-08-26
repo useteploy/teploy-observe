@@ -1,6 +1,6 @@
 // Analytics stats API — pageviews, visitors, breakdowns, etc.
 
-import { get, post, qs } from "./helpers.js";
+import { get, post, put, del, qs } from "./helpers.js";
 
 const BASE = "/api/v1/stats";
 
@@ -53,11 +53,40 @@ export interface JourneyPath { path: string[]; count: number; }
 export interface JourneyResult {
   transitions: JourneyStep[]; top_paths: JourneyPath[]; total_paths: number;
 }
+/** A conversion goal.
+ *
+ *  `goal_value` is the MATCHER — the pathname or event_type a conversion is
+ *  recognised by — and has nothing to do with money. The money is
+ *  `value_minor`, an integer count of `currency`'s ISO-4217 minor units
+ *  (cents for USD, whole yen for JPY). Format it with utils/money.ts; never
+ *  divide by 100 by hand. */
 export interface Goal {
   goal_id: string; site_id: string; name: string; goal_type: string; goal_value: string;
+  value_minor: number;
+  /** ISO-4217 code, or "" when the goal carries no value. Never assume USD. */
+  currency: string;
+  /** "fixed" — every conversion is worth value_minor.
+   *  "event" — each event carries its own amount in value_property. */
+  value_source: string;
+  value_property: string;
+  created_at?: string;
 }
 export interface GoalConversion {
-  goal: Goal; conversions: number; visitors: number; rate: number;
+  goal: Goal;
+  /** Distinct sessions that converted. */
+  conversions: number;
+  /** Conversion events. A session that buys twice is one conversion and two
+   *  events; money is summed over events, so this is what the value matches. */
+  conversion_events: number;
+  visitors: number;
+  rate: number;
+  /** Period total in goal.currency's minor units. */
+  total_value_minor: number;
+}
+export interface GoalInput {
+  site_id: string; name: string; goal_type: string; goal_value: string;
+  value_minor?: number; currency?: string;
+  value_source?: string; value_property?: string;
 }
 export interface Correlation {
   property: string; value: string; uplift: number;
@@ -133,10 +162,21 @@ export const analyticsApi = {
     get<RetentionCohort[]>(`${BASE}/retention?${qs(siteId, from, to)}${periodDays ? `&period_days=${periodDays}` : ""}`),
   journeys: (siteId: string, from: string, to: string) =>
     get<JourneyResult>(`${BASE}/journeys?${qs(siteId, from, to)}`),
-  goals: (siteId: string) =>
-    get<GoalConversion[]>(`/api/v1/goals?site_id=${siteId}`),
-  createGoal: (data: { site_id: string; name: string; goal_type: string; goal_value: string }) =>
+  // from/to matter: conversions and their value are counted over the window
+  // the page is showing, and omitting them silently fell back to the server's
+  // default range while the UI claimed it was the selected period.
+  goals: (siteId: string, from?: string, to?: string) =>
+    get<GoalConversion[]>(
+      `/api/v1/goals?site_id=${encodeURIComponent(siteId)}` +
+      (from ? `&from=${encodeURIComponent(from)}` : "") +
+      (to ? `&to=${encodeURIComponent(to)}` : ""),
+    ),
+  createGoal: (data: GoalInput) =>
     post<Goal>(`/api/v1/goals`, data),
+  updateGoal: (goalId: string, data: GoalInput) =>
+    put<Goal>(`/api/v1/goals/${encodeURIComponent(goalId)}`, data),
+  deleteGoal: (goalId: string, siteId: string) =>
+    del(`/api/v1/goals/${encodeURIComponent(goalId)}?site_id=${encodeURIComponent(siteId)}`),
   correlations: (siteId: string, from: string, to: string, target?: string) =>
     get<Correlation[]>(`${BASE}/correlations?${qs(siteId, from, to)}${target ? `&target=${encodeURIComponent(target)}` : ""}`),
   // Attribution endpoint lives outside /stats — it's at /api/v1/attribution.
