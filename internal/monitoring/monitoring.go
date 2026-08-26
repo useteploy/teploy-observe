@@ -448,13 +448,39 @@ func (s *CronService) insertCheckin(ctx context.Context, cron CronMonitor, statu
 		return fmt.Errorf("monitoring: record checkin: %w", err)
 	}
 	if s.OnCheckin != nil {
-		s.OnCheckin(ctx, cron)
+		// Detached from the caller's context on purpose. This runs on the
+		// check-in request's context, and the hook's job is to resolve the
+		// monitor's open incident — a heartbeat client that hangs up (curl
+		// -m, a killed cron) cancels that request mid-query, the close never
+		// lands, and the incident stays open forever. That is the
+		// `cron incident auto-resolve failed ... context canceled` in the log.
+		// The deadline still bounds it so a stuck query cannot leak.
+		hookCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), checkinHookTimeout)
+		defer cancel()
+		s.OnCheckin(hookCtx, cron)
 	}
 	return nil
 }
 
-// CheckMissed finds cron monitors that have not checked in within their grace period
-// and returns them.
+// checkinHookTimeout bounds the post-check-in hook. Generous next to a healthy
+// close (two bounded queries) and well short of anything an operator would wait
+// on.
+const checkinHookTimeout = 15 * time.Second
+
+// CheckMissed returns the enabled cron monitors whose next run is overdue.
+//
+// A monitor is overdue when now is past `last check-in + its schedule's period +
+// its grace period`. The period term is the whole point: this used to compare
+// against the grace period alone, so a cron that legitimately runs hourly with a
+// five-minute grace was "missed" for fifty-five minutes out of every hour. Its
+// incident opened, the next hourly ping closed it, and the cycle repeated — one
+// incident per cron run, forever. Ten monitors produced 12,398 incident rows
+// that way on the live instance, which is what buried the analytics chart under
+// overlapping markers.
+//
+// A schedule that cannot be read as a period contributes 0, which is exactly the
+// old behaviour, so an unparseable or empty schedule still alerts on grace alone.
+// A monitor that has never checked in is measured from its creation time.
 func (s *CronService) CheckMissed(ctx context.Context) ([]CronMonitor, error) {
 	crons, err := nucleus.Query[CronMonitor](ctx, s.db.SQL(),
 		`SELECT cron_id, tenant_id, site_id, name, slug, schedule,
@@ -465,36 +491,59 @@ func (s *CronService) CheckMissed(ctx context.Context) ([]CronMonitor, error) {
 		return nil, fmt.Errorf("monitoring: check missed query: %w", err)
 	}
 
-	now := time.Now().UTC()
+	nowMs := time.Now().UTC().UnixMilli()
 	var missed []CronMonitor
 
 	for _, c := range crons {
-		graceSecs := int64(c.GracePeriod)
-		if graceSecs <= 0 {
-			graceSecs = 300
-		}
-		cutoff := dbutil.IntParam(now.Add(-time.Duration(graceSecs) * time.Second).UnixMilli())
-
-		type countRow struct {
-			Count string `db:"count"`
-		}
-		rows, err := nucleus.Query[countRow](ctx, s.db.SQL(),
-			`SELECT CAST(COUNT(*) AS TEXT) AS count FROM cron_checkins
-			 WHERE cron_id = $1 AND timestamp >= $2`,
-			c.CronID, cutoff)
+		last, err := s.lastCheckinMs(ctx, c.CronID)
 		if err != nil {
-			s.logger.Error("monitoring: check missed count failed", "cron", c.CronID, "err", err)
+			s.logger.Error("monitoring: check missed last check-in failed", "cron", c.CronID, "err", err)
 			continue
 		}
-		if len(rows) > 0 {
-			cnt, _ := strconv.ParseInt(rows[0].Count, 10, 64)
-			if cnt == 0 {
-				missed = append(missed, c)
-			}
+		if last == 0 {
+			// Never checked in — measure from when the monitor was registered.
+			last, _ = strconv.ParseInt(c.CreatedAt, 10, 64)
+		}
+		if last == 0 {
+			continue
+		}
+		if nowMs > last+DueAfterMs(c.Schedule, c.GracePeriod) {
+			missed = append(missed, c)
 		}
 	}
 
 	return missed, nil
+}
+
+// DueAfterMs is how long after a check-in a monitor may stay silent before it
+// counts as missed: its schedule's period plus its grace period. Exported so the
+// detector's arithmetic is testable without a database.
+func DueAfterMs(schedule string, graceSecs int) int64 {
+	if graceSecs <= 0 {
+		graceSecs = 300
+	}
+	period, _ := SchedulePeriod(schedule)
+	return period.Milliseconds() + int64(graceSecs)*1000
+}
+
+// lastCheckinMs is the timestamp of the monitor's most recent check-in, or 0 if
+// it has never checked in. A single-column aggregate — the one query shape that
+// reliably streams on a large Nucleus table rather than materialising it.
+func (s *CronService) lastCheckinMs(ctx context.Context, cronID string) (int64, error) {
+	type lastRow struct {
+		Last string `db:"last"`
+	}
+	rows, err := nucleus.Query[lastRow](ctx, s.db.SQL(),
+		`SELECT CAST(COALESCE(MAX(timestamp), 0) AS TEXT) AS last FROM cron_checkins
+		 WHERE cron_id = $1`, cronID)
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	last, _ := strconv.ParseInt(rows[0].Last, 10, 64)
+	return last, nil
 }
 
 // ---------------------------------------------------------------------------

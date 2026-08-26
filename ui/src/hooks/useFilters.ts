@@ -2,12 +2,16 @@ import { createContext } from "preact";
 import { useContext, useEffect, useReducer } from "preact/hooks";
 import type { ComponentChildren } from "preact";
 import { h } from "preact";
+import { defaultRange, loadRange, saveRange } from "../utils/ranges.js";
+import type { PersistedRange } from "../utils/ranges.js";
 
 export interface DashboardState {
   siteId: string;
   from: string;
   to: string;
   rangeLabel: string;
+  /** See PersistedRange.rolling. */
+  rangeRolling: boolean;
   compare: string | null;
   filters: Record<string, string>;
   interval: string;
@@ -15,7 +19,7 @@ export interface DashboardState {
 
 export type Action =
   | { type: "SET_SITE"; siteId: string }
-  | { type: "SET_RANGE"; from: string; to: string; label: string }
+  | { type: "SET_RANGE"; from: string; to: string; label: string; rolling?: boolean }
   | { type: "SET_COMPARE"; compare: string | null }
   | { type: "SET_FILTER"; key: string; value: string }
   | { type: "REMOVE_FILTER"; key: string }
@@ -27,7 +31,13 @@ function reducer(state: DashboardState, action: Action): DashboardState {
     case "SET_SITE":
       return { ...state, siteId: action.siteId };
     case "SET_RANGE":
-      return { ...state, from: action.from, to: action.to, rangeLabel: action.label };
+      return {
+        ...state,
+        from: action.from,
+        to: action.to,
+        rangeLabel: action.label,
+        rangeRolling: action.rolling === true,
+      };
     case "SET_COMPARE":
       return { ...state, compare: action.compare };
     case "SET_FILTER":
@@ -55,6 +65,13 @@ const FilterContext = createContext<FilterContextValue | null>(null);
 
 /** localStorage key used by the SiteSwitcher to remember the last selected site. */
 export const SITE_STORAGE_KEY = "observe.site_id";
+
+export { RANGE_STORAGE_KEY, DEFAULT_RANGE_LABEL } from "../utils/ranges.js";
+
+/** PersistedRange to the DashboardState fields that hold it. */
+function rangeState(r: PersistedRange) {
+  return { from: r.from, to: r.to, rangeLabel: r.label, rangeRolling: r.rolling };
+}
 
 /**
  * Resolve initial siteId from URL `?site_id=`, then localStorage, then "default".
@@ -86,14 +103,11 @@ function initialFilters(): Record<string, string> {
 }
 
 export function FilterProvider({ siteId, children }: { siteId: string; children: ComponentChildren }) {
-  const now = new Date();
-  const yesterday = new Date(now.getTime() - 86400000);
-
+  // Bare routes (share links, embeds) deliberately do NOT adopt the operator's
+  // remembered range — they render the window their own URL asks for.
   const [state, dispatch] = useReducer(reducer, {
     siteId,
-    from: yesterday.toISOString(),
-    to: now.toISOString(),
-    rangeLabel: "Last 24 hours",
+    ...rangeState(defaultRange()),
     compare: null,
     filters: {},
     interval: "hour",
@@ -111,18 +125,25 @@ export function FilterProvider({ siteId, children }: { siteId: string; children:
  * dispatches, so deep-links and reloads round-trip the selection.
  */
 export function RouteFilterProvider({ children }: { children: ComponentChildren }) {
-  const now = new Date();
-  const yesterday = new Date(now.getTime() - 86400000);
-
   const [state, dispatch] = useReducer(reducer, {
     siteId: initialSiteId(),
-    from: yesterday.toISOString(),
-    to: now.toISOString(),
-    rangeLabel: "Last 24 hours",
+    ...rangeState(loadRange()),
     compare: null,
     filters: initialFilters(),
     interval: "hour",
   });
+
+  // Persist the selected range, the same way the selected site persists just
+  // below. Routing remounts this provider, so without it the range resets to
+  // "Last 24 hours" on every navigation.
+  useEffect(() => {
+    saveRange({
+      from: state.from,
+      to: state.to,
+      label: state.rangeLabel,
+      rolling: state.rangeRolling,
+    });
+  }, [state.from, state.to, state.rangeLabel, state.rangeRolling]);
 
   // Persist + canonicalize whenever siteId changes.
   useEffect(() => {

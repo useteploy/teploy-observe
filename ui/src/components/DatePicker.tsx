@@ -1,78 +1,7 @@
 import { useState, useRef, useEffect } from "preact/hooks";
 import { useFilters } from "../hooks/useFilters.js";
-
-interface RangePreset {
-  label: string;
-  getRange: () => { from: string; to: string };
-}
-
-function startOfDay(d: Date): Date {
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
-}
-
-/** Label the dropdown shows while a hand-picked range is active. */
-export const CUSTOM_LABEL = "Custom";
-
-// One rolling window per row of magnitude, the set Plausible and Fathom
-// settled on. The calendar-to-date twins this used to carry alongside them
-// ("This week" next to "Last 7 days", "This month" next to "Last 30 days",
-// "This year" next to "Last 12 months") named almost the same window as their
-// neighbour, so the menu asked for a choice that did not change the answer.
-// Custom covers the case a to-date window was actually wanted.
-//
-// Nothing persists the label — it lives only in the in-memory dashboard
-// state — so no saved view, board or scheduled report can hold a removed one.
-const PRESETS: RangePreset[] = [
-  {
-    label: "Today",
-    getRange: () => ({
-      from: startOfDay(new Date()).toISOString(),
-      to: new Date().toISOString(),
-    }),
-  },
-  {
-    label: "Last 24 hours",
-    getRange: () => ({
-      from: new Date(Date.now() - 86400000).toISOString(),
-      to: new Date().toISOString(),
-    }),
-  },
-  {
-    label: "Last 7 days",
-    getRange: () => ({
-      from: new Date(Date.now() - 7 * 86400000).toISOString(),
-      to: new Date().toISOString(),
-    }),
-  },
-  {
-    label: "Last 30 days",
-    getRange: () => ({
-      from: new Date(Date.now() - 30 * 86400000).toISOString(),
-      to: new Date().toISOString(),
-    }),
-  },
-  {
-    label: "Last 90 days",
-    getRange: () => ({
-      from: new Date(Date.now() - 90 * 86400000).toISOString(),
-      to: new Date().toISOString(),
-    }),
-  },
-  {
-    label: "Last 12 months",
-    getRange: () => ({
-      from: new Date(Date.now() - 365 * 86400000).toISOString(),
-      to: new Date().toISOString(),
-    }),
-  },
-  {
-    label: "All time",
-    getRange: () => ({
-      from: new Date("2020-01-01").toISOString(),
-      to: new Date().toISOString(),
-    }),
-  },
-];
+import { PRESETS, CUSTOM_LABEL } from "../utils/ranges.js";
+import type { RangePreset } from "../utils/ranges.js";
 
 function getRangeDurationMs(from: string, to: string): number {
   return new Date(to).getTime() - new Date(from).getTime();
@@ -107,7 +36,9 @@ function DatePicker() {
 
   function selectPreset(preset: RangePreset) {
     const { from, to } = preset.getRange();
-    dispatch({ type: "SET_RANGE", from, to, label: preset.label });
+    // rolling: the label names a window relative to now, so the persisted
+    // selection is recomputed rather than pinned to these instants.
+    dispatch({ type: "SET_RANGE", from, to, label: preset.label, rolling: true });
     setCustomOpen(false);
     setOpen(false);
   }
@@ -130,6 +61,7 @@ function DatePicker() {
       from: from.toISOString(),
       to: to.toISOString(),
       label: CUSTOM_LABEL,
+      rolling: false,
     });
     setCustomOpen(false);
     setOpen(false);
@@ -140,7 +72,10 @@ function DatePicker() {
     const shift = duration * direction;
     const newFrom = new Date(new Date(state.from).getTime() + shift).toISOString();
     const newTo = new Date(new Date(state.to).getTime() + shift).toISOString();
-    dispatch({ type: "SET_RANGE", from: newFrom, to: newTo, label: state.rangeLabel });
+    // Stepping off a preset pins the window: "Last 7 days" shifted back a week
+    // is a fixed span, and recomputing it on the next page would silently snap
+    // it forward to now.
+    dispatch({ type: "SET_RANGE", from: newFrom, to: newTo, label: state.rangeLabel, rolling: false });
   }
 
   function toggleCompare() {

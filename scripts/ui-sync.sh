@@ -23,8 +23,12 @@ command -v pnpm  >/dev/null || fail "pnpm not on PATH"
 command -v go    >/dev/null || fail "go not on PATH"
 
 log "rsync $OBSERVE_UI_SRC/ -> $CANONICAL_SRC/"
+# Unit tests (`npm test` in ui/, node --test) import node:test and must never
+# reach the browser bundle.
 rsync -a --delete \
   --exclude '.neutron-routes.d.ts' \
+  --exclude '*.test.ts' \
+  --exclude '*.test.tsx' \
   "$OBSERVE_UI_SRC/" "$CANONICAL_SRC/"
 
 # The HTML shell also lives beside src/, so an edit to ui/index.html (e.g. the

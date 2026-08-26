@@ -4,6 +4,32 @@ All notable changes to Observe are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **The selected date range now survives navigation and reload.** It lived only
+  in `useFilters`' in-memory state, so routing back to the dashboard from Errors
+  or Traces snapped it back to "Last 24 hours" and any longer window had to be
+  re-picked every time.
+
+  It persists in `localStorage` under `observe.range`, following the pattern the
+  site selection already uses, rather than going in the URL: the range applies
+  across every route and belongs to the operator, not to a link, and a URL that
+  pinned `from`/`to` would freeze a rolling window into a shared link. What is
+  stored is the **label**, not the instants, for anything rolling — "Last 7
+  days" names a window relative to now, so restoring frozen timestamps would
+  quietly pin the dashboard to whenever it was first picked and it would stop
+  showing today. Only a genuinely fixed selection (a hand-picked Custom range,
+  or one the arrows stepped off its preset) restores its instants verbatim.
+
+  The stored value is treated as hostile, because an older build or another tab
+  can leave anything there: blocked storage, unparseable JSON, a missing field,
+  an unparseable instant and a reversed range all fall back to the default
+  range, and a **rolling label this build no longer offers** — four presets were
+  removed in the entry above — falls back too rather than rendering a blank
+  range. A *pinned* removed label keeps its dates and is relabelled Custom,
+  since the dates are still real. `ui/src/utils/ranges.test.ts` covers each
+  case. Bare routes (share links, embeds) deliberately do not adopt it.
+
 ### Changed
 
 - **The date range menu carried three pairs of buttons that meant the same
@@ -14,13 +40,69 @@ All notable changes to Observe are recorded here.
   days, Last 90 days, Last 12 months, All time, plus **Custom**, which is what
   actually covers a to-date or arbitrary window and is why the calendar-to-date
   entries could go. "Last 6 months" went with them — 90 days and 12 months
-  bracket it. Nothing persists the range label (it lives only in the in-memory
-  dashboard state, never in a saved view, board or scheduled report), so no
-  stored object can reference a removed preset. The boards page keeps its own
+  bracket it. The label *is* persisted now (see "The selected date range now
+  survives navigation" below), but only in one browser's localStorage and with
+  an explicit fallback for a label this build no longer offers — no saved view,
+  board or scheduled report stores one. The boards page keeps its own
   window list because its keys are persisted per board; only its "Last 24h"
   label was aligned to read "Last 24 hours".
 
 ### Fixed
+
+- **Ten cron monitors filled the analytics chart with a solid block of orange.**
+  `incidents` held 12,398 rows — 6,192 closed incidents at two rows each plus 14
+  open, every one severity `warning` and source `cron`, from ten distinct
+  monitors. Charts draw one translucent band per incident, so thousands of them
+  compose into a wash of colour with the series invisible underneath.
+
+  The detector measured a monitor against its **grace period alone** and never
+  read its `schedule`. A cron that legitimately runs hourly with a five-minute
+  grace is therefore missed for fifty-five minutes out of every hour: an
+  incident opens, the next hourly ping closes it, and the cycle repeats — one
+  incident per cron run, forever. It was never a dedup failure; every cycle's
+  incident was genuinely new. `CheckMissed` now allows `last check-in +
+  the schedule's period + the grace`, reading the period from the `@`-shorthands,
+  `@every`, and 5- or 6-field cron expressions. A schedule it cannot read
+  contributes zero, which is exactly the old behaviour, so nothing silently
+  stops alerting.
+
+  Two things made it worse. The dedup guard was `if active, _ :=
+  ActiveByRule(...)`, which reads a *failed* query as "nothing is open" and
+  declares another incident — on a 45s tick, one per tick for as long as the
+  query keeps failing. And `ActiveByRule` read every row for the rule and
+  collapsed them in Go, so it got slower as the table grew, on a table that was
+  growing because of this. `incidents.EnsureOpen` replaces the pattern at both
+  auto-declare call sites: it reuses the rule's open incident and returns lookup
+  errors instead of swallowing them. The collapse to one row per incident now
+  runs in the database (`argMax(col, updated_at) GROUP BY incident_id`), so the
+  read returns one row instead of thousands, and `InRange` is capped so the
+  marker overlay cannot become a megabyte of JSON.
+
+- **A cron heartbeat client hanging up left its incident open forever.** The log
+  carried `cron incident auto-resolve failed ... context canceled` on repeat.
+  The hook that resolves a monitor's incident when it checks back in ran on the
+  **check-in request's own context**, so `curl -m 5` timing out, or a cron job
+  killed mid-ping, cancelled the close. It was a race the growing table kept
+  losing. The hook now runs detached from the request with its own 15s deadline.
+
+- **The chart now degrades legibly when the marker data is pathological.**
+  Markers are clamped to the plot window, merged when they overlap or sit within
+  4px of each other (per severity, so a merged band keeps a colour that means
+  something), and capped at 30 bands; the count of incidents not drawn appears
+  beside the legend. A window holding 6,206 incidents renders as a readable
+  chart rather than a solid block, whatever the API returns.
+
+  Migration **035** repairs the rows already on disk: rename aside, recreate,
+  and copy back one row per monitor for cron incidents (closed) plus every
+  non-cron incident unchanged. Unlike 034 it is small — measured complete inside
+  a 48 MB query budget, 128 times smaller than the live accessory's, so nothing
+  needs raising. `docs/operations/cron-incident-flood.md` has the analysis, the
+  measured costs and the verification queries.
+
+- **Export on the Incidents page threw on render.** It read a `resolved`
+  variable that does not exist in that component; the state is called `recent`.
+  A `tsc --noEmit` over the app surfaces it, which is worth doing before a
+  release — the bundler does not typecheck.
 
 - **The sort control on the breakdown panels did nothing on a small site, and
   the ten rows it showed were not the top ten.** Nothing decided the order of

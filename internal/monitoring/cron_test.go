@@ -104,3 +104,61 @@ func containsCron(crons []CronMonitor, id string) bool {
 	}
 	return false
 }
+
+// TestCheckMissed_HonoursTheSchedulePeriod is the database-level regression for
+// the incident flood.
+//
+// The monitor below runs hourly and has a one-second grace. It checked in a
+// moment ago, so it is not due for another hour and must NOT be reported
+// missed. The old detector compared against the grace period alone and reported
+// it as soon as that second elapsed — and since a check-in then closed the
+// incident and the next second reopened it, it produced one incident per cron
+// run indefinitely. The live instance reached 12,398 incident rows from ten
+// monitors that way, which is what filled the analytics chart with markers.
+//
+// With internal/monitoring/monitoring.go's CheckMissed reverted to the
+// count-within-grace form this fails with "reported missed 1.1s after checking
+// in".
+func TestCheckMissed_HonoursTheSchedulePeriod(t *testing.T) {
+	db, done := cronTestDB(t)
+	defer done()
+	ctx := context.Background()
+	svc := NewCronService(db, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+
+	site := fmt.Sprintf("test-sched-%d", time.Now().UnixNano())
+	hourly, err := svc.CreateCron(ctx, CronMonitor{
+		SiteID: site, Name: "hourly", Slug: "hourly",
+		Schedule: "0 * * * *", GracePeriod: 1,
+	})
+	if err != nil {
+		t.Fatalf("create hourly: %v", err)
+	}
+	if err := svc.RecordCheckinByToken(ctx, hourly.PingToken, "ok", 0); err != nil {
+		t.Fatalf("checkin: %v", err)
+	}
+
+	// A monitor with no schedule to read still alerts on grace alone, which is
+	// what proves the sleep below is long enough to matter.
+	graceOnly, err := svc.CreateCron(ctx, CronMonitor{
+		SiteID: site, Name: "gracely", Slug: "gracely", GracePeriod: 1,
+	})
+	if err != nil {
+		t.Fatalf("create grace-only: %v", err)
+	}
+	if err := svc.RecordCheckinByToken(ctx, graceOnly.PingToken, "ok", 0); err != nil {
+		t.Fatalf("checkin grace-only: %v", err)
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+
+	missed, err := svc.CheckMissed(ctx)
+	if err != nil {
+		t.Fatalf("check missed: %v", err)
+	}
+	if containsCron(missed, hourly.CronID) {
+		t.Fatal("an hourly cron was reported missed 1.1s after checking in — the detector is judging it on its grace period alone, which reopens an incident between every pair of runs")
+	}
+	if !containsCron(missed, graceOnly.CronID) {
+		t.Fatal("a monitor with an unreadable schedule must still alert on grace alone")
+	}
+}

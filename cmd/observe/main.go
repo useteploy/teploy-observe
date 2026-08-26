@@ -359,11 +359,7 @@ func main() {
 	// the incident service by keying on rule_id + open state — a
 	// repeatedly-firing rule should open one incident and stay open.
 	alertSvc.OnTrigger = func(ctx context.Context, rule platform.AlertRule, value float64) {
-		active, _ := incidentSvc.ActiveByRule(ctx, rule.RuleID)
-		if len(active) > 0 {
-			return
-		}
-		_, err := incidentSvc.Create(ctx, incidents.CreateInput{
+		_, _, err := incidentSvc.EnsureOpen(ctx, incidents.CreateInput{
 			SiteID:      rule.SiteID,
 			Title:       rule.Name,
 			Description: fmt.Sprintf("alert rule fired: %s=%.2f (threshold %.2f)", rule.Metric, value, rule.Threshold),
@@ -476,17 +472,19 @@ func main() {
 						return err
 					}
 					for _, c := range missed {
-						ruleKey := "cron:" + c.CronID
-						if active, _ := incidentSvc.ActiveByRule(ctx, ruleKey); len(active) > 0 {
-							continue // already open — dedup
-						}
-						_, err := incidentSvc.Create(ctx, incidents.CreateInput{
+						// EnsureOpen, never Create: this reuses the monitor's
+						// already-open incident and, critically, refuses to
+						// declare anything when the lookup itself fails. The
+						// old `if active, _ := ActiveByRule(...)` read a failed
+						// query as "nothing open" and opened another incident
+						// every tick.
+						_, _, err := incidentSvc.EnsureOpen(ctx, incidents.CreateInput{
 							SiteID:      c.SiteID,
 							Title:       fmt.Sprintf("Cron missed: %s", c.Name),
 							Description: fmt.Sprintf("cron %q (slug %q) has not checked in within its %ds grace period", c.Name, c.Slug, c.GracePeriod),
 							Severity:    "warning",
 							Source:      incidents.SourceCron,
-							RuleID:      ruleKey,
+							RuleID:      "cron:" + c.CronID,
 						}, "cron")
 						if err != nil {
 							logger.Warn("cron incident auto-create failed", "cron", c.CronID, "err", err)

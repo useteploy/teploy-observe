@@ -3,10 +3,22 @@ import type { TimeSeriesPoint } from "../api.js";
 import { api } from "../api.js";
 import { useFilters } from "../hooks/useFilters.js";
 import { formatNumber } from "../utils/format.js";
+import { prepareMarkers, markerSummary } from "../utils/incidentMarkers.js";
+import type { IncidentMarker } from "../utils/incidentMarkers.js";
 
 const PAGEVIEW_COLOR = "#6366f1";
 const VISITOR_COLOR = "#22c55e";
 const INTERVALS = ["hour", "day", "week", "month"] as const;
+
+/**
+ * How many incident bands the plot will draw, and how close two may sit before
+ * they are merged into one. Bands are translucent, so overlapping ones compose
+ * their alpha and enough of them turn the plot into a solid block — see
+ * utils/incidentMarkers.ts. These are the numbers that keep it legible: about
+ * one band per 3% of the plot's width, merged at 4px.
+ */
+const MAX_MARKER_BANDS = 30;
+const MARKER_MERGE_PX = 4;
 
 function TimeSeriesChart() {
   const { state, dispatch } = useFilters();
@@ -16,7 +28,8 @@ function TimeSeriesChart() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [data, setData] = useState<TimeSeriesPoint[]>([]);
   const [prevData, setPrevData] = useState<TimeSeriesPoint[]>([]);
-  const [markers, setMarkers] = useState<Array<{ id: string; title: string; severity: string; started_at: number; ended_at: number }>>([]);
+  const [markers, setMarkers] = useState<IncidentMarker[]>([]);
+  const [markerNote, setMarkerNote] = useState("");
   const [loading, setLoading] = useState(true);
   const [tooltip, setTooltip] = useState<{
     x: number; y: number; date: string; pageviews: number; visitors: number;
@@ -68,8 +81,11 @@ function TimeSeriesChart() {
     })
       .then((r) => r.ok ? r.json() : [])
       .then((list) => setMarkers(Array.isArray(list) ? list.map((inc: any) => ({
-        id: inc.incident_id, title: inc.title, severity: inc.severity,
-        started_at: inc.started_at, ended_at: inc.ended_at,
+        id: String(inc.incident_id ?? ""),
+        title: String(inc.title ?? ""),
+        severity: String(inc.severity ?? "info"),
+        started_at: Number(inc.started_at),
+        ended_at: Number(inc.ended_at),
       })) : []))
       .catch(() => setMarkers([]));
   }, [siteId, from, to]);
@@ -121,28 +137,35 @@ function TimeSeriesChart() {
     }
 
     // Incident markers: shaded vertical bands underneath the series lines.
-    // ended_at === 0 means "ongoing" — render to the right edge.
-    for (const m of markers) {
-      const sx = pad.left + ((m.started_at - minT) / rangeT) * plotW;
-      const ex = m.ended_at === 0
-        ? pad.left + plotW
-        : pad.left + ((m.ended_at - minT) / rangeT) * plotW;
+    //
+    // Never drawn one-to-one. prepareMarkers clamps them to the plot, merges
+    // anything that would overlap or land within MARKER_MERGE_PX of its
+    // neighbour, and caps what survives — without that, a site with thousands
+    // of incidents in the window renders as a solid wash of colour with the
+    // series invisible under it, which is what the live instance did.
+    const prepared = prepareMarkers(markers, {
+      minT,
+      maxT,
+      mergeGapMs: (MARKER_MERGE_PX / Math.max(plotW, 1)) * rangeT,
+      maxBands: MAX_MARKER_BANDS,
+    });
+    for (const band of prepared.bands) {
+      const sx = pad.left + ((band.start - minT) / rangeT) * plotW;
+      const ex = pad.left + ((band.end - minT) / rangeT) * plotW;
       const clipL = Math.max(pad.left, Math.min(sx, pad.left + plotW));
       const clipR = Math.max(pad.left, Math.min(ex, pad.left + plotW));
-      if (clipR - clipL < 1) {
-        // Single-point marker — draw a 2px line.
-        ctx.fillStyle = sevFill(m.severity);
-        ctx.fillRect(clipL, pad.top, 2, plotH);
-        continue;
-      }
-      ctx.fillStyle = sevFill(m.severity);
-      ctx.fillRect(clipL, pad.top, clipR - clipL, plotH);
-      ctx.strokeStyle = sevStroke(m.severity);
+      // A band narrower than 2px is invisible; give every one a floor so a
+      // point-in-time incident still reads, without letting it grow.
+      const width = Math.max(2, clipR - clipL);
+      ctx.fillStyle = sevFill(band.severity);
+      ctx.fillRect(clipL, pad.top, Math.min(width, pad.left + plotW - clipL), plotH);
+      ctx.strokeStyle = sevStroke(band.severity);
       ctx.beginPath();
       ctx.moveTo(clipL, pad.top);
       ctx.lineTo(clipL, pad.top + plotH);
       ctx.stroke();
     }
+    setMarkerNote(markerSummary(prepared));
 
     // Y-axis labels
     ctx.fillStyle = "#52525b";
@@ -367,6 +390,12 @@ function TimeSeriesChart() {
             <span class="obs-chart-legend-dot" style={`background:${VISITOR_COLOR}`} />
             <span>Visitors</span>
           </div>
+          {markerNote && (
+            <div class="obs-chart-legend-item" title="Incident markers are merged when they overlap, and capped so the plot stays readable">
+              <span class="obs-chart-legend-dot" style="background:rgba(245, 165, 36, 0.55)" />
+              <span>{markerNote}</span>
+            </div>
+          )}
         </div>
         <div class="obs-interval-btns">
           {INTERVALS.map((iv) => (

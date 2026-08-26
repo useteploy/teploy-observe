@@ -102,7 +102,7 @@ export default function IncidentsPage() {
         <div style={{ display: "flex", gap: "8px" }}>
           <ExportButton
             filename={`incidents-${Date.now()}.csv`}
-            rows={[...active, ...resolved]}
+            rows={[...active, ...recent]}
             columns={[
               { key: "title", label: "title" },
               { key: "severity", label: "severity" },

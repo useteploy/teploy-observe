@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "neutron-ts dev",
     "build": "neutron-ts build",
-    "preview": "neutron-ts preview"
+    "preview": "neutron-ts preview",
+    "test": "node --test --experimental-strip-types 'src/**/*.test.ts'"
   },
   "dependencies": {
     "neutron": "workspace:*",
