@@ -24,6 +24,7 @@ import (
 	"github.com/neutron-dev/neutron-go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/netsafe"
 	"github.com/useteploy/teploy-observe/internal/secretbox"
 )
 
@@ -53,12 +54,15 @@ type Service struct {
 	client *http.Client
 }
 
-// NewService creates an AI query service.
+// NewService creates an AI query service. The client is netsafe-wrapped: the
+// endpoint is operator-supplied, so it gets the same dial-time refusal of
+// loopback/link-local/RFC1918/metadata destinations every other outbound
+// fetcher in the repo applies.
 func NewService(db *nucleus.Client, logger *slog.Logger) *Service {
 	return &Service{
 		db:     db,
 		logger: logger,
-		client: &http.Client{Timeout: 30 * time.Second},
+		client: netsafe.Client(30 * time.Second),
 	}
 }
 
@@ -86,7 +90,9 @@ func (s *Service) GetConfig(ctx context.Context) (Config, error) {
 
 // SetConfig persists the AI config.  Admin-only — the caller must enforce
 // RBAC.  A blank APIKey preserves the existing key (so the admin can
-// re-save the form without retyping it).
+// re-save the form without retyping it). The endpoint is validated here so a
+// non-http(s) or otherwise unusable destination is rejected at save time
+// rather than on the first Generate call.
 func (s *Service) SetConfig(ctx context.Context, cfg Config) error {
 	if cfg.APIKey == "" {
 		// Preserve existing key on partial update.
