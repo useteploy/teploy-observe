@@ -6,6 +6,34 @@ All notable changes to Observe are recorded here.
 
 ### Added
 
+- **An "AI Assistant" traffic channel.** Referrals from ChatGPT, Claude, Grok,
+  Perplexity, Gemini, Copilot, DeepSeek, Mistral, Meta AI and friends were all
+  falling through to "Referral", alongside any random blog. They are now their
+  own channel, because the acquisition story is different: nobody linked to
+  you, a model cited you. Matched on the referrer host and on `utm_source`,
+  since AI surfaces often strip the referrer header. `bing.com/chat` is
+  deliberately absent — it cannot be told apart from Bing search by referrer.
+
+### Fixed
+
+- **Channel classification matched substrings, not hosts.** `sandbox.company`
+  contains `x.com` and was reported as Social; `kaolin.io` contains `aol` and
+  was reported as Organic Search. Matching is now host-aware: a dotted entry
+  matches the host or a subdomain of it, a bare brand entry matches a whole DNS
+  label (so `google.co.uk` and `news.google.com` still match, `kaolin.io` does
+  not). Silent mis-attribution — a wrong channel looks exactly like a right one.
+- **Every Gmail referral was counted as Organic Search.** Webmail lives on the
+  search engines' own domains (`mail.google.com`, `mail.yahoo.com`), and search
+  was checked before email. Channels are now ordered most-specific first. This
+  predates the host-aware matching; the substring match hid it rather than
+  caused it.
+- Google's AI surfaces (`gemini.google.com`, `bard.google.com`) matched the
+  `google` search entry, so AI traffic was not merely uncategorised — some of
+  it was attributed to organic search. The AI catalogue is checked first.
+
+
+### Added
+
 - **The selected date range now survives navigation and reload.** It lived only
   in `useFilters`' in-memory state, so routing back to the dashboard from Errors
   or Traces snapped it back to "Last 24 hours" and any longer window had to be
