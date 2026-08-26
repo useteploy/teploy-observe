@@ -60,8 +60,11 @@ it is also stored in `/etc/observe/observe.env` and rotatable from
 
 The direct installer verifies the release's SHA256 through an Ed25519-signed
 `checksums.txt` before installing anything. It fails closed if the signature
-or archive hash is invalid. Set `OBSERVE_HEALTH_URL` when upgrading an existing
-direct installation that does not listen on `http://127.0.0.1:3000/healthz`.
+or archive hash is invalid. `OBSERVE_HEALTH_URL` is read by the install script
+only, for the health poll it runs after restarting the existing service
+(default `http://127.0.0.1:3000/healthz`). It does not configure
+`observe upgrade`, which derives its readiness URL from `OBSERVE_ADDR`; pass
+`--health-url` instead for a non-default endpoint.
 
 ## Upgrade
 
@@ -71,6 +74,9 @@ Use the manager that installed Observe:
 # Direct Linux/systemd install
 sudo observe upgrade
 sudo observe upgrade --version v1.2.3
+# --service <unit>     systemd unit name (default: observe.service)
+# --health-url <url>   readiness URL for custom service configuration,
+#                      derived from OBSERVE_ADDR by default
 
 # Homebrew
 brew upgrade useteploy/tap/observe
