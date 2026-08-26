@@ -10,6 +10,9 @@
     "allowSyntheticDefaultImports": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
+    // Generated data and unit tests import each other by real path, because
+    // `node --test --experimental-strip-types` does no extension rewriting.
+    "allowImportingTsExtensions": true,
     "isolatedModules": true,
     "noEmit": true,
     "jsx": "react-jsx",

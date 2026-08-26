@@ -928,3 +928,77 @@ p { line-height: 1.6; }
   letter-spacing: 0.02em;
   text-transform: uppercase;
 }
+
+/* ─── World Map ───
+   Choropleth over Natural Earth 110m geometry (ui/src/data/). The SVG viewBox
+   is degrees, so strokes are pinned with vector-effect rather than scaled with
+   the panel. */
+.obs-worldmap {
+  position: relative;
+  width: 100%;
+}
+
+.obs-worldmap svg {
+  display: block;
+  width: 100%;
+  aspect-ratio: 360 / 143;
+  background: var(--obs-surface);
+  border-radius: var(--obs-radius-md);
+}
+
+.obs-worldmap svg path,
+.obs-worldmap svg circle {
+  stroke: var(--obs-surface);
+  stroke-width: 0.5px;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.obs-worldmap-hit:hover {
+  stroke: var(--obs-text);
+  stroke-width: 1.25px;
+}
+
+.obs-worldmap-tip {
+  position: absolute;
+  transform: translate(-50%, calc(-100% - 14px));
+  background: var(--obs-elevated);
+  border: 1px solid var(--obs-border);
+  border-radius: var(--obs-radius);
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--obs-text);
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 1;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.obs-worldmap-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--obs-text-muted);
+}
+
+.obs-worldmap-legend {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.obs-worldmap-legend i {
+  width: 18px;
+  height: 9px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.obs-worldmap-note {
+  cursor: help;
+}

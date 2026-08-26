@@ -32,6 +32,39 @@ All notable changes to Observe are recorded here.
 
 ### Changed
 
+- **"Visitors by Country" was not a world map.** Every landmass on it was one
+  hand-drawn path of three crude polygons, and the countries were roughly sixty
+  hardcoded `[code, x, y]` pixel guesses in an 800x400 box, drawn as bubbles.
+  Anything not in that list of sixty was invisible, and the outline resembled
+  nothing on Earth.
+
+  It is now a choropleth over real geometry: **Natural Earth 1:110m Admin 0
+  Countries**, which is public domain, committed at `ui/src/data/world110m.ts`
+  and imported by the bundle so the dashboard still works air-gapped. Provenance,
+  licence text and the processing applied are recorded in `ui/src/data/README.md`;
+  `scripts/gen-world-geometry.mjs` regenerates the file from a pinned Natural
+  Earth tag. 174 countries, 98 KB (39 KB gzipped), and it lands in the lazily
+  loaded dashboard route chunk rather than the entry.
+
+  Path coordinates are degrees written as `longitude,-latitude`, so the SVG
+  viewBox **is** the equirectangular projection and nothing projects anything at
+  runtime. Countries match on ISO-3166-1 alpha-2 resolved from Natural Earth's
+  `ISO_A2_EH` — the plain `ISO_A2` field carries `-99` for France and Norway, so
+  the obvious mapping would have silently lost both. A country with no data is
+  neutral land rather than a zero-visitor highlight, and the fill ramp is mixed
+  from the existing suite tokens (`--obs-accent` into `--obs-border`) so it
+  follows the theme. The ramp is a cube root of the ratio to the maximum: visitor
+  counts are long-tailed, and `log1p` put a 1,210-visitor country on the same
+  step as a 4,820-visitor one.
+
+  **Codes the geometry cannot claim are counted and printed under the map**, not
+  dropped — Natural Earth has no admin-0 feature for Hong Kong or Macao at any
+  scale, and those are real traffic. Countries too small for a polygon at this
+  resolution (Singapore, Malta, Bahrain, the Maldives) are drawn as discs at
+  Natural Earth's own tiny-country points and take a fill from the same scale.
+  `ui/src/utils/worldMap.test.ts` covers the code mapping, the scale at both
+  ends, and every way the breakdown can arrive malformed.
+
 - **The date range menu carried three pairs of buttons that meant the same
   thing.** "This week" sat next to "Last 7 days", "This month" next to "Last 30
   days", "This year" next to "Last 12 months" — eleven entries asking for a
