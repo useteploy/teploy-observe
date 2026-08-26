@@ -130,6 +130,13 @@ accessories:
 env:
   OBSERVE_ADDR: ":3000"
   OBSERVE_INGEST_ADDR: ":3001"
+  # Suite header: the `Teploy [Product v]` switcher in the top-left renders
+  # only when it knows where its siblings live. These are plain URLs, not
+  # secrets, and they belong here rather than being set by hand -- a deploy
+  # from a config that omits them silently drops the switcher, which is
+  # exactly how it disappeared on 2026-08-25.
+  TEPLOY_NAV_DASH_URL: "http://100.108.123.49:3456"
+  TEPLOY_NAV_SHIP_URL: "http://100.76.150.126:7460"
   OBSERVE_NUCLEUS_URL: "postgres://observe-nucleus:5432/observe"
   OBSERVE_SITE_ID: "default"
   OBSERVE_SESSION_SALT: "${TEPLOY_OBSERVE_SESSION_SALT}"
