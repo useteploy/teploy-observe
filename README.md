@@ -223,10 +223,14 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 | `OBSERVE_INGEST_ADDR` | (unset) | Optional second bind address serving ONLY telemetry-write endpoints (e.g. `:3001`). This is the port to expose publicly; the dashboard does not listen on it. |
 | `OBSERVE_PUBLIC_URL` | (unset) | External base URL (`https://observe.example.com`) used for SSO metadata and generated links. Falls back to the request's Host header, which a client can spoof — set it whenever the instance is reachable by a name. |
 | `OBSERVE_NUCLEUS_URL` | `postgres://localhost:5432/observe` | Nucleus connection. |
+| `OBSERVE_SITE_ID` | `default` | Default site ID for single-tenant mode. |
 | `OBSERVE_JWT_SECRET` | (random) | JWT signing secret — set in prod to persist sessions across restarts. |
+| `OBSERVE_AUDIT_KEY` | (falls back to `OBSERVE_JWT_SECRET`) | HMAC key for the audit tamper-evidence chain. Unset still keys the chain (via the JWT secret) but the two then live together; set a separate key held outside the DB host for the strongest guarantee — without it `compliance.go` reports "chain intact but unkeyed". |
 | `OBSERVE_SECRET_KEY` | (unset) | Master key for encrypting stored secrets (LLM API key, S3/R2 credentials) at rest; required to configure those features. |
+| `OBSERVE_BACKUP_ENCRYPTION_KEY` | (unset — backups are plaintext) | Base64 of exactly 32 raw bytes; wraps `observe backup` output in AES-256-GCM. Malformed values fail loudly rather than silently falling back to plaintext. |
 | `OBSERVE_ADMIN_USER` | `admin` | Bootstrap admin username. |
 | `OBSERVE_ADMIN_PASSWORD` | (unset) | Bootstrap admin password; unset means no default — the `/setup` wizard creates the account on first visit. |
+| `OBSERVE_RESET_ADMIN_PASSWORD` | (unset) | Startup escape hatch: force-updates the admin password hash without the current password, then continues booting. Unset it after recovery. |
 | `OBSERVE_SESSION_SALT` | (random) | Session-ID hashing salt — set it to keep session/visitor IDs stable across restarts. |
 | `OBSERVE_DEMO_MODE` | (unset) | Set to `true` to lock the deployment to a read-only public demo (write ops on `/api/v1/*` return 403). |
 | `OBSERVE_SEED_DEMO` | (unset) | Set to `true` for first-boot demo seeding (off by default; also on when demo mode is set). |
@@ -240,6 +244,7 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 | `OBSERVE_REQUIRE_WAL` | (unset) | Set to `true` (or `1`) to refuse to start when WAL-backed ingestion durability is unavailable, instead of degrading to memory-only. |
 | `OBSERVE_RAW_RETENTION_DAYS` | `30` | Raw event retention. Also the window over which visitor counts are exact from raw events; past it they are counted from the `sessions` table (90 days), and past both the dashboard says which window the figure covers. |
 | `OBSERVE_HOURLY_RETENTION_DAYS` | `365` | Hourly rollup retention. |
+| `OBSERVE_SOURCEMAP_KEEP_RELEASES` | `10` | Releases of source maps retained per site; older releases are pruned. |
 | `OBSERVE_LOG_ROUTES` | `0` | Set to `1` to print route table at boot. |
 | `OBSERVE_SMTP_HOST` | | SMTP server for email reports. |
 | `OBSERVE_SMTP_PORT` | `587` | SMTP port. |
@@ -274,6 +279,8 @@ period is disabled (authentication becomes required).
 | `OBSERVE_OIDC_EDITOR_GROUP` | | Group whose members become `editor`. |
 | `OBSERVE_OIDC_VIEWER_GROUP` | | Group whose members become `viewer`. |
 | `OBSERVE_OIDC_DEFAULT_ROLE` | `viewer` | Role for an authenticated user matching no role claim or group (least privilege). |
+| `OBSERVE_OIDC_ALLOWED_EMAILS` | (unset) | Comma/space-separated emails that may sign in. Unset means anyone the IdP authenticates is allowed. |
+| `OBSERVE_OIDC_ALLOWED_DOMAINS` | (unset) | Comma/space-separated email domains that may sign in (`example.com`). Combine with `OBSERVE_OIDC_ALLOWED_EMAILS` for exceptions. |
 
 Role resolution order: a recognized `teploy_role` claim wins; otherwise groups
 are matched (admin > editor > viewer); otherwise the default role. SSO users are
