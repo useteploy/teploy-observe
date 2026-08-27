@@ -136,7 +136,9 @@ env:
   # from a config that omits them silently drops the switcher, which is
   # exactly how it disappeared on 2026-08-25.
   TEPLOY_NAV_DASH_URL: "http://100.108.123.49:3456"
-  TEPLOY_NAV_SHIP_URL: "http://100.76.150.126:7460"
+  # Ship moved to infra-home 2026-08-27 (its sandboxes run on compute-1, which
+  # is what lets its control plane sit beside the forge).
+  TEPLOY_NAV_SHIP_URL: "http://100.108.123.49:7460"
   OBSERVE_NUCLEUS_URL: "postgres://observe-nucleus:5432/observe"
   OBSERVE_SITE_ID: "default"
   OBSERVE_SESSION_SALT: "${TEPLOY_OBSERVE_SESSION_SALT}"
