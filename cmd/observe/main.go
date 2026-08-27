@@ -1403,9 +1403,9 @@ func printHelp() {
 	os.Stdout.WriteString(`Observe — self-hosted analytics, errors, logs, traces, replays.
 
 Usage:
-  teploy-observe              Start the HTTP server (default).
-  teploy-observe backup       Stream a tar archive of all tables to stdout.
-  teploy-observe restore      Read a tar archive from stdin and insert into tables.
+  observe                      Start the HTTP server (default).
+  observe backup              Stream a tar archive of all tables to stdout.
+  observe restore             Read a tar archive from stdin and insert into tables.
   observe upgrade             Verify and install a release through systemd.
   observe reindex             Rebuild the FTS index from error_events.
   observe version             Print the Observe version.
@@ -1447,8 +1447,8 @@ Env vars:
                                (off by default; also on when demo mode is set)
 
 Example backup:
-  teploy-observe backup | zstd > teploy-observe-$(date +%F).tar.zst
-  zstdcat teploy-observe-2026-04-17.tar.zst | teploy-observe restore
+  observe backup | zstd > teploy-observe-$(date +%F).tar.zst
+  zstdcat teploy-observe-2026-04-17.tar.zst | observe restore
 
 Example upgrade:
   sudo observe upgrade
