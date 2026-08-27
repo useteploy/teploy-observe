@@ -260,6 +260,7 @@ func (s *AlertService) CheckRules(ctx context.Context) error {
 		if s.webhookSvc != nil {
 			s.webhookSvc.Fire(ctx, rule.SiteID, AlertPayload{
 				AlertID:   alertID,
+				RuleID:    rule.RuleID,
 				RuleName:  rule.Name,
 				Metric:    rule.Metric,
 				Value:     value,

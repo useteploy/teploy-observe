@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -28,24 +30,28 @@ func NewWebhookService(db *nucleus.Client, logger *slog.Logger) *WebhookService 
 	return &WebhookService{
 		db:     db,
 		logger: logger,
-		client: netsafe.Client(10 * time.Second),
+		// Webhook delivery is the ONE fetch path with an operator who has
+		// declared where their own services live. Empty by default, in which
+		// case this is exactly netsafe.Client. See netsafe.Allow for why the
+		// allowance is CIDRs and why link-local is never allowlistable.
+		client: netsafe.ClientWithAllow(10*time.Second, webhookAllow()),
 	}
 }
 
 type Webhook struct {
-	WebhookID   string    `json:"webhook_id" db:"webhook_id"`
-	TenantID    string    `json:"-" db:"tenant_id"`
-	SiteID      string    `json:"site_id" db:"site_id"`
-	Name        string    `json:"name"`
-	WebhookType string    `json:"webhook_type" db:"webhook_type"`
-	URL         string    `json:"url"`
-	Secret      string    `json:"-" db:"secret"`
+	WebhookID   string `json:"webhook_id" db:"webhook_id"`
+	TenantID    string `json:"-" db:"tenant_id"`
+	SiteID      string `json:"site_id" db:"site_id"`
+	Name        string `json:"name"`
+	WebhookType string `json:"webhook_type" db:"webhook_type"`
+	URL         string `json:"url"`
+	Secret      string `json:"-" db:"secret"`
 	// SecretReveal carries the signing secret back to the caller exactly once,
 	// at creation. It has no db tag, so List/Get never populate it.
-	SecretReveal string   `json:"secret,omitempty"`
-	Enabled     bool      `json:"enabled"`
-	CreatedAt   time.Time `json:"created_at" db:"created_at"`
-	Version     string    `json:"-" db:"version"`
+	SecretReveal string    `json:"secret,omitempty"`
+	Enabled      bool      `json:"enabled"`
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
+	Version      string    `json:"-" db:"version"`
 }
 
 func (s *WebhookService) Create(ctx context.Context, siteID, name, webhookType, url string) (*Webhook, error) {
@@ -98,7 +104,13 @@ func (s *WebhookService) Delete(ctx context.Context, webhookID string) error {
 
 // AlertPayload is sent to webhooks when an alert triggers.
 type AlertPayload struct {
-	AlertID   string  `json:"alert_id"`
+	AlertID string `json:"alert_id"`
+	// RuleID identifies the RULE, where AlertID identifies one firing of it.
+	// A rule that keeps breaching fires once per cooldown and each firing gets
+	// a fresh alert_id, so a receiver that opens work items keyed on alert_id
+	// opens a new one every cooldown for a single ongoing incident. rule_id is
+	// the stable key that lets it collapse them.
+	RuleID    string  `json:"rule_id"`
 	RuleName  string  `json:"rule_name"`
 	Metric    string  `json:"metric"`
 	Value     float64 `json:"value"`
@@ -138,6 +150,12 @@ func (s *WebhookService) fireHTTP(url, secret string, payload AlertPayload) erro
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// A delivery id, unique per attempt. Receivers dedupe on it so a resend
+	// cannot re-run whatever the first delivery started; without one they have
+	// to fall back to hashing the body, which does not distinguish a resend
+	// from a genuinely repeated alert. Set unconditionally — an unsigned
+	// webhook needs replay protection at least as much as a signed one.
+	req.Header.Set("X-Observe-Delivery", genID())
 	// Sign so the receiver can verify authenticity:
 	//   X-Observe-Signature: sha256=hex(HMAC-SHA256(secret, timestamp + "." + body))
 	if secret != "" {
@@ -176,4 +194,27 @@ func (s *WebhookService) fireSlack(url string, payload AlertPayload) error {
 		return fmt.Errorf("slack webhook returned %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// webhookAllow reads OBSERVE_WEBHOOK_ALLOW_CIDRS.
+//
+// Self-hosted Teploy runs entirely on a tailnet (100.64.0.0/10), which the SSRF
+// guard blocks by design — so without this an alert could never reach a
+// self-hosted receiver, and the first person to hit it would be tempted to
+// weaken the guard itself. A malformed value is logged and IGNORED rather than
+// silently treated as empty: an operator who mistyped a CIDR should not
+// discover it as a delivery that never arrives.
+func webhookAllow() netsafe.Allow {
+	raw := strings.TrimSpace(os.Getenv("OBSERVE_WEBHOOK_ALLOW_CIDRS"))
+	if raw == "" {
+		return nil
+	}
+	allow, err := netsafe.ParseAllow(raw)
+	if err != nil {
+		slog.Error("OBSERVE_WEBHOOK_ALLOW_CIDRS is malformed and was ignored; webhook delivery to private addresses stays blocked",
+			"error", err)
+		return nil
+	}
+	slog.Info("webhook delivery may reach operator-declared private networks", "cidrs", raw)
+	return allow
 }

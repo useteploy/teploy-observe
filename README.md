@@ -219,6 +219,7 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OBSERVE_ADDR` | `:3000` | Listen address. Keep on localhost/tailnet when publishing ingest. |
+| `OBSERVE_WEBHOOK_ALLOW_CIDRS` | (unset) | Networks webhook delivery may reach despite being private, as CIDRs (`100.64.0.0/10, 10.0.0.0/8`); a bare IP means that address alone. Self-hosted fleets live on a tailnet, which the SSRF guard blocks by design — without this an alert can never reach a self-hosted receiver. Applies to webhook delivery ONLY, never to integrations or uptime monitoring. Link-local (169.254.169.254 cloud metadata), multicast and the unspecified address stay blocked whatever you declare. Hostnames are refused: allowing by name would hand back DNS rebinding. |
 | `OBSERVE_INGEST_ADDR` | (unset) | Optional second bind address serving ONLY telemetry-write endpoints (e.g. `:3001`). This is the port to expose publicly; the dashboard does not listen on it. |
 | `OBSERVE_PUBLIC_URL` | (unset) | External base URL (`https://observe.example.com`) used for SSO metadata and generated links. Falls back to the request's Host header, which a client can spoof — set it whenever the instance is reachable by a name. |
 | `OBSERVE_NUCLEUS_URL` | `postgres://localhost:5432/observe` | Nucleus connection. |
