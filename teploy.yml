@@ -87,7 +87,27 @@ accessories:
     # the engine. v0.1.6's breaking change applies: SKIP LOCKED, NOWAIT and
     # partial CREATE INDEX ... WHERE now error rather than being ignored —
     # checked, neither Observe nor Ship uses them.
-    image: ghcr.io/neutron-build/nucleus:v0.1.8
+    #
+    # v1.0.0 (2026-08-31), up from v0.1.8. Two wire-protocol fixes are why this
+    # release exists. The RowDescription a client received did not always
+    # describe the DataRows that followed it — 20,800 of 125,419 statements
+    # over a ten-second concurrent read were answered with a description that
+    # did not match their rows, and a client reading fields positionally throws
+    # while one reading by name silently decodes a row with fields missing.
+    # And Describe could EXECUTE a side-effecting statement, because whether to
+    # describe statically or by running the statement was decided by a text
+    # scan that a comment between a function name and its arguments defeats.
+    #
+    # ROLLING BACK TO v0.1.8 IS NOT A BINARY SWAP. DB_FORMAT_VERSION is still
+    # 2, so the engine will NOT refuse the older binary, and the rollback
+    # runbook's decision tree tells you to try exactly that first. S63 added
+    # transaction-tagged KV WAL records (0x06-0x09) that 0.1.8 has no case for;
+    # its replay fallthrough is RecordStep::Stop, so it treats the first tagged
+    # record as end-of-log and silently discards every KV record after it. The
+    # tags appear only where a KV mutation runs inside a coordinating SQL
+    # transaction. A v0.1.8 physical snapshot still restores into v1.0.0, so
+    # the pre-upgrade backup is the way back — fix forward, do not swap.
+    image: ghcr.io/neutron-build/nucleus:v1.0.0
     port: 5432
     # Hard cgroup cap, and the only bound the kernel enforces.
     # NUCLEUS_MAX_MEMORY_MB below is the engine's accounting of its OWN
