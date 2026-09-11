@@ -65,12 +65,21 @@ func NewDiskQueue(dir, name string, fsyncInterval time.Duration, maxBytes int64,
 		return nil, fmt.Errorf("ingest queue: stat: %w", err)
 	}
 
+	// A torn final line (crash mid-append) must be repaired before anything
+	// else: the next append would continue the partial line and merge two
+	// records into one unparseable JSON line, losing BOTH on replay.
+	size, err := repairTornTail(f, info.Size(), logger, name)
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("ingest queue: repair torn tail: %w", err)
+	}
+
 	cp, err := readCheckpoint(filepath.Join(full, "checkpoint"))
 	if err != nil {
 		_ = f.Close()
 		return nil, err
 	}
-	if cp > info.Size() {
+	if cp > size {
 		// A checkpoint past the log means the log was replaced (compaction)
 		// without the checkpoint surviving — replaying from the stored
 		// offset would seek into mid-record bytes of a fresh log and parse
@@ -78,7 +87,7 @@ func NewDiskQueue(dir, name string, fsyncInterval time.Duration, maxBytes int64,
 		// already committed. The stale file is removed so the repair
 		// survives another crash before the next checkpoint.
 		logger.Warn("ingest queue: checkpoint beyond log length, replaying from start",
-			"queue", name, "checkpoint", cp, "logBytes", info.Size())
+			"queue", name, "checkpoint", cp, "logBytes", size)
 		if err := os.Remove(filepath.Join(full, "checkpoint")); err != nil && !errors.Is(err, os.ErrNotExist) {
 			_ = f.Close()
 			return nil, fmt.Errorf("ingest queue: remove stale checkpoint: %w", err)
@@ -93,7 +102,7 @@ func NewDiskQueue(dir, name string, fsyncInterval time.Duration, maxBytes int64,
 		maxBytes:      maxBytes,
 		file:          f,
 		writer:        bufio.NewWriterSize(f, 64*1024),
-		offset:        info.Size(),
+		offset:        size,
 		checkpoint:    cp,
 		stopCh:        make(chan struct{}),
 		logger:        logger,
@@ -329,6 +338,60 @@ func (q *DiskQueue) fsyncLoop() {
 			q.mu.Unlock()
 		}
 	}
+}
+
+// repairTornTail truncates an unterminated final line — the signature of a
+// crash mid-append — back to the last record boundary, and returns the
+// (possibly shortened) log length. Every Append writes exactly one
+// newline-terminated JSON line, so a missing terminator is by definition a
+// torn record: without this repair the next append continues the partial
+// line and the two records merge into one unparseable JSON line, losing
+// BOTH on replay. A newline-terminated tail is left alone; corrupt but
+// complete lines are already skipped at replay.
+func repairTornTail(f *os.File, size int64, logger *slog.Logger, name string) (int64, error) {
+	if size == 0 {
+		return 0, nil
+	}
+	var last [1]byte
+	if _, err := f.ReadAt(last[:], size-1); err != nil {
+		return size, err
+	}
+	if last[0] == '\n' {
+		return size, nil
+	}
+	// Scan backwards for the last record boundary.
+	const scanChunk = 4096
+	buf := make([]byte, scanChunk)
+	end := size
+	for end > 0 {
+		start := end - scanChunk
+		if start < 0 {
+			start = 0
+		}
+		n, err := f.ReadAt(buf[:end-start], start)
+		if err != nil && n == 0 {
+			return size, err
+		}
+		for i := n - 1; i >= 0; i-- {
+			if buf[i] == '\n' {
+				keep := start + int64(i) + 1
+				if err := f.Truncate(keep); err != nil {
+					return size, err
+				}
+				logger.Warn("ingest queue: truncated torn tail from crashed append",
+					"queue", name, "droppedBytes", size-keep)
+				return keep, nil
+			}
+		}
+		end = start
+	}
+	// No newline anywhere: the whole file is one torn record.
+	if err := f.Truncate(0); err != nil {
+		return size, err
+	}
+	logger.Warn("ingest queue: truncated torn tail from crashed append",
+		"queue", name, "droppedBytes", size)
+	return 0, nil
 }
 
 func readCheckpoint(path string) (int64, error) {

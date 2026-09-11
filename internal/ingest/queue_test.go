@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -340,6 +341,73 @@ func TestDiskQueue_OpenClampsCheckpointPastLog(t *testing.T) {
 	}
 	if got := ids(pending); !equal(got, appended) {
 		t.Fatalf("pending = %v, want %v (stale checkpoint must not eat into fresh records)", got, appended)
+	}
+}
+
+// TestDiskQueue_TruncatesTornTailOnOpen is the observe-05 regression: a
+// crash mid-append leaves an unterminated JSON line; unrepaired, the next
+// append continues that partial line and the two records merge into one
+// unparseable line — recovery then loses BOTH. Open must truncate the torn
+// tail to the last record boundary so an append after it survives restart.
+func TestDiskQueue_TruncatesTornTailOnOpen(t *testing.T) {
+	dir := t.TempDir()
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	q1, err := NewDiskQueue(dir, "events", time.Hour, 1<<30, logger)
+	if err != nil {
+		t.Fatalf("NewDiskQueue: %v", err)
+	}
+	off1, err := q1.Append(ev("e1"))
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := q1.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Torn write: half a record, no newline.
+	logPath := filepath.Join(dir, "events", "current.log")
+	torn, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := torn.Write([]byte(`{"event_id":"tor`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := torn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	q2, err := NewDiskQueue(dir, "events", time.Hour, 1<<30, logger)
+	if err != nil {
+		t.Fatalf("reopen with torn tail: %v", err)
+	}
+	info, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != off1 {
+		t.Fatalf("torn tail must be truncated to the last boundary: size=%d, want %d", info.Size(), off1)
+	}
+	if !strings.Contains(logBuf.String(), "truncated torn tail") {
+		t.Fatalf("repair must be logged, got: %s", logBuf.String())
+	}
+
+	// The record appended after the repair must recover intact on restart.
+	if _, err := q2.Append(ev("e2")); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := q2.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	q3 := testQueue2(t, q2)
+	defer q3.Close()
+	pending, err := q3.Pending()
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if got, want := ids(pending), []string{"e1", "e2"}; !equal(got, want) {
+		t.Fatalf("pending after torn-tail repair = %v, want %v (no merged record)", got, want)
 	}
 }
 
