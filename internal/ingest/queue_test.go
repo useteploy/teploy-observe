@@ -1,8 +1,10 @@
 package ingest
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -158,6 +160,83 @@ func TestDiskQueue_ConcurrentAppendCheckpoint(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+// TestDiskQueue_AppendAfterCheckpointIsStillFlushed is the observe-01
+// regression: the checkpoint-file write used to run after q.mu was released,
+// so an Append landing between the flush and the write was marked clean
+// (dirtySinceFlush=false) and the background fsync loop then SKIPPED bytes it
+// had never flushed. An append after a checkpoint must reach the file within
+// one fsyncInterval without any help from Close.
+func TestDiskQueue_AppendAfterCheckpointIsStillFlushed(t *testing.T) {
+	interval := 25 * time.Millisecond
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	q, err := NewDiskQueue(dir, "events", interval, 1<<30, logger)
+	if err != nil {
+		t.Fatalf("NewDiskQueue: %v", err)
+	}
+
+	off, err := q.Append(ev("e1"))
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := q.Checkpoint(off); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if _, err := q.Append(ev("e2")); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	// Quiet period: only the fsync loop can flush now. Then simulate a
+	// crash by reading the file as it sits on disk — no Close().
+	time.Sleep(5 * interval)
+	raw, err := os.ReadFile(filepath.Join(dir, "events", "current.log"))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	_ = q.Close()
+	if !bytes.Contains(raw, []byte(`"event_id":"e2"`)) {
+		t.Fatalf("append after a checkpoint was not flushed by the fsync loop within %s: %q", interval, raw)
+	}
+}
+
+// TestDiskQueue_ConcurrentAppendCheckpointNoStrandedBytes pins the observe-01
+// invariant: once appends and checkpoints have both quiesced, every byte past
+// the checkpoint must still be awaiting a flush (dirty). A cleared dirty flag
+// with bytes past the checkpoint means the fsync loop would skip them.
+func TestDiskQueue_ConcurrentAppendCheckpointNoStrandedBytes(t *testing.T) {
+	q := testQueue(t)
+	defer q.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1500; i++ {
+			if _, err := q.Append(ev("e")); err != nil {
+				t.Errorf("append: %v", err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 150; i++ {
+			if err := q.Checkpoint(q.Offset()); err != nil {
+				t.Errorf("checkpoint: %v", err)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+
+	q.mu.Lock()
+	dirty := q.dirtySinceFlush
+	cp, off := q.checkpoint, q.offset
+	q.mu.Unlock()
+	if cp < off && !dirty {
+		t.Fatalf("bytes past the checkpoint (offset %d, checkpoint %d) are not flagged dirty — the fsync loop would skip them", off, cp)
+	}
 }
 
 // --- helpers ---

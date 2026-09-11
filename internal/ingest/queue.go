@@ -30,18 +30,18 @@ import (
 //	current.log   append-only JSON lines, one event per line
 //	checkpoint    decimal byte offset; everything <= this has been flushed
 type DiskQueue struct {
-	mu             sync.Mutex
-	dir            string
-	name           string
-	fsyncInterval  time.Duration
-	maxBytes       int64
-	file           *os.File
-	writer         *bufio.Writer
-	offset         int64 // current byte position in current.log
-	checkpoint     int64 // bytes <= checkpoint have been flushed
-	stopCh         chan struct{}
-	stopped        bool
-	logger         *slog.Logger
+	mu              sync.Mutex
+	dir             string
+	name            string
+	fsyncInterval   time.Duration
+	maxBytes        int64
+	file            *os.File
+	writer          *bufio.Writer
+	offset          int64 // current byte position in current.log
+	checkpoint      int64 // bytes <= checkpoint have been flushed
+	stopCh          chan struct{}
+	stopped         bool
+	logger          *slog.Logger
 	dirtySinceFlush bool
 }
 
@@ -135,37 +135,50 @@ func (q *DiskQueue) Offset() int64 {
 // The checkpoint only ever advances (monotonic clamp): a stale or out-of-order
 // call can never roll it backward past data already confirmed durable. target
 // is also clamped to the current offset so a bogus value can't skip past
-// un-written bytes. The bufio flush and fsync run while holding q.mu so they
-// cannot race a concurrent Append or the fsyncLoop (bufio.Writer is not safe
-// for concurrent use).
+// un-written bytes. The bufio flush, fsync, checkpoint-file write, and
+// compaction all run while holding q.mu: they cannot race a concurrent
+// Append or the fsyncLoop (bufio.Writer is not safe for concurrent use), and
+// the offset persisted to the checkpoint file is exactly one this call
+// flushed. An Append arriving after the fsync lands beyond that offset and
+// stays dirty for the next flush.
 //
 // Correctness relies on the single-flusher invariant: Buffer serializes Flush
 // (and thus Checkpoint) so batches are inserted and checkpointed in WAL order.
 func (q *DiskQueue) Checkpoint(target int64) error {
 	q.mu.Lock()
+	defer q.mu.Unlock()
 	if q.stopped {
-		q.mu.Unlock()
 		return errors.New("ingest queue: closed")
 	}
 	if target <= q.checkpoint {
-		q.mu.Unlock()
 		return nil // already durable up to (or past) target
 	}
 	if target > q.offset {
 		target = q.offset
 	}
 	if err := q.writer.Flush(); err != nil {
-		q.mu.Unlock()
 		return err
 	}
 	if err := q.file.Sync(); err != nil {
-		q.mu.Unlock()
 		return err
 	}
-	q.mu.Unlock()
-	return q.writeCheckpoint(target)
+	// The checkpoint write must happen inside the SAME lock hold as the
+	// flush above. Writing it after releasing q.mu let an Append land
+	// between the two: the append set dirtySinceFlush, the checkpoint
+	// write then cleared it, and the fsync loop skipped bytes it had
+	// never flushed — losing appends the durability model promises are
+	// on disk within one fsyncInterval.
+	if err := q.writeCheckpoint(target); err != nil {
+		return err
+	}
+	// Best-effort compaction: if the file has grown beyond maxBytes and the
+	// checkpoint is at the end, truncate it.
+	return q.maybeCompact()
 }
 
+// writeCheckpoint persists the checkpoint file and advances the in-memory
+// durability point. The caller must hold q.mu, so the offset recorded is
+// exactly one the current Checkpoint call flushed and fsynced.
 func (q *DiskQueue) writeCheckpoint(offset int64) error {
 	path := filepath.Join(q.dir, "checkpoint")
 	tmp := path + ".tmp"
@@ -175,18 +188,14 @@ func (q *DiskQueue) writeCheckpoint(offset int64) error {
 	if err := os.Rename(tmp, path); err != nil {
 		return err
 	}
-	q.mu.Lock()
 	q.checkpoint = offset
 	q.dirtySinceFlush = false
-	q.mu.Unlock()
-	// Best-effort compaction: if the file has grown beyond maxBytes and the
-	// checkpoint is at the end, truncate it.
-	return q.maybeCompact()
+	return nil
 }
 
+// maybeCompact resets the log once it has grown beyond maxBytes and
+// everything in it is checkpointed. The caller must hold q.mu.
 func (q *DiskQueue) maybeCompact() error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
 	if q.offset < q.maxBytes {
 		return nil
 	}
