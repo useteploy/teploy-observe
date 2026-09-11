@@ -1,8 +1,15 @@
 package ingest
 
 import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/neutron-dev/neutron-go/nucleus"
 )
 
 // TestBuffer uses a nil db client to test push/drain logic only.
@@ -64,5 +71,116 @@ func TestBuffer_DrainOnFlush(t *testing.T) {
 	}
 	if buf.Len() != 0 {
 		t.Fatalf("expected empty buffer after drain, got %d", buf.Len())
+	}
+}
+
+// TestBuffer_FlushFailureRequeueKeepsAllUnderPressure is the observe-04
+// regression: a failed flush used to requeue only what fit below maxSize and
+// silently drop the rest. The dropped events were WAL-appended below
+// lastOffset, so the next successful flush checkpointed past them — lost for
+// good, restart included. The requeue must retain everything, at the front.
+func TestBuffer_FlushFailureRequeueKeepsAllUnderPressure(t *testing.T) {
+	buf := NewBuffer(nil, 4, 100, time.Hour, nil)
+	// Buffer already at maxSize with events pushed while the flush was
+	// in flight — zero headroom, the exact pressure case.
+	for _, id := range []string{"n1", "n2", "n3", "n4"} {
+		buf.events = append(buf.events, ev(id))
+	}
+
+	buf.requeueFailed([]Event{ev("e1"), ev("e2"), ev("e3")})
+
+	if got := buf.Len(); got != 7 {
+		t.Fatalf("all failed-batch events must survive under pressure: %d of 7", got)
+	}
+	buf.mu.Lock()
+	got := ids(buf.events)
+	buf.mu.Unlock()
+	want := []string{"e1", "e2", "e3", "n1", "n2", "n3", "n4"}
+	if !equal(got, want) {
+		t.Fatalf("requeue order = %v, want the failed batch at the front: %v", got, want)
+	}
+}
+
+// TestBuffer_FlushFailureSurvivesRetryAndRestart walks the observe-04
+// acceptance end-to-end against a real Nucleus: events accepted before a
+// failed flush must all survive the retry AND a restart would have replayed
+// them (nothing checkpointed past uncommitted records).
+func TestBuffer_FlushFailureSurvivesRetryAndRestart(t *testing.T) {
+	dbFail, doneFail := ingestTestDB(t)
+	defer doneFail()
+	dbRetry, doneRetry := ingestTestDB(t)
+	defer doneRetry()
+
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	q, err := NewDiskQueue(dir, "ingest", time.Hour, 1<<30, logger)
+	if err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+	buf := NewBuffer(dbFail, 8, 100, time.Hour, logger)
+	if err := buf.AttachQueue(q); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+
+	site := fmt.Sprintf("obs04-%d", time.Now().UnixNano())
+	ts := time.Now().UTC().UnixMilli()
+	push := func(i int) {
+		id := fmt.Sprintf("%s-e%d", site, i)
+		if !buf.Push(Event{EventID: id, TenantID: "default", SiteID: site, SessionID: "s", VisitID: "s", EventType: "pageview", Timestamp: ts}) {
+			t.Fatalf("push %d refused", i)
+		}
+	}
+	for i := 1; i <= 4; i++ {
+		push(i)
+	}
+
+	// The flush fails (dead connection) with the buffer under pressure.
+	dbFail.Close()
+	buf.Flush()
+	if got := buf.Len(); got != 4 {
+		t.Fatalf("failed flush must retain every accepted event, got %d of 4", got)
+	}
+	if cp, err := readCheckpoint(filepath.Join(dir, "ingest", "checkpoint")); err != nil || cp != 0 {
+		t.Fatalf("failed flush must not advance the checkpoint, got %d (err %v)", cp, err)
+	}
+
+	// Retry against a live connection: every accepted event is inserted.
+	buf.mu.Lock()
+	buf.db = dbRetry
+	buf.mu.Unlock()
+	buf.Flush()
+	if got := buf.Len(); got != 0 {
+		t.Fatalf("retry must drain the requeued events, %d left", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	type idRow struct {
+		EventID string `db:"event_id"`
+	}
+	rows, err := nucleus.Query[idRow](ctx, dbRetry.SQL(),
+		"SELECT event_id FROM events WHERE site_id = $1", site)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("all 4 events must have survived the failed flush + retry, got %d", len(rows))
+	}
+
+	// And the WAL is fully checkpointed now — a restart replays nothing.
+	if err := q.Close(); err != nil {
+		t.Fatalf("close queue: %v", err)
+	}
+	q2, err := NewDiskQueue(dir, "ingest", time.Hour, 1<<30, logger)
+	if err != nil {
+		t.Fatalf("reopen queue: %v", err)
+	}
+	defer q2.Close()
+	pending, err := q2.Pending()
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("checkpoint must cover the retried batch, %d pending", len(pending))
 	}
 }

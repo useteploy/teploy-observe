@@ -295,15 +295,7 @@ func (b *Buffer) Flush() {
 		b.logger.Error("flush failed", "committed", committed, "requeue", len(unsent), "err", err)
 		// We deliberately do NOT checkpoint, so these events stay in the WAL and
 		// a later successful flush checkpoints them via lastOffset.
-		b.mu.Lock()
-		remaining := b.maxSize - len(b.events)
-		if remaining > 0 {
-			if len(unsent) > remaining {
-				unsent = unsent[:remaining]
-			}
-			b.events = append(b.events, unsent...)
-		}
-		b.mu.Unlock()
+		b.requeueFailed(unsent)
 		return
 	}
 	b.logger.Info("flushed events OK", "count", len(batch))
@@ -312,6 +304,19 @@ func (b *Buffer) Flush() {
 			b.logger.Warn("ingest queue: checkpoint failed", "err", err)
 		}
 	}
+}
+
+// requeueFailed puts a failed batch's uncommitted tail back at the FRONT of
+// the buffer, untruncated. The old code appended only what fit below maxSize
+// and silently dropped the rest under pressure — but the dropped events were
+// already WAL-appended below lastOffset, so the next successful flush
+// checkpointed PAST them and they were lost for good, restart included.
+// Retaining them can temporarily push the buffer over maxSize; Push refuses
+// new events until the retry drains it back down.
+func (b *Buffer) requeueFailed(unsent []Event) {
+	b.mu.Lock()
+	b.events = append(unsent, b.events...)
+	b.mu.Unlock()
 }
 
 // Len returns the current number of buffered events.
