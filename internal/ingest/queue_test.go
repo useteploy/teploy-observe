@@ -2,6 +2,8 @@ package ingest
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -236,6 +238,108 @@ func TestDiskQueue_ConcurrentAppendCheckpointNoStrandedBytes(t *testing.T) {
 	q.mu.Unlock()
 	if cp < off && !dirty {
 		t.Fatalf("bytes past the checkpoint (offset %d, checkpoint %d) are not flagged dirty — the fsync loop would skip them", off, cp)
+	}
+}
+
+// TestDiskQueue_CompactRotationKeepsNewRecordsReplayable is the observe-02
+// rotation regression: compaction used to truncate the log and only then
+// remove the checkpoint file, so a crash in between left a durable checkpoint
+// pointing past an empty/replacement log. Rotation must clear the checkpoint
+// first; a crash at either boundary still leaves new valid records replayable.
+func TestDiskQueue_CompactRotationKeepsNewRecordsReplayable(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	const maxBytes = 512
+	q, err := NewDiskQueue(dir, "events", time.Hour, maxBytes, logger)
+	if err != nil {
+		t.Fatalf("NewDiskQueue: %v", err)
+	}
+	// Append past maxBytes, then checkpoint everything: this is the
+	// checkpoint that triggers compaction.
+	var off int64
+	for i := 0; q.Offset() <= maxBytes; i++ {
+		off, err = q.Append(ev(fmt.Sprintf("old%d", i)))
+		if err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	if err := q.Checkpoint(off); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if got := q.Offset(); got != 0 {
+		t.Fatalf("compaction must reset the log, offset=%d", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "events", "checkpoint")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("compaction must remove the checkpoint file, stat err=%v", err)
+	}
+	// New records land in the fresh log and must survive a restart.
+	if _, err := q.Append(ev("post1")); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if _, err := q.Append(ev("post2")); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	q2 := testQueue2(t, q)
+	defer q2.Close()
+	pending, err := q2.Pending()
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if got, want := ids(pending), []string{"post1", "post2"}; !equal(got, want) {
+		t.Fatalf("pending after rotation = %v, want %v", got, want)
+	}
+}
+
+// TestDiskQueue_OpenClampsCheckpointPastLog is the observe-02 load-time
+// guard: a checkpoint pointing beyond the actual log (the on-disk state a
+// crash mid-rotation, or anything else, can leave) must never be replayed
+// from — that seeks into mid-record bytes and parses garbage. It replays from
+// the start instead.
+func TestDiskQueue_OpenClampsCheckpointPastLog(t *testing.T) {
+	dir := t.TempDir()
+	logDir := filepath.Join(dir, "events")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Poison state: empty log, checkpoint far past its length.
+	if err := os.WriteFile(filepath.Join(logDir, "checkpoint"), []byte("500"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	q, err := NewDiskQueue(dir, "events", time.Hour, 1<<30, logger)
+	if err != nil {
+		t.Fatalf("open with poisoned checkpoint: %v", err)
+	}
+	q.mu.Lock()
+	cp := q.checkpoint
+	q.mu.Unlock()
+	if cp != 0 {
+		t.Fatalf("checkpoint past log length must clamp to 0 on load, got %d", cp)
+	}
+	// Grow the fresh log past the stale offset: replay must return exactly
+	// the new records, each parsing cleanly — never a merged mid-record read.
+	var appended []string
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("new%d", i)
+		if _, err := q.Append(ev(id)); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		appended = append(appended, id)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	q2 := testQueue2(t, q)
+	defer q2.Close()
+	pending, err := q2.Pending()
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if got := ids(pending); !equal(got, appended) {
+		t.Fatalf("pending = %v, want %v (stale checkpoint must not eat into fresh records)", got, appended)
 	}
 }
 

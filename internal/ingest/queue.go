@@ -70,6 +70,21 @@ func NewDiskQueue(dir, name string, fsyncInterval time.Duration, maxBytes int64,
 		_ = f.Close()
 		return nil, err
 	}
+	if cp > info.Size() {
+		// A checkpoint past the log means the log was replaced (compaction)
+		// without the checkpoint surviving — replaying from the stored
+		// offset would seek into mid-record bytes of a fresh log and parse
+		// garbage. Start from 0 instead; replay dedup drops whatever was
+		// already committed. The stale file is removed so the repair
+		// survives another crash before the next checkpoint.
+		logger.Warn("ingest queue: checkpoint beyond log length, replaying from start",
+			"queue", name, "checkpoint", cp, "logBytes", info.Size())
+		if err := os.Remove(filepath.Join(full, "checkpoint")); err != nil && !errors.Is(err, os.ErrNotExist) {
+			_ = f.Close()
+			return nil, fmt.Errorf("ingest queue: remove stale checkpoint: %w", err)
+		}
+		cp = 0
+	}
 
 	q := &DiskQueue{
 		dir:           full,
@@ -203,6 +218,21 @@ func (q *DiskQueue) maybeCompact() error {
 		return nil // still have pending data past the checkpoint
 	}
 	// Everything is flushed — start fresh.
+	//
+	// Crash-consistent rotation: the persisted checkpoint must be gone
+	// BEFORE the log is replaced, or a crash in between leaves a durable
+	// checkpoint pointing past the replacement log — replay would then
+	// seek into mid-record bytes and parse garbage (the load-time clamp
+	// is the backstop for disks already in that state). Worst case — a
+	// crash between the two steps — the full old log replays and the
+	// committed prefix is dropped by replay dedup.
+	if err := os.Remove(filepath.Join(q.dir, "checkpoint")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := syncDir(q.dir); err != nil {
+		return err
+	}
+	q.checkpoint = 0 // the on-disk checkpoint is gone; match it even if the swap below fails
 	if err := q.file.Truncate(0); err != nil {
 		return err
 	}
@@ -211,9 +241,18 @@ func (q *DiskQueue) maybeCompact() error {
 	}
 	q.writer.Reset(q.file)
 	q.offset = 0
-	q.checkpoint = 0
-	_ = os.Remove(filepath.Join(q.dir, "checkpoint"))
 	return nil
+}
+
+// syncDir fsyncs a directory so a remove within it is durable before the
+// steps that depend on that ordering run.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // Pending reads events appended after the last checkpoint and returns
