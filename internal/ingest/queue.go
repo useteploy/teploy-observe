@@ -50,12 +50,12 @@ type DiskQueue struct {
 // to disk during steady-state writes.
 func NewDiskQueue(dir, name string, fsyncInterval time.Duration, maxBytes int64, logger *slog.Logger) (*DiskQueue, error) {
 	full := filepath.Join(dir, name)
-	if err := os.MkdirAll(full, 0o755); err != nil {
+	if err := os.MkdirAll(full, 0o700); err != nil {
 		return nil, fmt.Errorf("ingest queue: mkdir: %w", err)
 	}
 
 	logPath := filepath.Join(full, "current.log")
-	f, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("ingest queue: open: %w", err)
 	}
@@ -206,7 +206,7 @@ func (q *DiskQueue) Checkpoint(target int64) error {
 func (q *DiskQueue) writeCheckpoint(offset int64) error {
 	path := filepath.Join(q.dir, "checkpoint")
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(strconv.FormatInt(offset, 10)), 0o644); err != nil {
+	if err := os.WriteFile(tmp, []byte(strconv.FormatInt(offset, 10)), 0o600); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {

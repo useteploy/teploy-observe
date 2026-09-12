@@ -68,8 +68,13 @@ type Buffer struct {
 	db            *nucleus.Client
 	logger        *slog.Logger
 	stopCh        chan struct{}
-	wg            sync.WaitGroup
-	queue         *DiskQueue
+	// flushCh coalesces size-triggered flush wakeups: capacity one, so any
+	// number of above-threshold Pushes while an insertion is in flight
+	// collapse into a single pending wakeup instead of piling up goroutines
+	// that all block on flushMu to perform the same drain.
+	flushCh chan struct{}
+	wg      sync.WaitGroup
+	queue   *DiskQueue
 	// lastOffset is the WAL offset after the most recently appended event,
 	// guarded by mu. It is the checkpoint target for the current batch: every
 	// event in the buffer was WAL-appended at or below it, and no later event
@@ -93,6 +98,7 @@ func NewBuffer(db *nucleus.Client, maxSize, flushSize int, flushInterval time.Du
 		db:            db,
 		logger:        logger,
 		stopCh:        make(chan struct{}),
+		flushCh:       make(chan struct{}, 1),
 	}
 }
 
@@ -214,6 +220,18 @@ func (b *Buffer) Start() {
 			select {
 			case <-ticker.C:
 				b.Flush()
+			case <-b.flushCh:
+				// Size-triggered drain. Loop while still above threshold
+				// so one wakeup covers a refill that raced the drain.
+				for {
+					b.mu.Lock()
+					above := len(b.events) >= b.flushSize
+					b.mu.Unlock()
+					if !above {
+						break
+					}
+					b.Flush()
+				}
 			case <-b.stopCh:
 				b.Flush() // final flush
 				return
@@ -258,7 +276,12 @@ func (b *Buffer) Push(e Event) bool {
 	b.mu.Unlock()
 
 	if shouldFlush {
-		go b.Flush()
+		// Non-blocking wakeup of the owned flush loop: one outstanding
+		// signal is enough — the loop drains until below threshold.
+		select {
+		case b.flushCh <- struct{}{}:
+		default:
+		}
 	}
 	return true
 }
