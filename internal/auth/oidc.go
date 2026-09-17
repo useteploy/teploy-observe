@@ -220,11 +220,23 @@ func parseOIDCAllowlistSlice(raw string) []string {
 
 // allowed reports whether the authenticated identity may sign in. With no
 // allowlist configured it always returns true.
+//
+// When an email/domain allowlist IS configured, the email claim must be
+// verified by the IdP (audit F04): a signed ID token proves the issuer
+// authenticated the subject, not that the subject controls the asserted
+// email — and with an IdP that lets users set an unverified email (or a
+// multi-tenant one where anyone can register), an unverified match would
+// satisfy the allowlist without proving control of the address. Missing,
+// false, or non-boolean email_verified therefore fails closed.
 func (o *OIDCAuth) allowed(claims map[string]any) bool {
 	if len(o.allowedEmails) == 0 && len(o.allowedDomains) == 0 {
 		return true
 	}
-	email := strings.ToLower(claimString(claims["email"]))
+	verified, ok := claims["email_verified"].(bool)
+	if !ok || !verified {
+		return false
+	}
+	email := strings.ToLower(strings.TrimSpace(claimString(claims["email"])))
 	if email == "" {
 		return false
 	}
@@ -232,7 +244,7 @@ func (o *OIDCAuth) allowed(claims map[string]any) bool {
 		return true
 	}
 	at := strings.LastIndex(email, "@")
-	if at < 0 {
+	if at <= 0 || at == len(email)-1 {
 		return false
 	}
 	domain := email[at+1:]

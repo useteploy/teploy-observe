@@ -1258,10 +1258,14 @@ func main() {
 		neutron.WithTags("heatmaps"), neutron.WithSummary("Aggregated click heatmap for a URL"))
 
 	// --- Tracked links ---
+	// Audit F06: creating a tracked link is a write (it mints a public
+	// redirect endpoint), so it sits behind requireEditor like every other
+	// content mutation; the listing stays readable for signed-in viewers.
 	linkGroup := r.Group("/api/v1/links", jwtMW)
+	linkEditor := linkGroup.Group("", requireEditor)
 	neutron.Get(linkGroup, "", listLinksHandler(linkSvc),
 		neutron.WithTags("links"), neutron.WithSummary("List tracked links"))
-	neutron.Post(linkGroup, "", createLinkHandler(linkSvc),
+	neutron.Post(linkEditor, "", createLinkHandler(linkSvc),
 		neutron.WithTags("links"), neutron.WithSummary("Create tracked link"))
 	// Public redirect (no auth)
 	r.HandleFunc("GET /l/{slug}", linkSvc.ClickHandler())
@@ -1667,6 +1671,17 @@ func orAll(s string) string {
 func setupStatusHandler(authSvc *auth.AuthService) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		// Audit F01: with OIDC configured, admission is the IdP's job — a
+		// local-account setup wizard must not advertise itself, or an
+		// unauthenticated caller who reaches the dashboard listener could
+		// bootstrap a local admin and bypass the IdP's admission policy.
+		// OIDC logins deliberately create no admin_users rows, so
+		// HasAdminUsers alone would wrongly answer needs_setup:true here.
+		if authSvc.OIDCEnabled() {
+			w.Write([]byte(`{"needs_setup":false}`))
+			return
+		}
 		has, err := authSvc.HasAdminUsers(req.Context())
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1726,6 +1741,16 @@ type setupCreateInput struct {
 func setupCreateHandler(authSvc *auth.AuthService) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		// Audit F01: public local-account bootstrap is closed while OIDC SSO
+		// is enabled — otherwise anyone who can reach the dashboard listener
+		// mints a local administrator and sidesteps the IdP's admission
+		// policy. Local break-glass remains possible via the trusted
+		// OBSERVE_ADMIN_USER/OBSERVE_ADMIN_PASSWORD startup provisioning.
+		if authSvc.OIDCEnabled() {
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte(`{"error":"public local-account setup is disabled while OIDC is enabled"}`))
+			return
+		}
 		var input setupCreateInput
 		if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
 			w.WriteHeader(http.StatusBadRequest)

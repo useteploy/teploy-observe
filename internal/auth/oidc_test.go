@@ -156,3 +156,40 @@ func TestOIDCEnabledNilSafe(t *testing.T) {
 		t.Fatal("nil OIDCAuth label must be empty")
 	}
 }
+
+// TestAllowedRequiresVerifiedEmail is the audit F04 regression: with an
+// email/domain allowlist configured, only a boolean-true email_verified plus
+// a matching identity passes. A signed ID token alone does not prove the
+// subject controls the asserted email.
+func TestAllowedRequiresVerifiedEmail(t *testing.T) {
+	o := newTestOIDC()
+	o.allowedEmails = map[string]bool{"alice@example.com": true}
+	o.allowedDomains = []string{"example.com"}
+
+	cases := []struct {
+		name   string
+		claims map[string]any
+		want   bool
+	}{
+		{"verified matching email", map[string]any{"email": "alice@example.com", "email_verified": true}, true},
+		{"verified matching domain", map[string]any{"email": "bob@Example.com", "email_verified": true}, true},
+		{"unverified matching email", map[string]any{"email": "alice@example.com", "email_verified": false}, false},
+		{"missing email_verified", map[string]any{"email": "alice@example.com"}, false},
+		{"string email_verified", map[string]any{"email": "alice@example.com", "email_verified": "true"}, false},
+		{"verified non-matching", map[string]any{"email": "mallory@evil.test", "email_verified": true}, false},
+		{"domain suffix confusion", map[string]any{"email": "a@notexample.com", "email_verified": true}, false},
+		{"whitespace email", map[string]any{"email": " alice@example.com ", "email_verified": true}, true},
+	}
+	for _, tc := range cases {
+		if got := o.allowed(tc.claims); got != tc.want {
+			t.Errorf("%s: allowed = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// No allowlist configured: admission is the issuer's problem, and the
+	// verified-email requirement must not activate.
+	bare := newTestOIDC()
+	if !bare.allowed(map[string]any{"email": "anyone@anywhere.test"}) {
+		t.Fatal("no allowlist configured must admit any authenticated identity")
+	}
+}
