@@ -24,12 +24,24 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata
 COPY --from=builder /observe /usr/local/bin/observe
 
+# Audit F50: run as a dedicated unprivileged identity instead of the image's
+# default root. Only the data directory (WAL queue, backup temp files) must
+# be writable; existing volumes chowned by an earlier root-mode deployment
+# need a one-time `chown -R 10001:10001 /var/lib/observe` on the host —
+# the application deliberately does not chown host paths itself.
+RUN addgroup -S -g 10001 observe \
+ && adduser -S -D -H -u 10001 -G observe observe \
+ && mkdir -p /var/lib/observe \
+ && chown observe:observe /var/lib/observe
+
 EXPOSE 3000
 ENV OBSERVE_ADDR=:3000
 ENV OBSERVE_NUCLEUS_URL=postgres://nucleus:5432/observe
 ENV OBSERVE_DATA_DIR=/var/lib/observe
 
 VOLUME ["/var/lib/observe"]
+
+USER 10001:10001
 
 # /healthz is not a static 200: it runs `SELECT 1` against Nucleus, which is
 # the point (a process that cannot reach its database is not healthy). But that

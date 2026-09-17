@@ -41,3 +41,40 @@ jobs:
       - name: Test SDK
         working-directory: sdk/go
         run: go test ./...
+
+  # Audit F49: the browser and Python SDK contracts were only exercised
+  # locally, so transport regressions (F29-F33, F51) passed the required
+  # checks. Node 20 and Python 3.12 match the versions the SDKs declare.
+  sdk-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Typecheck
+        working-directory: sdk/browser
+        run: |
+          npm ci
+          npm run typecheck
+      - name: Test
+        working-directory: sdk/browser
+        run: npm test
+      - name: Build
+        working-directory: sdk/browser
+        run: npm run build
+
+  sdk-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test
+        working-directory: sdk/python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          python -m pip install -e .
+          python -m pytest tests -q

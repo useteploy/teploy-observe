@@ -7,12 +7,21 @@ RUN apk add --no-cache ca-certificates tzdata
 ARG TARGETPLATFORM
 COPY $TARGETPLATFORM/observe /usr/local/bin/observe
 
+# Audit F50: dedicated unprivileged runtime identity (same UID/GID as the
+# from-source Dockerfile).
+RUN addgroup -S -g 10001 observe \
+ && adduser -S -D -H -u 10001 -G observe observe \
+ && mkdir -p /var/lib/observe \
+ && chown observe:observe /var/lib/observe
+
 EXPOSE 3000
 ENV OBSERVE_ADDR=:3000
 ENV OBSERVE_NUCLEUS_URL=postgres://nucleus:5432/observe
 ENV OBSERVE_DATA_DIR=/var/lib/observe
 
 VOLUME ["/var/lib/observe"]
+
+USER 10001:10001
 
 HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
     CMD wget -q --spider http://localhost:3000/healthz || exit 1
