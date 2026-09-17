@@ -167,12 +167,35 @@ sdk-browser and sdk-python are now required CI jobs. The
 `git diff --exit-code -- cmd/observe/ui/dist` freshness gate stays deferred
 until the UI build environment (Neutron TS workspace) is reproducibly
 provisioned in CI — until then ui-sync remains a documented local step
-(this session's UI fixes at 5402af4 need one such sync).
+(the 5402af4 UI fixes were synced in 5fbf61f, 2026-09-17).
 
 ## Resolution log (2026-09-12 — prior register, closed)
 
 - teploy-observe-06: FIXED - single owned flush loop with a capacity-one wakeup channel; size/timer/shutdown flushes share one lifecycle (audit commit).
 - teploy-observe-03: PARTIALLY FIXED - queue dirs now 0700 and WAL/checkpoint files 0600. DEFERRED (design): disk high-water backpressure and bounded streaming replay — now item F16 above.
+
+## Resolution log (2026-09-17 — release close-out)
+
+- Embedded UI rebuilt via scripts/ui-sync.sh and committed (5fbf61f): every
+  hashed asset rotated against the 2026-09-17 audit source changes; Go
+  binary builds.
+- Nucleus-backed integration suites run for the first time, against a
+  fresh live Nucleus (debug build of the current Neutron working tree):
+  migrations 038/039 verified on both the fresh-install and pending-upgrade
+  paths; 43 packages green, 0 skips, run serially (`-p 1` — concurrent
+  packages racing `schema.Apply` trip the known upstream Migrate ledger
+  TOCTOU, reconfirmed and logged).
+- Defects the run exposed, fixed in dd182f3: 038/039 em-dash prose panicked
+  the Nucleus query cache-key normalizer (connection dropped mid-migration;
+  migrations from 038 now guarded pure-ASCII); upsertSession selected bare
+  non-key columns next to a GROUP BY (invalid SQL, 0A000) and computed
+  per-batch instead of session-spanning duration (F20); the api-key
+  revocation test predated F09's site-existence check; the raw-retention
+  coverage seed was UTC-midnight dependent.
+- Upstream reports appended to `Teploy/_internal/UPSTREAM_BUGS.md` (new:
+  cache-key normalizer byte-slice panic; reconfirmed: Migrate ledger
+  TOCTOU). No Neutron/Nucleus edits made from this session.
+- Still not run: e2e (Playwright).
 
 ## Resolution log (2026-09-17 — 51-finding pass)
 
