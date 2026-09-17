@@ -44,6 +44,31 @@
   var replayId = makeReplayId();
 
   // --- DOM Snapshot ---
+  //
+  // Audit F37: the serializer used to copy every text node verbatim and
+  // every attribute except on* and input/textarea value. A textarea's
+  // INITIAL content is a child text node, so pre-filled private messages
+  // were recorded despite the advertised input masking; contenteditable
+  // regions and data-* attributes (often tokens) leaked the same way.
+  //
+  // Policy now: form controls (input/textarea/select/option) and
+  // script-bearing elements serialize as opaque placeholders; text inside
+  // contenteditable or an element marked data-observe-block is masked;
+  // data-* attributes are never copied. Ordinary visible text in the rest
+  // of the DOM is still recorded — default-masking ALL text is a product
+  // decision recorded in AUDIT_OPEN.md, not something to slip into a bug
+  // fix. A subtree can opt into masking with data-observe-block; there is
+  // deliberately no opt-OUT from blocking.
+
+  var PRIVATE_TAG = /^(input|textarea|select|option|script|noscript|iframe|object|embed|style)$/;
+
+  function isPrivateElement(el) {
+    var tag = el.tagName.toLowerCase();
+    if (PRIVATE_TAG.test(tag)) return true;
+    if (el.isContentEditable) return true;
+    if (el.hasAttribute && el.hasAttribute('data-observe-block')) return true;
+    return false;
+  }
 
   function serializeNode(node) {
     if (node.nodeType === 3) {
@@ -52,15 +77,22 @@
     if (node.nodeType !== 1) return null;
 
     var tag = node.tagName.toLowerCase();
-    // Skip script and style content for privacy
     if (tag === 'script' || tag === 'noscript') return null;
+
+    if (isPrivateElement(node)) {
+      return { type: 'element', tag: 'div', attrs: {}, children: [] };
+    }
 
     var attrs = {};
     for (var i = 0; i < node.attributes.length; i++) {
       var attr = node.attributes[i];
-      // Skip event handlers and sensitive attrs
-      if (attr.name.startsWith('on') || attr.name === 'value' && (tag === 'input' || tag === 'textarea')) continue;
-      attrs[attr.name] = attr.value;
+      var name = attr.name;
+      // Skip event handlers, data-* attributes (token-bearing), and the
+      // value attribute anywhere it can hold user input.
+      if (name.lastIndexOf('on', 0) === 0) continue;
+      if (name.lastIndexOf('data-', 0) === 0) continue;
+      if (name === 'value') continue;
+      attrs[name] = attr.value;
     }
 
     var children = [];

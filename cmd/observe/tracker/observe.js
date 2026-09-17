@@ -297,6 +297,11 @@
      * Associate subsequent events with a user identifier. The server
      * hashes the value with the per-site session_salt before storage —
      * raw IDs never persist by default. Pass null to clear.
+     *
+     * Traits are sent as properties of the $identify event, minus any
+     * identity-shaped key (audit F33): the raw ID travels ONLY in the
+     * top-level distinct_id field the server hashes. properties.user_id
+     * used to duplicate it verbatim into stored event properties.
      */
     identify: function(userId, traits) {
       if (userId === null || userId === undefined || userId === '') {
@@ -306,7 +311,14 @@
       }
       distinctId = String(userId);
       try { localStorage.setItem('observe_distinct_id', distinctId); } catch (e) {}
-      var props = traits ? Object.assign({ user_id: distinctId }, traits) : { user_id: distinctId };
+      var props = {};
+      if (traits) {
+        for (var k in traits) {
+          if (!Object.prototype.hasOwnProperty.call(traits, k)) continue;
+          if (k === 'user_id' || k === 'distinct_id' || k === 'email') continue;
+          props[k] = traits[k];
+        }
+      }
       send('$identify', props);
     },
     reset: function() {

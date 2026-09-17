@@ -44,9 +44,16 @@ func NewSiteService(db *nucleus.Client) *SiteService {
 
 // PrivacyConfig returns the (session_salt, raw_distinct_id_optin) pair
 // for a site. Used by ingest handlers to hash distinct_id consistently
-// per site. Cached in-process. Returns ("", false) if the site is
-// unknown — callers should treat that as "do not hash" or apply the
-// global salt as a fallback.
+// per site. Cached in-process; hot reads take the RLock fast path.
+// Returns ("", false) if the site is unknown — callers should treat that
+// as "do not hash" or apply the global salt as a fallback.
+//
+// Audit F21: the DB fetch on a cache miss runs under the WRITE lock. The
+// old read-lock/fetch/install sequence let an in-flight miss load the old
+// privacy row, overlap a SetRawDistinctID flip (which invalidated the
+// cache), and then install the stale opt-out afterwards — silently
+// reinstating raw-identity storage the operator had just turned off.
+// Serializing misses against invalidations removes that window.
 func (s *SiteService) PrivacyConfig(ctx context.Context, siteID string) (salt string, rawOptIn bool, ok bool) {
 	if siteID == "" {
 		return "", false, false
@@ -58,13 +65,18 @@ func (s *SiteService) PrivacyConfig(ctx context.Context, siteID string) (salt st
 	}
 	s.mu.RUnlock()
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Re-check under the write lock: another goroutine may have filled the
+	// entry (or an invalidation may have raced) since the RLock read.
+	if site, hit := s.cache[siteID]; hit {
+		return site.SessionSalt, site.RawDistinctID, true
+	}
 	site, err := s.Get(ctx, siteID)
 	if err != nil || site.SiteID == "" {
 		return "", false, false
 	}
-	s.mu.Lock()
 	s.cache[siteID] = site
-	s.mu.Unlock()
 	return site.SessionSalt, site.RawDistinctID, true
 }
 

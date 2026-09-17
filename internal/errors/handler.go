@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -194,7 +195,11 @@ func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (strin
 
 	// Resolve distinct_id: hash with the per-site salt if a privacy
 	// lookup is wired and the site is known; otherwise fall back to the
-	// global salt; otherwise leave raw (test/dev fallback only).
+	// global salt. With no salt anywhere the identifier is DROPPED, not
+	// stored raw (audit F21): a missing privacy dependency must never turn
+	// into consent for raw storage. main.go always seeds a random fallback
+	// salt, so this is defense in depth for other wiring paths — same rule
+	// internal/replays already enforces.
 	distinctID := ""
 	if input.DistinctID != "" {
 		salt := s.fallbackSalt
@@ -206,9 +211,8 @@ func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (strin
 			}
 		}
 		if salt == "" && !rawOptIn {
-			// No salt anywhere — store as-is rather than hash with empty
-			// key (which would give every site the same digest).
-			distinctID = input.DistinctID
+			slog.Warn("errors: dropping distinct_id — no salt available and site has not opted into raw storage",
+				"site", input.SiteID)
 		} else {
 			distinctID = identity.MaybeHashDistinctID(input.DistinctID, salt, rawOptIn)
 		}
@@ -231,12 +235,14 @@ func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (strin
 		return "", fmt.Errorf("insert error event: %w", err)
 	}
 
-	// Index in FTS for BM25 search (non-fatal — search degrades gracefully).
+	// Index in FTS for BM25 search (non-fatal — search degrades gracefully,
+	// and operators can rebuild via `observe reindex`). The failure is
+	// logged (audit F27) so search falling behind is visible operationally
+	// instead of silently diverging; the event contents are not logged.
 	if s.searchSvc != nil {
 		if err := s.searchSvc.IndexError(ctx, input.SiteID, errorID, input.ErrorType, input.ErrorValue); err != nil {
-			// Log but don't fail the ingestion. Operators can rebuild via
-			// `observe reindex` if FTS files are corrupted or missing.
-			_ = err
+			slog.Warn("errors: FTS indexing failed (search will lag until reindex)",
+				"site", input.SiteID, "error_id", errorID, "err", err)
 		}
 	}
 
