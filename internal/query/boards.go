@@ -198,12 +198,14 @@ func (s *BoardService) summarizeSite(ctx context.Context, siteID string, fromMs,
 		row.Errors = r[0].Errors
 	}
 
-	// Replay session count.
+	// Replay session count. COUNT(DISTINCT replay_id), not COUNT(*):
+	// replay_sessions is versioned since 039 (multi-batch sessions upsert a
+	// new row per batch), so raw rows overcount until the engine merges.
 	type rpRow struct {
 		ReplayCount int64 `db:"replay_count"`
 	}
 	if r, err := nucleus.Query[rpRow](ctx, s.db.SQL(),
-		`SELECT COUNT(*) AS replay_count
+		`SELECT COUNT(DISTINCT replay_id) AS replay_count
 		 FROM replay_sessions
 		 WHERE site_id = $1
 		   AND start_time >= $2

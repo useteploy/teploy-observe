@@ -48,6 +48,9 @@ var replacingKeys = map[string][]string{
 	"cron_monitors":    {"tenant_id", "site_id", "cron_id"},
 	"dashboards":       {"tenant_id", "site_id", "dashboard_id"},
 	"dashboard_panels": {"tenant_id", "dashboard_id", "panel_id"},
+	// 039_replay_sessions_replacing — see that migration for why start_time
+	// stays in the key (retention deletes on it; versions preserve it).
+	"replay_sessions": {"tenant_id", "site_id", "start_time", "replay_id"},
 	// 006_wave1
 	"integrations":     {"tenant_id", "site_id", "integration_id"},
 	"saved_views":      {"tenant_id", "site_id", "view_id"},

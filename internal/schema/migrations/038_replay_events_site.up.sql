@@ -1,0 +1,25 @@
+-- 038 (2026-09-17): replay child events are scoped to their owning site
+-- (audit F08).
+--
+-- replay_events rows were inserted with only tenant_id='default' and a
+-- caller-supplied replay_id, and GetReplayEvents filtered on replay_id alone.
+-- Replay IDs are client-generated, so a key valid for site A that knew (or
+-- guessed) a replay ID in use by site B could append events into B's replay
+-- stream — fixing the ingest-site binding (F07) was not enough, because the
+-- child-event key was globally shared.
+--
+-- site_id is added as a non-key column via plain ALTER ADD COLUMN: the
+-- historical Nucleus 0.1.0 bug that made ADD COLUMN drop subsequent inserts
+-- (027's reason for rename-aside) was retested against the current Nucleus
+-- image and found fixed — see 031, which shipped the same conclusion for
+-- share_links and has run in production since.
+--
+-- Legacy rows backfill to '' (NOT NULL DEFAULT ''). Their ownership is
+-- resolved at READ time through replay_sessions (which always carried
+-- site_id) rather than by a SQL backfill here: Nucleus has no proven
+-- correlated-subquery UPDATE, and assigning ambiguous legacy IDs by guess
+-- would be worse than resolving them from the session row. The read query
+-- accepts (site_id = <owning site> OR site_id = ''), and ingest rejects
+-- writes whose site disagrees with the session's recorded owner.
+
+ALTER TABLE replay_events ADD COLUMN IF NOT EXISTS site_id TEXT NOT NULL DEFAULT '';

@@ -352,3 +352,23 @@ func SiteIDFromContext(ctx context.Context) string {
 	}
 	return ""
 }
+
+// ErrSiteMismatch is returned by BoundSite when a body-supplied site_id
+// disagrees with the site the authenticated API key was resolved to.
+var ErrSiteMismatch = errors.New("site_id does not match the authenticated key")
+
+// BoundSite resolves the effective site for an ingest write (audit F07).
+// The key-bound context site is AUTHORITATIVE: a body site_id that disagrees
+// with it is a cross-tenant write attempt (ErrSiteMismatch -> 403). An empty
+// body site binds to the key's site. With no key-bound site (the no-keys
+// grace period on a fresh install) the supplied site is trusted as before.
+func BoundSite(ctx context.Context, requested string) (string, error) {
+	authenticated := SiteIDFromContext(ctx)
+	if authenticated == "" {
+		return requested, nil
+	}
+	if requested != "" && requested != authenticated {
+		return "", ErrSiteMismatch
+	}
+	return authenticated, nil
+}

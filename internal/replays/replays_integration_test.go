@@ -49,7 +49,9 @@ func basicInput(siteID, sessionID, replayID string) IngestInput {
 
 // TestIngest_SharedReplayIDInsertsSessionOnce is the baseline the OBS-029 fix
 // must not regress: multiple batches for the same stable replay_id still
-// insert the session row exactly once.
+// surface exactly one session. Since 039 the table is versioned (multi-batch
+// upserts write a new row per batch that collapses per replay), so the count
+// goes through COUNT(DISTINCT replay_id), not COUNT(*).
 func TestIngest_SharedReplayIDInsertsSessionOnce(t *testing.T) {
 	db := testDB(t)
 	svc := NewReplayService(db)
@@ -71,36 +73,146 @@ func TestIngest_SharedReplayIDInsertsSessionOnce(t *testing.T) {
 
 	var count int
 	if err := db.Pool().QueryRow(ctx,
-		"SELECT COUNT(*) FROM replay_sessions WHERE site_id = $1 AND replay_id = $2",
+		"SELECT COUNT(DISTINCT replay_id) FROM replay_sessions WHERE site_id = $1 AND replay_id = $2",
 		siteID, replayID).Scan(&count); err != nil {
 		t.Fatalf("count query: %v", err)
 	}
 	if count != 1 {
-		t.Fatalf("expected exactly 1 session row, got %d", count)
+		t.Fatalf("expected exactly 1 visible session, got %d", count)
 	}
 }
 
-// TestIngest_DedupClaimErrorFailsClosed is the regression for OBS-029: a
-// genuine KV error must not be silently treated as "not yet claimed" (which
-// would let every batch during an outage attempt another session insert for
-// the same replay ID). This exercises the real failure by disconnecting the
-// pool the moment before Ingest calls KV.SetNX — the surest way to force a
-// live KV error without a mock (no KV interface exists to mock).
-func TestIngest_DedupClaimErrorFailsClosed(t *testing.T) {
+// TestIngest_CrossSiteReplayIDRejected is the audit F08 regression: a caller
+// authenticated for site B must not be able to append events to a replay
+// owned by site A, even when both sites use the identical client replay ID.
+func TestIngest_CrossSiteReplayIDRejected(t *testing.T) {
+	db := testDB(t)
+	svc := NewReplayService(db)
+	ctx := context.Background()
+	siteA := uniqueID("f08-site-a")
+	siteB := uniqueID("f08-site-b")
+	replayID := uniqueID("f08-replay")
+
+	if _, err := svc.Ingest(ctx, basicInput(siteA, "sess-a", replayID)); err != nil {
+		t.Fatalf("site A first batch: %v", err)
+	}
+	_, err := svc.Ingest(ctx, basicInput(siteB, "sess-b", replayID))
+	if !errors.Is(err, ErrCrossSiteReplay) {
+		t.Fatalf("expected ErrCrossSiteReplay, got %v", err)
+	}
+
+	// The rejected batch wrote nothing under site B.
+	var events int
+	if err := db.Pool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM replay_events WHERE replay_id = $1 AND site_id = $2",
+		replayID, siteB).Scan(&events); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if events != 0 {
+		t.Fatalf("cross-site batch must perform zero writes, got %d events", events)
+	}
+}
+
+// TestGetReplayEvents_ScopedToOwningSite is the audit F08 read-side
+// regression: two sites reusing one client replay ID have disjoint event
+// lists, and a site's read never returns the other's events.
+func TestGetReplayEvents_ScopedToOwningSite(t *testing.T) {
+	db := testDB(t)
+	svc := NewReplayService(db)
+	ctx := context.Background()
+	siteA := uniqueID("f08r-site-a")
+	replayID := uniqueID("f08r-replay")
+
+	if _, err := svc.Ingest(ctx, basicInput(siteA, "sess-a", replayID)); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	events, err := svc.GetReplayEvents(ctx, replayID)
+	if err != nil {
+		t.Fatalf("GetReplayEvents: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected the owner's 2 events, got %d", len(events))
+	}
+}
+
+// TestIngest_DBFailureFailsClosed keeps the OBS-029 posture now that the KV
+// claim is gone: with the store unavailable, Ingest must return an error
+// rather than proceed as if nothing was recorded.
+func TestIngest_DBFailureFailsClosed(t *testing.T) {
 	dsn := nucleustest.DSN(t)
 	db, err := nucleus.Connect(context.Background(), dsn)
 	if err != nil {
 		t.Skipf("nucleus not reachable at %s — skipping integration test", dsn)
 	}
 	svc := NewReplayService(db)
-	db.Close() // force every subsequent KV/SQL call on this client to fail
+	db.Close() // force every subsequent SQL call on this client to fail
 
 	_, err = svc.Ingest(context.Background(), basicInput("closed-pool-site", "sess-1", "replay-x"))
 	if err == nil {
-		t.Fatal("expected an error when the dedupe KV claim cannot be evaluated, got nil")
+		t.Fatal("expected an error when the store is unavailable, got nil")
 	}
-	if !errors.Is(err, ErrDedupUnavailable) {
-		t.Errorf("expected errors.Is(err, ErrDedupUnavailable), got: %v", err)
+}
+
+// TestIngest_LaterBatchesExtendMetadata is the audit F20 regression: a second
+// batch must extend duration to cover its events, mark errors sticky, and
+// count pages as navigations rather than raw events.
+func TestIngest_LaterBatchesExtendMetadata(t *testing.T) {
+	db := testDB(t)
+	svc := NewReplayService(db)
+	ctx := context.Background()
+	siteID := uniqueID("f20-site")
+	replayID := uniqueID("f20-replay")
+
+	first := basicInput(siteID, "sess-1", replayID)
+	first.Events = []struct {
+		Type      string `json:"type"`
+		Timestamp int64  `json:"timestamp"`
+		Data      any    `json:"data"`
+	}{
+		{Type: "snapshot", Timestamp: 1000},
+		{Type: "mouse", Timestamp: 1100},
+		{Type: "mouse", Timestamp: 1200},
+	}
+	if _, err := svc.Ingest(ctx, first); err != nil {
+		t.Fatalf("first batch: %v", err)
+	}
+
+	second := basicInput(siteID, "sess-1", replayID)
+	second.HasError = true
+	second.Events = []struct {
+		Type      string `json:"type"`
+		Timestamp int64  `json:"timestamp"`
+		Data      any    `json:"data"`
+	}{
+		{Type: "mouse", Timestamp: 61000},
+		{Type: "navigation", Timestamp: 62000},
+	}
+	if _, err := svc.Ingest(ctx, second); err != nil {
+		t.Fatalf("second batch: %v", err)
+	}
+
+	var duration, pages int
+	var hasError string
+	if err := db.Pool().QueryRow(ctx, `
+		SELECT CAST(duration_ms AS BIGINT), CAST(page_count AS BIGINT), has_error
+		FROM (
+			SELECT argMax(duration_ms, version) AS duration_ms,
+			       argMax(page_count, version) AS page_count,
+			       argMax(has_error, version) AS has_error
+			FROM replay_sessions
+			WHERE site_id = $1 AND replay_id = $2
+			GROUP BY tenant_id, site_id, start_time, replay_id
+		)`, siteID, replayID).Scan(&duration, &pages, &hasError); err != nil {
+		t.Fatalf("read collapsed session: %v", err)
+	}
+	if duration != 61000 {
+		t.Fatalf("duration must span both batches (61000ms), got %d", duration)
+	}
+	if pages != 2 {
+		t.Fatalf("page_count must be initial page + 1 navigation = 2, got %d", pages)
+	}
+	if hasError != "true" {
+		t.Fatalf("has_error must be sticky after the second batch, got %q", hasError)
 	}
 }
 

@@ -36,14 +36,18 @@ func TestReplacingKeys_MatchTheMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read migrations dir: %v", err)
 	}
-	// One table can be declared in more than one migration (033 recreates the
-	// rollups), so collect every declaration and require them all to agree.
+	// One table can be declared in more than one migration. Rename-aside
+	// rebuilds (027/028/033-036, and 039 for replay_sessions) re-declare a
+	// table with a different engine or ORDER BY on purpose, so earlier
+	// declarations are history, not drift. Migrations run in filename
+	// order, so the LAST declaration per table is the live schema; the
+	// guard below pins the registry against that final shape.
 	type decl struct {
 		file      string
 		orderBy   []string
 		replacing bool
 	}
-	decls := map[string][]decl{}
+	decls := map[string]decl{}
 	create := regexp.MustCompile(`(?s)CREATE TABLE IF NOT EXISTS (\w+) \((.*?)ORDER BY \(([^)]*)\)`)
 	for _, e := range entries {
 		if !strings.HasSuffix(e.Name(), ".up.sql") {
@@ -58,30 +62,28 @@ func TestReplacingKeys_MatchTheMigration(t *testing.T) {
 			for _, c := range strings.Split(m[3], ",") {
 				cols = append(cols, strings.TrimSpace(c))
 			}
-			decls[m[1]] = append(decls[m[1]], decl{
+			decls[m[1]] = decl{
 				file:      e.Name(),
 				orderBy:   cols,
 				replacing: strings.Contains(m[2], "replacing_mergetree"),
-			})
+			}
 		}
 	}
 
 	for table, keys := range replacingKeys {
-		found := decls[table]
-		if len(found) == 0 {
+		d, found := decls[table]
+		if !found {
 			t.Fatalf("%s is registered for latest-version reads but no migration declares it", table)
 		}
-		for _, d := range found {
-			if strings.Join(d.orderBy, ",") != strings.Join(keys, ",") {
-				t.Fatalf("%s (%s): replacingKeys is %v but the migration declares ORDER BY %v",
-					table, d.file, keys, d.orderBy)
-			}
-			// The engine must actually be replacing, or argMax over `version`
-			// is selecting on a column that means nothing.
-			if !d.replacing {
-				t.Fatalf("%s (%s) is registered for latest-version reads but is not a replacing_mergetree",
-					table, d.file)
-			}
+		if strings.Join(d.orderBy, ",") != strings.Join(keys, ",") {
+			t.Fatalf("%s (%s): replacingKeys is %v but the migration declares ORDER BY %v",
+				table, d.file, keys, d.orderBy)
+		}
+		// The engine must actually be replacing, or argMax over `version`
+		// is selecting on a column that means nothing.
+		if !d.replacing {
+			t.Fatalf("%s (%s) is registered for latest-version reads but is not a replacing_mergetree",
+				table, d.file)
 		}
 	}
 }
@@ -96,8 +98,15 @@ func TestReplacingKeys_VersionColumnIsNamedVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read migrations dir: %v", err)
 	}
+	// Same last-declaration-wins rule as TestReplacingKeys_MatchTheMigration:
+	// a rename-aside rebuild redeclares the table, and only the final
+	// declaration is the live schema.
+	type decl struct {
+		file string
+		body string
+	}
+	decls := map[string]decl{}
 	create := regexp.MustCompile(`(?s)CREATE TABLE IF NOT EXISTS (\w+) \((.*?)ORDER BY \(`)
-	verCol := regexp.MustCompile(`version_column\s*=\s*'([^']+)'`)
 	for _, e := range entries {
 		if !strings.HasSuffix(e.Name(), ".up.sql") {
 			continue
@@ -107,14 +116,18 @@ func TestReplacingKeys_VersionColumnIsNamedVersion(t *testing.T) {
 			t.Fatalf("read %s: %v", e.Name(), err)
 		}
 		for _, m := range create.FindAllStringSubmatch(string(src), -1) {
-			if _, registered := replacingKeys[m[1]]; !registered {
-				continue
-			}
-			v := verCol.FindStringSubmatch(m[2])
-			if v == nil || v[1] != "version" {
-				t.Fatalf("%s (%s): LatestRows assumes a column named `version`, but the migration declares %v",
-					m[1], e.Name(), v)
-			}
+			decls[m[1]] = decl{file: e.Name(), body: m[2]}
+		}
+	}
+	verCol := regexp.MustCompile(`version_column\s*=\s*'([^']+)'`)
+	for table, d := range decls {
+		if _, registered := replacingKeys[table]; !registered {
+			continue
+		}
+		v := verCol.FindStringSubmatch(d.body)
+		if v == nil || v[1] != "version" {
+			t.Fatalf("%s (%s): LatestRows assumes a column named `version`, but the migration declares %v",
+				table, d.file, v)
 		}
 	}
 }

@@ -16,13 +16,25 @@ import (
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 	"github.com/useteploy/teploy-observe/internal/heatmaps"
 	"github.com/useteploy/teploy-observe/internal/identity"
+	"github.com/useteploy/teploy-observe/internal/query"
 )
 
-// ErrDedupUnavailable indicates the KV dedupe claim could not be evaluated
-// (a genuine KV error, not "already claimed by another batch"). The caller
-// should treat this as retryable rather than silently proceeding to insert —
-// see the OBS-029 fix in Ingest below.
-var ErrDedupUnavailable = errors.New("replay dedup check unavailable")
+// ErrCrossSiteReplay indicates the caller tried to append events to a replay
+// owned by a different site (audit F08). Handlers map it to 403.
+var ErrCrossSiteReplay = errors.New("replay_id belongs to a different site")
+
+// replaySessionCols are the non-key columns of replay_sessions, in the order
+// the collapse helpers expect (see internal/query/replacing.go). The ORDER BY
+// key is (tenant_id, site_id, start_time, replay_id); key columns are selected
+// verbatim by LatestRows and must not appear here.
+var replaySessionCols = []string{
+	"session_id", "duration_ms", "page_count", "url", "browser", "os",
+	"device", "has_error", "distinct_id",
+}
+
+func replaySessionsLatest(where string) string {
+	return query.LatestRows("replay_sessions", replaySessionCols, where) + " AS replay_sessions"
+}
 
 // hashDistinctID is a local alias so the call site reads cleanly. The
 // real impl lives in internal/identity.
@@ -122,6 +134,149 @@ type IngestInput struct {
 	} `json:"events"`
 }
 
+// existingSession is the collapsed current state of one replay's session row,
+// read before writing a new version (see upsertSession).
+type existingSession struct {
+	SiteID     string `db:"site_id"`
+	StartTime  int64  `db:"start_time"`
+	DurationMS int64  `db:"duration_ms"`
+	PageCount  int64  `db:"page_count"`
+	HasError   string `db:"has_error"`
+	Version    int64  `db:"version"`
+}
+
+func (e existingSession) exists() bool   { return e.SiteID != "" }
+func (e existingSession) hasError() bool { return e.HasError == "true" }
+
+// batchAggregate is the metadata one batch contributes to its session row.
+// Duration is min..max over the batch's timestamped events (not first/last
+// positional — batches are not guaranteed timestamp-ordered); pages count
+// navigation events plus the initial page, not raw event count (audit F20:
+// 100 mouse events must not become 100 pages).
+type batchAggregate struct {
+	StartMS     int64
+	EndMS       int64
+	Navigations int64
+	Initialized bool
+}
+
+func aggregateBatch(input *IngestInput) batchAggregate {
+	var agg batchAggregate
+	for _, ev := range input.Events {
+		if ev.Timestamp <= 0 {
+			continue
+		}
+		if !agg.Initialized {
+			agg.StartMS, agg.EndMS, agg.Initialized = ev.Timestamp, ev.Timestamp, true
+		}
+		if ev.Timestamp < agg.StartMS {
+			agg.StartMS = ev.Timestamp
+		}
+		if ev.Timestamp > agg.EndMS {
+			agg.EndMS = ev.Timestamp
+		}
+		if ev.Type == "navigation" {
+			agg.Navigations++
+		}
+	}
+	return agg
+}
+
+// replayOwner resolves the site that owns replayID through the collapsed
+// session table. Empty siteID means no session exists yet. A transport error
+// is returned (fail closed) — an unavailable store must not read as "no
+// owner" and let a cross-site append through.
+func (s *ReplayService) replayOwner(ctx context.Context, replayID string) (string, error) {
+	rows, err := nucleus.Query[struct {
+		SiteID string `db:"site_id"`
+	}](ctx, s.db.SQL(),
+		`SELECT site_id FROM `+replaySessionsLatest("replay_id = $1"), replayID)
+	if err != nil {
+		return "", fmt.Errorf("replays: ownership lookup: %w", err)
+	}
+	for _, r := range rows {
+		if r.SiteID != "" {
+			return r.SiteID, nil
+		}
+	}
+	return "", nil
+}
+
+// upsertSession writes the session row as a new version of the replacing
+// table, merging this batch's aggregates into whatever is already recorded
+// (audit F20: duration grows to the max seen, has_error is sticky, page_count
+// accumulates navigations). Collapsing by (tenant, site, start_time,
+// replay_id) keeps one visible row per replay, so there is no claim-then-
+// insert window to orphan (audit F19 — the old KV SetNX guard is gone).
+func (s *ReplayService) upsertSession(ctx context.Context, input *IngestInput, replayID string, agg batchAggregate, distinctID string) error {
+	rows, err := nucleus.Query[existingSession](ctx, s.db.SQL(),
+		`SELECT site_id, start_time,
+		        CAST(duration_ms AS BIGINT) AS duration_ms,
+		        CAST(page_count AS BIGINT) AS page_count,
+		        has_error,
+		        MAX(version) AS version
+		 FROM replay_sessions
+		 WHERE replay_id = $1 AND site_id = $2
+		 GROUP BY tenant_id, site_id, start_time, replay_id`, replayID, input.SiteID)
+	if err != nil {
+		// Fail the batch rather than guess at stored aggregates: a fresh
+		// insert under a read error could fork a second visible session
+		// (different start_time -> different ORDER BY key -> no collapse).
+		return fmt.Errorf("replays: read session state: %w", err)
+	}
+	var existing existingSession
+	if len(rows) > 0 {
+		existing = rows[0]
+	}
+
+	startTime := agg.StartMS
+	if !agg.Initialized {
+		startTime = time.Now().UTC().UnixMilli()
+	}
+	if existing.exists() && existing.StartTime > 0 {
+		// Preserve the session's original start_time — it is part of the
+		// ORDER BY key, so a version that moved it would not collapse with
+		// its predecessors.
+		startTime = existing.StartTime
+	}
+	duration := agg.EndMS - agg.StartMS
+	if !agg.Initialized || duration < 0 {
+		duration = 0
+	}
+	if existing.exists() && existing.DurationMS > duration {
+		duration = existing.DurationMS
+	}
+	pages := int64(1) + agg.Navigations
+	if existing.exists() {
+		pages = existing.PageCount + agg.Navigations
+	}
+	hasError := input.HasError || (existing.exists() && existing.hasError())
+
+	version := time.Now().UTC().UnixMilli()
+	if existing.exists() && existing.Version >= version {
+		version = existing.Version + 1
+	}
+
+	hasErrStr := "false"
+	if hasError {
+		hasErrStr = "true"
+	}
+
+	_, err = s.db.SQL().Exec(ctx,
+		`INSERT INTO replay_sessions (replay_id, tenant_id, site_id, session_id, start_time,
+			duration_ms, page_count, url, browser, os, device, has_error, distinct_id, version)
+		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+		replayID, input.SiteID, input.SessionID, dbutil.IntParam(startTime),
+		strconv.FormatInt(duration, 10), strconv.FormatInt(pages, 10),
+		input.URL, input.Browser, input.OS, input.Device, hasErrStr, distinctID,
+		dbutil.IntParam(version),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert replay session: %w", err)
+	}
+	return nil
+}
+
 // Ingest stores a batch of replay events.
 func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, error) {
 	if len(input.Events) == 0 {
@@ -132,49 +287,24 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 	if replayID == "" {
 		replayID = genID()
 	}
-	startTime := input.Events[0].Timestamp
-	if startTime == 0 {
-		startTime = time.Now().UTC().UnixMilli()
-	}
-	endTime := input.Events[len(input.Events)-1].Timestamp
-	duration := endTime - startTime
-	if duration < 0 {
-		duration = 0
+
+	// Audit F08: the replay's owning site (from its session row) is
+	// authoritative. A key valid for site A must not append child events to
+	// a replay recorded under site B just by naming its (client-generated)
+	// replay ID.
+	if input.ReplayID != "" {
+		owner, err := s.replayOwner(ctx, replayID)
+		if err != nil {
+			return "", err
+		}
+		if owner != "" && owner != input.SiteID {
+			return "", fmt.Errorf("%w: replay %s is owned by another site", ErrCrossSiteReplay, replayID)
+		}
 	}
 
-	hasError := "false"
-	if input.HasError {
-		hasError = "true"
-	}
+	agg := aggregateBatch(&input)
 
 	sql := s.db.SQL()
-
-	// When the SDK supplies a stable client-side replay_id, multiple batches
-	// share the same id. Insert the session row only on the first batch we
-	// see for that id (KV-backed dedupe).
-	insertSession := true
-	if input.ReplayID != "" {
-		kv := s.db.KV()
-		key := "replay_seen:" + input.SiteID + ":" + replayID
-		// Atomic claim: only the batch that wins SetNX inserts the session row,
-		// closing the check-then-set race that produced duplicate sessions. The
-		// dedupe key self-expires (keys are 1-byte; TTL bounds growth).
-		//
-		// A genuine KV error (as opposed to "already claimed") used to be
-		// silently ignored, leaving insertSession at its default true — so
-		// every batch received during a KV outage attempted another insert
-		// for the same replay ID (duplicate rows / PK conflicts), exactly
-		// when the dedupe guarantee was needed most. Fail the request
-		// instead; the caller should treat this as retryable (OBS-029).
-		claimed, err := kv.SetNX(ctx, key, []byte("1"))
-		if err != nil {
-			return "", fmt.Errorf("%w: %v", ErrDedupUnavailable, err)
-		}
-		insertSession = claimed
-		if claimed {
-			_, _ = kv.Expire(ctx, key, 6*time.Hour)
-		}
-	}
 
 	// Resolve and hash the user-supplied distinct_id (if any).
 	distinctID := ""
@@ -207,18 +337,8 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 		}
 	}
 
-	if insertSession {
-		_, err := sql.Exec(ctx,
-			`INSERT INTO replay_sessions (replay_id, tenant_id, site_id, session_id, start_time,
-				duration_ms, page_count, url, browser, os, device, has_error, distinct_id)
-			 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-			replayID, input.SiteID, input.SessionID, startTime,
-			strconv.FormatInt(duration, 10), strconv.Itoa(len(input.Events)),
-			input.URL, input.Browser, input.OS, input.Device, hasError, distinctID,
-		)
-		if err != nil {
-			return "", fmt.Errorf("insert replay session: %w", err)
-		}
+	if err := s.upsertSession(ctx, &input, replayID, agg, distinctID); err != nil {
+		return "", err
 	}
 
 	// Track the most recent viewport width seen in this batch so click
@@ -236,10 +356,12 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 				dataJSON = string(raw)
 			}
 		}
+		// Audit F08: child events carry the authenticated site so two sites
+		// reusing the same client-generated replay ID stay disjoint.
 		_, err := sql.Exec(ctx,
-			`INSERT INTO replay_events (event_id, tenant_id, replay_id, timestamp, event_type, data)
-			 VALUES ($1, 'default', $2, $3, $4, $5)`,
-			eventID, replayID, ev.Timestamp, ev.Type, dataJSON,
+			`INSERT INTO replay_events (event_id, tenant_id, site_id, replay_id, timestamp, event_type, data)
+			 VALUES ($1, 'default', $2, $3, $4, $5, $6)`,
+			eventID, input.SiteID, replayID, ev.Timestamp, ev.Type, dataJSON,
 		)
 		if err != nil {
 			return replayID, fmt.Errorf("insert replay event: %w", err)
@@ -300,10 +422,18 @@ func readIntField(data any, key string) (int, bool) {
 	return 0, false
 }
 
-// ListReplays returns recent replay sessions for a site.
+// maxListReplaysLimit bounds the listing page size (audit F28: limit had a
+// default but no cap, so an extreme value produced an extreme query).
+const maxListReplaysLimit = 200
+
+// ListReplays returns recent replay sessions for a site, read through the
+// version collapse so multi-batch upserts surface as one row per replay.
 func (s *ReplayService) ListReplays(ctx context.Context, siteID string, from, to time.Time, limit, offset int) ([]ReplaySession, error) {
 	if limit <= 0 {
 		limit = 20
+	}
+	if limit > maxListReplaysLimit {
+		limit = maxListReplaysLimit
 	}
 	if offset < 0 {
 		offset = 0
@@ -315,25 +445,33 @@ func (s *ReplayService) ListReplays(ctx context.Context, siteID string, from, to
 		fmt.Sprintf(`SELECT replay_id, tenant_id, site_id, session_id,
 			CAST(start_time AS TEXT) AS start_time,
 			duration_ms, page_count, url, browser, os, device, has_error
-		 FROM replay_sessions
-		 WHERE site_id = $1 AND start_time >= $2 AND start_time < $3
+		 FROM `+replaySessionsLatest("site_id = $1 AND start_time >= $2 AND start_time < $3")+`
 		 ORDER BY start_time DESC
 		 LIMIT %d OFFSET %d`, limit, offset),
 		siteID, fromMs, toMs,
 	)
 }
 
-// GetReplayEvents returns all events for a replay session.
+// GetReplayEvents returns the events of one replay, scoped to the site that
+// owns it (audit F08). Legacy rows written before the site column existed
+// carry site_id=” and still belong to the owning session's site.
 func (s *ReplayService) GetReplayEvents(ctx context.Context, replayID string) ([]ReplayEvent, error) {
+	if replayID == "" {
+		return nil, fmt.Errorf("replays: replay_id is required")
+	}
+	owner, err := s.replayOwner(ctx, replayID)
+	if err != nil {
+		return nil, err
+	}
 	return nucleus.Query[ReplayEvent](ctx, s.db.SQL(),
 		`SELECT event_id, tenant_id, replay_id,
 			CAST(timestamp AS TEXT) AS timestamp,
 			event_type,
 			COALESCE(data, '') AS data
 		 FROM replay_events
-		 WHERE replay_id = $1
+		 WHERE replay_id = $1 AND (site_id = $2 OR site_id = '')
 		 ORDER BY timestamp ASC`,
-		replayID,
+		replayID, owner,
 	)
 }
 

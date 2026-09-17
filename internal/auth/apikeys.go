@@ -70,8 +70,13 @@ func (s *AuthService) CreateAPIKey(ctx context.Context, siteID, label string) (p
 }
 
 // ValidateAPIKey hashes the provided plaintext key and looks it up in the
-// api_keys table. Returns the associated site_id if the key is valid and
-// not revoked.
+// api_keys table. Returns the associated site_id if the key is valid, not
+// revoked, and its site still exists.
+//
+// The site-existence check (audit F09) closes the window where a deletion
+// failure — or a pre-revoke-first deletion — left a live key pointing at a
+// removed site. A store error here fails CLOSED (the key is rejected): an
+// unavailable sites table must not silently authorize ingest.
 func (s *AuthService) ValidateAPIKey(ctx context.Context, key string) (string, error) {
 	sql := s.db.SQL()
 
@@ -88,6 +93,16 @@ func (s *AuthService) ValidateAPIKey(ctx context.Context, key string) (string, e
 
 	if row.Revoked == "true" {
 		return "", fmt.Errorf("auth: api key revoked")
+	}
+
+	siteRows, err := nucleus.Query[struct {
+		SiteID string `db:"site_id"`
+	}](ctx, sql, "SELECT site_id FROM sites WHERE site_id = $1", row.SiteID)
+	if err != nil {
+		return "", fmt.Errorf("auth: site validation unavailable: %w", err)
+	}
+	if len(siteRows) == 0 {
+		return "", fmt.Errorf("auth: api key site is unavailable")
 	}
 
 	return row.SiteID, nil

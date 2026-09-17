@@ -1929,13 +1929,17 @@ func deleteSiteHandler(siteSvc *sites.SiteService, authSvc *auth.AuthService) ne
 		if input.SiteID == "" {
 			return neutron.Empty{}, neutron.ErrBadRequest("site_id is required")
 		}
+		// Audit F09: revoke first, delete second. The old order reported a
+		// successful deletion even when key revocation failed, leaving valid
+		// credentials for a site that no longer exists (ingest doesn't
+		// re-check site existence per request). Revoked-keys-but-live-site
+		// (revocation succeeded, deletion failed) is the recoverable order:
+		// the operator re-mints keys; the reverse left a security hole.
+		if err := authSvc.RevokeKeysForSite(ctx, input.SiteID); err != nil {
+			return neutron.Empty{}, fmt.Errorf("revoking API keys for site: %w", err)
+		}
 		if err := siteSvc.Delete(ctx, input.SiteID); err != nil {
 			return neutron.Empty{}, err
-		}
-		// Revoke the site's API keys so a deleted site can't keep ingesting
-		// (ingest doesn't otherwise check that the key's site still exists).
-		if err := authSvc.RevokeKeysForSite(ctx, input.SiteID); err != nil {
-			slog.Warn("revoke keys for deleted site failed", "site", input.SiteID, "err", err)
 		}
 		return neutron.Empty{}, nil
 	}
@@ -2270,9 +2274,13 @@ func issueSessionHandler(issueSvc *obserrors.IssueService, statsSvc *query.Stats
 
 func llmIngestHandler(svc *llm.LLMService) neutron.HandlerFunc[llm.LLMInput, llm.LLMResponse] {
 	return func(ctx context.Context, input llm.LLMInput) (llm.LLMResponse, error) {
-		if input.SiteID == "" {
-			input.SiteID = ingest.SiteIDFromContext(ctx)
+		// Audit F07: the authenticated key's site is authoritative — a body
+		// site_id that disagrees is a cross-tenant write, not a default.
+		siteID, err := ingest.BoundSite(ctx, input.SiteID)
+		if err != nil {
+			return llm.LLMResponse{}, neutron.ErrForbidden(err.Error())
 		}
+		input.SiteID = siteID
 		return svc.Ingest(ctx, input)
 	}
 }
@@ -2316,10 +2324,14 @@ func llmTracesHandler(svc *llm.LLMService) neutron.HandlerFunc[llmTracesInput, [
 
 func infraReportHandler(svc *infra.InfraService) neutron.HandlerFunc[infra.MetricInput, map[string]string] {
 	return func(ctx context.Context, input infra.MetricInput) (map[string]string, error) {
-		if input.SiteID == "" {
-			input.SiteID = ingest.SiteIDFromContext(ctx)
+		// Audit F07: same site binding as the live raw route below — kept
+		// correct even though the raw handler is the one currently mounted.
+		siteID, err := ingest.BoundSite(ctx, input.SiteID)
+		if err != nil {
+			return nil, neutron.ErrForbidden(err.Error())
 		}
-		err := svc.Report(ctx, input)
+		input.SiteID = siteID
+		err = svc.Report(ctx, input)
 		if err != nil {
 			return nil, err
 		}
@@ -3450,9 +3462,14 @@ type logIngestResponse struct {
 
 func logIngestHandler(svc *logs.LogService) neutron.HandlerFunc[logs.LogInput, logIngestResponse] {
 	return func(ctx context.Context, input logs.LogInput) (logIngestResponse, error) {
-		if input.SiteID == "" {
-			input.SiteID = ingest.SiteIDFromContext(ctx)
+		// Audit F07: bind to the authenticated key's site; a mismatched body
+		// site_id is rejected (it also selects masking pipelines, so trusting
+		// it would let a key for site A write under site B's privacy policy).
+		siteID, err := ingest.BoundSite(ctx, input.SiteID)
+		if err != nil {
+			return logIngestResponse{}, neutron.ErrForbidden(err.Error())
 		}
+		input.SiteID = siteID
 		id, err := svc.IngestLog(ctx, input)
 		if err != nil {
 			return logIngestResponse{}, err
@@ -3473,11 +3490,14 @@ type logBatchResponse struct {
 
 func logIngestBatchHandler(svc *logs.LogService) neutron.HandlerFunc[logBatchInput, logBatchResponse] {
 	return func(ctx context.Context, input logBatchInput) (logBatchResponse, error) {
-		siteID := ingest.SiteIDFromContext(ctx)
+		// Audit F07: bind EVERY entry before writing any of them, so a
+		// mixed-site batch performs zero writes instead of a poisoned prefix.
 		for i := range input.Logs {
-			if input.Logs[i].SiteID == "" {
-				input.Logs[i].SiteID = siteID
+			siteID, err := ingest.BoundSite(ctx, input.Logs[i].SiteID)
+			if err != nil {
+				return logBatchResponse{}, neutron.ErrForbidden(err.Error())
 			}
+			input.Logs[i].SiteID = siteID
 		}
 		result, err := svc.IngestLogs(ctx, input.Logs)
 		if err != nil {
@@ -4065,11 +4085,18 @@ func executePanelHandler(svc *dashboards.DashboardService) neutron.HandlerFunc[e
 
 func replayIngestHandler(svc *replays.ReplayService) neutron.HandlerFunc[replays.IngestInput, map[string]string] {
 	return func(ctx context.Context, input replays.IngestInput) (map[string]string, error) {
-		if input.SiteID == "" {
-			input.SiteID = ingest.SiteIDFromContext(ctx)
+		// Audit F07: bind to the authenticated key's site; the service also
+		// enforces replay ownership against this site (F08).
+		siteID, err := ingest.BoundSite(ctx, input.SiteID)
+		if err != nil {
+			return nil, neutron.ErrForbidden(err.Error())
 		}
+		input.SiteID = siteID
 		id, err := svc.Ingest(ctx, input)
 		if err != nil {
+			if errors.Is(err, replays.ErrCrossSiteReplay) {
+				return nil, neutron.ErrForbidden(err.Error())
+			}
 			return nil, err
 		}
 		return map[string]string{"ok": "true", "replay_id": id}, nil
