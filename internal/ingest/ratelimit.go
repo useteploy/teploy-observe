@@ -6,6 +6,15 @@ import (
 	"time"
 )
 
+// maxBuckets bounds the total bucket cardinality (audit F23). The map used
+// to grow without limit between cleanup sweeps — an attacker rotating
+// body-supplied site ids (or a flood of spoofed source IPs behind a proxy
+// that sets them) could allocate memory proportional to distinct keys. When
+// the budget is full, admission for NEW keys fails; existing buckets keep
+// working, so a legitimate population already in place is not evicted to
+// make room for the attacker's fresh bursts.
+const maxBuckets = 250_000
+
 // RateLimiter implements a token bucket rate limiter keyed on a composite
 // key. After auth middleware has set site_id on the request context, keys
 // are "<site_id>|<ip>"; otherwise the bare IP. One noisy IP on site A
@@ -102,6 +111,11 @@ func (rl *RateLimiter) Allow(siteID, ip string) bool {
 		aggregate = rl.refillLocked("\x00site:"+siteID, siteOverride, siteOverride*2)
 	}
 
+	// nil bucket = the cardinality budget is full and this is a NEW key
+	// (audit F23): deny rather than grow the map without bound.
+	if composite == nil {
+		return false
+	}
 	if composite.tokens <= 0 {
 		return false
 	}
@@ -116,11 +130,17 @@ func (rl *RateLimiter) Allow(siteID, ip string) bool {
 }
 
 // refillLocked fetches (or creates) the bucket for key, applies any retuned
-// rate/cap, refills tokens for elapsed time, and returns it without consuming a
-// token. Caller must hold rl.mu.
+// rate/cap, refills tokens for elapsed time, and returns it without consuming
+// a token. Caller must hold rl.mu. Returns nil when the bucket-count budget
+// (maxBuckets, audit F23) is exhausted and key has no bucket yet — existing
+// buckets are never evicted to make room, so an in-place population keeps
+// service while brand-new keys are refused.
 func (rl *RateLimiter) refillLocked(key string, rate, cap int) *bucket {
 	b, ok := rl.buckets[key]
 	if !ok {
+		if len(rl.buckets) >= maxBuckets {
+			return nil
+		}
 		b = &bucket{tokens: cap, lastFill: time.Now(), cap: cap, rate: rate}
 		rl.buckets[key] = b
 		return b

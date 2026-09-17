@@ -956,6 +956,10 @@ func main() {
 	// request body) exactly like the analytics/OTLP ingest routes do.
 	r.Handle("POST /api/v1/infra/report", apiKeyMW(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		// Audit F22: this route is registered on the root router, so it does
+		// not inherit the ingest group's 2 MiB BodyLimit — bound it here,
+		// before decoding, or an oversized body is fully buffered first.
+		req.Body = http.MaxBytesReader(w, req.Body, 2<<20)
 		var input infra.MetricInput
 		if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -2918,14 +2922,30 @@ func flagHistoryHandler(svc *flags.FlagService) neutron.HandlerFunc[flagHistoryI
 // IP-rate-limited to curb enumeration / write floods and validates input so a
 // malformed request returns 400 instead of a silent {enabled:false} oracle.
 func flagEvaluateHandler(svc *flags.FlagService, rl *ingest.RateLimiter) http.HandlerFunc {
+	// Audit F23: an IP-only limiter admits the request BEFORE the body is
+	// parsed. The site-keyed limiter below runs after parsing, and its key
+	// includes a body-supplied site_id — without this first gate, one IP
+	// rotating site values spawned an independent bucket per value and
+	// evaded any per-IP ceiling while growing the bucket map.
+	flagIPLimiter := ingest.NewRateLimiter(120, time.Minute, 240)
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 
 		ip := r.RemoteAddr
-		if host, _, err := net.SplitHostPort(ip); err == nil {
+		if ctxIP := ingest.ClientIPFromContext(r.Context()); ctxIP != "" {
+			ip = ctxIP
+		} else if host, _, err := net.SplitHostPort(ip); err == nil {
 			ip = host
 		}
+		if !flagIPLimiter.Allow("", ip) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":"too many requests"}`, http.StatusTooManyRequests)
+			return
+		}
+
+		// Audit F22: bound the body before decoding.
+		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 		var input struct {
 			SiteID  string            `json:"site_id"`
 			FlagKey string            `json:"flag_key"`
@@ -2942,6 +2962,7 @@ func flagEvaluateHandler(svc *flags.FlagService, rl *ingest.RateLimiter) http.Ha
 		}
 		// Rate limit per (site, ip): bounds write floods into flag_evaluations.
 		if !rl.Allow(input.SiteID, ip) {
+			w.Header().Set("Retry-After", "1")
 			http.Error(w, `{"error":"too many requests"}`, http.StatusTooManyRequests)
 			return
 		}
@@ -3378,6 +3399,9 @@ func replayDeliveryHandler(svc *integrations.IntegrationService) neutron.Handler
 
 func feedbackSubmitHandler(svc *feedback.FeedbackService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Audit F22: public, unauthenticated JSON route — bound before
+		// decoding so a large body cannot be buffered whole.
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		var input feedback.FeedbackInput
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
@@ -4319,6 +4343,26 @@ func apiKeyOrEditorJWT(
 
 func srcmapUploadHandler(svc *sourcemaps.SourceMapService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Audit F22: bound the WHOLE multipart body and parse it explicitly
+		// BEFORE any FormValue/FormFile call. FormValue triggers parsing of
+		// the entire request (spooling oversized parts to disk) first, so
+		// the old per-file 10 MiB check only ran after the damage. 12 MiB
+		// covers the 10 MiB file cap plus bounded metadata overhead.
+		const maxSourcemap = 10 * 1024 * 1024 // 10MB per file
+		const maxMultipart = 12 * 1024 * 1024
+		r.Body = http.MaxBytesReader(w, r.Body, maxMultipart)
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				http.Error(w, "upload too large", http.StatusRequestEntityTooLarge)
+			} else {
+				http.Error(w, "invalid multipart upload", http.StatusBadRequest)
+			}
+			return
+		}
+		if r.MultipartForm != nil {
+			defer r.MultipartForm.RemoveAll()
+		}
 		siteID := r.FormValue("site_id")
 		if ctxSiteID := ingest.SiteIDFromContext(r.Context()); ctxSiteID != "" {
 			// API-key path (apiKeyOrEditorJWT) — trust the validated key's
@@ -4340,7 +4384,6 @@ func srcmapUploadHandler(svc *sourcemaps.SourceMapService) http.HandlerFunc {
 		// A single file.Read can return fewer bytes than requested, silently
 		// truncating larger sourcemaps and breaking symbolication. Read fully up
 		// to the cap (+1 byte so an over-limit upload is detected, not truncated).
-		const maxSourcemap = 10 * 1024 * 1024 // 10MB
 		data, err := io.ReadAll(io.LimitReader(file, maxSourcemap+1))
 		if err != nil {
 			http.Error(w, "failed to read sourcemap", http.StatusBadRequest)

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -70,7 +71,35 @@ type LLMResponse struct {
 	TraceID string `json:"trace_id"`
 }
 
+// maxTokensPerTrace and friends bound telemetry numerics at the boundary
+// (audit F28): negative or overflowed token/cost/latency values corrupted
+// usage reports and cost totals, and an int overflow in PromptTokens+
+// CompletionTokens wrapped to a bogus total.
+const (
+	maxTokensPerTrace = 100_000_000
+	maxLatencyMs      = 24 * 60 * 60 * 1000
+	maxCostUSD        = 1_000_000
+)
+
+func validateInput(input *LLMInput) error {
+	if input.PromptTokens < 0 || input.CompletionTokens < 0 ||
+		input.PromptTokens > maxTokensPerTrace || input.CompletionTokens > maxTokensPerTrace ||
+		input.CompletionTokens > maxTokensPerTrace-input.PromptTokens {
+		return fmt.Errorf("invalid token counts (each >= 0, sum <= %d)", maxTokensPerTrace)
+	}
+	if input.LatencyMs < 0 || input.LatencyMs > maxLatencyMs {
+		return fmt.Errorf("invalid latency_ms (must be in [0, %d])", maxLatencyMs)
+	}
+	if input.CostUSD < 0 || input.CostUSD > maxCostUSD || math.IsNaN(input.CostUSD) || math.IsInf(input.CostUSD, 0) {
+		return fmt.Errorf("invalid cost_usd (must be a finite number in [0, %d])", maxCostUSD)
+	}
+	return nil
+}
+
 func (s *LLMService) Ingest(ctx context.Context, input LLMInput) (LLMResponse, error) {
+	if err := validateInput(&input); err != nil {
+		return LLMResponse{}, err
+	}
 	id := genID()
 	now := time.Now().UTC().UnixMilli()
 	totalTokens := input.PromptTokens + input.CompletionTokens
