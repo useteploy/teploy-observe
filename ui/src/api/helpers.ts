@@ -59,6 +59,30 @@ export function qs(siteId: string, from: string, to: string, opts?: {
   return q;
 }
 
+// readResponse turns a fetch Response into T, treating structured error
+// bodies as the message and tolerating legitimately empty success responses
+// (audit F27): res.json() on a 204 or empty 200 threw a parse error, so a
+// successful delete was indistinguishable from a failed request.
+async function readResponse<T>(res: Response): Promise<T> {
+  const text = await res.text();
+  if (!res.ok) {
+    let message = `API ${res.status}: ${res.statusText}`;
+    try {
+      const body = JSON.parse(text);
+      if (body && (body.detail || body.title || body.error)) {
+        message = body.detail || body.title || body.error;
+      }
+    } catch {
+      /* keep the status-line message */
+    }
+    throw new Error(message);
+  }
+  if (res.status === 204 || res.status === 205 || text.trim() === "") {
+    return undefined as unknown as T;
+  }
+  return JSON.parse(text) as T;
+}
+
 export async function get<T>(path: string): Promise<T> {
   const token = localStorage.getItem("obs_token");
   const headers: Record<string, string> = {};
@@ -71,8 +95,7 @@ export async function get<T>(path: string): Promise<T> {
     }
     throw new Error("Unauthorized");
   }
-  if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
-  return res.json();
+  return readResponse<T>(res);
 }
 
 export async function post<T>(path: string, body: unknown): Promise<T> {
@@ -87,8 +110,7 @@ export async function post<T>(path: string, body: unknown): Promise<T> {
     }
     throw new Error("Unauthorized");
   }
-  if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
-  return res.json();
+  return readResponse<T>(res);
 }
 
 export async function put<T>(path: string, body: unknown): Promise<T> {
@@ -103,11 +125,10 @@ export async function put<T>(path: string, body: unknown): Promise<T> {
     }
     throw new Error("Unauthorized");
   }
-  if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
-  return res.json();
+  return readResponse<T>(res);
 }
 
-export async function del<T = { ok: boolean }>(path: string): Promise<T> {
+export async function del<T = { ok: boolean }>(path: string): Promise<T | undefined> {
   const token = localStorage.getItem("obs_token");
   const headers: Record<string, string> = {};
   if (token) headers["Authorization"] = `Bearer ${token}`;
@@ -119,6 +140,5 @@ export async function del<T = { ok: boolean }>(path: string): Promise<T> {
     }
     throw new Error("Unauthorized");
   }
-  if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
-  return res.json();
+  return readResponse<T>(res);
 }

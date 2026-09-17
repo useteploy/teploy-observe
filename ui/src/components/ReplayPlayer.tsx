@@ -30,15 +30,42 @@ function parseEvents(raw: ReplayEvent[]): ParsedEvent[] {
   return parsed;
 }
 
+// Audit F38: replay snapshots are untrusted stored data. The player writes
+// them into an iframe sandboxed without allow-scripts, so this is a
+// resource/privacy boundary, not script execution — but arbitrary tags and
+// attributes could still make the operator's browser issue network requests
+// (img/style/meta-refresh/base). Only allowlisted structural tags survive,
+// carrying only inert attributes; everything URL- or style-bearing is
+// dropped, and unknown tags keep their text children.
+const SAFE_TAGS = new Set([
+  "html", "head", "body", "div", "span", "p", "br", "a",
+  "section", "article", "header", "footer", "main", "nav", "aside",
+  "ul", "ol", "li", "dl", "dt", "dd",
+  "table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption",
+  "h1", "h2", "h3", "h4", "h5", "h6", "strong", "em", "b", "i", "u", "s",
+  "small", "mark", "abbr", "cite", "blockquote", "pre", "code", "kbd", "samp",
+  "sub", "sup", "figure", "figcaption", "details", "summary", "label",
+]);
+const SAFE_ATTRS = new Set(["class", "id", "colspan", "rowspan", "dir", "lang"]);
+const REPLAY_CSP =
+  "default-src 'none'; script-src 'none'; connect-src 'none'; img-src 'none'; " +
+  "style-src 'none'; media-src 'none'; frame-src 'none'; object-src 'none'; " +
+  "base-uri 'none'; form-action 'none'";
+
 function nodeToHTML(node: SerializedNode): string {
-  if (node.type === "text") return escapeText(node.value);
+  if (node.type === "text") return escapeText(String(node.value ?? ""));
+  const tag = String(node.tag).toLowerCase();
+  if (!SAFE_TAGS.has(tag)) {
+    // Unknown/unsafe tag: keep its textual content, drop the element.
+    return (node.children || []).map(nodeToHTML).join("");
+  }
   const attrs = Object.entries(node.attrs || {})
+    .filter(([k]) => SAFE_ATTRS.has(k))
     .map(([k, v]) => ` ${k}="${escapeAttr(String(v))}"`)
     .join("");
-  const voidTags = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
-  if (voidTags.has(node.tag)) return `<${node.tag}${attrs}>`;
+  if (tag === "br") return "<br>";
   const inner = (node.children || []).map(nodeToHTML).join("");
-  return `<${node.tag}${attrs}>${inner}</${node.tag}>`;
+  return `<${tag}${attrs}>${inner}</${tag}>`;
 }
 
 function escapeText(s: string): string {
@@ -49,9 +76,21 @@ function escapeAttr(s: string): string {
 }
 
 function snapshotToHTML(snap: Snapshot): string {
+  const csp = `<meta http-equiv="Content-Security-Policy" content="${REPLAY_CSP}">`;
   const doctype = snap.doctype || "<!DOCTYPE html>";
   if (typeof snap.html === "string") {
-    return `${doctype}<html>${snap.html}</html>`;
+    // Legacy raw-HTML snapshots (pre-serialization tracker). We cannot
+    // reliably sanitize arbitrary HTML without a parser, so a restrictive
+    // CSP is injected immediately after <head> (or at the document start)
+    // as a best-effort resource block; the structured path above is the
+    // hardened one.
+    let html = snap.html;
+    if (/<head[^>]*>/i.test(html)) {
+      html = html.replace(/<head([^>]*)>/i, `<head$1>${csp}`);
+    } else {
+      html = csp + html;
+    }
+    return `${doctype}<html>${html}</html>`;
   }
   if (snap.html && typeof snap.html === "object") {
     return `${doctype}${nodeToHTML(snap.html)}`;
@@ -187,9 +226,11 @@ export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerPro
   }, []);
 
   // Lazy-load aggregated clicks the first time the user toggles the
-  // overlay on. Falls back to clicks visible in the local session if the
-  // server returns nothing — keeps the toggle useful on a fresh install
-  // before any cross-session aggregation has occurred.
+  // overlay on (audit F40): replay ingestion already writes this session's
+  // clicks into the aggregate, so ADDING the local clicks to the fetched
+  // rollup double-counted them once the rollup was visible. The aggregate
+  // is authoritative when it has data; the local-session buckets are a
+  // labeled fallback for a fresh install where no rollup exists yet.
   useEffect(() => {
     if (!heatmapOn) return;
     if (heatmapClicks.length > 0) return;
@@ -223,20 +264,12 @@ export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerPro
           const to = now.toISOString();
           const remote = await heatmapsApi.query(siteId, url, from, to);
           if (cancelled) return;
-          // Merge remote + local so the overlay always shows the current
-          // session's clicks even before they've been written to the
-          // rollup table (which is async / best-effort by design).
-          const merged = new Map<string, Click>();
-          const ingest = (c: Click) => {
-            const k = `${c.x},${c.y}`;
-            const cur = merged.get(k);
-            if (cur) cur.count += c.count;
-            else merged.set(k, { ...c });
-          };
-          for (const c of remote || []) ingest(c);
-          for (const c of localClicks) ingest(c);
-          setHeatmapClicks(Array.from(merged.values()));
-          return;
+          // The rollup includes this session — use it alone, never merged
+          // with the local copy of the same clicks.
+          if (remote && remote.length > 0) {
+            setHeatmapClicks(remote.slice());
+            return;
+          }
         } catch {
           // Fall through to local-only clicks.
         }
