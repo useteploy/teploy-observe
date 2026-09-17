@@ -210,12 +210,26 @@ func (s *DashboardService) ListPanels(ctx context.Context, dashboardID string) (
 	// correlated `version = (SELECT MAX(version) FROM dashboard_panels dp2 ...)`
 	// — the same collapse, expressed as a per-row subquery, and one more place a
 	// stale version could win.
-	return nucleus.Query[Panel](ctx, s.db.SQL(),
+	//
+	// Audit F26: the tombstone filter runs AFTER the collapse, mirroring
+	// dashboards.List — DeletePanel writes an empty-panel_type row as the new
+	// version, and filtering before the collapse would resurrect the
+	// superseded live row. Without this filter, deleted panels stayed in the
+	// list as empty/broken panels and could be selected for execution.
+	rows, err := nucleus.Query[Panel](ctx, s.db.SQL(),
 		`SELECT panel_id, tenant_id, dashboard_id, panel_type, title, query_type,
 			COALESCE(query_config, '') AS query_config,
 			position_x, position_y, width, height, version
-		 FROM `+panelsLatest("dashboard_id = $1")+`
+		 FROM `+panelsLatest("dashboard_id = $1")+
+			` WHERE panel_type != ''
 		 ORDER BY CAST(position_y AS BIGINT), CAST(position_x AS BIGINT)`, dashboardID)
+	if err != nil {
+		return nil, err
+	}
+	if rows == nil {
+		rows = []Panel{}
+	}
+	return rows, nil
 }
 
 func (s *DashboardService) UpdatePanel(ctx context.Context, panel Panel) error {
@@ -288,6 +302,10 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 
 	sql := s.db.SQL()
 
+	// Audit F27: a failed query is an error, not a healthy zero. The old
+	// `if err != nil || len(rows) == 0 { return 0 }` turned a backend outage
+	// into "0 errors / 0 pageviews" — indistinguishable from real data.
+	// An empty result set remains a legitimate zero.
 	switch panel.QueryType {
 	case "pageviews":
 		type r struct {
@@ -297,7 +315,10 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 			`SELECT CAST(COUNT(*) AS TEXT) AS count FROM events
 			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3 AND event_type = 'pageview'`,
 			siteID, from, to)
-		if err != nil || len(rows) == 0 {
+		if err != nil {
+			return nil, fmt.Errorf("query panel (pageviews): %w", err)
+		}
+		if len(rows) == 0 {
 			return map[string]string{"value": "0"}, nil
 		}
 		return map[string]string{"value": rows[0].Count}, nil
@@ -310,7 +331,10 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 			`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count FROM events
 			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
 			siteID, from, to)
-		if err != nil || len(rows) == 0 {
+		if err != nil {
+			return nil, fmt.Errorf("query panel (visitors): %w", err)
+		}
+		if len(rows) == 0 {
 			return map[string]string{"value": "0"}, nil
 		}
 		return map[string]string{"value": rows[0].Count}, nil
@@ -323,7 +347,10 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 			`SELECT CAST(COUNT(*) AS TEXT) AS count FROM error_events
 			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
 			siteID, from, to)
-		if err != nil || len(rows) == 0 {
+		if err != nil {
+			return nil, fmt.Errorf("query panel (errors): %w", err)
+		}
+		if len(rows) == 0 {
 			return map[string]string{"value": "0"}, nil
 		}
 		return map[string]string{"value": rows[0].Count}, nil

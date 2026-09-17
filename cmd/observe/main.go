@@ -113,6 +113,16 @@ func main() {
 		}
 	}
 
+	// Audit F24: reject operator-tyoed numeric configuration before any
+	// listener, ticker, or buffer allocation happens. A negative buffer
+	// size panicked at construction; a non-positive flush interval made
+	// time.NewTicker panic; a malformed integer silently became a default
+	// that masked the typo. Failing here means no half-started process.
+	if err := cfg.Validate(); err != nil {
+		logger.Error("invalid configuration", "err", err)
+		os.Exit(1)
+	}
+
 	// Connect to Nucleus with retry
 	ctx := context.Background()
 	var db *nucleus.Client
@@ -314,6 +324,14 @@ func main() {
 	auditKey := cfg.AuditKey
 	if auditKey == "" {
 		auditKey = cfg.JWTSecret
+	}
+	if auditKey == "" {
+		// Audit F46: with neither key configured, NewAuthService generated a
+		// random JWT secret internally while this local value stayed empty —
+		// the chain was silently HMAC'd with a KNOWN empty key, detectable
+		// only against accidental edits. Say so at startup; a dedicated
+		// persistent key with rotation keyring is a deferred design item.
+		logger.Warn("audit chain is UNKEYED (empty HMAC key): tamper-evidence detects accidental edits only — set OBSERVE_AUDIT_KEY for a chain a database-level attacker cannot recompute")
 	}
 	auditSvc := audit.NewService(db, []byte(auditKey))
 
@@ -518,11 +536,26 @@ func main() {
 				if cfg.IngestAddr == "" {
 					return nil
 				}
+				// Audit F25: bind synchronously so a port collision or bad
+				// address fails startup — the old ListenAndServe-in-a-
+				// goroutine only logged the bind error after this hook had
+				// already reported success, leaving a "healthy" process
+				// whose published ingest port was absent.
+				ln, err := net.Listen("tcp", cfg.IngestAddr)
+				if err != nil {
+					return fmt.Errorf("bind ingest listener %s: %w", cfg.IngestAddr, err)
+				}
 				ingestSrv = newIngestServer(cfg.IngestAddr, app.Handler())
 				go func() {
 					logger.Info("ingest listener starting (ingest routes only)", "addr", cfg.IngestAddr)
-					if err := ingestSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-						logger.Error("ingest listener failed", "err", err)
+					if err := ingestSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+						// The listener died after a healthy start (fd closed,
+						// accept loop failure): telemetry is now unreachable
+						// while the dashboard keeps reporting health. Fail
+						// the process so the supervisor restarts it instead
+						// of running degraded-but-green forever.
+						logger.Error("ingest listener terminated — exiting so the supervisor restarts the service", "err", err)
+						os.Exit(1)
 					}
 				}()
 				return nil
@@ -1481,8 +1514,21 @@ func runBackup(cfg config.Config, logger *slog.Logger) {
 	defer db.Close()
 
 	ctx := context.Background()
+	// Audit F42: honor the documented OBSERVE_BACKUP_ENCRYPTION_KEY. The
+	// CLI used the nil-key wrappers, so an operator who configured the key
+	// still got a PLAINTEXT archive containing password hashes, API keys
+	// and tokens. A malformed configured key fails loudly here, before any
+	// output is produced; no key is an explicit warned plaintext backup.
+	key, err := backup.LoadBackupEncryptionKey()
+	if err != nil {
+		logger.Error("invalid backup encryption configuration", "err", err)
+		os.Exit(1)
+	}
+	if key == nil {
+		logger.Warn("backup is unencrypted and contains sensitive data — set OBSERVE_BACKUP_ENCRYPTION_KEY")
+	}
 	// Tar goes to stdout; per-table errors to stderr so the tar stream stays pristine.
-	if err := backup.DumpWithLog(ctx, db, os.Stdout, os.Stderr); err != nil {
+	if err := backup.DumpWithKey(ctx, db, os.Stdout, os.Stderr, key); err != nil {
 		fmt.Fprintf(os.Stderr, "backup completed with errors: %v\n", err)
 		os.Exit(2)
 	}
@@ -1493,7 +1539,15 @@ func runRestore(cfg config.Config, logger *slog.Logger) {
 	defer db.Close()
 
 	ctx := context.Background()
-	if err := backup.Restore(ctx, db, os.Stdin); err != nil {
+	// Audit F42: select the encrypted reader when a key is configured —
+	// Restore previously never decrypted, so a correctly-taken encrypted
+	// backup could not be restored through the documented path.
+	key, err := backup.LoadBackupEncryptionKey()
+	if err != nil {
+		logger.Error("invalid backup encryption configuration", "err", err)
+		os.Exit(1)
+	}
+	if err := backup.RestoreWithKey(ctx, db, os.Stdin, key); err != nil {
 		logger.Error("restore failed", "err", err)
 		os.Exit(1)
 	}
@@ -3981,10 +4035,19 @@ type dashboardDetail struct {
 func getDashboardHandler(svc *dashboards.DashboardService) neutron.HandlerFunc[getDashboardInput, dashboardDetail] {
 	return func(ctx context.Context, input getDashboardInput) (dashboardDetail, error) {
 		d, err := svc.Get(ctx, input.DashboardID)
-		if err != nil || d == nil {
+		if err != nil {
+			// A store failure is a 5xx, not a silent 404 (audit F27).
+			return dashboardDetail{}, err
+		}
+		if d == nil {
 			return dashboardDetail{}, neutron.ErrNotFound("dashboard not found")
 		}
-		panels, _ := svc.ListPanels(ctx, input.DashboardID)
+		// Audit F27: a panel-listing failure must not collapse into an
+		// empty-but-successful dashboard.
+		panels, err := svc.ListPanels(ctx, input.DashboardID)
+		if err != nil {
+			return dashboardDetail{}, err
+		}
 		if panels == nil {
 			panels = []dashboards.Panel{}
 		}

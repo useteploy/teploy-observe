@@ -122,3 +122,104 @@ func TestRestore_ValidationCatchesLateRowBeforeAnyApply(t *testing.T) {
 		t.Fatalf("expected the second table's malformed row to abort validation before any apply, got %v", err)
 	}
 }
+
+// validResults builds a completion record for the given tables (all OK).
+func validResults(t *testing.T, rs []TableResult) []byte {
+	t.Helper()
+	raw, err := json.Marshal(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// TestRestore_RejectsManifestOnlyArchive is the audit F44 regression: a
+// manifest-only (or boundary-truncated) archive passed the old validation
+// because every check was conditional on the entries present. The completion
+// record is now required, so truncation anywhere before it fails preflight.
+func TestRestore_RejectsManifestOnlyArchive(t *testing.T) {
+	archive := writeTarArchive(t, map[string][]byte{
+		manifestName: validManifest(t),
+	})
+	err := Restore(context.Background(), nil, bytes.NewReader(archive))
+	if err == nil || !strings.Contains(err.Error(), "missing its completion record") {
+		t.Fatalf("expected missing-completion-record rejection, got %v", err)
+	}
+}
+
+// TestRestore_RejectsRowCountMismatch: a completion record claiming rows the
+// archive does not hold (reassembled or edited archive) is rejected.
+func TestRestore_RejectsRowCountMismatch(t *testing.T) {
+	archive := writeTarArchive(t, map[string][]byte{
+		manifestName:  validManifest(t),
+		"sites.jsonl": []byte(`{"site_id": "a"}` + "\n"),
+		resultsName:   validResults(t, []TableResult{{Table: "sites", Rows: 7, OK: true}}),
+	})
+	err := Restore(context.Background(), nil, bytes.NewReader(archive))
+	if err == nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("expected row-count reconciliation rejection, got %v", err)
+	}
+}
+
+// TestRestore_RejectsMissingTableWithClaimedRows: the completion record says
+// a table was dumped with rows, but the archive lacks the entry.
+func TestRestore_RejectsMissingTableWithClaimedRows(t *testing.T) {
+	archive := writeTarArchive(t, map[string][]byte{
+		manifestName: validManifest(t),
+		resultsName:  validResults(t, []TableResult{{Table: "sites", Rows: 3, OK: true}}),
+	})
+	err := Restore(context.Background(), nil, bytes.NewReader(archive))
+	if err == nil || !strings.Contains(err.Error(), "missing from the archive") {
+		t.Fatalf("expected missing-table rejection, got %v", err)
+	}
+}
+
+// TestRestore_RejectsDuplicateTableEntry: two .jsonl entries for one table
+// (an archive reassembled by concatenation) are rejected.
+func TestRestore_RejectsDuplicateTableEntry(t *testing.T) {
+	sites := []byte(`{"site_id": "a"}` + "\n")
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, name := range []string{manifestName, "sites.jsonl", "sites.jsonl"} {
+		data := validManifest(t)
+		if name == "sites.jsonl" {
+			data = sites
+		}
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: int64(len(data)), ModTime: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err := Restore(context.Background(), nil, bytes.NewReader(buf.Bytes()))
+	if err == nil || !strings.Contains(err.Error(), "duplicate entries") {
+		t.Fatalf("expected duplicate-entry rejection, got %v", err)
+	}
+}
+
+// TestRestore_RejectsUndeclaredTable: an observed table the manifest does
+// not declare is rejected even though it is allowlisted.
+func TestRestore_RejectsUndeclaredTable(t *testing.T) {
+	archive := writeTarArchive(t, map[string][]byte{
+		manifestName:  validManifest(t),
+		"sites.jsonl": []byte(`{"site_id": "a"}` + "\n"),
+		resultsName:   validResults(t, []TableResult{{Table: "sites", Rows: 1, OK: true}}),
+	})
+	// Replace the manifest with one declaring no tables at all.
+	empty, _ := json.Marshal(Manifest{Version: manifestVersion, CreatedAt: time.Now()})
+	entries := map[string][]byte{
+		manifestName:  empty,
+		"sites.jsonl": []byte(`{"site_id": "a"}` + "\n"),
+		resultsName:   validResults(t, []TableResult{{Table: "sites", Rows: 1, OK: true}}),
+	}
+	_ = archive
+	archive = writeTarArchive(t, entries)
+	err := Restore(context.Background(), nil, bytes.NewReader(archive))
+	if err == nil || !strings.Contains(err.Error(), "does not declare") {
+		t.Fatalf("expected undeclared-table rejection, got %v", err)
+	}
+}

@@ -113,7 +113,12 @@ func spoolToTemp(r io.Reader) (path string, err error) {
 // validateArchive walks the spooled archive without touching the database:
 // manifest present and version-compatible; every table name in the backup
 // allowlist; every row of every table structurally decodable JSON with safe
-// column names; and, if a results entry is present, no table marked failed.
+// column names; and — the audit F44 completeness contract — exactly one
+// manifest, exactly one trailing results record, no duplicate table entries,
+// every observed table declared in the manifest, and every table the results
+// claim to have dumped with rows actually present with exactly that many
+// rows. A manifest-only or boundary-truncated archive therefore fails
+// preflight instead of restoring as a silent partial.
 func validateArchive(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -123,6 +128,10 @@ func validateArchive(path string) error {
 
 	tr := tar.NewReader(f)
 	var manifest *Manifest
+	var results []TableResult
+	manifestCount, resultsCount := 0, 0
+	observed := map[string]int64{}
+	declared := map[string]bool{}
 
 	for {
 		hdr, err := tr.Next()
@@ -134,6 +143,10 @@ func validateArchive(path string) error {
 		}
 		switch {
 		case hdr.Name == manifestName:
+			manifestCount++
+			if manifestCount > 1 {
+				return fmt.Errorf("archive contains more than one manifest")
+			}
 			var m Manifest
 			if err := json.NewDecoder(tr).Decode(&m); err != nil {
 				return fmt.Errorf("manifest decode: %w", err)
@@ -143,58 +156,114 @@ func validateArchive(path string) error {
 			}
 			manifest = &m
 		case hdr.Name == resultsName:
-			var results []TableResult
+			resultsCount++
+			if resultsCount > 1 {
+				return fmt.Errorf("archive contains more than one completion record")
+			}
 			if err := json.NewDecoder(tr).Decode(&results); err != nil {
 				return fmt.Errorf("results decode: %w", err)
-			}
-			var failed []string
-			for _, r := range results {
-				if !r.OK {
-					failed = append(failed, r.Table)
-				}
-			}
-			if len(failed) > 0 {
-				return fmt.Errorf("backup is partial — these tables failed to dump and are missing: %s", strings.Join(failed, ", "))
 			}
 		case strings.HasSuffix(hdr.Name, ".jsonl"):
 			table := strings.TrimSuffix(hdr.Name, ".jsonl")
 			if !restorableTables[table] {
 				return fmt.Errorf("refusing to restore unknown table %q (not in the backup allowlist)", table)
 			}
-			if err := validateTableRows(tr); err != nil {
+			if _, dup := observed[table]; dup {
+				return fmt.Errorf("archive contains duplicate entries for table %q", table)
+			}
+			rows, err := validateTableRows(tr)
+			if err != nil {
 				return fmt.Errorf("table %s: %w", table, err)
 			}
+			observed[table] = rows
 		}
 	}
 	if manifest == nil {
 		return fmt.Errorf("no manifest found — is this an observe backup?")
 	}
+	// F44: the completion record is written last by every dump this code has
+	// produced for years; an archive without it is either truncated before
+	// the dump finished or predates the format, and both must be rejected
+	// rather than restored as an unknown-quality partial.
+	if resultsCount == 0 {
+		return fmt.Errorf("archive is missing its completion record — it is truncated or from an unsupported old format; refusing to guess")
+	}
+
+	for _, name := range manifest.Tables {
+		if _, dup := declared[name]; dup {
+			return fmt.Errorf("manifest declares table %q twice", name)
+		}
+		declared[name] = true
+	}
+	var failed []string
+	byTable := make(map[string]TableResult, len(results))
+	for _, r := range results {
+		if !r.OK {
+			failed = append(failed, r.Table)
+			continue
+		}
+		if _, dup := byTable[r.Table]; dup {
+			return fmt.Errorf("completion record lists table %q twice", r.Table)
+		}
+		byTable[r.Table] = r
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("backup is partial — these tables failed to dump and are missing: %s", strings.Join(failed, ", "))
+	}
+
+	// Observed tables must be declared, and row counts must reconcile with
+	// the completion record (truncation inside a table entry is caught by
+	// the tar reader; reassembled or edited archives are caught here).
+	for table, rows := range observed {
+		if !declared[table] {
+			return fmt.Errorf("archive contains table %q which its manifest does not declare", table)
+		}
+		r, ok := byTable[table]
+		if !ok {
+			return fmt.Errorf("completion record is missing table %q", table)
+		}
+		if rows != r.Rows {
+			return fmt.Errorf("table %q is incomplete: completion record says %d rows, archive holds %d", table, r.Rows, rows)
+		}
+	}
+	// A table the dump claims produced rows MUST have an entry; one with
+	// zero rows legitimately has none (the source instance lacked it).
+	for table, r := range byTable {
+		if r.Rows > 0 {
+			if _, present := observed[table]; !present {
+				return fmt.Errorf("table %q is missing from the archive (completion record says %d rows)", table, r.Rows)
+			}
+		}
+	}
 	return nil
 }
 
 // validateTableRows decodes and structurally checks every row of one table
-// entry without touching the database. This is what guarantees a malformed
-// row deep inside a large table is caught before ANY row of ANY table has
-// been inserted, not merely before the rest of that one table.
-func validateTableRows(r io.Reader) error {
+// entry without touching the database, returning the row count for the
+// completeness reconciliation. This is what guarantees a malformed row deep
+// inside a large table is caught before ANY row of ANY table has been
+// inserted, not merely before the rest of that one table.
+func validateTableRows(r io.Reader) (int64, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 1<<20), 16<<20) // up to 16 MiB per row
+	var n int64
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
 		}
+		n++
 		var row map[string]any
 		if err := json.Unmarshal(line, &row); err != nil {
-			return fmt.Errorf("decode row: %w", err)
+			return n, fmt.Errorf("decode row: %w", err)
 		}
 		for k := range row {
 			if !validIdent.MatchString(k) {
-				return fmt.Errorf("row has unsafe column name %q", k)
+				return n, fmt.Errorf("row has unsafe column name %q", k)
 			}
 		}
 	}
-	return scanner.Err()
+	return n, scanner.Err()
 }
 
 // applyArchive re-reads the already-validated spooled archive and performs

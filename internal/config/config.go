@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -50,29 +51,53 @@ type Config struct {
 	// DemoMode locks the deployment to a read-only public demo state.
 	// Writes on /api/v1/* (except auth/login and ingest) return 403.
 	DemoMode bool
+
+	// parseErr records malformed numeric env values so Validate can fail
+	// loudly at startup instead of Load silently swapping in a default
+	// that masks the operator's typo (audit F24).
+	parseErr error
 }
 
 func Load() Config {
 	c := Config{
-		Addr:                envOr("OBSERVE_ADDR", ":3000"),
-		IngestAddr:          envOr("OBSERVE_INGEST_ADDR", ""),
-		PublicURL:           strings.TrimRight(envOr("OBSERVE_PUBLIC_URL", ""), "/"),
-		NucleusURL:          envOr("OBSERVE_NUCLEUS_URL", "postgres://localhost:5432/observe"),
-		SiteID:              envOr("OBSERVE_SITE_ID", "default"),
-		SessionSalt:         envOr("OBSERVE_SESSION_SALT", ""),
-		BufferSize:          envInt("OBSERVE_BUFFER_SIZE", 100_000),
-		FlushInterval:       time.Duration(envInt("OBSERVE_FLUSH_INTERVAL_MS", 2000)) * time.Millisecond,
-		FlushSize:           envInt("OBSERVE_FLUSH_SIZE", 500),
-		RawRetentionDays:    envInt("OBSERVE_RAW_RETENTION_DAYS", 30),
-		HourlyRetentionDays: envInt("OBSERVE_HOURLY_RETENTION_DAYS", 365),
-		RateLimit:           envInt("OBSERVE_RATE_LIMIT", 1000),
-		TrustedProxies:      envOr("OBSERVE_TRUSTED_PROXIES", ""),
-		JWTSecret:           envOr("OBSERVE_JWT_SECRET", ""),
-		AuditKey:            envOr("OBSERVE_AUDIT_KEY", ""),
-		AdminUser:           envOr("OBSERVE_ADMIN_USER", "admin"),
-		AdminPassword:       envOr("OBSERVE_ADMIN_PASSWORD", ""),
-		DemoMode:            envOr("OBSERVE_DEMO_MODE", "") == "true",
+		Addr:           envOr("OBSERVE_ADDR", ":3000"),
+		IngestAddr:     envOr("OBSERVE_INGEST_ADDR", ""),
+		PublicURL:      strings.TrimRight(envOr("OBSERVE_PUBLIC_URL", ""), "/"),
+		NucleusURL:     envOr("OBSERVE_NUCLEUS_URL", "postgres://localhost:5432/observe"),
+		SiteID:         envOr("OBSERVE_SITE_ID", "default"),
+		SessionSalt:    envOr("OBSERVE_SESSION_SALT", ""),
+		RateLimit:      1000,
+		TrustedProxies: envOr("OBSERVE_TRUSTED_PROXIES", ""),
+		JWTSecret:      envOr("OBSERVE_JWT_SECRET", ""),
+		AuditKey:       envOr("OBSERVE_AUDIT_KEY", ""),
+		AdminUser:      envOr("OBSERVE_ADMIN_USER", "admin"),
+		AdminPassword:  envOr("OBSERVE_ADMIN_PASSWORD", ""),
+		DemoMode:       envOr("OBSERVE_DEMO_MODE", "") == "true",
 	}
+	var err error
+	set := func(key string, def int, dst *int) {
+		if err != nil {
+			return
+		}
+		var n int
+		n, err = envIntStrict(key, def)
+		if err == nil {
+			*dst = n
+		}
+	}
+	set("OBSERVE_BUFFER_SIZE", 100_000, &c.BufferSize)
+	set("OBSERVE_FLUSH_SIZE", 500, &c.FlushSize)
+	set("OBSERVE_RAW_RETENTION_DAYS", 30, &c.RawRetentionDays)
+	set("OBSERVE_HOURLY_RETENTION_DAYS", 365, &c.HourlyRetentionDays)
+	set("OBSERVE_RATE_LIMIT", 1000, &c.RateLimit)
+	flushMs := 2000
+	set("OBSERVE_FLUSH_INTERVAL_MS", 2000, &flushMs)
+	if err == nil {
+		c.FlushInterval = time.Duration(flushMs) * time.Millisecond
+	} else {
+		c.FlushInterval = 2000 * time.Millisecond
+	}
+	c.parseErr = err
 	return c
 }
 
@@ -83,11 +108,46 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-func envInt(key string, fallback int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
+// envIntStrict parses an integer env var, failing on malformed values
+// instead of silently substituting the default (audit F24: a typo'd value
+// used to become a different, working-looking configuration).
+func envIntStrict(key string, fallback int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
 	}
-	return fallback
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer, got %q", key, raw)
+	}
+	return n, nil
+}
+
+// Validate rejects configurations that would panic at construction or
+// silently disable ingestion (audit F24). Run before any service starts.
+func (c Config) Validate() error {
+	if c.parseErr != nil {
+		return c.parseErr
+	}
+	if c.BufferSize < 1 {
+		return fmt.Errorf("OBSERVE_BUFFER_SIZE must be >= 1, got %d", c.BufferSize)
+	}
+	if c.FlushSize < 1 || c.FlushSize > c.BufferSize {
+		return fmt.Errorf("OBSERVE_FLUSH_SIZE must be in [1, OBSERVE_BUFFER_SIZE=%d], got %d", c.BufferSize, c.FlushSize)
+	}
+	// Non-positive intervals panic time.NewTicker; unboundedly large ones
+	// are certainly a unit mistake (ms vs s).
+	if c.FlushInterval <= 0 || c.FlushInterval > time.Minute {
+		return fmt.Errorf("OBSERVE_FLUSH_INTERVAL_MS must be in (0, 60000] milliseconds, got %d", c.FlushInterval.Milliseconds())
+	}
+	if c.RateLimit < 1 {
+		return fmt.Errorf("OBSERVE_RATE_LIMIT must be >= 1, got %d", c.RateLimit)
+	}
+	if c.RawRetentionDays < 1 {
+		return fmt.Errorf("OBSERVE_RAW_RETENTION_DAYS must be >= 1, got %d", c.RawRetentionDays)
+	}
+	if c.HourlyRetentionDays < 1 {
+		return fmt.Errorf("OBSERVE_HOURLY_RETENTION_DAYS must be >= 1, got %d", c.HourlyRetentionDays)
+	}
+	return nil
 }

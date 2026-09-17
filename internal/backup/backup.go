@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -185,9 +186,14 @@ func DumpWithKey(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io
 	return dumpTar(ctx, db, w, errLog)
 }
 
-func dumpTar(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io.Writer) error {
+func dumpTar(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io.Writer) (retErr error) {
 	tw := tar.NewWriter(w)
-	defer tw.Close()
+	// Audit F43: a tar writer buffers the final padding blocks for Close.
+	// The deferred Close's error was dropped, so a broken pipe or full
+	// destination could end the archive mid-air with a successful exit —
+	// defeating the trailing results record whose entire job is making a
+	// partial dump detectable.
+	defer func() { retErr = errors.Join(retErr, tw.Close()) }()
 
 	manifest := Manifest{
 		Version:   manifestVersion,
@@ -221,8 +227,15 @@ func dumpTar(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io.Wri
 		}
 		results = append(results, TableResult{Table: table, Rows: rows, OK: true})
 	}
-	if raw, err := json.MarshalIndent(results, "", "  "); err == nil {
-		_ = writeEntry(tw, resultsName, raw)
+	// Audit F43: the completion record is load-bearing (restore rejects
+	// archives without it since F44) — a failure to marshal or write it
+	// must fail the backup, not vanish behind the per-table errors.
+	raw, err = json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		return errors.Join(firstErr, fmt.Errorf("results marshal: %w", err))
+	}
+	if err := writeEntry(tw, resultsName, raw); err != nil {
+		return errors.Join(firstErr, err)
 	}
 	return firstErr
 }
