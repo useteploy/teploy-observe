@@ -322,7 +322,12 @@ func seedPastRawRetention(ctx context.Context, t *testing.T, db *nucleus.Client)
 	browsers := []string{"Chrome", "Chrome", "Firefox", "Safari", "Firefox"}
 
 	// 45 days back: past the 30-day raw window, inside the 90-day session one.
-	base := time.Now().UTC().Add(-45 * 24 * time.Hour)
+	// Pin to the first hour of that UTC day: seeding relative to the wall
+	// clock crosses UTC midnight late in the day, which splits the sessions
+	// across two day-buckets while the stats_daily row below covers only the
+	// first — the series then legitimately reports the second bucket's
+	// visitors nowhere and the day-sum assertion below fails by wall clock.
+	base := time.Now().UTC().Add(-45 * 24 * time.Hour).Truncate(24 * time.Hour).Add(time.Hour)
 	for i, b := range browsers {
 		first := base.Add(time.Duration(i) * time.Hour)
 		for _, version := range []int64{1000, 2000} {

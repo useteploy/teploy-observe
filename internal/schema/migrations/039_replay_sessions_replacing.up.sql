@@ -3,7 +3,7 @@
 -- a crash between claim and insert can no longer orphan a replay (audit F19).
 --
 -- Background: replay_sessions was a plain mergetree ordered by
--- (tenant_id, site_id, start_time). Multi-batch replays (the normal case —
+-- (tenant_id, site_id, start_time). Multi-batch replays (the normal case -
 -- the tracker flushes every 10s) wrote their session row ONCE, guarded by a
 -- KV SetNX claim keyed replay_seen:<site>:<id>. That claim was the F19
 -- defect: it succeeded before the session INSERT, so a transient SQL failure
@@ -21,12 +21,12 @@
 -- (a) every version of a row preserves the first batch's start_time verbatim
 -- so the key is stable across versions, and (b) the retention job DELETEs by
 -- start_time, and Nucleus DML filtered on a column outside the ORDER BY key
--- silently no-ops (see internal/auth/apikeys.go) — dropping start_time from
+-- silently no-ops (see internal/auth/apikeys.go) - dropping start_time from
 -- the key would have made the 14-day replay TTL inert.
 --
 -- Rename-aside + create + copy, in the style of 027/028/033-036. ALTER TABLE
 -- ADD COLUMN cannot change the engine or the ORDER BY, so a rebuild is the
--- only route. Legacy version is start_time (epoch-ms) — every new version
+-- only route. Legacy version is start_time (epoch-ms) - every new version
 -- written after this migration stamps version = max(now_ms, prior+1), which
 -- always supersedes it. Legacy duplicates from the pre-OBS-029 race collapse
 -- via argMax on the shared key.

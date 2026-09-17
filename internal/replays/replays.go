@@ -209,11 +209,14 @@ func (s *ReplayService) replayOwner(ctx context.Context, replayID string) (strin
 // replay_id) keeps one visible row per replay, so there is no claim-then-
 // insert window to orphan (audit F19 — the old KV SetNX guard is gone).
 func (s *ReplayService) upsertSession(ctx context.Context, input *IngestInput, replayID string, agg batchAggregate, distinctID string) error {
+	// Non-key columns collapse newest-wins via argMax on version — the same
+	// collapse LatestRows applies elsewhere; they cannot be selected bare
+	// next to this GROUP BY (strict-mode engines reject that, 0A000).
 	rows, err := nucleus.Query[existingSession](ctx, s.db.SQL(),
 		`SELECT site_id, start_time,
-		        CAST(duration_ms AS BIGINT) AS duration_ms,
-		        CAST(page_count AS BIGINT) AS page_count,
-		        has_error,
+		        CAST(argMax(duration_ms, version) AS BIGINT) AS duration_ms,
+		        CAST(argMax(page_count, version) AS BIGINT) AS page_count,
+		        argMax(has_error, version) AS has_error,
 		        MAX(version) AS version
 		 FROM replay_sessions
 		 WHERE replay_id = $1 AND site_id = $2
@@ -239,7 +242,12 @@ func (s *ReplayService) upsertSession(ctx context.Context, input *IngestInput, r
 		// its predecessors.
 		startTime = existing.StartTime
 	}
-	duration := agg.EndMS - agg.StartMS
+	// Duration spans from the session's start (startTime, preserved from the
+	// first batch when merging) to this batch's latest event, so a later
+	// batch extends the session rather than reporting only its own span.
+	// The max against the stored value keeps it monotonic: a late batch of
+	// older events must not shrink the recorded duration.
+	duration := agg.EndMS - startTime
 	if !agg.Initialized || duration < 0 {
 		duration = 0
 	}

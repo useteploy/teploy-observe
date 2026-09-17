@@ -5,13 +5,13 @@
 -- caller-supplied replay_id, and GetReplayEvents filtered on replay_id alone.
 -- Replay IDs are client-generated, so a key valid for site A that knew (or
 -- guessed) a replay ID in use by site B could append events into B's replay
--- stream — fixing the ingest-site binding (F07) was not enough, because the
+-- stream - fixing the ingest-site binding (F07) was not enough, because the
 -- child-event key was globally shared.
 --
 -- site_id is added as a non-key column via plain ALTER ADD COLUMN: the
 -- historical Nucleus 0.1.0 bug that made ADD COLUMN drop subsequent inserts
 -- (027's reason for rename-aside) was retested against the current Nucleus
--- image and found fixed — see 031, which shipped the same conclusion for
+-- image and found fixed - see 031, which shipped the same conclusion for
 -- share_links and has run in production since.
 --
 -- Legacy rows backfill to '' (NOT NULL DEFAULT ''). Their ownership is

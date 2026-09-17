@@ -70,6 +70,16 @@ func TestAPIKeyRevocationPersists(t *testing.T) {
 	svc := testService(db)
 
 	site := uniqueSite("revtest")
+	// ValidateAPIKey fail-closes when the key's site has no sites row (audit
+	// F09), so the site has to exist for the pre-revoke validation below to
+	// legitimately pass.
+	if _, err := db.SQL().Exec(ctx,
+		`INSERT INTO sites (site_id, tenant_id, domain, name, created_at, session_salt)
+		 VALUES ($1, 'default', '', 'revocation test', $2, $3)`,
+		site, strconv.FormatInt(time.Now().UnixMilli(), 10), site+"-salt",
+	); err != nil {
+		t.Fatalf("plant site: %v", err)
+	}
 	plaintext, info, err := svc.CreateAPIKey(ctx, site, "revocation-test")
 	if err != nil {
 		t.Fatalf("create api key: %v", err)
