@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -150,7 +151,15 @@ func (h *OTLPLogsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	result, ierr := ingestExport(r.Context(), h.svc, inputs)
 	if ierr != nil {
-		http.Error(w, ierr.Error(), http.StatusInternalServerError)
+		// Audit F13: a storage failure is retryable. OTLP exporters treat
+		// 500 as non-retryable and drop the batch; 503 + Retry-After tells
+		// them to re-send instead of silently losing every record.
+		if errors.Is(ierr, ErrBatchTooLarge) {
+			http.Error(w, ierr.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "storage unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

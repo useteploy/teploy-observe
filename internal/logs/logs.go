@@ -156,6 +156,11 @@ func (s *LogService) IngestLog(ctx context.Context, input LogInput) (string, err
 // batch cap — bounds request size and worst-case per-request insert count.
 const maxLogBatchSize = 200
 
+// ErrBatchTooLarge reports a batch exceeding maxLogBatchSize. A distinct
+// sentinel so the HTTP layer can answer 400 (protocol error) while storage
+// failures answer 503 (retryable) — audit F13.
+var ErrBatchTooLarge = fmt.Errorf("batch too large: max %d entries", maxLogBatchSize)
+
 // LogBatchResult reports how many of a batch's entries were stored.
 type LogBatchResult struct {
 	Accepted int `json:"accepted"`
@@ -171,7 +176,7 @@ type LogBatchResult struct {
 // has no way to retry only the bad entries anyway.
 func (s *LogService) IngestLogs(ctx context.Context, inputs []LogInput) (LogBatchResult, error) {
 	if len(inputs) > maxLogBatchSize {
-		return LogBatchResult{}, fmt.Errorf("batch too large: %d entries (max %d)", len(inputs), maxLogBatchSize)
+		return LogBatchResult{}, ErrBatchTooLarge
 	}
 	result := LogBatchResult{}
 	if len(inputs) == 0 {
@@ -204,11 +209,15 @@ func (s *LogService) IngestLogs(ctx context.Context, inputs []LogInput) (LogBatc
 		return result, nil
 	}
 
-	// A chunk failure isn't surfaced to the caller as a batch-level error —
-	// matches the old per-line loop, which never returned one either. The
-	// committed/toInsert count difference already flows into Rejected, and
-	// insertLogsBatch has already logged the cause of any shortfall.
-	committed, _ := s.insertLogsBatch(ctx, toInsert)
+	// Audit F13: a storage failure is surfaced to the caller instead of
+	// being folded into Rejected-with-OK. Clients that treat HTTP 200/ok as
+	// an acknowledgement were discarding logs that were never persisted,
+	// and the per-entry counts could not identify what was safe to retry.
+	// committed rows are still published and counted; the error tells the
+	// transport layer this is retryable (handler maps it to 503 +
+	// Retry-After). A configured pipeline drop stays a successful policy
+	// decision — it was counted as Accepted above and never reaches here.
+	committed, storageErr := s.insertLogsBatch(ctx, toInsert)
 	result.Accepted += len(committed)
 	result.Rejected += len(toInsert) - len(committed)
 
@@ -218,6 +227,9 @@ func (s *LogService) IngestLogs(ctx context.Context, inputs []LogInput) (LogBatc
 		}
 	}
 
+	if storageErr != nil {
+		return result, fmt.Errorf("log batch persistence failed: %w", storageErr)
+	}
 	return result, nil
 }
 

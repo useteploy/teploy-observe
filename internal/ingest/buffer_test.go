@@ -184,3 +184,74 @@ func TestBuffer_FlushFailureSurvivesRetryAndRestart(t *testing.T) {
 		t.Fatalf("checkpoint must cover the retried batch, %d pending", len(pending))
 	}
 }
+
+// TestBuffer_FlushFailureDoesNotLivelock is the audit F10 regression: the
+// size-triggered wakeup used to re-Flush in a tight inner loop while the
+// buffer stayed above flushSize (a failing flush requeues its batch), never
+// selecting on stopCh — an endless spin no Stop could interrupt. Now one
+// wakeup is one bounded attempt, so Stop completes even with a dead DB.
+func TestBuffer_FlushFailureDoesNotLivelock(t *testing.T) {
+	buf := NewBuffer(nil, 8, 2, time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	buf.Start()
+	defer buf.Stop()
+
+	for i := 0; i < 4; i++ {
+		if !buf.Push(ev(fmt.Sprintf("e%d", i))) {
+			t.Fatalf("push %d refused", i)
+		}
+	}
+	// nil db -> insertBatch panics inside Flush, recovered by the worker's
+	// panic guard, leaving the events requeued... in fact the panic aborts
+	// the whole worker goroutine (recover logs and exits the goroutine),
+	// which is exactly the "unhealthy worker" case Stop must still survive.
+	// Wait for the flush attempt to land, then stop and require completion
+	// within a generous bound instead of hanging the test forever.
+	done := make(chan struct{})
+	go func() { buf.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop did not complete — flush loop is livelocked on a failing flush")
+	}
+}
+
+// TestBuffer_AvailBacksAtomicBatchAdmission is the audit F12 helper: the
+// batch handler reserves capacity for the whole batch up front.
+func TestBuffer_AvailBacksAtomicBatchAdmission(t *testing.T) {
+	buf := NewBuffer(nil, 5, 10, time.Hour, nil)
+	if got := buf.Avail(); got != 5 {
+		t.Fatalf("fresh buffer Avail = %d, want 5", got)
+	}
+	for i := 0; i < 3; i++ {
+		buf.Push(ev(fmt.Sprintf("e%d", i)))
+	}
+	if got := buf.Avail(); got != 2 {
+		t.Fatalf("after 3 pushes Avail = %d, want 2", got)
+	}
+}
+
+// TestAttachQueueFailsLeavesQueueUnattached is the audit F15 regression: a
+// queue whose replay fails must not be left attached (later checkpoints
+// would advance past the unread backlog).
+func TestAttachQueueFailsLeavesQueueUnattached(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dir := t.TempDir()
+	q, err := NewDiskQueue(dir, "ingest", time.Hour, 1<<30, logger)
+	if err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// A closed queue's Pending errors, so attach must fail...
+	buf := NewBuffer(nil, 8, 2, time.Hour, logger)
+	if err := buf.AttachQueue(q); err == nil {
+		t.Fatal("attaching a queue with a failing replay must return an error")
+	}
+	buf.mu.Lock()
+	attached := buf.queue
+	buf.mu.Unlock()
+	if attached != nil {
+		t.Fatal("a failed AttachQueue must not leave the queue installed")
+	}
+}

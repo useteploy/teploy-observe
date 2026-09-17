@@ -17,32 +17,32 @@ import (
 
 // ErrorInput is the JSON body for POST /api/v1/errors (SDK envelope format).
 type ErrorInput struct {
-	SiteID      string       `json:"site_id"`
-	SessionID   string       `json:"session_id"`
-	ReplayID    string       `json:"replay_id"`
+	SiteID    string `json:"site_id"`
+	SessionID string `json:"session_id"`
+	ReplayID  string `json:"replay_id"`
 	// DistinctID, when present, is the user identifier from identify().
 	// The server hashes it with the site's session_salt before storage.
-	DistinctID  string       `json:"distinct_id,omitempty"`
-	ErrorType   string       `json:"error_type"`
-	ErrorValue  string       `json:"error_value"`
-	Mechanism   string       `json:"mechanism"`
-	Handled     bool         `json:"handled"`
-	Level       string       `json:"level"`
-	ReleaseTag  string       `json:"release"`
+	DistinctID string `json:"distinct_id,omitempty"`
+	ErrorType  string `json:"error_type"`
+	ErrorValue string `json:"error_value"`
+	Mechanism  string `json:"mechanism"`
+	Handled    bool   `json:"handled"`
+	Level      string `json:"level"`
+	ReleaseTag string `json:"release"`
 	// ReleaseTagAlt accepts the alternate `release_tag` wire field some SDKs
 	// send, so the release isn't silently dropped on a key-name mismatch.
 	// Reconciled into ReleaseTag in the handler.
-	ReleaseTagAlt string     `json:"release_tag"`
-	Environment string       `json:"environment"`
-	URL         string       `json:"url"`
-	Browser     string       `json:"browser"`
-	OS          string       `json:"os"`
-	Device      string       `json:"device"`
-	StackTrace  []StackFrame `json:"stack_trace"`
-	Breadcrumbs []Breadcrumb `json:"breadcrumbs"`
-	Contexts    any          `json:"contexts"`
-	Extra       any          `json:"extra"`
-	Fingerprint []string     `json:"fingerprint"`
+	ReleaseTagAlt string       `json:"release_tag"`
+	Environment   string       `json:"environment"`
+	URL           string       `json:"url"`
+	Browser       string       `json:"browser"`
+	OS            string       `json:"os"`
+	Device        string       `json:"device"`
+	StackTrace    []StackFrame `json:"stack_trace"`
+	Breadcrumbs   []Breadcrumb `json:"breadcrumbs"`
+	Contexts      any          `json:"contexts"`
+	Extra         any          `json:"extra"`
+	Fingerprint   []string     `json:"fingerprint"`
 	// Selector identifies the synthetic source of the error (e.g. the DOM
 	// selector for a RageClick auto-issue). Used by grouping for non-stack
 	// errors so multiple rage clicks on the same target collapse together.
@@ -127,11 +127,11 @@ func NewErrorHandler(db *nucleus.Client, issueSvc *IssueService, searchSvc *Sear
 }
 
 // IngestErrorEvent inserts an error event end-to-end:
-//   1. compute grouphash (custom fingerprint, rage-click special-case, or stack-based),
-//   2. resolve or create the parent issue,
-//   3. (optionally) resolve a minified stack via source maps,
-//   4. INSERT into error_events,
-//   5. index the error message in FTS for BM25 search.
+//  1. compute grouphash (custom fingerprint, rage-click special-case, or stack-based),
+//  2. resolve or create the parent issue,
+//  3. (optionally) resolve a minified stack via source maps,
+//  4. INSERT into error_events,
+//  5. index the error message in FTS for BM25 search.
 //
 // Returns the issue_id so callers can present a link to the user.
 func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (string, error) {

@@ -9,6 +9,16 @@ import (
 
 // ErrorBuffer accumulates error events and batch-processes them
 // asynchronously, decoupling HTTP response from KV+FTS+issue resolution.
+//
+// Audit F11: size-triggered flushes used to launch `go b.Flush()` goroutines
+// that Stop never waited for, and a failed Handle dropped the event with a
+// log line. Flushes now run on ONE owned worker woken by a coalesced channel
+// (same lifecycle as the analytics buffer), admission closes before the
+// drain, and Stop waits for the worker. Events whose storage still fails
+// during shutdown are reported in the stop log — a durable retry spool needs
+// an idempotent sink (IngestErrorEvent mints fresh IDs per call, so blindly
+// requeueing would double-count issue counters); that design is deferred and
+// recorded in AUDIT_OPEN.md.
 type ErrorBuffer struct {
 	mu            sync.Mutex
 	events        []bufferedError
@@ -18,7 +28,13 @@ type ErrorBuffer struct {
 	handler       *ErrorHandler
 	logger        *slog.Logger
 	stopCh        chan struct{}
-	wg            sync.WaitGroup
+	// wake coalesces size-triggered flush wakeups: capacity one, so any
+	// number of above-threshold Pushes while a flush is in flight collapse
+	// into a single pending wakeup instead of piling up goroutines.
+	wake     chan struct{}
+	wg       sync.WaitGroup
+	closing  bool
+	stopOnce sync.Once
 }
 
 type bufferedError struct {
@@ -35,6 +51,7 @@ func NewErrorBuffer(handler *ErrorHandler, maxSize, flushSize int, flushInterval
 		handler:       handler,
 		logger:        logger,
 		stopCh:        make(chan struct{}),
+		wake:          make(chan struct{}, 1),
 	}
 }
 
@@ -53,6 +70,11 @@ func (b *ErrorBuffer) Start() {
 			select {
 			case <-ticker.C:
 				b.Flush()
+			case <-b.wake:
+				// One bounded attempt per wakeup (audit F10 pattern): a
+				// failing flush is retried by the ticker, not by a tight
+				// loop the stop channel cannot interrupt.
+				b.Flush()
 			case <-b.stopCh:
 				b.Flush()
 				return
@@ -61,29 +83,42 @@ func (b *ErrorBuffer) Start() {
 	}()
 }
 
+// Stop closes admission, wakes the worker, and waits for the final flush.
+// Idempotent; safe to call concurrently with Push.
 func (b *ErrorBuffer) Stop() {
-	close(b.stopCh)
+	b.stopOnce.Do(func() {
+		b.mu.Lock()
+		b.closing = true
+		b.mu.Unlock()
+		close(b.stopCh)
+	})
 	b.wg.Wait()
 }
 
-// Push adds an error to the buffer. Returns false if buffer is full.
+// Push adds an error to the buffer. Returns false if the buffer is full or
+// shutdown has begun.
 func (b *ErrorBuffer) Push(siteID string, input ErrorInput) bool {
 	b.mu.Lock()
-	if len(b.events) >= b.maxSize {
+	if b.closing || len(b.events) >= b.maxSize {
 		b.mu.Unlock()
 		return false
 	}
 	b.events = append(b.events, bufferedError{Input: input, SiteID: siteID})
-	shouldFlush := len(b.events) >= b.flushSize
+	full := len(b.events) >= b.flushSize
 	b.mu.Unlock()
 
-	if shouldFlush {
-		go b.Flush()
+	if full {
+		select {
+		case b.wake <- struct{}{}:
+		default:
+		}
 	}
 	return true
 }
 
-// Flush processes all buffered errors.
+// Flush processes all buffered errors on the caller's goroutine. The worker
+// is the only routine that calls it in normal operation; the HTTP ingest
+// path no longer spawns per-push flushes (audit F11).
 func (b *ErrorBuffer) Flush() {
 	b.mu.Lock()
 	if len(b.events) == 0 {

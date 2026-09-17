@@ -310,6 +310,16 @@ func BatchHandler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.
 		if len(input.Events) == 0 {
 			return IngestResponse{OK: true}, nil
 		}
+		// Audit F12: reserve capacity for the WHOLE batch before processing
+		// any entry. The only mid-batch admission failure is backpressure
+		// (per-event errors after this point are pure validation, counted as
+		// rejected); admitting a prefix and then refusing the tail made a
+		// client retry duplicate the already-accepted prefix. All-or-nothing
+		// admission removes that mixed state.
+		if avail := buf.Avail(); len(input.Events) > avail {
+			return IngestResponse{}, neutron.ErrRateLimited(
+				fmt.Sprintf("buffer capacity %d below batch size %d, retry the whole batch later", avail, len(input.Events)))
+		}
 		accepted, rejected := 0, 0
 		for _, ev := range input.Events {
 			if _, err := singleHandler(ctx, ev); err != nil {

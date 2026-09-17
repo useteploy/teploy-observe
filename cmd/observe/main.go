@@ -1296,6 +1296,12 @@ func main() {
 		durability := "wal"
 		if walDegraded {
 			durability = "memory-only"
+		} else if eventsQ != nil && eventsQ.LastError() != nil {
+			// Audit F14: a WAL failure after healthy startup (disk full,
+			// I/O error) latches in the queue; ingestion is refused while
+			// the durability contract is broken, and health must show it
+			// instead of reporting "wal" on a queue that stopped writing.
+			durability = "wal-degraded"
 		}
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"status":     "ok",
@@ -3501,7 +3507,19 @@ func logIngestBatchHandler(svc *logs.LogService) neutron.HandlerFunc[logBatchInp
 		}
 		result, err := svc.IngestLogs(ctx, input.Logs)
 		if err != nil {
-			return logBatchResponse{}, err
+			// Audit F13: a storage failure is retryable, not the client's
+			// fault — 503 (not the default 500) tells a well-behaved batch
+			// logger to re-send the whole batch later. An oversized batch is
+			// a 400 protocol error. Stable per-item ids for partial-commit
+			// retries are a protocol change deferred with F12.
+			if errors.Is(err, logs.ErrBatchTooLarge) {
+				return logBatchResponse{}, neutron.ErrBadRequest(err.Error())
+			}
+			return logBatchResponse{}, &neutron.AppError{
+				Status: http.StatusServiceUnavailable,
+				Title:  "Service Unavailable",
+				Detail: "log batch persistence failed; retry the batch",
+			}
 		}
 		return logBatchResponse{OK: true, Accepted: result.Accepted, Rejected: result.Rejected}, nil
 	}

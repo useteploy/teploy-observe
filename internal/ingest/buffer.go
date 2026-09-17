@@ -84,6 +84,10 @@ type Buffer struct {
 	// the monotonic checkpoint clamp then can't advance past an un-inserted
 	// earlier batch.
 	flushMu sync.Mutex
+	// stopOnce makes Stop idempotent (audit F10): a second Stop (lifecycle
+	// hook plus a test defer, or concurrent shutdown paths) must not close
+	// an already-closed channel.
+	stopOnce sync.Once
 }
 
 // NewBuffer creates a new ingestion buffer. If queue is non-nil, every Push
@@ -104,17 +108,23 @@ func NewBuffer(db *nucleus.Client, maxSize, flushSize int, flushInterval time.Du
 
 // AttachQueue enables WAL-backed durability. Must be called before Start;
 // any surviving events from the previous process are replayed immediately.
+//
+// Audit F15: the queue is installed ONLY after replay succeeds. Installing it
+// first meant a failed replay could leave a live queue attached whose
+// checkpoint later advanced past the still-unread backlog — turning a
+// recoverable replay problem into skipped data.
 func (b *Buffer) AttachQueue(q *DiskQueue) error {
-	b.queue = q
 	pending, err := q.Pending()
 	if err != nil {
-		return err
+		return fmt.Errorf("WAL replay failed: %w", err)
 	}
-	// Exactly-once: a crash between a flush's DB commit and its WAL checkpoint
-	// leaves committed events still in the WAL, so replay would re-insert (and
-	// double-count) them. Drop any pending event whose event_id is already in
-	// the DB before replaying. This is a one-time, startup-only cost on the rare
-	// post-crash path; the hot ingest path is untouched.
+	// Exactly-once replay of committed events: a crash between a flush's DB
+	// commit and its WAL checkpoint leaves committed events still in the WAL,
+	// so replay would re-insert (and double-count) them. Drop any pending
+	// event whose event_id is already in the DB before replaying. On a lookup
+	// error this FAILS OPEN (keeps all events) — durability over dedup — so
+	// it is a recovery optimization, not an unconditional exactly-once
+	// guarantee.
 	if len(pending) > 0 {
 		before := len(pending)
 		pending = b.dropAlreadyCommitted(pending)
@@ -124,6 +134,10 @@ func (b *Buffer) AttachQueue(q *DiskQueue) error {
 	}
 
 	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.queue != nil {
+		return fmt.Errorf("WAL already attached")
+	}
 	// Seed the high-water mark to the WAL end so the first flush after replay
 	// checkpoints past the replayed region; otherwise those events (already on
 	// disk below the new writes) would replay again on the next crash.
@@ -131,10 +145,10 @@ func (b *Buffer) AttachQueue(q *DiskQueue) error {
 	if len(pending) > 0 {
 		b.events = append(b.events, pending...)
 	}
-	b.mu.Unlock()
 	if len(pending) > 0 {
 		b.logger.Info("ingest queue: replayed", "count", len(pending))
 	}
+	b.queue = q
 	return nil
 }
 
@@ -221,17 +235,15 @@ func (b *Buffer) Start() {
 			case <-ticker.C:
 				b.Flush()
 			case <-b.flushCh:
-				// Size-triggered drain. Loop while still above threshold
-				// so one wakeup covers a refill that raced the drain.
-				for {
-					b.mu.Lock()
-					above := len(b.events) >= b.flushSize
-					b.mu.Unlock()
-					if !above {
-						break
-					}
-					b.Flush()
-				}
+				// Audit F10: ONE bounded attempt per wakeup. The old inner
+				// loop re-flushed while len(events) >= flushSize without
+				// selecting on stopCh — a failing flush requeues its batch,
+				// the threshold stayed true, and the worker spun in a tight
+				// livelock no Stop could interrupt. A failed flush is now
+				// retried by the next coalesced wakeup (a Push above
+				// threshold re-signals) or by the ticker, which bounds the
+				// retry rate at the configured flush interval.
+				b.Flush()
 			case <-b.stopCh:
 				b.Flush() // final flush
 				return
@@ -241,8 +253,9 @@ func (b *Buffer) Start() {
 }
 
 // Stop signals the flush loop to exit and waits for the final flush.
+// Idempotent — safe under concurrent or repeated shutdown paths.
 func (b *Buffer) Stop() {
-	close(b.stopCh)
+	b.stopOnce.Do(func() { close(b.stopCh) })
 	b.wg.Wait()
 	if b.queue != nil {
 		if err := b.queue.Close(); err != nil {
@@ -252,7 +265,10 @@ func (b *Buffer) Stop() {
 }
 
 // Push adds an event to the buffer. Returns false if the buffer is full
-// (backpressure signal).
+// (backpressure signal), or if a WAL append failed while the WAL is attached
+// (audit F14: a WAL-backed deployment must not acknowledge events as
+// crash-safe when the log write failed — silent fallback to memory-only
+// ingestion turned disk-full into data loss with healthy-looking acks).
 func (b *Buffer) Push(e Event) bool {
 	b.mu.Lock()
 	if len(b.events) >= b.maxSize {
@@ -261,16 +277,23 @@ func (b *Buffer) Push(e Event) bool {
 	}
 	b.events = append(b.events, e)
 	// WAL under mu so the on-disk order matches b.events order; lastOffset then
-	// tracks the offset of the final buffered event. A failed append is logged,
-	// not fatal — the in-memory path still flushes it, it just isn't crash-safe.
-	// The bufio write is in-memory (fsync is on the background loop), so holding
-	// mu here does not block on disk I/O.
+	// tracks the offset of the final buffered event. The bufio write is
+	// in-memory (fsync is on the background loop), so holding mu here does
+	// not block on disk I/O.
 	if b.queue != nil {
-		if off, err := b.queue.Append(e); err != nil {
-			b.logger.Warn("ingest queue: append failed", "err", err)
-		} else {
-			b.lastOffset = off
+		off, err := b.queue.Append(e)
+		if err != nil {
+			// Roll the event back out: the WAL is the durability contract,
+			// and accepting the event anyway would ack data the process
+			// promised is crash-safe but is not. The queue latches the error
+			// (see DiskQueue.Append); admission stays refused until it
+			// recovers, and /healthz reports the degradation.
+			b.events = b.events[:len(b.events)-1]
+			b.mu.Unlock()
+			b.logger.Error("ingest queue: append failed — refusing admission (WAL-backed durability unavailable)", "err", err)
+			return false
 		}
+		b.lastOffset = off
 	}
 	shouldFlush := len(b.events) >= b.flushSize
 	b.mu.Unlock()
@@ -284,6 +307,15 @@ func (b *Buffer) Push(e Event) bool {
 		}
 	}
 	return true
+}
+
+// Avail returns how many more events the buffer can accept before backpressure.
+// BatchHandler uses it to admit a batch atomically (all-or-nothing) instead of
+// accepting a prefix and then refusing the tail (audit F12).
+func (b *Buffer) Avail() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.maxSize - len(b.events)
 }
 
 // Flush drains the buffer and batch-inserts into Nucleus. It is serialized by

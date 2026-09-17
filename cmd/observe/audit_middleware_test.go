@@ -21,15 +21,15 @@ func TestAuditableRequest(t *testing.T) {
 		method, path string
 		want         bool
 	}{
-		{"GET", "/api/v1/sites", false},           // reads are not audited
-		{"POST", "/api/v1/sites", true},            // admin mutation
+		{"GET", "/api/v1/sites", false}, // reads are not audited
+		{"POST", "/api/v1/sites", true}, // admin mutation
 		{"DELETE", "/api/v1/exports/scheduled/1", true},
-		{"POST", "/api/v1/ingest", false},          // telemetry firehose
-		{"POST", "/api/v1/auth/login", false},      // recorded directly
-		{"POST", "/api/v1/audit", false},           // producer endpoint (no double-record)
-		{"POST", "/api/v1/checkin/x", false},       // cron pings
-		{"POST", "/api/v1/flags/evaluate", false},  // high-volume eval
-		{"POST", "/other", false},                  // outside /api/v1
+		{"POST", "/api/v1/ingest", false},         // telemetry firehose
+		{"POST", "/api/v1/auth/login", false},     // recorded directly
+		{"POST", "/api/v1/audit", false},          // producer endpoint (no double-record)
+		{"POST", "/api/v1/checkin/x", false},      // cron pings
+		{"POST", "/api/v1/flags/evaluate", false}, // high-volume eval
+		{"POST", "/other", false},                 // outside /api/v1
 	}
 	for _, c := range cases {
 		if got := auditableRequest(c.method, c.path); got != c.want {
@@ -40,11 +40,11 @@ func TestAuditableRequest(t *testing.T) {
 
 func TestDeriveAction(t *testing.T) {
 	cases := map[string]string{
-		"POST /api/v1/sites":                        "sites.create",
+		"POST /api/v1/sites": "sites.create",
 		"DELETE /api/v1/exports/scheduled/deadbeef1234abcd00": "exports.scheduled.delete",
-		"POST /api/v1/exports/scheduled/42/run":     "exports.scheduled.run.create",
-		"PUT /api/v1/ai/config":                     "ai.config.update",
-		"DELETE /api/v1/users/12345":                "users.delete",
+		"POST /api/v1/exports/scheduled/42/run":               "exports.scheduled.run.create",
+		"PUT /api/v1/ai/config":                               "ai.config.update",
+		"DELETE /api/v1/users/12345":                          "users.delete",
 	}
 	for in, want := range cases {
 		var method, path string

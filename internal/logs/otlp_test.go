@@ -85,7 +85,7 @@ func TestSeverityToLevel(t *testing.T) {
 		text   string
 		want   string
 	}{
-		{0, "", "info"},   // unspecified
+		{0, "", "info"}, // unspecified
 		{1, "", "trace"},
 		{5, "", "debug"},
 		{9, "", "info"},
