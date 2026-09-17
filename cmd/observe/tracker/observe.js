@@ -27,6 +27,12 @@
   var queue = [];
   var flushTimer = null;
   var FLUSH_INTERVAL = 500;
+  // Audit F32: the server rejects >100 events per batch request with a 400
+  // the tracker treated as delivered. Send in legal chunks, keep a failed
+  // chunk for the next flush (bounded, so an outage cannot grow memory
+  // forever), and never send keepalive bodies the browser will refuse.
+  var MAX_BATCH_EVENTS = 100;
+  var MAX_KEPT_ON_FAILURE = 500;
   var currentUrl = null;
   // Set by window.observe.identify(userId). Persisted across page loads
   // via localStorage so SPA navigations and reloads don't lose it.
@@ -59,34 +65,60 @@
     flushTimer = null;
     if (!queue.length) return;
 
-    var events = queue.splice(0);
-    var body = JSON.stringify({ events: events });
+    var batch = queue.splice(0, MAX_BATCH_EVENTS);
 
-    // sendBeacon cannot set request headers, so a keyed install sends the key
-    // via fetch with keepalive — same survives-unload guarantee — and falls
-    // back to XHR where fetch is unavailable.
-    if (!apiKey && navigator.sendBeacon) {
-      navigator.sendBeacon(endpoint, new Blob([body], { type: 'application/json' }));
-      return;
+    var sendChunk = function(events) {
+      var body = JSON.stringify({ events: events });
+
+      // sendBeacon cannot set request headers, so a keyed install sends the
+      // key via fetch with keepalive — same survives-unload guarantee — and
+      // falls back to XHR where fetch is unavailable. An unchecked beacon
+      // return used to count a refused queuing as delivered (audit F32);
+      // a false return now falls through to fetch.
+      if (!apiKey && navigator.sendBeacon) {
+        try {
+          if (navigator.sendBeacon(endpoint, new Blob([body], { type: 'application/json' }))) {
+            return;
+          }
+        } catch (e) { /* fall through to fetch */ }
+      }
+
+      if (typeof fetch === 'function') {
+        var headers = { 'Content-Type': 'application/json' };
+        if (apiKey) headers['X-API-Key'] = apiKey;
+        fetch(endpoint, {
+          method: 'POST',
+          headers: headers,
+          body: body,
+          keepalive: body.length <= 48 * 1024,
+          mode: 'cors',
+          credentials: 'omit'
+        }).then(function(res) {
+          if (!res.ok && queue.length < MAX_KEPT_ON_FAILURE) {
+            // Server rejected the chunk — retain for the next flush tick
+            // rather than silently erasing it. (Without producer-side
+            // idempotency a retried chunk may double-count; the server-side
+            // batch admission contract is tracked as audit F12 follow-up.)
+            queue = events.concat(queue);
+          }
+        }).catch(function() {
+          if (queue.length < MAX_KEPT_ON_FAILURE) queue = events.concat(queue);
+        });
+        return;
+      }
+
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', endpoint, true);
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      if (apiKey) xhr.setRequestHeader('X-API-Key', apiKey);
+      xhr.send(body);
+    };
+
+    // Chunk to the server's per-request event cap; one flush may need
+    // several requests when the queue grew past it.
+    for (var i = 0; i < batch.length; i += MAX_BATCH_EVENTS) {
+      sendChunk(batch.slice(i, i + MAX_BATCH_EVENTS));
     }
-
-    if (apiKey && typeof fetch === 'function') {
-      fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
-        body: body,
-        keepalive: true,
-        mode: 'cors',
-        credentials: 'omit'
-      }).catch(function() {});
-      return;
-    }
-
-    var xhr = new XMLHttpRequest();
-    xhr.open('POST', endpoint, true);
-    xhr.setRequestHeader('Content-Type', 'application/json');
-    if (apiKey) xhr.setRequestHeader('X-API-Key', apiKey);
-    xhr.send(body);
   }
 
   function trackPageview() {

@@ -248,53 +248,73 @@
   // sendBeacon, but supports headers. Only fall back to sendBeacon when no
   // key is configured, matching the original behavior for grace-period
   // (single-tenant, no-keys-yet) installs.
+  //
+  // Audit F32: keepalive is only set for small bodies (the browser fails
+  // any keepalive request over its 64 KiB in-flight budget, which large
+  // snapshots used to hit), beacon queuing refusals fall through to fetch,
+  // and fetch rejections are handled so they never surface as unhandled
+  // promise rejections.
   function send(url, payload) {
     var body = JSON.stringify(payload);
+    var small = body.length <= 48 * 1024;
     if (apiKey) {
-      try {
-        fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
-          body: body,
-          keepalive: true
-        });
-        return;
-      } catch (e) {
-        // fall through to the no-key paths below on very old browsers
-        // without fetch/keepalive support
+      if (typeof fetch === 'function') {
+        try {
+          fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+            body: body,
+            keepalive: small
+          }).catch(function() { /* best effort; replay batches are not idempotent */ });
+          return;
+        } catch (e) {
+          // fall through to the no-key paths below on very old browsers
+          // without fetch/keepalive support
+        }
       }
     }
     if (navigator.sendBeacon) {
-      navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }));
-    } else {
-      var xhr = new XMLHttpRequest();
-      xhr.open('POST', url, true);
-      xhr.setRequestHeader('Content-Type', 'application/json');
-      if (apiKey) xhr.setRequestHeader('X-API-Key', apiKey);
-      xhr.send(body);
+      try {
+        if (navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }))) {
+          return;
+        }
+      } catch (e) { /* fall through to XHR */ }
     }
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', url, true);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    if (apiKey) xhr.setRequestHeader('X-API-Key', apiKey);
+    xhr.send(body);
   }
 
   function flush() {
     if (events.length === 0) return;
-    var batch = events.splice(0);
+    // Audit F32: the ingest route caps request bodies at 2 MiB; a long
+    // session's batch (up to maxEvents records with DOM snapshots) could
+    // exceed it and be rejected whole. Flush in bounded chunks.
+    var MAX_FLUSH_EVENTS = 1000;
+    var batch = events.splice(0, MAX_FLUSH_EVENTS);
 
-    var payload = {
-      site_id: siteId,
-      session_id: sessionId,
-      replay_id: replayId,
-      url: location.href,
-      browser: navigator.userAgent.substring(0, 128),
-      os: '',
-      device: '',
-      has_error: hasError,
-      viewport_width: window.innerWidth || 0,
-      events: batch
+    var makePayload = function(chunk) {
+      var payload = {
+        site_id: siteId,
+        session_id: sessionId,
+        replay_id: replayId,
+        url: location.href,
+        browser: navigator.userAgent.substring(0, 128),
+        os: '',
+        device: '',
+        has_error: hasError,
+        viewport_width: window.innerWidth || 0,
+        events: chunk
+      };
+      var distinctId = readDistinctID();
+      if (distinctId) payload.distinct_id = distinctId;
+      return payload;
     };
-    var distinctId = readDistinctID();
-    if (distinctId) payload.distinct_id = distinctId;
 
-    send(endpoint, payload);
+    send(endpoint, makePayload(batch));
+    // Any remainder rides the regular interval tick set up in init().
   }
 
   // Read the distinct_id set by observe.js's identify(). Lives in

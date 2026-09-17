@@ -71,6 +71,16 @@ type Client struct {
 	metrics *metricsBuf
 	closed  chan struct{}
 	done    chan struct{}
+	// flushWake coalesces size-triggered log flushes onto the owned worker
+	// (audit F35: they used to run in untracked goroutines Close never
+	// waited for).
+	flushWake chan struct{}
+	closing   bool
+	// closeOnce + closeErr make Close safe under concurrent callers (audit
+	// F35: the select/default + close pair let two closers both take the
+	// default path and the second close panicked).
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Field represents a single key/value attribute on a log entry.
@@ -158,37 +168,37 @@ func New(opts Options) (*Client, error) {
 		opts.LogFlushInterval = 2 * time.Second
 	}
 	c := &Client{
-		opts:   opts,
-		http:   opts.HTTPClient,
-		closed: make(chan struct{}),
-		done:   make(chan struct{}),
+		opts:      opts,
+		http:      opts.HTTPClient,
+		closed:    make(chan struct{}),
+		done:      make(chan struct{}),
+		flushWake: make(chan struct{}, 1),
 	}
 	go c.loop()
 	return c, nil
 }
 
-// Close flushes any buffered logs and stops the background goroutine.
-// Safe to call multiple times.
+// Close flushes any buffered telemetry and stops the background goroutine.
+// Safe to call multiple times and from multiple goroutines: every caller
+// waits for the same single finalization and receives the same result
+// (audit F35 — the old select/default + close raced a double close panic,
+// and untracked flush goroutines could outlive Close's return).
 func (c *Client) Close() error {
-	select {
-	case <-c.closed:
-		return nil
-	default:
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closing = true // new admissions rejected from here on
+		c.mu.Unlock()
 		close(c.closed)
-	}
-	<-c.done
-	// Drain spans, metrics, then logs. Metrics share the same best-effort
-	// shutdown semantics as logs/spans (no retry on drop).
-	spanErr := c.flushSpans(context.Background())
-	metricErr := c.FlushMetrics(context.Background())
-	logErr := c.flushLogs(context.Background())
-	if spanErr != nil {
-		return spanErr
-	}
-	if metricErr != nil {
-		return metricErr
-	}
-	return logErr
+		<-c.done // includes ALL owned flush work, not only the ticker
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		c.closeErr = errors.Join(
+			c.flushSpans(ctx),
+			c.FlushMetrics(ctx),
+			c.flushLogs(ctx),
+		)
+	})
+	return c.closeErr
 }
 
 func (c *Client) loop() {
@@ -199,6 +209,12 @@ func (c *Client) loop() {
 		select {
 		case <-c.closed:
 			return
+		case <-c.flushWake:
+			// One bounded attempt per wakeup; a failing flush is retried
+			// by the ticker rather than a tight loop.
+			_ = c.flushLogs(context.Background())
+			_ = c.flushSpans(context.Background())
+			_ = c.FlushMetrics(context.Background())
 		case <-t.C:
 			_ = c.flushLogs(context.Background())
 			_ = c.flushSpans(context.Background())
@@ -255,17 +271,32 @@ func (c *Client) log(level, msg string, fields []Field) {
 		Attributes:  attrs,
 	}
 	c.mu.Lock()
+	if c.closing {
+		// Post-close admission used to enqueue work with no guaranteed
+		// consumer (audit F35) — refuse instead.
+		c.mu.Unlock()
+		return
+	}
 	c.logs = append(c.logs, entry)
 	full := len(c.logs) >= c.opts.LogBatchSize
 	c.mu.Unlock()
 	if full {
-		go func() { _ = c.flushLogs(context.Background()) }()
+		// Wake the owned worker; never spawn an untracked goroutine.
+		select {
+		case c.flushWake <- struct{}{}:
+		default:
+		}
 	}
 }
 
 // Flush immediately sends any buffered logs.
 func (c *Client) Flush(ctx context.Context) error { return c.flushLogs(ctx) }
 
+// serverLogBatchCap mirrors the server's /logs/batch limit.
+const serverLogBatchCap = 200
+
+// flushLogs sends buffered entries through the batch endpoint in bounded
+// chunks (audit F35: one HTTP request per log amplified shutdown latency).
 func (c *Client) flushLogs(ctx context.Context) error {
 	c.mu.Lock()
 	if len(c.logs) == 0 {
@@ -276,14 +307,22 @@ func (c *Client) flushLogs(ctx context.Context) error {
 	c.logs = nil
 	c.mu.Unlock()
 
-	// The ingest endpoint accepts a single log per request today. Send sequentially.
 	var firstErr error
-	for _, entry := range batch {
-		if err := c.post(ctx, "/api/v1/logs", entry); err != nil && firstErr == nil {
+	for start := 0; start < len(batch); start += serverLogBatchCap {
+		end := start + serverLogBatchCap
+		if end > len(batch) {
+			end = len(batch)
+		}
+		if err := c.post(ctx, "/api/v1/logs/batch", logBatchWire{Logs: batch[start:end]}); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	return firstErr
+}
+
+// logBatchWire is the /logs/batch request shape.
+type logBatchWire struct {
+	Logs []LogEntry `json:"logs"`
 }
 
 func (c *Client) post(ctx context.Context, path string, body any) error {

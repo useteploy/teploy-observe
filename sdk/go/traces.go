@@ -252,7 +252,7 @@ func buildOTLPRequest(serviceName, environment string, spans []pendingSpan) map[
 
 	return map[string]any{
 		"resourceSpans": []map[string]any{{
-			"resource":   map[string]any{"attributes": resourceAttrs},
+			"resource": map[string]any{"attributes": resourceAttrs},
 			"scopeSpans": []map[string]any{{
 				"scope": map[string]any{"name": "github.com/useteploy/teploy-observe/sdk/go", "version": "0.1.0"},
 				"spans": otlpSpans,

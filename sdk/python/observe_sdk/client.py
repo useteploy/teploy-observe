@@ -8,8 +8,10 @@ import os
 import threading
 import time
 import traceback
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Any, Dict, Iterator, List, Optional
 from urllib import request as urlrequest
 from urllib.error import URLError
 
@@ -27,11 +29,25 @@ class Options:
     timeout: float = 10.0
 
 
+# Server-side /logs/batch cap; entries beyond it are a 400.
+_MAX_LOG_BATCH = 200
+# Byte cap per serialized log entry, enforced at admission (audit F36): one
+# unserializable or huge entry used to abort the detached batch loop and
+# take every valid entry behind it down too.
+_MAX_ENTRY_BYTES = 64 * 1024
+
+
 class Client:
     """Submits events, errors, and logs to Observe.
 
     Use one Client per process. ``init()`` stores a module-level default so
     the convenience helpers (``info``, ``capture_exception``, etc.) can use it.
+
+    Identity is request-scoped (audit F34): a multi-user threaded or async
+    server that shared one mutable ``_distinct_id`` attributed one request's
+    errors/logs to whichever user happened to identify last. Use
+    ``bind_identity`` around each request; ``identify`` sets the identity for
+    the CURRENT context only.
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -41,10 +57,12 @@ class Client:
         self._lock = threading.Lock()
         self._buffer: List[Dict[str, Any]] = []
         self._stop = threading.Event()
-        # Set by identify(); included verbatim in subsequent payloads.
-        # The server hashes it with the per-site session_salt before
-        # storage, so the raw value never persists by default.
-        self._distinct_id: Optional[str] = None
+        # Context-local identity (audit F34): each thread/task sees its own
+        # value; unset reads are anonymous. Capture it into a payload BEFORE
+        # handing work to a background thread — ContextVar does not transfer.
+        self._identity: ContextVar[Optional[str]] = ContextVar(
+            f"observe_identity_{id(self)}", default=None
+        )
         self._thread = threading.Thread(
             target=self._loop, name="observe-flush", daemon=True
         )
@@ -52,29 +70,51 @@ class Client:
 
     # ── public API ────────────────────────────────────────────────────────
 
+    @contextmanager
+    def bind_identity(self, user_id: Optional[str]) -> Iterator[None]:
+        """Bind the identity for the current request/task context.
+
+        Use as a request middleware: ``with client.bind_identity(user.id):``
+        — everything logged inside is attributed to that user, and the
+        binding is reliably reset on exit even on exceptions.
+        """
+        token = self._identity.set(str(user_id) if user_id is not None else None)
+        try:
+            yield
+        finally:
+            self._identity.reset(token)
+
     def identify(self, user_id: str, traits: Optional[Dict[str, Any]] = None) -> None:
-        """Associate subsequent events / errors / logs with a user identifier.
+        """Associate subsequent events / errors / logs with a user identifier
+        IN THE CURRENT CONTEXT (audit F34).
 
         The server hashes ``user_id`` with the per-site ``session_salt`` so
         the raw value never lands in storage (unless the site has the
-        ``raw_distinct_id`` opt-in flag set).
-
-        ``traits`` are optional and reserved for the future persons UI; for
-        now they're attached to the one-shot ``$identify`` log line.
+        ``raw_distinct_id`` opt-in flag set). Emits a one-shot ``$identify``
+        ANALYTICS event whose only identity field is the top-level
+        ``distinct_id`` the server hashes (audit F33: the old marker was a
+        log line carrying a raw ``user_id`` attribute, and the ``distinct_id``
+        put on log payloads was silently ignored by the server).
         """
         if not user_id:
             return
-        self._distinct_id = str(user_id)
-        # Emit a one-shot log line so the server has an explicit identify
-        # marker, mirroring the browser SDK's $identify event.
-        attrs: Dict[str, Any] = {"user_id": self._distinct_id}
+        self._identity.set(str(user_id))
+        payload: Dict[str, Any] = {
+            "site_id": self.opts.site_id,
+            "event_type": "$identify",
+            "distinct_id": str(user_id),
+        }
         if traits:
-            attrs.update(traits)
-        self.log("info", "$identify", **attrs)
+            payload["properties"] = {
+                k: v
+                for k, v in traits.items()
+                if k not in {"user_id", "distinct_id", "email"}
+            }
+        self._post("/api/v1/events", payload)
 
     def reset(self) -> None:
-        """Clear the active distinct_id (e.g. on logout)."""
-        self._distinct_id = None
+        """Clear the active distinct_id for the current context (e.g. logout)."""
+        self._identity.set(None)
 
     def capture_exception(
         self,
@@ -85,6 +125,9 @@ class Client:
         span_id: Optional[str] = None,
     ) -> None:
         """Submit a single exception with stack trace. Sends immediately.
+
+        The identity is captured from the CURRENT context before the network
+        call so a concurrent reset/identify cannot mislabel it.
 
         ``trace_id``/``span_id`` attach the active trace context when the
         error was captured inside a traced operation, enabling exact
@@ -99,8 +142,9 @@ class Client:
             "level": "error",
             "stack_trace": _stack_frames(exc),
         }
-        if self._distinct_id:
-            payload["distinct_id"] = self._distinct_id
+        ident = self._identity.get()
+        if ident:
+            payload["distinct_id"] = ident
         if trace_id:
             payload["trace_id"] = trace_id
         if span_id:
@@ -115,8 +159,11 @@ class Client:
             "service_name": self.opts.service_name or "",
             "attributes": fields,
         }
-        if self._distinct_id:
-            entry["distinct_id"] = self._distinct_id
+        # Audit F36: validate serialization AT ADMISSION. json.dumps used to
+        # run inside the flush loop AFTER the buffer was detached, so one
+        # unsupported attribute type raised TypeError out of the loop and
+        # silently discarded every valid entry behind it.
+        encode_entry(entry)
         with self._lock:
             self._buffer.append(entry)
             full = len(self._buffer) >= self.opts.log_batch_size
@@ -130,21 +177,28 @@ class Client:
     def fatal(self, msg: str, **fields: Any) -> None: self.log("fatal", msg, **fields)
 
     def flush(self) -> None:
-        """Drain the log buffer synchronously."""
-        with self._lock:
-            if not self._buffer:
-                return
-            batch = self._buffer
-            self._buffer = []
-        for entry in batch:
-            self._post("/api/v1/logs", entry, silent=True)
+        """Drain the log buffer synchronously via the batch endpoint."""
+        while True:
+            with self._lock:
+                if not self._buffer:
+                    return
+                batch = self._buffer[:_MAX_LOG_BATCH]
+                del self._buffer[:_MAX_LOG_BATCH]
+            if batch:
+                self._post_batch("/api/v1/logs/batch", batch)
 
     def close(self) -> None:
-        """Stop the background flusher and drain pending logs."""
+        """Stop the background flusher and drain pending logs.
+
+        The join is bounded by the flush interval plus one request timeout
+        per remaining batch — a timed-out join still drains synchronously
+        afterwards, and any entry that cannot be sent raises instead of
+        being reported as success.
+        """
         if self._stop.is_set():
             return
         self._stop.set()
-        self._thread.join(timeout=self.opts.log_flush_interval + 1)
+        self._thread.join(timeout=self.opts.log_flush_interval + self.opts.timeout + 1.0)
         self.flush()
 
     # ── internal ──────────────────────────────────────────────────────────
@@ -171,6 +225,38 @@ class Client:
         except (URLError, TimeoutError) as exc:
             if not silent:
                 raise RuntimeError(f"observe: post {path} failed: {exc}") from exc
+
+    def _post_batch(self, path: str, entries: List[Dict[str, Any]]) -> None:
+        data = json.dumps({"logs": entries}).encode("utf-8")
+        url = self.opts.endpoint.rstrip("/") + path
+        headers = {"Content-Type": "application/json"}
+        if self.opts.api_key:
+            headers["X-API-Key"] = self.opts.api_key
+        req = urlrequest.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urlrequest.urlopen(req, timeout=self.opts.timeout) as resp:
+                if resp.status >= 400:
+                    raise RuntimeError(f"observe: {path} returned {resp.status}")
+        except (URLError, TimeoutError) as exc:
+            raise RuntimeError(f"observe: post {path} failed: {exc}") from exc
+
+
+def encode_entry(entry: Dict[str, Any]) -> bytes:
+    """Serialize one log entry at admission, rejecting what cannot go over
+    the wire rather than letting it abort a later detached batch (audit F36).
+    NaN/Infinity are rejected too: they are not valid JSON."""
+    try:
+        raw = json.dumps(entry, allow_nan=False, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "observe: log entry is not JSON-serializable (attributes must be "
+            "JSON types, not NaN/Infinity or arbitrary objects)"
+        ) from exc
+    if len(raw) > _MAX_ENTRY_BYTES:
+        raise ValueError(
+            f"observe: log entry exceeds {_MAX_ENTRY_BYTES} bytes after serialization"
+        )
+    return raw
 
 
 # ── module-level default client ────────────────────────────────────────────

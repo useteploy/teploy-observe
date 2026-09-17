@@ -71,8 +71,10 @@ def test_log_batching_flushes_on_close(server):
         client.info("hello", i=i)
     client.close()
 
-    log_posts = [p for p in posts if p[0] == "/api/v1/logs"]
-    assert len(log_posts) == 5
+    # One batch request carries all five entries (audit F36: batching).
+    batch_posts = [p for p in posts if p[0] == "/api/v1/logs/batch"]
+    assert len(batch_posts) == 1
+    assert len(batch_posts[0][1]["logs"]) == 5
 
 
 def test_auto_flush_at_batch_size(server):
@@ -86,6 +88,66 @@ def test_auto_flush_at_batch_size(server):
         client.warn("warn", n=i)
     # Flush is synchronous when the buffer fills.
     time.sleep(0.1)
-    log_posts = [p for p in posts if p[0] == "/api/v1/logs"]
-    assert len(log_posts) == 3
+    batch_posts = [p for p in posts if p[0] == "/api/v1/logs/batch"]
+    assert sum(len(p[1]["logs"]) for p in batch_posts) == 3
     client.close()
+
+
+# Audit F36: an unserializable attribute used to raise inside the detached
+# flush loop AFTER the buffer was detached, silently discarding the valid
+# entries behind it. Admission-time validation rejects just the bad entry.
+def test_unserializable_entry_rejected_at_admission(server):
+    endpoint, posts = server
+    client = observe_sdk.Client(
+        endpoint=endpoint, log_batch_size=100, log_flush_interval=3600.0
+    )
+    with pytest.raises(ValueError):
+        client.info("bad", blob=object())
+    client.info("good")
+    client.close()
+    batch_posts = [p for p in posts if p[0] == "/api/v1/logs/batch"]
+    assert sum(len(p[1]["logs"]) for p in batch_posts) == 1
+
+
+# Audit F34: shared mutable identity attributed one request's telemetry to
+# whichever user identified last. bind_identity scopes it per context.
+def test_identity_is_context_scoped(server):
+    endpoint, posts = server
+    client = observe_sdk.Client(
+        endpoint=endpoint, log_flush_interval=3600.0
+    )
+    import asyncio
+
+    async def user(name: str) -> None:
+        with client.bind_identity(name):
+            await asyncio.sleep(0.02)
+            client.capture_exception(RuntimeError(f"err-{name}"))
+
+    async def main() -> None:
+        await asyncio.gather(user("alice"), user("bob"))
+
+    asyncio.run(main())
+    error_posts = [p for p in posts if p[0] == "/api/v1/errors"]
+    idents = sorted(p[1]["distinct_id"] for p in error_posts)
+    assert idents == ["alice", "bob"]
+    # Anonymous afterwards.
+    client.capture_exception(RuntimeError("anon"))
+    error_posts = [p for p in posts if p[0] == "/api/v1/errors"]
+    assert error_posts[-1][1].get("distinct_id", "") == ""
+    client.close()
+
+
+# Audit F33: identify emits an analytics $identify event whose ONLY identity
+# field is the hashed-on-the-server top-level distinct_id — no raw user_id
+# attribute, and no silently-ignored distinct_id on log payloads.
+def test_identify_sends_analytics_event_without_raw_traits(server):
+    endpoint, posts = server
+    client = observe_sdk.Client(endpoint=endpoint, log_flush_interval=3600.0)
+    client.identify("u-1", {"plan": "pro", "user_id": "u-1", "email": "a@b.c"})
+    client.close()
+    ident_posts = [p for p in posts if p[0] == "/api/v1/events"]
+    assert len(ident_posts) == 1
+    body = ident_posts[0][1]
+    assert body["event_type"] == "$identify"
+    assert body["distinct_id"] == "u-1"
+    assert body["properties"] == {"plan": "pro"}

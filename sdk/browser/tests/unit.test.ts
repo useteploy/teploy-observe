@@ -110,18 +110,67 @@ test("pageview carries an explicit pathname as a property", async () => {
   assert.deepEqual(e.properties, { pathname: "/checkout/step-2" });
 });
 
-test("identify sends traits as properties and stamps distinct_id", async () => {
+test("identify stamps distinct_id without duplicating the raw id into properties", async () => {
   identify("u_123", { plan: "pro" });
   const e = await sentEvent();
 
   assert.equal(e.event_type, "$identify");
   assert.equal(e.distinct_id, "u_123");
-  assert.deepEqual(e.properties, { user_id: "u_123", plan: "pro" });
+  // Audit F33: the raw id travels ONLY in the top-level field the server
+  // hashes; identity-shaped trait keys never reach stored properties.
+  assert.deepEqual(e.properties, { plan: "pro" });
 
   // Subsequent events carry the distinct_id too.
   track("checkout");
   const next = await sentEvent();
   assert.equal(next.distinct_id, "u_123");
+});
+
+test("identify filters identity-shaped trait keys", async () => {
+  identify("u_123", { user_id: "u_123", distinct_id: "u_123", email: "a@b.c", plan: "pro" });
+  const e = await sentEvent();
+  assert.deepEqual(e.properties, { plan: "pro" });
+});
+
+// Audit F29: analytics flush used to omit the configured API key, so keyed
+// installs 401'd on the batch endpoint even though error/log sends worked.
+test("flush sends the configured API key on the events batch", async () => {
+  init({ endpoint: "https://observe.example.com", siteId: "s1", apiKey: "obs_test_key" });
+  let sawHeader: string | undefined;
+  (globalThis as any).fetch = (url: string, opts: any) => {
+    sawHeader = opts.headers["X-API-Key"];
+    sent.push({ url, body: JSON.parse(opts.body) });
+    return Promise.resolve({ ok: true });
+  };
+  track("evt");
+  await flush();
+  assert.equal(sawHeader, "obs_test_key");
+  assert.equal(sent.length, 1);
+});
+
+// Audit F30: the old stack regex excluded ':' from the filename group, so
+// ordinary https:// frames never matched and web errors lost their stacks.
+test("stack parser accepts URL, port, and file frames", async () => {
+  const stack = [
+    "Error: boom",
+    "    at checkout (https://shop.example/app.js:42:7)",
+    "    at https://shop.example:8443/app.js:43:9",
+    "    at checkout (C:\\app\\main.js:44:11)",
+    "checkout@https://shop.example/app.js:45:13",
+  ].join("\n");
+  const fabricated = new Error("boom");
+  fabricated.stack = stack;
+  const { captureException } = await import("../src/index.js");
+  await captureException(fabricated, { release: "v1" });
+  // captureException sends immediately; inspect the last sent payload.
+  const errPayload = sent[sent.length - 1].body;
+  assert.ok(errPayload.stack_trace.length >= 4, `expected >=4 frames, got ${errPayload.stack_trace.length}`);
+  const [f1, f2, f3, f4] = errPayload.stack_trace;
+  assert.equal(f1.filename, "https://shop.example/app.js");
+  assert.equal(f1.lineno, 42);
+  assert.equal(f2.filename, "https://shop.example:8443/app.js");
+  assert.equal(f3.filename, "C:\\app\\main.js");
+  assert.equal(f4.function, "checkout");
 });
 
 test("properties are capped at the server limit of 50", async () => {
