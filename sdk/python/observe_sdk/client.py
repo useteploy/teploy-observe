@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import math
 import os
 import threading
 import time
@@ -35,6 +36,30 @@ _MAX_LOG_BATCH = 200
 # unserializable or huge entry used to abort the detached batch loop and
 # take every valid entry behind it down too.
 _MAX_ENTRY_BYTES = 64 * 1024
+# AUD-026/AUD-035 (round 2): pack request bodies by ENCODED BYTES, not
+# entry count — 200 near-64-KiB entries exceeded the route's 2 MiB cap and
+# the whole batch was rejected. 1 MiB leaves envelope headroom.
+_MAX_BATCH_BYTES = 1024 * 1024
+# AUD-035: bound total queued bytes so a stalled endpoint cannot grow the
+# queue without limit while the worker is blocked.
+_MAX_QUEUE_BYTES = 8 * 1024 * 1024
+
+
+def _validate_options(opts: "Options") -> None:
+    """AUD-037 (round 2): reject configuration that would spin the worker
+    (zero/negative interval), hang requests (non-finite timeout), or break
+    batching — BEFORE the thread starts, not at first failure."""
+    if type(opts.log_batch_size) is not int or not 1 <= opts.log_batch_size <= _MAX_LOG_BATCH:
+        raise ValueError(f"log_batch_size must be an integer in [1, {_MAX_LOG_BATCH}]")
+    for name, value, lower, upper in (
+        # The interval's upper bound is generous: tests and batch-only
+        # deployments pass 3600 to effectively disable the background loop.
+        ("log_flush_interval", opts.log_flush_interval, 0.05, 3600.0),
+        ("timeout", opts.timeout, 0.1, 60.0),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(value) or not lower <= value <= upper:
+            raise ValueError(f"{name} must be a finite number in [{lower}, {upper}]")
 
 
 class Client:
@@ -54,9 +79,21 @@ class Client:
         if not kwargs.get("endpoint"):
             raise ValueError("observe_sdk: endpoint is required")
         self.opts = Options(**kwargs)
+        _validate_options(self.opts)
         self._lock = threading.Lock()
-        self._buffer: List[Dict[str, Any]] = []
+        # AUD-036 (round 2): the queue holds the bytes encoded AT ADMISSION.
+        # Queueing the original dict let callers mutate nested fields after
+        # log() returned, silently changing (or poisoning) the eventual body.
+        self._buffer: List[bytes] = []
+        self._buffer_bytes = 0
+        self._flush_lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._state = "open"  # open | closing | closed (AUD-037)
         self._stop = threading.Event()
+        self._last_error: Optional[BaseException] = None
+        # Optional non-throwing diagnostics hook for background failures
+        # (AUD-035): `_loop` used to swallow every exception.
+        self.on_error: Optional[Any] = None
         # Context-local identity (audit F34): each thread/task sees its own
         # value; unset reads are anonymous. Capture it into a payload BEFORE
         # handing work to a background thread — ContextVar does not transfer.
@@ -159,13 +196,22 @@ class Client:
             "service_name": self.opts.service_name or "",
             "attributes": fields,
         }
-        # Audit F36: validate serialization AT ADMISSION. json.dumps used to
-        # run inside the flush loop AFTER the buffer was detached, so one
-        # unsupported attribute type raised TypeError out of the loop and
-        # silently discarded every valid entry behind it.
-        encode_entry(entry)
+        # AUD-036 (round 2): validate serialization AT ADMISSION and queue
+        # the OWNED bytes — json.dumps used to run inside the flush loop
+        # AFTER the buffer was detached, so one unsupported attribute type
+        # raised TypeError out of the loop and silently discarded every
+        # valid entry behind it; worse, the original dict stayed mutable by
+        # the caller.
+        raw = encode_entry(entry)
         with self._lock:
-            self._buffer.append(entry)
+            if self._state != "open":
+                # AUD-037: no admission once closing starts — a queued
+                # entry with no consumer is a silent loss.
+                raise RuntimeError("observe_sdk: client is closing or closed")
+            if self._buffer_bytes + len(raw) > _MAX_QUEUE_BYTES:
+                raise BufferError("observe_sdk: log queue byte limit reached")
+            self._buffer.append(raw)
+            self._buffer_bytes += len(raw)
             full = len(self._buffer) >= self.opts.log_batch_size
         if full:
             self.flush()
@@ -177,29 +223,73 @@ class Client:
     def fatal(self, msg: str, **fields: Any) -> None: self.log("fatal", msg, **fields)
 
     def flush(self) -> None:
-        """Drain the log buffer synchronously via the batch endpoint."""
-        while True:
+        """Drain the log buffer synchronously via the batch endpoint.
+
+        AUD-035 (round 2): one flush owner; a batch is removed from the
+        queue only once its request succeeded. A failed post leaves the
+        entries queued, updates ``last_error``, notifies ``on_error``, and
+        re-raises — a caller (or ``close``) can observe the failure instead
+        of a silent loss.
+        """
+        with self._flush_lock:
             with self._lock:
-                if not self._buffer:
-                    return
-                batch = self._buffer[:_MAX_LOG_BATCH]
-                del self._buffer[:_MAX_LOG_BATCH]
-            if batch:
-                self._post_batch("/api/v1/logs/batch", batch)
+                remaining = len(self._buffer)  # fixed watermark, not a live drain
+            while remaining:
+                with self._lock:
+                    chosen: List[bytes] = []
+                    size = len(b'{"logs":[]}')
+                    for raw in self._buffer[: min(remaining, _MAX_LOG_BATCH)]:
+                        extra = len(raw) + (1 if chosen else 0)
+                        if size + extra > _MAX_BATCH_BYTES and chosen:
+                            break
+                        chosen.append(raw)
+                        size += extra
+                if not chosen:
+                    raise ValueError(
+                        "observe_sdk: single log entry exceeds the request byte budget"
+                    )
+                body = b'{"logs":[' + b",".join(chosen) + b']}'
+                try:
+                    self._post_bytes("/api/v1/logs/batch", body)
+                except Exception as exc:  # noqa: BLE001 - surfaced + re-raised
+                    self._last_error = exc
+                    if self.on_error is not None:
+                        try:
+                            self.on_error(exc)
+                        except Exception:  # noqa: BLE001 - hook must not break flush
+                            pass
+                    raise
+                with self._lock:
+                    del self._buffer[: len(chosen)]
+                    self._buffer_bytes -= sum(len(c) for c in chosen)
+                remaining -= len(chosen)
+            self._last_error = None
 
     def close(self) -> None:
         """Stop the background flusher and drain pending logs.
 
-        The join is bounded by the flush interval plus one request timeout
-        per remaining batch — a timed-out join still drains synchronously
-        afterwards, and any entry that cannot be sent raises instead of
-        being reported as success.
+        AUD-037 (round 2): open -> closing -> closed with an explicit
+        failure state. A timed-out join raises TimeoutError (close is
+        incomplete, retryable) instead of returning success; a failed drain
+        raises and leaves the client in ``closing`` so a later close can
+        retry; ``log()`` refuses admission once closing starts.
         """
-        if self._stop.is_set():
-            return
-        self._stop.set()
-        self._thread.join(timeout=self.opts.log_flush_interval + self.opts.timeout + 1.0)
-        self.flush()
+        with self._close_lock:
+            with self._lock:
+                if self._state == "closed":
+                    return
+                self._state = "closing"
+            self._stop.set()
+            self._thread.join(
+                timeout=self.opts.log_flush_interval + self.opts.timeout + 1.0
+            )
+            if self._thread.is_alive():
+                raise TimeoutError(
+                    "observe_sdk: flush worker has not stopped; close is incomplete"
+                )
+            self.flush()  # may raise; state stays "closing" for a retry
+            with self._lock:
+                self._state = "closed"
 
     # ── internal ──────────────────────────────────────────────────────────
 
@@ -207,13 +297,25 @@ class Client:
         while not self._stop.wait(self.opts.log_flush_interval):
             try:
                 self.flush()
-            except Exception:
-                # Never let the flush thread die.
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # AUD-035: the background loop REPORTS failures instead of
+                # `except: pass` — a lost batch was indistinguishable from
+                # a successful one at close time.
+                self._last_error = exc
+                if self.on_error is not None:
+                    try:
+                        self.on_error(exc)
+                    except Exception:  # noqa: BLE001
+                        pass
 
     def _post(self, path: str, body: Dict[str, Any], *, silent: bool = False) -> None:
         url = self.opts.endpoint.rstrip("/") + path
         data = json.dumps(body).encode("utf-8")
+        self._post_bytes(path, data, url=url, silent=silent)
+
+    def _post_bytes(self, path: str, data: bytes, *, url: Optional[str] = None, silent: bool = False) -> None:
+        if url is None:
+            url = self.opts.endpoint.rstrip("/") + path
         headers = {"Content-Type": "application/json"}
         if self.opts.api_key:
             headers["X-API-Key"] = self.opts.api_key
@@ -225,20 +327,6 @@ class Client:
         except (URLError, TimeoutError) as exc:
             if not silent:
                 raise RuntimeError(f"observe: post {path} failed: {exc}") from exc
-
-    def _post_batch(self, path: str, entries: List[Dict[str, Any]]) -> None:
-        data = json.dumps({"logs": entries}).encode("utf-8")
-        url = self.opts.endpoint.rstrip("/") + path
-        headers = {"Content-Type": "application/json"}
-        if self.opts.api_key:
-            headers["X-API-Key"] = self.opts.api_key
-        req = urlrequest.Request(url, data=data, headers=headers, method="POST")
-        try:
-            with urlrequest.urlopen(req, timeout=self.opts.timeout) as resp:
-                if resp.status >= 400:
-                    raise RuntimeError(f"observe: {path} returned {resp.status}")
-        except (URLError, TimeoutError) as exc:
-            raise RuntimeError(f"observe: post {path} failed: {exc}") from exc
 
 
 def encode_entry(entry: Dict[str, Any]) -> bytes:

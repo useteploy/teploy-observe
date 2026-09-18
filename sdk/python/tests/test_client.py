@@ -151,3 +151,93 @@ def test_identify_sends_analytics_event_without_raw_traits(server):
     assert body["event_type"] == "$identify"
     assert body["distinct_id"] == "u-1"
     assert body["properties"] == {"plan": "pro"}
+
+
+# AUD-035 (round 2): a failed batch post leaves the entries queued.
+def test_failed_flush_retains_queue(server):
+    endpoint, posts = server
+    client = observe_sdk.Client(
+        endpoint=endpoint, log_batch_size=100, log_flush_interval=3600.0
+    )
+    errors = []
+    client.on_error = lambda exc: errors.append(exc)
+    # Point the client at a dead port by closing the real server first.
+    client.info("doomed")
+    # Simulate failure by monkeypatching _post_bytes.
+    def boom(path, data, **kw):
+        raise RuntimeError("observe: post failed: connection refused")
+    orig = client._post_bytes
+    client._post_bytes = boom
+    with pytest.raises(RuntimeError):
+        client.flush()
+    client._post_bytes = orig
+    assert len(client._buffer) == 1, "failed batch must remain queued"
+    client.flush()
+    assert len(client._buffer) == 0
+    batch_posts = [p for p in posts if p[0] == "/api/v1/logs/batch"]
+    assert sum(len(p[1]["logs"]) for p in batch_posts) == 1
+    client.close()
+
+
+# AUD-036 (round 2): entries are frozen at admission — caller mutation
+# after log() cannot change the delivered body.
+def test_queued_entries_are_immutable_snapshots(server):
+    endpoint, posts = server
+    client = observe_sdk.Client(
+        endpoint=endpoint, log_batch_size=100, log_flush_interval=3600.0
+    )
+    attrs = {"k": "original"}
+    client.info("m", attrs=attrs)
+    attrs["k"] = "mutated"
+    client.flush()
+    batch_posts = [p for p in posts if p[0] == "/api/v1/logs/batch"]
+    assert batch_posts[0][1]["logs"][0]["attributes"]["attrs"]["k"] == "original"
+    client.close()
+
+
+# AUD-037 (round 2): invalid options are rejected before the thread starts.
+def test_invalid_options_rejected():
+    for kwargs in (
+        {"log_flush_interval": 0},
+        {"log_flush_interval": float("nan")},
+        {"log_flush_interval": float("inf")},
+        {"timeout": 0},
+        {"log_batch_size": 0},
+        {"log_batch_size": 500},
+    ):
+        try:
+            observe_sdk.Client(
+                endpoint="http://127.0.0.1:1", **kwargs
+            )
+        except ValueError:
+            continue
+        pytest.fail(f"{kwargs} must be rejected at construction")
+
+
+# AUD-037: log() after close refuses admission instead of queueing for a
+# dead worker.
+def test_log_after_close_raises(server):
+    endpoint, _ = server
+    client = observe_sdk.Client(
+        endpoint=endpoint, log_flush_interval=3600.0
+    )
+    client.close()
+    with pytest.raises(RuntimeError):
+        client.info("late")
+
+
+# AUD-026 (round 2): batches pack by encoded bytes, not entry count.
+def test_batch_respects_byte_budget(server):
+    endpoint, posts = server
+    client = observe_sdk.Client(
+        endpoint=endpoint, log_batch_size=200, log_flush_interval=3600.0
+    )
+    blob = "x" * (30 * 1024)  # ~30 KiB per entry; 40 of them exceed 1 MiB
+    for i in range(40):
+        client.warn("big", blob=blob)
+    client.flush()
+    batch_posts = [p for p in posts if p[0] == "/api/v1/logs/batch"]
+    assert len(batch_posts) >= 2, "byte budget must split the batch into multiple requests"
+    for path, body, _ in batch_posts:
+        assert len(json.dumps(body)) < 2 * 1024 * 1024
+    client.close()
