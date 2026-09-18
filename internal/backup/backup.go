@@ -140,6 +140,16 @@ type Manifest struct {
 	Version   int       `json:"version"`
 	CreatedAt time.Time `json:"created_at"`
 	Tables    []string  `json:"tables"`
+	// KVSections names the KV namespaces the archive additionally carries
+	// (F45); absent in pre-KV archives, which restore accepts as simply
+	// having no KV section.
+	KVSections []string `json:"kv_sections,omitempty"`
+	// Lease records whether the dump ran inside a snapshot lease (one
+	// point-in-time moment across every table; the KV srcmap section
+	// carries its own convergence proof — see kvsrcmap.go). Nil on
+	// archives from engines predating the lease, whose dumps are
+	// independent per-table reads — the downgrade is stated, not hidden.
+	Lease *LeaseInfo `json:"lease,omitempty"`
 }
 
 // TableResult records the outcome of dumping one table, written to a trailing
@@ -197,10 +207,41 @@ func dumpTar(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io.Wri
 	// partial dump detectable.
 	defer func() { retErr = errors.Join(retErr, tw.Close()) }()
 
+	// F45: the whole dump reads through one lease-holding transaction, so
+	// every table is captured at ONE moment and related tables cannot
+	// diverge mid-dump (other sessions' SQL writes wait at the engine's
+	// gate until the lease releases at this tx's rollback). The KV srcmap
+	// section rides the same runner but cannot inherit the moment — the
+	// engine's lease gate does not cover KV scalar writes — so it carries
+	// its own convergence proof (kvsrcmap.go). Engines predating the lease
+	// fall back to the historical pool reads with the downgrade recorded
+	// in the manifest and warned here.
+	runner := pgxRunner(db.Pool())
+	var lease *leaseState
+	leaseInfo := LeaseInfo{TimeoutMillis: 0}
+	tx, err := db.Pool().Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin dump transaction: %w", err)
+	}
+	lease, err = acquireDumpLease(ctx, tx, leaseTimeoutMillis(), errLog)
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		return err
+	}
+	if lease != nil {
+		runner = tx
+		leaseInfo = LeaseInfo{Held: true, TimeoutMillis: lease.timeoutMillis}
+		defer func() { _ = tx.Rollback(ctx) }() // releases the lease
+	} else {
+		_ = tx.Rollback(ctx)
+	}
+
 	manifest := Manifest{
-		Version:   manifestVersion,
-		CreatedAt: time.Now().UTC(),
-		Tables:    Tables,
+		Version:    manifestVersion,
+		CreatedAt:  time.Now().UTC(),
+		Tables:     Tables,
+		KVSections: []string{kvSrcmapSection},
+		Lease:      &leaseInfo,
 	}
 	raw, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -216,9 +257,9 @@ func dumpTar(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io.Wri
 	// table is OMITTED (not written as an empty .jsonl that masquerades as a
 	// complete, empty table).
 	var firstErr error
-	results := make([]TableResult, 0, len(Tables))
+	results := make([]TableResult, 0, len(Tables)+1)
 	for _, table := range Tables {
-		rows, err := dumpTable(ctx, db, tw, table)
+		rows, err := dumpTable(ctx, runner, tw, table)
 		if err != nil {
 			fmt.Fprintf(errLog, "backup: table %s: %v\n", table, err)
 			results = append(results, TableResult{Table: table, OK: false, Error: err.Error()})
@@ -229,6 +270,30 @@ func dumpTar(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io.Wri
 		}
 		results = append(results, TableResult{Table: table, Rows: rows, OK: true})
 	}
+
+	// F45 app half: the KV srcmap domain rides in the same archive, the
+	// same results machinery vouching for its completeness.
+	kvRows, err := dumpKVSrcmap(ctx, runner, tw)
+	if err != nil {
+		fmt.Fprintf(errLog, "backup: kv srcmap: %v\n", err)
+		results = append(results, TableResult{Table: kvSrcmapResultTable, OK: false, Error: err.Error()})
+		if firstErr == nil {
+			firstErr = fmt.Errorf("kv srcmap: %w", err)
+		}
+	} else {
+		results = append(results, TableResult{Table: kvSrcmapResultTable, Rows: kvRows, OK: true})
+	}
+
+	// The consistency claim on the manifest ("lease.held") is only honest
+	// if every read happened inside the window; expiry means blocked
+	// writers woke mid-dump, so fail instead of labeling a mixed-moment
+	// archive as one moment. A failed dump here leaves no results entry,
+	// which restore rejects (F44).
+	if err := checkLeaseWindow(lease); err != nil {
+		fmt.Fprintf(errLog, "backup: %v\n", err)
+		return err
+	}
+
 	// Audit F43: the completion record is load-bearing (restore rejects
 	// archives without it since F44) — a failure to marshal or write it
 	// must fail the backup, not vanish behind the per-table errors.
@@ -249,7 +314,7 @@ func dumpTar(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io.Wri
 // was accumulated in one growing []byte before the tar entry was written
 // (writeEntry needs the total size upfront, which the tar format requires
 // declared in the header before any data bytes).
-func dumpTable(ctx context.Context, db *nucleus.Client, tw *tar.Writer, table string) (int64, error) {
+func dumpTable(ctx context.Context, r pgxRunner, tw *tar.Writer, table string) (int64, error) {
 	// Nucleus ships everything as text via SimpleProtocol. Read raw bytes so
 	// we sidestep pgx's built-in type decoding (which chokes on Nucleus's
 	// JSONB representation). Rows are serialized as {column: "textvalue"|null}.
@@ -259,11 +324,11 @@ func dumpTable(ctx context.Context, db *nucleus.Client, tw *tar.Writer, table st
 	// carried (and a restore recreated) the same duplicate rows the read path
 	// now has to work around — a soft-deleted webhook came back alive if an
 	// older enabled='true' version happened to be re-read first.
-	sel, err := latestSelect(ctx, db, table)
+	sel, err := latestSelect(ctx, r, table)
 	if err != nil {
 		return 0, err
 	}
-	rows, err := db.Pool().Query(ctx, sel, pgx.QueryExecModeSimpleProtocol)
+	rows, err := r.Query(ctx, sel, pgx.QueryExecModeSimpleProtocol)
 	if err != nil {
 		if strings.Contains(err.Error(), "does not exist") || strings.Contains(err.Error(), "unknown table") {
 			return 0, nil
@@ -366,12 +431,12 @@ func writeEntry(tw *tar.Writer, name string, data []byte) error {
 // returns nothing — the table does not exist on this instance, or carries no
 // `version` column — the plain `SELECT *` is used and dumpTable's existing
 // missing-table handling applies.
-func latestSelect(ctx context.Context, db *nucleus.Client, table string) (string, error) {
+func latestSelect(ctx context.Context, r pgxRunner, table string) (string, error) {
 	keys := query.Keys(table)
 	if len(keys) == 0 {
 		return "SELECT * FROM " + table, nil
 	}
-	cols, err := tableColumns(ctx, db, table)
+	cols, err := tableColumns(ctx, r, table)
 	if err != nil || len(cols) == 0 {
 		// Not a hard failure: fall back to the uncollapsed dump rather than
 		// lose the table from the archive.
@@ -414,22 +479,26 @@ func contains(list []string, want string) bool {
 	return false
 }
 
-type columnRow struct {
-	ColumnName string `db:"column_name"`
-}
-
-func tableColumns(ctx context.Context, db *nucleus.Client, table string) ([]string, error) {
-	rows, err := nucleus.Query[columnRow](ctx, db.SQL(),
+func tableColumns(ctx context.Context, r pgxRunner, table string) ([]string, error) {
+	// information_schema is read through the dump's runner (the lease's
+	// point-in-time view) with the same raw SimpleProtocol posture as the
+	// table dumps — one scan loop, no SDK model needed on a pgx.Tx.
+	rows, err := r.Query(ctx,
 		`SELECT column_name FROM information_schema.columns WHERE table_name = $1`,
-		table)
+		pgx.QueryExecModeSimpleProtocol, table)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(rows))
-	for _, r := range rows {
-		if r.ColumnName != "" {
-			out = append(out, r.ColumnName)
+	defer rows.Close()
+	out := make([]string, 0, 8)
+	for rows.Next() {
+		var name *string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		if name != nil && *name != "" {
+			out = append(out, *name)
 		}
 	}
-	return out, nil
+	return out, rows.Err()
 }

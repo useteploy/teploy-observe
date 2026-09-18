@@ -84,25 +84,32 @@ func RestoreWithKey(ctx context.Context, db *nucleus.Client, r io.Reader, key []
 	}
 	defer os.Remove(spoolPath)
 
-	if err := validateArchive(spoolPath); err != nil {
+	manifest, err := validateArchive(spoolPath)
+	if err != nil {
 		return fmt.Errorf("archive rejected — nothing was written to the database: %w", err)
 	}
 	// AUD-044 (round 2): restore APPENDS. Applied over a populated target it
 	// mixes old and new state and duplicates append-only data, and a rerun
 	// after a partial apply doubles everything again. Refuse any nonempty
 	// restore table up front — restore into a fresh/isolated database (the
-	// documented safe procedure), verify, then cut over.
-	if err := requireEmptyRestoreTarget(ctx, db); err != nil {
+	// documented safe procedure), verify, then cut over. The KV namespace
+	// emptiness requirement applies only when the archive carries a KV
+	// section: a pre-F45 archive restores tables only and must keep
+	// working against an instance that legitimately holds source maps.
+	if err := requireEmptyRestoreTarget(ctx, db, len(manifest.KVSections) > 0); err != nil {
 		return fmt.Errorf("restore target is not empty — nothing was written: %w", err)
 	}
 	return applyArchive(ctx, db, spoolPath)
 }
 
 // requireEmptyRestoreTarget fails when any restorable table already holds
-// rows (AUD-044). A count check races concurrent writers; restore is an
-// offline operation run against a quiesced instance, which the emptiness
+// rows, or — for archives that carry KV sections — when the KV srcmap
+// namespace is nonempty (AUD-044 + F45: the KV section appends like the
+// tables do, so a populated namespace would mix old and restored source
+// maps). A count check races concurrent writers; restore is an offline
+// operation run against a quiesced instance, which the emptiness
 // requirement now makes explicit rather than accidental.
-func requireEmptyRestoreTarget(ctx context.Context, db *nucleus.Client) error {
+func requireEmptyRestoreTarget(ctx context.Context, db *nucleus.Client, kvSections bool) error {
 	for _, table := range Tables {
 		rows, err := nucleus.Query[struct {
 			N int64 `db:"n"`
@@ -117,6 +124,21 @@ func requireEmptyRestoreTarget(ctx context.Context, db *nucleus.Client) error {
 		if len(rows) > 0 && rows[0].N > 0 {
 			return fmt.Errorf("table %s holds %d rows — restore appends and must run against an empty (isolated) target", table, rows[0].N)
 		}
+	}
+	if !kvSections {
+		return nil
+	}
+	// KV_KEYS cannot see collection keys (upstream; see kvsrcmap.go), so
+	// this check covers the string blobs and — via the dump's own
+	// site-derivation shape — any site that still has blobs. Orphaned
+	// set/zset indexes without blobs are invisible to it; the upstream
+	// KV_KEYS fix closes that.
+	keys, err := kvListKeys(ctx, db.Pool(), kvSrcmapPattern)
+	if err != nil {
+		return fmt.Errorf("inspect kv target: %w", err)
+	}
+	if len(keys) > 0 {
+		return fmt.Errorf("kv namespace %s holds %d key(s) — restore appends and must run against an empty (isolated) target", kvSrcmapPattern, len(keys))
 	}
 	return nil
 }
@@ -151,11 +173,13 @@ func spoolToTemp(r io.Reader) (path string, err error) {
 // every observed table declared in the manifest, and every table the results
 // claim to have dumped with rows actually present with exactly that many
 // rows. A manifest-only or boundary-truncated archive therefore fails
-// preflight instead of restoring as a silent partial.
-func validateArchive(path string) error {
+// preflight instead of restoring as a silent partial. Returns the validated
+// manifest so the caller can gate target requirements on what the archive
+// actually carries.
+func validateArchive(path string) (*Manifest, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer f.Close()
 
@@ -165,6 +189,8 @@ func validateArchive(path string) error {
 	manifestCount, resultsCount := 0, 0
 	observed := map[string]int64{}
 	declared := map[string]bool{}
+	kvDeclared := map[string]bool{}
+	kvObserved := map[string]int64{}
 
 	for {
 		hdr, err := tr.Next()
@@ -172,78 +198,107 @@ func validateArchive(path string) error {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("tar next: %w", err)
+			return nil, fmt.Errorf("tar next: %w", err)
 		}
 		switch {
 		case hdr.Name == manifestName:
 			manifestCount++
 			if manifestCount > 1 {
-				return fmt.Errorf("archive contains more than one manifest")
+				return nil, fmt.Errorf("archive contains more than one manifest")
 			}
 			var m Manifest
 			if err := json.NewDecoder(tr).Decode(&m); err != nil {
-				return fmt.Errorf("manifest decode: %w", err)
+				return nil, fmt.Errorf("manifest decode: %w", err)
 			}
 			if m.Version != manifestVersion {
-				return fmt.Errorf("backup version %d not supported (expected %d)", m.Version, manifestVersion)
+				return nil, fmt.Errorf("backup version %d not supported (expected %d)", m.Version, manifestVersion)
 			}
 			manifest = &m
 		case hdr.Name == resultsName:
 			resultsCount++
 			if resultsCount > 1 {
-				return fmt.Errorf("archive contains more than one completion record")
+				return nil, fmt.Errorf("archive contains more than one completion record")
 			}
 			if err := json.NewDecoder(tr).Decode(&results); err != nil {
-				return fmt.Errorf("results decode: %w", err)
+				return nil, fmt.Errorf("results decode: %w", err)
 			}
+		case hdr.Name == kvSrcmapEntryName:
+			// F45: the KV srcmap section is its own entry, validated with
+			// the same strictness as table rows — shape-checked line by
+			// line, duplicate keys rejected, and the count reconciled
+			// against the completion record below.
+			if _, dup := kvObserved[kvSrcmapSection]; dup {
+				return nil, fmt.Errorf("archive contains duplicate entries for the kv srcmap section")
+			}
+			rows, err := validateKVRows(tr)
+			if err != nil {
+				return nil, fmt.Errorf("kv srcmap section: %w", err)
+			}
+			kvObserved[kvSrcmapSection] = rows
 		case strings.HasSuffix(hdr.Name, ".jsonl"):
 			table := strings.TrimSuffix(hdr.Name, ".jsonl")
 			if !restorableTables[table] {
-				return fmt.Errorf("refusing to restore unknown table %q (not in the backup allowlist)", table)
+				return nil, fmt.Errorf("refusing to restore unknown table %q (not in the backup allowlist)", table)
 			}
 			if _, dup := observed[table]; dup {
-				return fmt.Errorf("archive contains duplicate entries for table %q", table)
+				return nil, fmt.Errorf("archive contains duplicate entries for table %q", table)
 			}
 			rows, err := validateTableRows(tr)
 			if err != nil {
-				return fmt.Errorf("table %s: %w", table, err)
+				return nil, fmt.Errorf("table %s: %w", table, err)
 			}
 			observed[table] = rows
 		}
 	}
 	if manifest == nil {
-		return fmt.Errorf("no manifest found — is this an observe backup?")
+		return nil, fmt.Errorf("no manifest found — is this an observe backup?")
 	}
 	// F44: the completion record is written last by every dump this code has
 	// produced for years; an archive without it is either truncated before
 	// the dump finished or predates the format, and both must be rejected
 	// rather than restored as an unknown-quality partial.
 	if resultsCount == 0 {
-		return fmt.Errorf("archive is missing its completion record — it is truncated or from an unsupported old format; refusing to guess")
+		return nil, fmt.Errorf("archive is missing its completion record — it is truncated or from an unsupported old format; refusing to guess")
 	}
 
 	for _, name := range manifest.Tables {
 		if _, dup := declared[name]; dup {
-			return fmt.Errorf("manifest declares table %q twice", name)
+			return nil, fmt.Errorf("manifest declares table %q twice", name)
 		}
 		declared[name] = true
+	}
+	// F45: KV sections declared by the manifest form their own declaration
+	// domain, with the same bijection contract as tables.
+	for _, section := range manifest.KVSections {
+		if _, dup := kvDeclared[section]; dup {
+			return nil, fmt.Errorf("manifest declares kv section %q twice", section)
+		}
+		if _, known := kvSections[section]; !known {
+			return nil, fmt.Errorf("manifest declares unknown kv section %q", section)
+		}
+		kvDeclared[section] = true
 	}
 	var failed []string
 	byTable := make(map[string]TableResult, len(results))
 	for _, r := range results {
-		if !restorableTables[r.Table] {
-			return fmt.Errorf("completion record names unknown table %q", r.Table)
+		isKV := r.Table == kvSrcmapResultTable
+		if !restorableTables[r.Table] && !isKV {
+			return nil, fmt.Errorf("completion record names unknown table %q", r.Table)
 		}
-		if !declared[r.Table] {
+		if isKV {
+			if !kvDeclared[kvSrcmapSection] {
+				return nil, fmt.Errorf("completion record lists the kv srcmap section, which the manifest does not declare")
+			}
+		} else if !declared[r.Table] {
 			// AUD-040 (round 2): a result for a table the manifest does not
 			// declare means the archive was reassembled or edited.
-			return fmt.Errorf("completion record lists table %q which the manifest does not declare", r.Table)
+			return nil, fmt.Errorf("completion record lists table %q which the manifest does not declare", r.Table)
 		}
 		if r.Rows < 0 {
-			return fmt.Errorf("completion record for %q has a negative row count (%d)", r.Table, r.Rows)
+			return nil, fmt.Errorf("completion record for %q has a negative row count (%d)", r.Table, r.Rows)
 		}
 		if _, dup := byTable[r.Table]; dup {
-			return fmt.Errorf("completion record lists table %q twice", r.Table)
+			return nil, fmt.Errorf("completion record lists table %q twice", r.Table)
 		}
 		if !r.OK {
 			failed = append(failed, r.Table)
@@ -256,7 +311,7 @@ func validateArchive(path string) error {
 		byTable[r.Table] = r
 	}
 	if len(failed) > 0 {
-		return fmt.Errorf("backup is partial — these tables failed to dump and are missing: %s", strings.Join(failed, ", "))
+		return nil, fmt.Errorf("backup is partial — these tables failed to dump and are missing: %s", strings.Join(failed, ", "))
 	}
 
 	// AUD-040 (round 2): every manifest-declared table must carry a
@@ -265,7 +320,7 @@ func validateArchive(path string) error {
 	// admin_users untouched while restore reported success.
 	for _, name := range manifest.Tables {
 		if _, ok := byTable[name]; !ok {
-			return fmt.Errorf("declared table %q has no completion result — the archive is incomplete", name)
+			return nil, fmt.Errorf("declared table %q has no completion result — the archive is incomplete", name)
 		}
 	}
 
@@ -274,26 +329,79 @@ func validateArchive(path string) error {
 	// the tar reader; reassembled or edited archives are caught here).
 	for table, rows := range observed {
 		if !declared[table] {
-			return fmt.Errorf("archive contains table %q which its manifest does not declare", table)
+			return nil, fmt.Errorf("archive contains table %q which its manifest does not declare", table)
 		}
 		r, ok := byTable[table]
 		if !ok {
-			return fmt.Errorf("completion record is missing table %q", table)
+			return nil, fmt.Errorf("completion record is missing table %q", table)
 		}
 		if rows != r.Rows {
-			return fmt.Errorf("table %q is incomplete: completion record says %d rows, archive holds %d", table, r.Rows, rows)
+			return nil, fmt.Errorf("table %q is incomplete: completion record says %d rows, archive holds %d", table, r.Rows, rows)
 		}
 	}
 	// A table the dump claims produced rows MUST have an entry; one with
-	// zero rows legitimately has none (the source instance lacked it).
+	// zero rows legitimately has none (the source instance lacked it). The
+	// kv srcmap result is excluded here — the kv block below owns its
+	// three-way reconciliation.
 	for table, r := range byTable {
+		if table == kvSrcmapResultTable {
+			continue
+		}
 		if r.Rows > 0 {
 			if _, present := observed[table]; !present {
-				return fmt.Errorf("table %q is missing from the archive (completion record says %d rows)", table, r.Rows)
+				return nil, fmt.Errorf("table %q is missing from the archive (completion record says %d rows)", table, r.Rows)
 			}
 		}
 	}
-	return nil
+
+	// F45: the kv srcmap section gets the same three-way reconciliation —
+	// declared implies a completion result, an observed entry must be
+	// declared, and the entry's line count must equal the result's.
+	if kvDeclared[kvSrcmapSection] {
+		r, ok := byTable[kvSrcmapResultTable]
+		if !ok {
+			return nil, fmt.Errorf("declared kv section %q has no completion result — the archive is incomplete", kvSrcmapSection)
+		}
+		if rows, present := kvObserved[kvSrcmapSection]; present {
+			if rows != r.Rows {
+				return nil, fmt.Errorf("kv section %q is incomplete: completion record says %d keys, archive holds %d", kvSrcmapSection, r.Rows, rows)
+			}
+		} else if r.Rows > 0 {
+			return nil, fmt.Errorf("kv section %q is missing from the archive (completion record says %d keys)", kvSrcmapSection, r.Rows)
+		}
+	}
+	for section := range kvObserved {
+		if !kvDeclared[section] {
+			return nil, fmt.Errorf("archive contains kv section %q which its manifest does not declare", section)
+		}
+	}
+	return manifest, nil
+}
+
+// validateKVRows shape-checks every line of the kv srcmap entry (F45) with
+// the same preflight posture as validateTableRows: a malformed key anywhere
+// fails the whole archive before any row of any table is applied.
+func validateKVRows(r io.Reader) (int64, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 1<<20), maxKVValueBytes+(64<<20))
+	var n int64
+	seen := make(map[string]bool)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		n++
+		row, err := decodeKVRow(line)
+		if err != nil {
+			return n, fmt.Errorf("decode row: %w", err)
+		}
+		if seen[row.Key] {
+			return n, fmt.Errorf("duplicate key %q", row.Key)
+		}
+		seen[row.Key] = true
+	}
+	return n, scanner.Err()
 }
 
 // validateTableRows decodes and structurally checks every row of one table
@@ -363,6 +471,12 @@ func applyArchive(ctx context.Context, db *nucleus.Client, path string) error {
 		}
 		if err != nil {
 			return fmt.Errorf("tar next: %w", err)
+		}
+		if hdr.Name == kvSrcmapEntryName {
+			if err := applyKVSection(ctx, db, tr); err != nil {
+				return fmt.Errorf("restore kv srcmap: %w", err)
+			}
+			continue
 		}
 		if !strings.HasSuffix(hdr.Name, ".jsonl") {
 			continue

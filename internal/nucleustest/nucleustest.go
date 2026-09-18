@@ -13,16 +13,22 @@ import (
 // unset. Deliberately not 5432: that is PostgreSQL's port, and on a machine
 // running Postgres the old default connected to it happily.
 //
+// Two working shapes (2026-09-18, later session): the published image —
+//
 //	docker run -d --platform linux/amd64 --name nucleus-test -p 55432:5432 \
 //	  -e NUCLEUS_ALLOW_NO_AUTH=1 -e NUCLEUS_ALLOW_INSECURE_CLUSTER=1 \
 //	  -e NUCLEUS_ALLOW_INSECURE_REPLICATION=1 \
 //	  ghcr.io/neutron-build/nucleus:v0.1.8 \
 //	  start --host 0.0.0.0 --port 5432 --cluster-port 5433 --data /data --max-memory 512
 //
-// v0.1.8, not a repo-built binary: engines built from the current Neutron
-// tree (and from this repo's pinned submodule) fail observe's migration
-// ladder on a fresh database at 027 - see AUDIT_OPEN.md 2026-09-18 and the
-// matching upstream report. The v0.1.8 image applies the full ladder.
+// — and a repo-built binary from the Neutron tree
+// (`cargo build --bin nucleus` in Neutron/nucleus, then `start` with the
+// same flags on a free port). Engines built from the tree FAILED the
+// migration ladder at 027 until the 2026-09-18 upstream fix (`6286531a`,
+// same-transaction rename visibility); verified fixed from the
+// backup/SDK close session — a repo-built engine now applies the full
+// ladder and is the shape that exercises the newest engine surfaces
+// (e.g. ACQUIRE SNAPSHOT LEASE, which v0.1.8 predates).
 const DefaultDSN = "postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable"
 
 // DSN returns the DSN for the test engine, skipping the test unless something
