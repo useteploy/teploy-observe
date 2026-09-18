@@ -33,7 +33,16 @@ SDK feature work. Two NEW upstream engine reports filed (2026-09-18, see
 the Upstream section below). F45's app half (KV srcmap in backups) is
 unchanged — it waits on the Nucleus snapshot API.
 
-Open items: 12 (1 P1 product/schema decision, 9 P2 designs/halves, 2 hardening/producer notes)
+Backup/SDK close session (2026-09-18, later): F45 FIXED (app half) and
+F32 FIXED (retry half) — see their entries. Both 2026-09-18 upstream
+engine reports are RESOLVED upstream (Neutron `6286531a`, verified live:
+a repo-built engine now applies the full migration ladder) and the
+snapshot-lease primitive has LANDED in the tree, which unblocked F45.
+Three NEW upstream reports filed from verifying F45 against the live
+repo-built engine (lease scope gaps — see the Upstream section); the
+observe side carries documented, tested workarounds for each.
+
+Open items: 10 (1 P1 product/schema decision, 7 P2 designs/halves, 2 hardening/producer notes)
 
 ## F02 - P1 - Open (design decision): first-run grace authorizes administration
 
@@ -169,16 +178,28 @@ accumulated data (see Upstream below) — the F20 metadata test
 idempotency tests themselves are unaffected (children and the ledger
 write path do not hit the defect).
 
-## F32 - P1/P2 - Partially fixed: transports no longer drop silently; bounded client retry deferred (now UNBLOCKED)
+## F32 - P1/P2 - Fixed 2026-09-18 (later session): bounded automatic retry in the browser SDK; transport half fixed earlier
 
-Landed: res.ok checks, byte-bounded keepalive, beacon-return checks, chunked
-batches, failed-chunk retention (bounded), onError hook, reinit disposal.
-Deferred: automatic client retries beyond the retained-buffer retry —
-UNBLOCKED 2026-09-18 by the F12/F19 producer-side identity (a retried batch
-now carries stable event/batch ids and the server dedupes it), but the
-retry POLICY in each SDK (backoff, budget, giving up) is still unbuilt
-feature work. Oversized individual replay snapshots need a chunking
-protocol or a normal foreground request (tracked with F39's protocol work).
+Landed (transport half, 2026-09-17 pass): res.ok checks, byte-bounded
+keepalive, beacon-return checks, chunked batches, failed-chunk retention
+(bounded), onError hook, reinit disposal.
+Landed (retry half, backup/SDK close session): the browser SDK now
+re-sends a failed batch automatically on a doubling backoff
+(`retryBackoffMs`, cap 60 s) with a per-batch attempt budget
+(`maxRetryAttempts`, default 5) — a batch that exhausts the budget is
+dropped with a loud onError report instead of retrying forever, retention
+still drop-oldest-bounded at 200 events, and the new `onRetry` hook makes
+the policy visible to the application. Retried batches keep their F12
+producer/event/batch ids, so the server's admission dedupe makes every
+redelivery safe. Tests in sdk/browser/tests/unit.test.ts cover the backoff
+gate, the doubling, identity-stable retry, budget exhaustion + recovery,
+and the retention cap under sustained failure. Still deferred: the classic
+snippet tracker (cmd/observe/tracker/observe.js) keeps its F32
+transport-half fixes without an automatic retry loop (its retained-buffer
+retry on the next interval remains); porting the policy there is future
+work if the snippet ever needs it. Oversized individual replay snapshots
+need a chunking protocol or a normal foreground request (tracked with
+F39's protocol work).
 
 ## F37 - P1 - Fixed for form controls/contenteditable/data-*; default-text-mask policy open
 
@@ -215,17 +236,48 @@ extract allowlisted campaign params into explicit fields (server-side
 extraction from an already-stripped URL is impossible), text capture
 opt-in. Wire + storage + migration change; deferred.
 
-## F45 - P2 - Open (app half + upstream): backups omit KV source maps; no consistent snapshot
+## F45 - P2 - Fixed 2026-09-18 (later session): snapshot-lease dumps + KV srcmap archive section; upstream lease-scope caveats registered
 
-Upstream: Nucleus has no cross-table snapshot/lease primitive — logged in
-`Teploy/_internal/UPSTREAM_BUGS.md` (2026-09-17 entry), status open; no
-Neutron/Nucleus edits made from this session.
-Ours, deferred: source-map blobs and release indexes live in Nucleus KV
-(`srcmap:*`) and are absent from backup.Tables; adding them needs a durable
-KV-domain dump section + restore validation keyed on the namespace, plus
-the quiesce/drain boundary once upstream provides a snapshot primitive.
-Meanwhile F42/F43/F44 (landed) make the SQL-domain archive encrypted,
-honest, and completeness-checked.
+Upstream primitive: LANDED — Nucleus grew `ACQUIRE SNAPSHOT LEASE
+[TIMEOUT ms]` (release at COMMIT/ROLLBACK/disconnect/expiry); the
+2026-09-17 upstream report for the missing primitive is closed. The
+2026-09-18 migration-ladder report is also resolved upstream
+(`6286531a`, rename visibility in-tx) — verified live: a repo-built
+engine applies the full 001-041 ladder.
+
+Ours, landed (internal/backup): the dump wraps in one lease-holding
+transaction (`lease.go`), so every SQL table is read at one moment while
+other sessions' DML waits at the engine gate; engines predating the
+statement fall back to pool reads with the downgrade recorded in the
+manifest (`lease.held=false`) and warned. The KV srcmap domain
+(`srcmap:*` blobs, `releases` sets, `relage` zsets) rides in the archive
+as its own JSONL entry (`kvsrcmap.go`) with the F44 completeness contract
+extended to it: manifest-declared sections, per-line strict validation
+pre-apply, three-way reconciliation against the completion record, a
+typed post-apply completeness proof (blobs byte-identical, set members
+present, zset scores exact), and restore-target emptiness enforced for
+the namespace when the archive carries it. Live proofs
+(internal/backup/lease_live_test.go, kvsrcmap_live_test.go): concurrent
+atomic cross-domain units are never cut in half below the straddling
+transaction; SQL mutations block at the gate until release; a churning
+srcmap namespace fails the dump loudly and recovers when quiesced; the
+KV round-trip restores every key with exact values.
+
+Honest limits, each verified live against the repo-built engine and
+logged upstream (three NEW 2026-09-18 reports; see the Upstream section):
+the lease gate does NOT cover KV scalar writes and the holder's KV reads
+are not snapshot-pinned — the KV section therefore carries its own
+convergence proof (two deep-equal consecutive namespace reads plus a
+closing relist) instead of inheriting the lease moment; KV_KEYS cannot
+enumerate set/zset keys — the dump reconstructs the release indexes from
+site ids derived off the blob keys (a residual hole for orphaned indexes
+of blob-less sites is documented in kvsrcmap.go); and the holder sees
+another session's in-flight UNCOMMITTED writes (the lease's MVCC promise
+is not delivered) — a dump can archive a row its writer subsequently
+rolls back. Engine canaries pin all three shapes
+(TestLease_KVScalarWritesBypassTheGate,
+TestLease_HolderSeesInFlightUncommittedWrites) and fail when upstream
+closes them, at which point the workarounds should be simplified.
 
 ## F46 - P2 - Partially fixed: empty audit key warns at startup
 
@@ -473,7 +525,12 @@ no Neutron/Nucleus edits made from this session):
   The published v0.1.5 image fails one step later (028). The v0.1.8 image
   applies the whole 001-041 ladder — which is why the CI fixture pins it
   and why nucleustest's documented scratch-engine invocation was updated
-  to v0.1.8.
+  to v0.1.8. RESOLVED UPSTREAM 2026-09-18 (`6286531a`, same-transaction
+  rename visibility on the disk stack), verified live from this session:
+  a repo-built engine of the current tree passes the full ladder
+  (schema.Apply on an empty database reaches the end). The CI fixture
+  stays on the published image for reproducibility; nucleustest's comment
+  now records that repo-built engines work again.
 - Intermittent committed-upsert loss (v0.1.8 image, accumulated data):
   a same-key ReplacingMergeTree insert inside a multi-table transaction
   (the exact replay_sessions upsert shape since 039) commits successfully
@@ -481,6 +538,46 @@ no Neutron/Nucleus edits made from this session):
   Reproduced with pure SQL (no observe code). This makes the pre-existing
   F20 metadata test flaky on v0.1.8; the F12/F19 idempotency proofs are
   unaffected. If the new CI job flakes, this is the first suspect.
+  RESOLVED UPSTREAM 2026-09-18 (recorded in the engine tree's docs commit
+  `952a446b` alongside the rename fix); the live suite in this session ran
+  the replay idempotency paths green against the repo-built engine.
+
+Upstream (2026-09-18, from the backup/SDK close session — three NEW
+reports, all lease-scope findings hit while verifying F45 against a live
+repo-built engine; logged in
+`Teploy/_internal/UPSTREAM_BUGS.md` with standalone reproducers; no
+Neutron/Nucleus edits made from this session):
+
+- Lease gate bypass for KV writes: `SELECT KV_SET/SADD/ZADD/DEL(...)`
+  from another session commits straight through a held ACQUIRE SNAPSHOT
+  LEASE (DML waits; KV scalar functions do not), and the holder's own KV
+  reads are not snapshot-pinned — mid-lease the holder sees another
+  session's committed KV writes immediately. The lease module's own scope
+  note carves out non-executor writes, so this is a documented limitation
+  rather than a pure defect, but it breaks the dump boundary F45 needed.
+  Observe workaround (internal/backup/kvsrcmap.go): the KV section is
+  dumped under a convergence proof — two deep-equal consecutive namespace
+  reads plus a closing relist — and a churning namespace fails the dump
+  loudly (proven by TestDump_KVSrcmapChurnFailsLoudlyThenRecovers).
+- KV_KEYS cannot enumerate collection keys: `KvStore::keys` iterates only
+  the string shards; sets/zsets (lists/hashes/etc.) live in the
+  collections store and are invisible to KV_KEYS regardless of how they
+  were created. Observe workaround: the srcmap release indexes are
+  reconstructed from site ids derived off the listed blob keys (the
+  namespace's key names are deterministic per site); residual hole for
+  orphaned indexes of blob-less sites documented in kvsrcmap.go. Restore
+  verifies per key by type instead of by relisting.
+- Holder sees in-flight uncommitted writes (dirty reads under the lease):
+  a statement already past the writer gate when the lease is acquired
+  stays visible to the holder BEFORE its commit and vanishes if that
+  transaction rolls back — the lease's "MVCC snapshot, stable across
+  statements" promise is not delivered; visibility is live-with-a-commit-
+  gate. Consequence: a dump can archive a row its writer later rolls
+  back. No observe-side workaround is possible (commit state is not
+  visible to the reader); the consistency proof tolerates exactly one
+  straddling unit (TestDump_LeaseConsistentMomentUnderConcurrentWrites)
+  and a canary test pins the shape for removal when upstream fixes it.
 
 Earlier standing upstream item: F45's snapshot-boundary primitive
-(2026-09-17 entry) remains the only other open one.
+(2026-09-17 entry) — CLOSED 2026-09-18: the primitive landed in the
+tree (see the F45 entry above).
