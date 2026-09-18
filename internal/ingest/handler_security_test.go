@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -98,7 +99,13 @@ func TestTruncateUTF8_NeverSplitsRunes(t *testing.T) {
 // AUD-015: unserializable properties are rejected at admission rather
 // than silently stored as {}.
 func TestPrepareEvent_RejectsUnserializableProperties(t *testing.T) {
-	_, err := prepareEvent(context.Background(), IngestInput{
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/events", nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh) TestAgent/1.0")
+	var ctx context.Context
+	RequestInfoMiddleware(ParseTrustedProxies(""))(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		ctx = r.Context()
+	})).ServeHTTP(httptest.NewRecorder(), req)
+	_, err := prepareEvent(ctx, IngestInput{
 		SiteID:     "s1",
 		Properties: map[string]any{"chan": make(chan int)},
 	}, "salt", nil)
