@@ -112,3 +112,9 @@ func UserAgentFromContext(ctx context.Context) string {
 	}
 	return ""
 }
+
+// WithUserAgent stores a User-Agent in the context (tests and direct
+// callers; the HTTP path gets it from RequestInfoMiddleware).
+func WithUserAgent(ctx context.Context, ua string) context.Context {
+	return context.WithValue(ctx, keyUserAgent, ua)
+}

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -44,6 +45,14 @@ type IngestInput struct {
 	// stamp release_tag on the resulting sessions row, which feeds
 	// crash-free-session computation per release.
 	Release string `json:"release,omitempty"`
+	// EventID is the producer-assigned identity of this event (protocol
+	// v2, audit F12). A producer generates it once when the event is
+	// recorded and keeps it through every requeue and retry, so a retried
+	// batch carries the same ids and the server can deduplicate at flush.
+	// Empty (v1 producers) -> the server generates a random id as before.
+	// Invalid shapes are ignored (v1 fallback), not rejected: the field is
+	// an optimization boundary, not a security one.
+	EventID string `json:"event_id,omitempty"`
 }
 
 // ingestKnownKeys are the top-level JSON keys IngestInput actually consumes.
@@ -51,7 +60,28 @@ type IngestInput struct {
 var ingestKnownKeys = map[string]bool{
 	"site_id": true, "event_type": true, "url": true, "referrer": true,
 	"title": true, "language": true, "screen": true, "properties": true,
-	"distinct_id": true, "release": true,
+	"distinct_id": true, "release": true, "event_id": true,
+	// Transport metadata on the v2 single-event path (batch envelope fields
+	// accepted inline); consumed for tracing context, never stored.
+	"producer_id": true, "v": true,
+}
+
+// validProducerID accepts the id shapes producers may use for event ids,
+// producer ids, and batch ids (protocol v2): 8-64 chars of url-safe
+// letters/digits/hyphens/underscores. Anything else falls back to v1
+// (server-generated) semantics.
+func validProducerID(id string) bool {
+	if len(id) < 8 || len(id) > 64 {
+		return false
+	}
+	for _, c := range id {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // UnmarshalJSON decodes the documented shape and, in addition, collects any
@@ -113,6 +143,9 @@ type IngestResponse struct {
 	// single-event response shape unchanged.
 	Accepted int `json:"accepted,omitempty"`
 	Rejected int `json:"rejected,omitempty"`
+	// Deduped is true when a v2 batch was recognized as a retry of one this
+	// process already admitted (F12): nothing was buffered again.
+	Deduped bool `json:"deduped,omitempty"`
 }
 
 // maxStoredEventBytes caps the serialized size of one stored event
@@ -209,6 +242,11 @@ func prepareEvent(ctx context.Context, input IngestInput, salt string, siteSvc *
 	sessionID := session.ID(siteID, ip, ua, salt)
 	visitID := session.VisitID(sessionID, now)
 	eventID := generateID()
+	if validProducerID(input.EventID) {
+		// F12: stable producer-side event id - the identity that survives
+		// requeue and retry, letting the flush path deduplicate.
+		eventID = input.EventID
+	}
 	parsed := ParseUA(ua)
 	country := geo.Lookup(ip)
 
@@ -345,20 +383,112 @@ func cleanReferrer(raw, selfHost string) string {
 }
 
 // BatchInput accepts an array of events in one POST.
+//
+// Protocol v2 (F12): V is the wire version, ProducerID identifies the
+// tracker instance, BatchID identifies one detached batch and MUST be
+// reused when that batch is retried (the SDKs derive it from the first
+// event's stable event_id, which survives requeue by construction).
 type BatchInput struct {
-	Events []IngestInput `json:"events"`
+	V          int           `json:"v,omitempty"`
+	ProducerID string        `json:"producer_id,omitempty"`
+	BatchID    string        `json:"batch_id,omitempty"`
+	Events     []IngestInput `json:"events"`
 }
+
+// BatchDeduper is the in-process admission cache for v2 event batches
+// (F12). It exists to stop a client retrying an ambiguous (response-lost)
+// batch from re-buffering events the server already admitted - the fast
+// path. The durable boundary is the flush-time event-id existence filter
+// (see Buffer.insertBatch), which covers restarts, WAL replay, and any
+// cache miss; this cache is an optimization, and its loss (restart, TTL,
+// bound eviction) never produces duplicates, only a redundant admission
+// that the flush filter then drops.
+//
+// Deliberately in-memory and per-process: observe runs one instance per
+// database (the same documented single-process boundary as the replay
+// striped locks, AUD-018); a multi-replica deployment needs the
+// stable-key/CAS design this defers to.
+type BatchDeduper struct {
+	mu    sync.Mutex
+	seen  map[string]time.Time
+	order []string
+	head  int
+	ttl   time.Duration
+	max   int
+	now   func() time.Time
+}
+
+func NewBatchDeduper(ttl time.Duration, max int) *BatchDeduper {
+	return &BatchDeduper{
+		seen: make(map[string]time.Time),
+		ttl:  ttl,
+		max:  max,
+		now:  time.Now,
+	}
+}
+
+// duplicate reports whether key was recorded within the TTL, refreshing its
+// timestamp so a busy retrying producer cannot slide its own batch back
+// under the TTL by hammering it.
+func (d *BatchDeduper) duplicate(key string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if t, ok := d.seen[key]; ok && d.now().Sub(t) < d.ttl {
+		d.seen[key] = d.now()
+		return true
+	}
+	return false
+}
+
+// record remembers key as admitted. Called only AFTER the batch was
+// successfully buffered, so a refused (429) first attempt stays retryable.
+// order is a fixed-capacity ring: at capacity the oldest recorded key is
+// overwritten, bounding both the map and the ring to max entries.
+func (d *BatchDeduper) record(key string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.seen[key] = d.now()
+	if len(d.order) < d.max {
+		d.order = append(d.order, key)
+		return
+	}
+	delete(d.seen, d.order[d.head])
+	d.order[d.head] = key
+	d.head = (d.head + 1) % d.max
+}
+
+// DefaultBatchDedupeTTL bounds how long an admitted batch id is remembered.
+// A producer that retries the same batch after this window (with the
+// process alive) re-admits it; the flush-time event-id filter still drops
+// the duplicates within the flush dedupe horizon.
+const DefaultBatchDedupeTTL = 10 * time.Minute
+
+// DefaultBatchDeduperCapacity bounds the admission cache.
+const DefaultBatchDeduperCapacity = 16384
 
 // BatchHandler processes multiple events in a single request.
 // This is the preferred ingestion path — the tracker sends all queued
 // events as one POST instead of one request per event.
-func BatchHandler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.HandlerFunc[BatchInput, IngestResponse] {
+func BatchHandler(buf *Buffer, salt string, siteSvc *sites.SiteService, deduper *BatchDeduper) neutron.HandlerFunc[BatchInput, IngestResponse] {
 	return func(ctx context.Context, input BatchInput) (IngestResponse, error) {
 		if len(input.Events) > 100 {
 			return IngestResponse{}, neutron.ErrBadRequest("batch too large (max 100 events)")
 		}
 		if len(input.Events) == 0 {
 			return IngestResponse{OK: true}, nil
+		}
+		// F12: a v2 batch whose identity this process already admitted is a
+		// retry of an ambiguous submit - acknowledge as a duplicate WITHOUT
+		// re-buffering. The key is recorded only after successful admission
+		// below, so a 429'd first attempt stays retryable; a concurrent
+		// double-submit both miss here and the flush-time event-id filter
+		// drops the loser.
+		var batchKey string
+		if deduper != nil && validProducerID(input.ProducerID) && validProducerID(input.BatchID) {
+			batchKey = input.ProducerID + "\x00" + input.BatchID
+			if deduper.duplicate(batchKey) {
+				return IngestResponse{OK: true, Deduped: true}, nil
+			}
 		}
 		// AUD-010 (round 2): prepare EVERY event side-effect-free first,
 		// then admit the survivors in one atomic Buffer.PushBatch under the
@@ -394,6 +524,9 @@ func BatchHandler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.
 		if !buf.PushBatch(prepared) {
 			return IngestResponse{}, neutron.ErrRateLimited(
 				fmt.Sprintf("buffer capacity below batch size %d, retry the whole batch later", len(prepared)))
+		}
+		if batchKey != "" {
+			deduper.record(batchKey)
 		}
 		accepted += len(prepared)
 		return IngestResponse{OK: true, Accepted: accepted, Rejected: rejected}, nil

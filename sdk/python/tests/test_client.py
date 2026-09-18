@@ -151,6 +151,9 @@ def test_identify_sends_analytics_event_without_raw_traits(server):
     assert body["event_type"] == "$identify"
     assert body["distinct_id"] == "u-1"
     assert body["properties"] == {"plan": "pro"}
+    # F12: producer-stable event identity rides on the single-event path.
+    assert len(body["event_id"]) == 32
+    assert len(body["producer_id"]) == 32
 
 
 # AUD-035 (round 2): a failed batch post leaves the entries queued.

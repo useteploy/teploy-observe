@@ -279,3 +279,47 @@ test("oversized events are dropped individually, valid neighbors delivered", asy
   assert.ok(!delivered.includes("monster"), "the oversized event must be dropped");
   assert.ok(errs.some((m) => m.includes("byte budget")), "the drop must be reported");
 });
+
+// F12 (protocol v2): every event carries a producer-assigned stable
+// event_id, and the batch envelope identifies the producer and the batch.
+test("events carry stable producer ids and a v2 batch envelope", async () => {
+  init({ endpoint: "https://observe.example.com", siteId: "s1" });
+  track("one");
+  track("two");
+  await flush();
+  assert.equal(sent[0].body.v, 2);
+  assert.ok(sent[0].body.producer_id, "producer_id must be set");
+  assert.equal(sent[0].body.batch_id, sent[0].body.events[0].event_id);
+  for (const e of sent[0].body.events) {
+    assert.match(e.event_id, /^[0-9a-f]{32}$/, "event_id is a 32-hex producer id");
+  }
+  assert.notEqual(sent[0].body.events[0].event_id, sent[0].body.events[1].event_id);
+});
+
+// F12: a failed-then-retried batch must reuse the SAME batch_id (and the
+// same event ids), so the server recognizes the retry instead of
+// double-counting it.
+test("retried batch reuses its batch id and event ids", async () => {
+  init({ endpoint: "https://observe.example.com", siteId: "s1" });
+  let failedBody: any = null;
+  (globalThis as any).fetch = (_url: string, opts: any) => {
+    failedBody = JSON.parse(opts.body);
+    return Promise.resolve({ ok: false, status: 503 });
+  };
+  track("retry-me");
+  await flush();
+  assert.ok(failedBody, "first attempt must have been issued");
+  (globalThis as any).fetch = (url: string, opts: any) => {
+    sent.push({ url, body: JSON.parse(opts.body) });
+    return Promise.resolve({ ok: true });
+  };
+  await flush();
+  assert.equal(sent.length, 1);
+  // The retried batch is bit-identical in identity: same batch_id and the
+  // same event ids, so a server dedupe keyed on either recognizes it.
+  assert.equal(sent[0].body.batch_id, failedBody.batch_id);
+  assert.deepEqual(
+    sent[0].body.events.map((e: any) => e.event_id),
+    failedBody.events.map((e: any) => e.event_id),
+  );
+});

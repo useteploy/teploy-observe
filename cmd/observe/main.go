@@ -231,6 +231,10 @@ func main() {
 		}
 	}
 	buf := ingest.NewBuffer(db, cfg.BufferSize, cfg.FlushSize, cfg.FlushInterval, logger)
+	// F12: admission-time dedupe cache for v2 event batches. In-process and
+	// best-effort by design - the durable boundary is the flush-time
+	// event-id existence filter inside Buffer.insertBatch.
+	eventBatchDeduper := ingest.NewBatchDeduper(ingest.DefaultBatchDedupeTTL, ingest.DefaultBatchDeduperCapacity)
 	// AUD-015 (round 2): serialized-byte budget across queued + in-flight
 	// events, so individually legal large events cannot exhaust memory while
 	// the database stalls. Count caps alone did not bound bytes.
@@ -664,7 +668,7 @@ func main() {
 		neutron.WithTags("ingest"),
 		neutron.WithSummary("Ingest analytics event"),
 	)
-	neutron.Post(ingestGroup, "/events/batch", ingest.BatchHandler(buf, cfg.SessionSalt, siteSvc),
+	neutron.Post(ingestGroup, "/events/batch", ingest.BatchHandler(buf, cfg.SessionSalt, siteSvc, eventBatchDeduper),
 		neutron.WithTags("ingest"),
 		neutron.WithSummary("Ingest batch of analytics events"),
 	)
@@ -808,6 +812,16 @@ func main() {
 	)
 
 	// --- Platform API (JWT auth, admin-only for writes) ---
+	// AUD-008: the stream-ticket mint sits here (JWT-authed) rather than on
+	// the public login group. Any authenticated role may mint; the ticket
+	// only ever authorizes its bound route prefix, and that route's own
+	// RBAC still applies when the ticket is presented (the middleware
+	// restores the role from the ticket claims).
+	streamGroup := r.Group("/api/v1/auth", jwtMW)
+	neutron.Post(streamGroup, "/stream-ticket", streamTicketHandler(authSvc),
+		neutron.WithTags("auth"),
+		neutron.WithSummary("Mint a short-lived stream ticket for EventSource/download routes"),
+	)
 	platformGroup := r.Group("/api/v1/platform", jwtMW)
 	platformAdmin := platformGroup.Group("", requireAdmin)
 	neutron.Get(platformGroup, "/users", listUsersHandler(userSvc),
@@ -1926,6 +1940,42 @@ func loginHandler(authSvc *auth.AuthService, auditSvc *audit.Service) neutron.Ha
 type changePasswordInput struct {
 	CurrentPassword string `json:"current_password"`
 	NewPassword     string `json:"new_password"`
+}
+
+// streamTicketInput mints a single-purpose credential for EventSource and
+// download consumers, which cannot set Authorization headers (AUD-008).
+type streamTicketInput struct {
+	Route string `json:"route"`
+}
+
+type streamTicketResponse struct {
+	Ticket    string `json:"ticket"`
+	ExpiresIn int    `json:"expires_in"`
+}
+
+func streamTicketHandler(authSvc *auth.AuthService) neutron.HandlerFunc[streamTicketInput, streamTicketResponse] {
+	return func(ctx context.Context, input streamTicketInput) (streamTicketResponse, error) {
+		if !auth.StreamTicketRouteValid(input.Route) {
+			return streamTicketResponse{}, neutron.ErrBadRequest(
+				"route must be one of: " + strings.Join(auth.StreamTicketRoutes, ", "))
+		}
+		claims, _ := neutronauth.ClaimsFromContext(ctx)
+		sub, _ := claims["sub"].(string)
+		if sub == "" {
+			return streamTicketResponse{}, neutron.ErrUnauthorized("invalid token")
+		}
+		// Embed the CURRENT token version so revocation retires outstanding
+		// tickets: the middleware's version check is unconditional.
+		tv, err := authSvc.CurrentTokenVersion(ctx, sub)
+		if err != nil {
+			return streamTicketResponse{}, neutron.ErrUnauthorized("session invalid")
+		}
+		ticket, err := authSvc.GenerateStreamTicket(claims, input.Route, tv)
+		if err != nil {
+			return streamTicketResponse{}, err
+		}
+		return streamTicketResponse{Ticket: ticket, ExpiresIn: int(auth.StreamTicketTTL.Seconds())}, nil
+	}
 }
 
 func changePasswordHandler(authSvc *auth.AuthService) neutron.HandlerFunc[changePasswordInput, neutron.Empty] {
@@ -4230,14 +4280,21 @@ func replayIngestHandler(svc *replays.ReplayService) neutron.HandlerFunc[replays
 			return nil, neutron.ErrForbidden(err.Error())
 		}
 		input.SiteID = siteID
-		id, err := svc.Ingest(ctx, input)
+		res, err := svc.Ingest(ctx, input)
 		if err != nil {
 			if errors.Is(err, replays.ErrCrossSiteReplay) {
 				return nil, neutron.ErrForbidden(err.Error())
 			}
+			if errors.Is(err, replays.ErrBatchIDReuse) || errors.Is(err, replays.ErrV2BatchNeedsReplayID) {
+				return nil, neutron.ErrConflict(err.Error())
+			}
 			return nil, err
 		}
-		return map[string]string{"ok": "true", "replay_id": id}, nil
+		out := map[string]string{"ok": "true", "replay_id": res.ReplayID}
+		if res.Deduped {
+			out["deduped"] = "true"
+		}
+		return out, nil
 	}
 }
 

@@ -59,16 +59,16 @@ func TestIngest_SharedReplayIDInsertsSessionOnce(t *testing.T) {
 	siteID := "dedupe-test-site"
 	replayID := "shared-replay-1"
 
-	id1, err := svc.Ingest(ctx, basicInput(siteID, "sess-1", replayID))
+	res1, err := svc.Ingest(ctx, basicInput(siteID, "sess-1", replayID))
 	if err != nil {
 		t.Fatalf("first batch: %v", err)
 	}
-	id2, err := svc.Ingest(ctx, basicInput(siteID, "sess-1", replayID))
+	res2, err := svc.Ingest(ctx, basicInput(siteID, "sess-1", replayID))
 	if err != nil {
 		t.Fatalf("second batch: %v", err)
 	}
-	if id1 != replayID || id2 != replayID {
-		t.Fatalf("expected replay id %q both times, got %q and %q", replayID, id1, id2)
+	if res1.ReplayID != replayID || res2.ReplayID != replayID {
+		t.Fatalf("expected replay id %q both times, got %q and %q", replayID, res1.ReplayID, res2.ReplayID)
 	}
 
 	var count int
@@ -232,10 +232,11 @@ func TestIngest_NoSaltNoRawOptInDropsIdentifierNotBatch(t *testing.T) {
 	input := basicInput(siteID, "sess-1", uniqueID("replay-no-salt"))
 	input.DistinctID = "user-raw-identifier@example.com"
 
-	replayID, err := svc.Ingest(ctx, input)
+	res, err := svc.Ingest(ctx, input)
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
+	replayID := res.ReplayID
 
 	var distinctID string
 	if err := db.Pool().QueryRow(ctx,
@@ -277,10 +278,11 @@ func TestIngest_RawOptInStillStoresRawIdentifier(t *testing.T) {
 	input := basicInput(siteID, "sess-1", uniqueID("replay-raw-optin"))
 	input.DistinctID = "user-raw-identifier@example.com"
 
-	replayID, err := svc.Ingest(ctx, input)
+	res, err := svc.Ingest(ctx, input)
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
+	replayID := res.ReplayID
 
 	var distinctID string
 	if err := db.Pool().QueryRow(ctx,
@@ -304,10 +306,11 @@ func TestIngest_SaltedHashesIdentifier(t *testing.T) {
 	input := basicInput(siteID, "sess-1", uniqueID("replay-salted"))
 	input.DistinctID = "user-raw-identifier@example.com"
 
-	replayID, err := svc.Ingest(ctx, input)
+	res, err := svc.Ingest(ctx, input)
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
+	replayID := res.ReplayID
 
 	var distinctID string
 	if err := db.Pool().QueryRow(ctx,

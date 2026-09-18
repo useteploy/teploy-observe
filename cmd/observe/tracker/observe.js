@@ -41,9 +41,31 @@
     distinctId = localStorage.getItem('observe_distinct_id') || null;
   } catch (e) { /* localStorage may be disabled */ }
 
+  // F12 (protocol v2): producer identity + per-event stable ids, so a
+  // retried chunk re-presents the same event identities and the server can
+  // dedupe at admission and at flush.
+  var PROTOCOL_VERSION = 2;
+  var producerId = makeId();
+
+  function makeId() {
+    var bytes = new Uint8Array(16);
+    var c = window.crypto || window.msCrypto;
+    if (c && c.getRandomValues) {
+      c.getRandomValues(bytes);
+    } else {
+      for (var i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+    }
+    var hex = '';
+    for (var j = 0; j < bytes.length; j++) {
+      hex += (bytes[j] < 16 ? '0' : '') + bytes[j].toString(16);
+    }
+    return hex;
+  }
+
   function send(eventType, props) {
     var payload = {
       event_type: eventType || 'pageview',
+      event_id: makeId(),
       site_id: siteId,
       url: location.href,
       referrer: document.referrer || '',
@@ -68,7 +90,15 @@
     var batch = queue.splice(0, MAX_BATCH_EVENTS);
 
     var sendChunk = function(events) {
-      var body = JSON.stringify({ events: events });
+      // F12 v2 envelope. batch_id is the first event's stable event_id, so
+      // a requeued chunk that is retried on a later flush presents the SAME
+      // batch id (and the same event ids) to the server.
+      var body = JSON.stringify({
+        v: PROTOCOL_VERSION,
+        producer_id: producerId,
+        batch_id: events.length ? events[0].event_id : '',
+        events: events
+      });
 
       // sendBeacon cannot set request headers, so a keyed install sends the
       // key via fetch with keepalive — same survives-unload guarantee — and

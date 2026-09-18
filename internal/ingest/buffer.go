@@ -199,29 +199,11 @@ func approxEventBytes(e Event) int {
 	return len(raw)
 }
 
-// dropAlreadyCommitted returns the subset of events whose event_id is NOT
-// already present in the events table — so a WAL replay of committed-but-not-
-// checkpointed events doesn't double-count them. Bounded by a timestamp floor
-// so the lookup uses the (…, timestamp, …) sort-key prefix instead of a full
-// scan. On any error it FAILS OPEN (keeps all events) — preserving durability
-// at the cost of a possible duplicate, which is the pre-existing behavior.
-func (b *Buffer) dropAlreadyCommitted(pending []Event) []Event {
-	if len(pending) == 0 {
-		return pending
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Collect ids and the earliest timestamp to bound the scan.
-	ids := make([]string, 0, len(pending))
-	minTS := pending[0].Timestamp
-	for _, e := range pending {
-		ids = append(ids, e.EventID)
-		if e.Timestamp < minTS {
-			minTS = e.Timestamp
-		}
-	}
-
+// existingEventIDs returns the subset of ids already stored in events, with
+// a timestamp floor so the lookup stays bounded (see flushDedupeHorizon).
+// Shared by the WAL-replay dedup (dropAlreadyCommitted) and the flush-time
+// dedup (filterUncommitted).
+func existingEventIDs(ctx context.Context, sqlc *nucleus.SQLModel, ids []string, minTS int64, logger *slog.Logger) map[string]struct{} {
 	existing := make(map[string]struct{}, len(ids))
 	type idRow struct {
 		EventID string `db:"event_id"`
@@ -243,17 +225,45 @@ func (b *Buffer) dropAlreadyCommitted(pending []Event) []Event {
 		q := fmt.Sprintf(
 			"SELECT event_id FROM events WHERE timestamp >= $1 AND event_id IN (%s)",
 			strings.Join(ph, ","))
-		rows, err := nucleus.Query[idRow](ctx, b.db.SQL(), q, args...)
+		rows, err := nucleus.Query[idRow](ctx, sqlc, q, args...)
 		if err != nil {
 			// Fail open: keep all pending (durability over dedup).
-			b.logger.Warn("ingest queue: replay dedup lookup failed, keeping all pending", "err", err)
-			return pending
+			if logger != nil {
+				logger.Warn("ingest: event-id dedup lookup failed, keeping all candidates", "err", err)
+			}
+			return nil
 		}
 		for _, r := range rows {
 			existing[r.EventID] = struct{}{}
 		}
 	}
-	if len(existing) == 0 {
+	return existing
+}
+
+// dropAlreadyCommitted returns the subset of events whose event_id is NOT
+// already present in the events table — so a WAL replay of committed-but-not-
+// checkpointed events doesn't double-count them. Bounded by a timestamp floor
+// so the lookup uses the (…, timestamp, …) sort-key prefix instead of a full
+// scan. On any error it FAILS OPEN (keeps all events) — preserving durability
+// at the cost of a possible duplicate, which is the pre-existing behavior.
+func (b *Buffer) dropAlreadyCommitted(pending []Event) []Event {
+	if len(pending) == 0 {
+		return pending
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	ids := make([]string, 0, len(pending))
+	minTS := pending[0].Timestamp
+	for _, e := range pending {
+		ids = append(ids, e.EventID)
+		if e.Timestamp < minTS {
+			minTS = e.Timestamp
+		}
+	}
+
+	existing := existingEventIDs(ctx, b.db.SQL(), ids, minTS, b.logger)
+	if existing == nil || len(existing) == 0 {
 		return pending
 	}
 	out := pending[:0]
@@ -315,6 +325,13 @@ func (b *Buffer) Start() {
 
 // Stop signals the flush loop to exit and waits for the final flush.
 // Idempotent — safe under concurrent or repeated shutdown paths.
+//
+// The final Flush is SKIPPED when the worker died (workerErr latched,
+// AUD-016): whatever killed it (in these tests a nil db panicking
+// insertBatch) would panic the same call on the STOP CALLER's goroutine,
+// which has no recover — a rare race where the worker died with events
+// still buffered turned Stop into a process panic instead of a clean
+// unhealthy-shutdown report.
 func (b *Buffer) Stop() {
 	b.stopOnce.Do(func() {
 		b.mu.Lock()
@@ -322,7 +339,9 @@ func (b *Buffer) Stop() {
 		close(b.stopCh)
 		b.mu.Unlock()
 		b.wg.Wait()
-		b.Flush() // covers a buffer that was never Started
+		if b.WorkerErr() == nil {
+			b.Flush() // covers a buffer that was never Started
+		}
 		if b.queue != nil {
 			if err := b.queue.Close(); err != nil {
 				b.logger.Warn("ingest queue: close failed", "err", err)
@@ -589,6 +608,43 @@ func eventsRecentArgs(dst []any, e *Event) []any {
 	)
 }
 
+// flushDedupeHorizon bounds how far back the flush-time event-id dedup
+// searches for an already-committed original. A retried batch is re-prepared
+// with fresh server timestamps, so the original copy it would duplicate is
+// OLDER than the retry's own timestamps - the floor reaches down past them
+// by this margin. A producer retrying the same batch more than a horizon
+// later (and after an admission-cache miss) can still double-count; the
+// SDKs' bounded retention queues make that window unreachable in practice.
+const flushDedupeHorizon = 24 * time.Hour
+
+// filterUncommitted drops chunk events whose event_id already exists in the
+// events table (F12: the durable dedupe boundary for producer-stable event
+// ids). Runs inside the chunk's own transaction; Flush is serialized by
+// flushMu, so within one process the existence check and the INSERT it
+// guards cannot interleave with another flush of the same ids. Fails OPEN
+// on a lookup error (a possible duplicate beats certain data loss).
+func (b *Buffer) filterUncommitted(ctx context.Context, sqlc *nucleus.SQLModel, chunk []Event) []Event {
+	ids := make([]string, 0, len(chunk))
+	minTS := chunk[0].Timestamp
+	for _, e := range chunk {
+		ids = append(ids, e.EventID)
+		if e.Timestamp < minTS {
+			minTS = e.Timestamp
+		}
+	}
+	existing := existingEventIDs(ctx, sqlc, ids, minTS-flushDedupeHorizon.Milliseconds(), b.logger)
+	if existing == nil || len(existing) == 0 {
+		return chunk
+	}
+	out := chunk[:0]
+	for _, e := range chunk {
+		if _, dup := existing[e.EventID]; !dup {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // insertBatch inserts events in chunks. Each chunk's events + events_recent
 // inserts run inside a single transaction so a failure of the second can never
 // leave the first committed (which previously let events_recent diverge from
@@ -596,6 +652,12 @@ func eventsRecentArgs(dst []any, e *Event) []any {
 // re-queues only the unsubmitted tail rather than the whole batch — that whole-
 // batch re-queue was the main way a flush retry double-counted already-inserted
 // events.
+//
+// F12: each chunk is first filtered against already-committed event ids, so a
+// client retry that slipped past the admission cache (restart, TTL, concurrent
+// submit) is dropped here instead of double-counted. `committed` still counts
+// the chunk's whole span once its transaction commits: dropped duplicates were
+// acknowledged to their producer by the FIRST successful insert of those ids.
 func (b *Buffer) insertBatch(ctx context.Context, batch []Event) (committed int, err error) {
 	// Chunk size chosen so each statement stays well under protocol limits
 	// even for wide rows (29 cols * 50 rows = 1450 placeholders).
@@ -606,6 +668,22 @@ func (b *Buffer) insertBatch(ctx context.Context, batch []Event) (committed int,
 			end = len(batch)
 		}
 		chunk := batch[start:end]
+
+		tx, txErr := b.db.Begin(ctx)
+		if txErr != nil {
+			return committed, fmt.Errorf("batch begin tx %d-%d: %w", start+1, end, txErr)
+		}
+		txSQL := tx.SQL()
+
+		chunk = b.filterUncommitted(ctx, txSQL, chunk)
+		if len(chunk) == 0 {
+			// Every event in this span is already stored; committing the
+			// empty transaction is fine (and keeps rollback handling
+			// uniform), the span still counts as processed.
+			_ = tx.Commit(ctx)
+			committed = end
+			continue
+		}
 
 		eventsQuery := "INSERT INTO events (" + eventsColList + ") VALUES " +
 			buildPlaceholders(len(chunk), eventsCols)
@@ -619,11 +697,6 @@ func (b *Buffer) insertBatch(ctx context.Context, batch []Event) (committed int,
 			recentArgs = eventsRecentArgs(recentArgs, &chunk[i])
 		}
 
-		tx, txErr := b.db.Begin(ctx)
-		if txErr != nil {
-			return committed, fmt.Errorf("batch begin tx %d-%d: %w", start+1, end, txErr)
-		}
-		txSQL := tx.SQL()
 		if _, e := txSQL.Exec(ctx, eventsQuery, eventsArgs...); e != nil {
 			_ = tx.Rollback(ctx)
 			return committed, fmt.Errorf("batch insert events %d-%d: %w", start+1, end, e)

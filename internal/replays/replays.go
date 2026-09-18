@@ -3,6 +3,7 @@ package replays
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,18 @@ import (
 // ErrCrossSiteReplay indicates the caller tried to append events to a replay
 // owned by a different site (audit F08). Handlers map it to 403.
 var ErrCrossSiteReplay = errors.New("replay_id belongs to a different site")
+
+// ErrBatchIDReuse indicates a (producer_id, batch_id) pair was resubmitted
+// with DIFFERENT event content (F12/F19). A legitimate retry of an
+// ambiguous batch replays byte-identical events, so a digest mismatch is a
+// producer bug or an intentional replay-ID squat; either way it is refused
+// loudly rather than silently dropping the new content as a "duplicate".
+var ErrBatchIDReuse = errors.New("batch_id reused with different event content")
+
+// ErrV2BatchNeedsReplayID: the v2 idempotency key is (site, replay, batch);
+// a batch without a client-generated replay_id could never be deduplicated
+// because the server would assign a fresh replay id on every attempt.
+var ErrV2BatchNeedsReplayID = errors.New("v2 batches require a client-generated replay_id")
 
 // replaySessionCols are the non-key columns of replay_sessions, in the order
 // the collapse helpers expect (see internal/query/replacing.go). The ORDER BY
@@ -134,12 +147,25 @@ type ReplayEvent struct {
 // a vw_bucket for clicks that occur before any `resize` event in the
 // batch. The replay SDK populates it from `window.innerWidth` at flush
 // time (see cmd/observe/tracker/observe-replay.js).
+//
+// F12/F19 idempotency fields (protocol v2, all optional for v1 producers):
+// V is the wire protocol version (2); ProducerID is a stable id for the
+// tracker instance (one per page load); BatchID identifies one flushed
+// batch and MUST be reused when that same batch is retried. When both
+// ProducerID and BatchID are present the batch is deduplicated against the
+// replay_batches ledger written in the same transaction as its children,
+// and child event ids become deterministic functions of
+// (site, replay, batch, index) - so a retry after a lost response or a
+// rolled-back transaction can never duplicate children, session
+// aggregates, or heatmap contributions.
 type IngestInput struct {
 	SiteID    string `json:"site_id"`
 	SessionID string `json:"session_id"`
 	// ReplayID is generated client-side so observe-errors.js can attach
 	// errors to the same replay before the first batch reaches the server.
-	// Empty -> the server assigns a fresh id.
+	// Empty -> the server assigns a fresh id (v1 semantics only; a v2
+	// batch with idempotency fields and no replay_id is rejected, see
+	// ErrV2BatchNeedsReplayID).
 	ReplayID      string `json:"replay_id"`
 	URL           string `json:"url"`
 	Browser       string `json:"browser"`
@@ -151,11 +177,83 @@ type IngestInput struct {
 	// via identify(userId). Hashed with the per-site session_salt
 	// before storage.
 	DistinctID string `json:"distinct_id,omitempty"`
+	V          int    `json:"v,omitempty"`
+	ProducerID string `json:"producer_id,omitempty"`
+	BatchID    string `json:"batch_id,omitempty"`
 	Events     []struct {
 		Type      string `json:"type"`
 		Timestamp int64  `json:"timestamp"`
 		Data      any    `json:"data"`
 	} `json:"events"`
+}
+
+// idempotent reports whether this batch carries the v2 producer identity
+// that enables ledger dedupe (F12/F19).
+func (in *IngestInput) idempotent() bool {
+	return in.ProducerID != "" && in.BatchID != ""
+}
+
+// batchDigest is the sha256 over the canonical JSON encoding of the batch's
+// event list. Go marshals struct fields in declaration order and map keys
+// sorted, so the same events always digest identically on producer and
+// server retries alike.
+func (in *IngestInput) batchDigest() string {
+	raw, err := json.Marshal(in.Events)
+	if err != nil {
+		// Events already marshal-checked per-child during insert; a digest
+		// failure here degrades to a per-attempt unique digest (no dedupe)
+		// rather than blocking ingest.
+		return fmt.Sprintf("undigestable:%d:%v", len(in.Events), err)
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+// DeterministicChildID derives one replay child event id from
+// (site, replay, batch, index) - the F12/F19 stable child identity. A
+// retried batch re-derives the same ids, so children are natural
+// deduplicates of themselves under any future unique-key or CAS scheme.
+func DeterministicChildID(siteID, replayID, batchID string, index int) string {
+	sum := sha256.Sum256([]byte("observe-replay-v2|" + siteID + "|" + replayID + "|" + batchID + "|" + strconv.Itoa(index)))
+	return hex.EncodeToString(sum[:16])
+}
+
+// Result is the outcome of one Ingest call.
+type Result struct {
+	ReplayID string
+	// Deduped is true when the batch was recognized as a retry of an
+	// already-committed batch (v2 ledger hit with a matching digest) and
+	// nothing was written.
+	Deduped bool
+}
+
+// ledgerRow is the collapsed state of one replay_batches key.
+type ledgerRow struct {
+	EventCount int64  `db:"event_count"`
+	PayloadSHA string `db:"payload_sha"`
+}
+
+var replayBatchCols = []string{"event_count", "payload_sha"}
+
+// replayBatchLatest renders the collapsed replay_batches derived table for
+// one (site, replay, batch) key.
+func replayBatchLatest(where string) string {
+	return query.LatestRows("replay_batches", replayBatchCols, where) + " AS replay_batches"
+}
+
+// ledgerLookup returns the committed ledger row for a batch key, or nil.
+func (s *ReplayService) ledgerLookup(ctx context.Context, sqlc *nucleus.SQLModel, siteID, replayID, batchID string) (*ledgerRow, error) {
+	rows, err := nucleus.Query[ledgerRow](ctx, sqlc,
+		`SELECT event_count, payload_sha FROM `+
+			replayBatchLatest("site_id = $1 AND replay_id = $2 AND batch_id = $3"),
+		siteID, replayID, batchID)
+	if err != nil {
+		return nil, fmt.Errorf("replays: batch ledger lookup: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return &rows[0], nil
 }
 
 // existingSession is the collapsed current state of one replay's session row,
@@ -321,13 +419,28 @@ func (s *ReplayService) upsertSession(ctx context.Context, sqlc *nucleus.SQLMode
 // child event commit in ONE transaction — a mid-batch child failure
 // rolls the session metadata back with the children instead of leaving
 // updated counters behind a failed batch.
-func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, error) {
+//
+// F12/F19 (batch idempotency): a v2 batch (producer_id + batch_id
+// present, replay_id client-generated) is deduplicated through the
+// replay_batches ledger. The ledger row commits in the SAME transaction
+// as the session upsert and the children, so the dedupe boundary is one
+// atomic SQL unit - not a KV SetNX followed by an insert, the
+// non-atomic pair the audit rejected. A retry of a committed batch hits
+// the ledger and returns Deduped without writing; a retry of a batch
+// whose transaction rolled back finds no ledger row (nor children, nor
+// session - they rolled back together) and re-inserts children with the
+// SAME deterministic ids. Session aggregates and heatmap rollups run
+// only on the non-duplicate path, so a retry cannot double-count them.
+func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (Result, error) {
 	if len(input.Events) == 0 {
-		return "", nil
+		return Result{}, nil
 	}
 
 	replayID := input.ReplayID
 	if replayID == "" {
+		if input.idempotent() {
+			return Result{}, ErrV2BatchNeedsReplayID
+		}
 		replayID = genID()
 	}
 
@@ -341,10 +454,10 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 	if input.ReplayID != "" {
 		owner, err := s.replayOwner(ctx, replayID)
 		if err != nil {
-			return "", err
+			return Result{}, err
 		}
 		if owner != "" && owner != input.SiteID {
-			return "", fmt.Errorf("%w: replay %s is owned by another site", ErrCrossSiteReplay, replayID)
+			return Result{}, fmt.Errorf("%w: replay %s is owned by another site", ErrCrossSiteReplay, replayID)
 		}
 	}
 
@@ -383,13 +496,30 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
-		return "", fmt.Errorf("replays: begin ingest tx: %w", err)
+		return Result{}, fmt.Errorf("replays: begin ingest tx: %w", err)
 	}
 	defer tx.Rollback(ctx) // no-op once Commit has succeeded
 	sqlc := tx.SQL()
 
+	// F12/F19: the ledger read runs INSIDE the transaction (under the
+	// striped replay lock), so for any single process the check and the
+	// writes it guards are one serialized unit. A duplicate whose digest
+	// matches returns without writing anything.
+	if input.idempotent() {
+		prior, err := s.ledgerLookup(ctx, sqlc, input.SiteID, replayID, input.BatchID)
+		if err != nil {
+			return Result{}, err
+		}
+		if prior != nil {
+			if prior.PayloadSHA != input.batchDigest() {
+				return Result{}, fmt.Errorf("%w: producer %s batch %s", ErrBatchIDReuse, input.ProducerID, input.BatchID)
+			}
+			return Result{ReplayID: replayID, Deduped: true}, nil
+		}
+	}
+
 	if err := s.upsertSession(ctx, sqlc, &input, replayID, agg, distinctID); err != nil {
-		return "", err
+		return Result{}, err
 	}
 
 	// Track the most recent viewport width seen in this batch so click
@@ -403,8 +533,15 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 	}
 	clickEvents := make([]attributedClick, 0)
 
-	for _, ev := range input.Events {
+	idempotent := input.idempotent()
+	for i, ev := range input.Events {
 		eventID := genID()
+		if idempotent {
+			// F12/F19: children of an idempotent batch are named by
+			// (site, replay, batch, index) so any re-insert path lands on
+			// the same rows.
+			eventID = DeterministicChildID(input.SiteID, replayID, input.BatchID, i)
+		}
 		dataJSON := "null"
 		if ev.Data != nil {
 			if raw, err := json.Marshal(ev.Data); err == nil {
@@ -419,7 +556,7 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 			eventID, input.SiteID, replayID, ev.Timestamp, ev.Type, dataJSON,
 		)
 		if err != nil {
-			return replayID, fmt.Errorf("insert replay event: %w", err)
+			return Result{}, fmt.Errorf("insert replay event: %w", err)
 		}
 
 		switch ev.Type {
@@ -455,15 +592,36 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 		}
 	}
 
+	// F12/F19: the ledger row commits with the children and the session
+	// version it describes. Crash before commit -> no ledger, no children
+	// (the tx rolled back) -> a retry reprocesses fully with the same
+	// deterministic child ids. Crash or response-loss after commit -> the
+	// ledger hit returns Deduped above with zero writes.
+	if idempotent {
+		now := time.Now().UTC().UnixMilli()
+		if _, err := sqlc.Exec(ctx,
+			`INSERT INTO replay_batches (tenant_id, site_id, replay_id, batch_id, event_count, payload_sha, first_seen, version)
+			 VALUES ('default', $1, $2, $3, $4, $5, $6, $6)`,
+			input.SiteID, replayID, input.BatchID,
+			strconv.FormatInt(int64(len(input.Events)), 10),
+			input.batchDigest(), dbutil.IntParam(now),
+		); err != nil {
+			return Result{}, fmt.Errorf("replays: write batch ledger: %w", err)
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
-		return replayID, fmt.Errorf("replays: commit ingest tx (outcome may be unknown — batch is not idempotent yet, see F12/F19): %w", err)
+		return Result{ReplayID: replayID}, fmt.Errorf("replays: commit ingest tx: %w", err)
 	}
 
 	// Write the per-bucket heatmap rollups. Best-effort: a heatmap write
 	// failure must not fail the underlying replay ingest because the raw
 	// event rows are already durable. Pattern matches tracing rollups
-	// (see internal/tracing/ingest.go). A durable derived-work outbox
-	// remains deferred with F19's idempotency work.
+	// (see internal/tracing/ingest.go). F12/F19: this path is reached only
+	// for batches that were NOT ledger deduped, so a retried batch cannot
+	// double-count click heat. A durable derived-work outbox remains
+	// deferred (a heatmap write failure here still skips the rollup for
+	// that batch - the retry that would redo it is deduped away).
 	byPage := make(map[string][]heatmaps.RawEvent, 1)
 	for _, c := range clickEvents {
 		if c.page == "" {
@@ -482,7 +640,7 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 		}
 	}
 
-	return replayID, nil
+	return Result{ReplayID: replayID}, nil
 }
 
 // telemetryPageURL sanitizes a tracker-captured page URL for heatmap

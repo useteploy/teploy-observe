@@ -15,6 +15,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional
 from urllib import request as urlrequest
 from urllib.error import URLError
+import uuid
+
+# Wire protocol version this SDK speaks (F12/F19 idempotent delivery).
+PROTOCOL_VERSION = 2
 
 
 @dataclass
@@ -81,6 +85,10 @@ class Client:
         self.opts = Options(**kwargs)
         _validate_options(self.opts)
         self._lock = threading.Lock()
+        # F12: stable producer identity for this client instance. Sent with
+        # the v2 event envelope so the server can attribute and deduplicate
+        # per producer.
+        self._producer_id = uuid.uuid4().hex
         # AUD-036 (round 2): the queue holds the bytes encoded AT ADMISSION.
         # Queueing the original dict let callers mutate nested fields after
         # log() returned, silently changing (or poisoning) the eventual body.
@@ -140,6 +148,10 @@ class Client:
             "site_id": self.opts.site_id,
             "event_type": "$identify",
             "distinct_id": str(user_id),
+            # F12: producer-stable event id - lets the flush-time dedupe on
+            # the server drop a redelivered copy instead of double-counting.
+            "event_id": uuid.uuid4().hex,
+            "producer_id": self._producer_id,
         }
         if traits:
             payload["properties"] = {

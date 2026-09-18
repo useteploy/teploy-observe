@@ -145,3 +145,39 @@ test("keyed configuration never queues a beacon", async () => {
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(beaconUsed, false, "beacon must never be used when an API key is configured");
 });
+
+// F12/F19: batches carry v2 identity (producer_id + stable batch_id), and a
+// failed chunk retries under the SAME batch id so the server ledger can
+// dedupe it instead of double-counting children and heatmap clicks.
+test("replay batches carry v2 identity and retry under the same batch id", async () => {
+  let fail = true;
+  const bodies = [];
+  const { sandbox, listeners } = makeSandbox({
+    fetchImpl: (_url, opts) => {
+      bodies.push(JSON.parse(opts.body));
+      return fail ? Promise.resolve({ ok: false, status: 503 }) : Promise.resolve({ ok: true });
+    },
+  });
+  click(listeners, 8, 8);
+  sandbox.observeReplay.stop(); // first flush -> 503, chunk retained
+  await new Promise((r) => setTimeout(r, 10));
+  assert.ok(bodies.length >= 1, "first attempt issued");
+  assert.equal(bodies[0].v, 2, "protocol v2 stamped");
+  assert.ok(bodies[0].producer_id, "producer_id present");
+  assert.ok(bodies[0].batch_id, "batch_id present");
+
+  fail = false;
+  sandbox.observeReplay.start();
+  sandbox.observeReplay.stop(); // retry flush with delivery restored
+  await new Promise((r) => setTimeout(r, 10));
+  // The retry is the body reusing the failed batch id (a fresh chunk for
+  // the second start()'s snapshot may follow it).
+  const retry = bodies.find((b, i) => i > 0 && b.batch_id === bodies[0].batch_id);
+  assert.ok(retry, "the failed chunk must be retried under its original batch id");
+  assert.equal(retry.producer_id, bodies[0].producer_id, "producer id stable");
+  assert.deepEqual(
+    retry.events.map((e) => [e.type, e.timestamp]),
+    bodies[0].events.map((e) => [e.type, e.timestamp]),
+    "retry carries the same events",
+  );
+});

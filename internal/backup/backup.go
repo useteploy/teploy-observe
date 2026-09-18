@@ -73,6 +73,7 @@ var Tables = []string{
 	"metric_points",
 	"host_metrics",
 	"replay_sessions",
+	"replay_batches",
 	"replay_events",
 	"click_heatmaps",
 	"feature_flags",

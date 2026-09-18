@@ -67,6 +67,9 @@ var replacingKeys = map[string][]string{
 	// managed users, and issuer-namespaced OIDC identities (audit F03/F05).
 	// Keyed on id alone: ids are globally unique across all three origins.
 	"principals": {"id"},
+	// 041_replay_batch_ledger — insert-once per (site, replay, batch);
+	// replacing so a cross-process double-submit collapses to one row.
+	"replay_batches": {"tenant_id", "site_id", "replay_id", "batch_id"},
 }
 
 // Keys returns the registered ORDER BY key of a replacing table, or nil.

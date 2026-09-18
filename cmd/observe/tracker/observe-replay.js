@@ -33,6 +33,16 @@
   var sessionId = '';
   var hasError = false;
 
+  // F12/F19 (protocol v2): producer identity for this recorder instance and
+  // a monotonic sequence numbering the chunks this recorder detaches. A
+  // chunk keeps its id when requeued, so a retry after a lost response is
+  // recognized by the server's batch ledger instead of double-counted.
+  var PROTOCOL_VERSION = 2;
+  var producerId = makeReplayId();
+  var chunkSeq = 0;
+  // Failed chunks awaiting retry, as {id, events} - identity intact.
+  var pendingChunks = [];
+
   // AUD-027: explicit lifecycle. `active` gates every capture path — a
   // stopped recorder's listeners/wrappers become inert instead of quietly
   // continuing to record, and repeated start() cannot stack duplicate
@@ -405,6 +415,9 @@
   function makePayload(chunk) {
     var ctx = pageContext();
     var payload = {
+      v: PROTOCOL_VERSION,
+      producer_id: producerId,
+      batch_id: chunk.id,
       site_id: siteId,
       session_id: sessionId,
       replay_id: replayId,
@@ -414,7 +427,7 @@
       device: '',
       has_error: hasError,
       viewport_width: ctx.viewport_width,
-      events: chunk
+      events: chunk.events
     };
     var distinctId = readDistinctID();
     if (distinctId) payload.distinct_id = distinctId;
@@ -422,6 +435,8 @@
   }
 
   // Split a batch into request-legal chunks by encoded bytes AND count.
+  // Each chunk is born with a stable id (F12/F19): retries of a failed
+  // chunk re-send under the SAME id so the server dedupes them.
   function chunkBatch(batch) {
     var chunks = [];
     var cur = [];
@@ -430,26 +445,37 @@
       var size = byteLength(JSON.stringify(batch[i])) + 1;
       if (cur.length >= MAX_FLUSH_EVENTS ||
           (curBytes + size > MAX_REQUEST_BYTES && cur.length > 0)) {
-        chunks.push(cur);
+        chunks.push({ id: replayId + '-' + (++chunkSeq), events: cur });
         cur = [];
         curBytes = 512;
       }
       curBytes += size;
       cur.push(batch[i]);
     }
-    if (cur.length) chunks.push(cur);
+    if (cur.length) chunks.push({ id: replayId + '-' + (++chunkSeq), events: cur });
     return chunks;
+  }
+
+  function countChunkEvents(chunks, from) {
+    var n = 0;
+    for (var i = from; i < chunks.length; i++) n += chunks[i].events.length;
+    return n;
   }
 
   function sendChunks(chunks, idx, done) {
     if (idx >= chunks.length) { done(null); return; }
     deliver(endpoint, makePayload(chunks[idx]), function(err) {
       if (err) {
-        // Requeue this chunk and every chunk not yet attempted; already
-        // accepted chunks stay sent. Bounded by maxEvents via record().
-        var requeue = [];
-        for (var k = idx; k < chunks.length; k++) requeue = requeue.concat(chunks[k]);
-        events = requeue.concat(events);
+        // Requeue this chunk (identity intact) and every chunk not yet
+        // attempted; already accepted chunks stay sent. Bounded by
+        // maxEvents: the oldest pending chunk events are dropped and
+        // reported when a long outage exceeds the cap.
+        for (var k = idx; k < chunks.length; k++) pendingChunks.push(chunks[k]);
+        while (countChunkEvents(pendingChunks, 0) > maxEvents && pendingChunks.length > 1) {
+          var dropped = pendingChunks.shift();
+          onErrorHook(new Error('observe-replay: dropped ' + dropped.events.length +
+            ' queued event(s) - retention cap reached'));
+        }
         onErrorHook(err);
         done(err);
         return;
@@ -459,11 +485,17 @@
   }
 
   function flush() {
-    if (events.length === 0) return;
+    if (events.length === 0 && pendingChunks.length === 0) return;
     if (flushInFlight) return; // one owned batch at a time
+    // Previously-failed chunks retry FIRST and under their original ids -
+    // the batch is the unit of idempotency, so its composition must never
+    // be reshuffled between attempts.
+    var chunks = pendingChunks;
+    pendingChunks = [];
     var batch = events.splice(0, MAX_FLUSH_EVENTS);
+    if (batch.length) chunks = chunks.concat(chunkBatch(batch));
     flushInFlight = true;
-    sendChunks(chunkBatch(batch), 0, function() {
+    sendChunks(chunks, 0, function() {
       flushInFlight = false;
     });
     // Any remainder rides the interval tick set up in init().
@@ -544,6 +576,7 @@
       if (history.replaceState === wrappedReplace) history.replaceState = origReplace;
       if (options && options.discard) {
         events.length = 0;
+        pendingChunks = [];
       } else {
         flush();
       }

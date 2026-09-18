@@ -45,6 +45,10 @@ export interface InitOptions {
 export interface EventPayload {
   site_id: string;
   event_type: string;
+  /** Producer-assigned stable identity (F12): generated once when the event
+   * is recorded, kept through requeue and retry so the server can dedupe a
+   * redelivered batch at flush. */
+  event_id?: string;
   url?: string;
   referrer?: string;
   title?: string;
@@ -57,6 +61,9 @@ export interface EventPayload {
   properties?: Record<string, unknown>;
   [key: string]: unknown;
 }
+
+/** Wire protocol version this SDK speaks (F12/F19 idempotent batches). */
+export const PROTOCOL_VERSION = 2;
 
 export interface ErrorPayload {
   site_id: string;
@@ -104,6 +111,9 @@ interface Client {
   timer: number | null;
   userId: string | null;
   sessionId: string | null;
+  /** F12: stable producer identity for this SDK instance; part of every
+   * batch envelope so the server can dedupe per-producer batch ids. */
+  producerId: string;
   /** Single-flight flush owner (AUD-022): overlapping flushes used to send
    * duplicate prefixes and then slice differing lengths off a mutated
    * queue, deleting events neither request had sent. */
@@ -141,9 +151,25 @@ const MAX_BUFFERED_ON_ERROR = 200;
 
 const textEncoder = new TextEncoder();
 
-/** Measure the encoded byte length of a candidate `{events: [...]}` body. */
+/** Measure the encoded byte length of the v2 batch envelope around events.
+ * The batch_id is derived from the first event's stable event_id, so the
+ * measurement matches the body actually sent (F12). */
 function eventsBodyBytes(events: EventPayload[]): number {
-  return textEncoder.encode(JSON.stringify({ events })).byteLength;
+  return textEncoder.encode(JSON.stringify(batchEnvelope(events))).byteLength;
+}
+
+/** The v2 batch wire shape (F12): v + producer identity + events. batch_id
+ * is the first event's event_id, which makes it stable across retries of
+ * the same detached batch by construction - a requeued batch re-flushes
+ * with the identical id, so the server admission cache recognizes it. */
+function batchEnvelope(events: EventPayload[], producerId?: string): Record<string, unknown> {
+  const pid = producerId ?? client?.producerId ?? "";
+  return {
+    v: PROTOCOL_VERSION,
+    producer_id: pid,
+    batch_id: events[0]?.event_id ?? "",
+    events,
+  };
 }
 
 /**
@@ -263,7 +289,7 @@ export function init(options: InitOptions): void {
         reportError(previous, new Error("observe: dropped an event exceeding the request byte budget on re-init"));
       }
       for (const chunk of chunks) {
-        sendJSON(previous, "/api/v1/events/batch", { events: chunk }).catch((err) => {
+        sendJSON(previous, "/api/v1/events/batch", batchEnvelope(chunk, previous.producerId)).catch((err) => {
           reportError(previous, err instanceof Error ? err : new Error(String(err)));
         });
       }
@@ -286,6 +312,7 @@ export function init(options: InitOptions): void {
     timer: null,
     userId: null,
     sessionId: makeId(),
+    producerId: makeId(),
     flushing: null,
     dispose: () => {},
   };
@@ -365,6 +392,7 @@ export function pageview(pathname?: string): void {
 const RESERVED_FIELDS = new Set([
   "site_id",
   "event_type",
+  "event_id",
   "url",
   "referrer",
   "title",
@@ -390,6 +418,7 @@ export function track(eventType: string, props: Record<string, unknown> = {}): v
   const payload: EventPayload = {
     site_id: client.opts.siteId,
     event_type: eventType,
+    event_id: makeId(),
   };
   const properties: Record<string, unknown> = {};
   for (const key of Object.keys(props)) {
@@ -557,7 +586,7 @@ function flushClient(target: Client, unloading = false): Promise<void> {
       }
       const batch = target.buffer.splice(0, chunks[0]?.length ?? target.buffer.length);
       try {
-        await sendJSON(target, "/api/v1/events/batch", { events: batch }, unloading);
+        await sendJSON(target, "/api/v1/events/batch", batchEnvelope(batch), unloading);
       } catch (err) {
         // Delivery failed: prepend exactly THIS batch (bounded) and stop —
         // the next interval/visibility flush retries it.
