@@ -11,11 +11,11 @@ below.
 
 Pass record (2026-09-17 audit, remediation session same day):
 
-- Fixed: F01, F04, F06, F07, F08, F09, F10, F11, F12 (admission half),
-  F13, F14, F15, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27,
-  F28, F29, F30, F31, F32 (transport half), F33, F34, F35, F36, F37, F40,
-  F42, F43, F44, F48, F50, F51, plus the replay-half of F28.
-- Deferred with rationale: F02, F03, F05, F12 (idempotency half), F16,
+- Fixed: F01, F03, F04, F05, F06, F07, F08, F09, F10, F11, F12 (admission
+  half), F13, F14, F15, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26,
+  F27, F28, F29, F30, F31, F32 (transport half), F33, F34, F35, F36, F37,
+  F40, F42, F43, F44, F48, F50, F51, plus the replay-half of F28.
+- Deferred with rationale: F02, F12 (idempotency half), F16,
   F19 (full batch idempotency), F32 (client retry half), F37 (default-mask
   policy), F38 (asset proxy), F39, F41, F45 (app half), F46 (dedicated key
   migration), F47, F49 (UI-freshness gate).
@@ -24,7 +24,7 @@ Pass record (2026-09-17 audit, remediation session same day):
 - False positives: none — every finding verified against source before
   fixing or deferring.
 
-Open items: 17 (3 P1 product/schema decisions, 12 P2 designs, 2 CI/ops)
+Open items: 15 (2 P1 product/schema decisions, 11 P2 designs, 2 CI/ops)
 
 ## F02 - P1 - Open (design decision): first-run grace authorizes administration
 
@@ -43,23 +43,46 @@ first-writer-wins, and the grace closes permanently once any admin exists.
 Revisit trigger: observe ever exposed on a public address by default, or a
 request for headless/multi-tenant installs.
 
-## F03 - P1 - Open (architecture): user management and authentication use different principal stores
+## F03 - P1 - Fixed 2026-09-18 (f631c81): user management and authentication use different principal stores
 
-`platform/users` and `auth/admin_users` are separate tables with no
-synchronization; managed users cannot log in and role changes don't revoke
-tokens. Requires the canonical-principal migration the audit sketches
-(atomic credential+profile creation, role changes bumping token_version,
-backfill of existing managed users). Deferred as a schema + product
-migration, not a contained fix; the audit's regression gate (create → login
-→ promote → old token invalid) is the acceptance test when it lands.
+Resolved by migration 040 + internal/principals: one ReplacingMergeTree
+store (argMax collapse, 039-style monotonic version stamp) now backs every
+identity. platform.UserService writes the same store Login reads, so
+created users authenticate immediately; UpdateRole bumps token_version, so
+a role change retires every JWT minted under the old role on its next use.
+The audit's regression gate (create → login → promote → old token invalid)
+is TestF03Gate_CreateLoginPromoteOldTokenInvalid in internal/auth, green
+against live Nucleus (docker nucleus-f03). Existing installs converge via
+the 040 backfill: legacy ids and token_versions carry across verbatim,
+username collisions between the two legacy tables resolve to the
+admin-origin account (the one with a working password), and both legacy
+tables remain untouched as recovery artifacts. Convergence of an existing
+install is corpus-executed: Test040BackfillConvergesExistingInstall
+(internal/principals) rewinds the ledger past 040, seeds legacy
+admin_users/users rows including the duplicate-row UpdateRole pattern and
+a cross-table username collision, and asserts ids, token_versions, the
+newest-row collapse, and the admin-origin login tie-break. Follow-ups that
+stay open: the atomic bootstrap claim-as-record (AUD-003's deferred half,
+unchanged). CI note: the DB-backed suites self-skip without
+OBSERVE_NUCLEUS_URL (AUD-056 remainder); they were executed against a live
+scratch Nucleus (docker nucleus-f03) at commit time.
 
-## F05 - P2 - Open (architecture): OIDC sessions bypass revocation; identity key omits issuer
+## F05 - P2 - Fixed 2026-09-18 (f631c81): OIDC sessions bypass revocation; identity key omits issuer
 
-SSO-minted JWTs (24h, tv=0) have no principal row to revoke and `oidc:<sub>`
-is not namespaced by issuer. Fixing it needs the F03 principal store plus an
-admin "revoke sessions" operation; deferring with F03 as one migration.
-Operational note until then: rotating OBSERVE_JWT_SECRET is the documented
-emergency revocation (it invalidates all sessions, local and SSO).
+Landed with F03 as the one migration (040). Principal ids are
+issuer-namespaced — oidc:<sha256(issuer)[:16]:<sub> — so two issuers
+reusing a subject are two identities. Every SSO sign-in upserts a principal
+row and mints its JWT with the row's token_version; the middleware version
+check is unconditional, so a row-less token (every pre-040 "oidc:<sub>"
+session) is dead on its next request — live SSO sessions were implicitly
+rotated by the migration. New admin operation
+POST /api/v1/platform/users/{user_id}/revoke-sessions retires one
+principal's sessions; rotating OBSERVE_JWTSECRET remains the
+all-sessions emergency. An IdP re-sign-in refreshes profile and role but
+preserves token_version, so it cannot resurrect a revoked session.
+Covered by TestF05OIDCSessionsRevocableAndIssuerScoped,
+TestF05SubjectIDIssuerNamespaced, and TestF05Pre040OIDCTokenShapeRejected
+against live Nucleus.
 
 ## F12 - P1 - Partially fixed: batch admission atomic, stable producer IDs deferred
 
@@ -231,7 +254,8 @@ architectural half stays open):
   sites can no longer route writes. Behavior change: fresh installs accept
   no telemetry until an admin provisions a key.
 - AUD-003 (contained): bootstrap-claim release runs on a detached,
-  time-boxed context. Atomic claim-as-record stays deferred with F03.
+  time-boxed context. Atomic claim-as-record stays deferred (was parked
+  with F03; the principal store landed 2026-09-18 without it — see F03).
 - AUD-005: credential mutations serialized (EnsureAdmin/ChangePassword/
   ForceReset); created_at preserved on the DELETE+INSERT replacement.
 - AUD-007: partial OIDC config is a startup error; issuer URL validated
@@ -337,10 +361,10 @@ architectural half stays open):
   freshness gate remain deferred (F49/AUD-055).
 
 Deferred, standing round-1 items restated by this audit (unchanged
-rationales below): AUD-001 = F02, AUD-004 = F03, AUD-006 = F05,
-AUD-011 = F12/F19, AUD-013 = F16, AUD-029 = F37, AUD-042 = F45 (app
-half), AUD-043 = F45 (upstream half), AUD-049 = F46, AUD-050 = F47,
-AUD-055 = F49.
+rationales below): AUD-001 = F02, AUD-011 = F12/F19, AUD-013 = F16,
+AUD-029 = F37, AUD-042 = F45 (app half), AUD-043 = F45 (upstream half),
+AUD-049 = F46, AUD-050 = F47, AUD-055 = F49. (AUD-004/AUD-006 closed
+2026-09-18 with F03/F05 — f631c81.)
 
 New deferrals from this round:
 
