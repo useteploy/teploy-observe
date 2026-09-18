@@ -122,6 +122,61 @@ func (s *AuthService) ValidateToken(tokenStr string) (neutronauth.Claims, error)
 	return neutronauth.ParseToken(tokenStr, s.jwtSecret)
 }
 
+// StreamTicketTTL is how long a minted stream ticket lives. Tickets are
+// accepted at connection-open time only, so the TTL has to cover a user
+// clicking "export" or opening a log tail - not the duration of the stream
+// or download itself. Two minutes is deliberately far under the 24h general
+// token lifetime: a ticket leaking into a URL is compromised material for
+// minutes, not a day (AUD-008).
+const StreamTicketTTL = 2 * time.Minute
+
+// StreamTicketAudience marks a token as a single-purpose stream ticket.
+// Tokens carrying it are rejected everywhere except the ?ticket= query
+// parameter on their bound route prefix; and ONLY tokens carrying it are
+// accepted there (a normal access JWT in a query string is rejected - the
+// AUD-008 fix proper).
+const StreamTicketAudience = "observe-stream"
+
+// StreamTicketRoutes lists the route prefixes a ticket may be minted for
+// and accepted on: the EventSource and download paths that cannot set
+// Authorization headers. Keep in sync with queryTicketAllowedPaths.
+var StreamTicketRoutes = []string{
+	"/api/v1/export",
+	"/api/v1/logs/stream",
+	"/api/v1/live",
+	"/api/v1/stats/live",
+}
+
+// StreamTicketRouteValid reports whether route is a mintable stream route.
+func StreamTicketRouteValid(route string) bool {
+	for _, r := range StreamTicketRoutes {
+		if r == route {
+			return true
+		}
+	}
+	return false
+}
+
+// GenerateStreamTicket mints a short-lived single-purpose ticket bound to
+// one route prefix (AUD-008). base must be the validated claims of an
+// authenticated principal; the ticket copies sub/username/role and the
+// CURRENT token_version so the standard revocation check applies to ticket
+// use as well (a revoked session cannot keep streaming on an old ticket).
+func (s *AuthService) GenerateStreamTicket(base neutronauth.Claims, route string, tokenVersion int64) (string, error) {
+	sub, _ := base["sub"].(string)
+	username, _ := base["username"].(string)
+	role, _ := base["role"].(string)
+	claims := neutronauth.Claims{
+		"aud":      StreamTicketAudience,
+		"sub":      sub,
+		"username": username,
+		"role":     normalizeRole(role),
+		"tv":       tokenVersion,
+		"route":    route,
+	}
+	return neutronauth.GenerateToken(claims, s.jwtSecret, StreamTicketTTL)
+}
+
 // bootstrapClaimKey is the KV key EnsureAdmin claims atomically before
 // inserting the first admin row.
 const bootstrapClaimKey = "auth:bootstrap_admin_claimed"

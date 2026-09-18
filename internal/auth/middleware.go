@@ -64,10 +64,11 @@ func RequireRole(authSvc *AuthService, allowed ...string) neutron.Middleware {
 	}
 }
 
-// queryTokenAllowedPaths lists URL path prefixes where ?token=<jwt> is accepted
-// on GET requests. EventSource / download contexts can't set Authorization
-// headers, so they carry auth in the query string. All other routes must use
-// the Authorization header.
+// queryTokenAllowedPaths lists URL path prefixes where a query-string
+// credential is accepted on GET requests. EventSource / download contexts
+// can't set Authorization headers, so they carry a minted stream ticket in
+// ?ticket= instead (AUD-008). All other routes must use the Authorization
+// header. Keep in sync with StreamTicketRoutes.
 var queryTokenAllowedPaths = []string{
 	"/api/v1/export",
 	"/api/v1/logs/stream",
@@ -91,6 +92,14 @@ func queryTokenAllowed(r *http.Request) bool {
 // JWTAuthMiddleware returns middleware that validates JWT tokens from the
 // Authorization: Bearer <token> header. If no admin users exist yet
 // (first-run grace period), requests are allowed through unauthenticated.
+//
+// AUD-008 (round 2): the query string accepts ONLY short-lived stream
+// tickets (?ticket=), never a normal access JWT - a 24h bearer credential
+// in a URL leaks through history, proxies, and logs. Symmetrically, a
+// stream ticket presented as an Authorization header is rejected: it is
+// not a general bearer token. Both checks run BEFORE the signature check
+// so the rejection is a property of the token's declared purpose, not of
+// its validity.
 func JWTAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -109,10 +118,19 @@ func JWTAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 
 			header := r.Header.Get("Authorization")
 			var token string
+			fromQuery := false
 			if strings.HasPrefix(header, "Bearer ") {
 				token = strings.TrimPrefix(header, "Bearer ")
-			} else if q := r.URL.Query().Get("token"); q != "" && queryTokenAllowed(r) {
+			} else if q := r.URL.Query().Get("ticket"); q != "" && queryTokenAllowed(r) {
 				token = q
+				fromQuery = true
+			} else if r.URL.Query().Get("token") != "" && queryTokenAllowed(r) {
+				// AUD-008: the old ?token= fallback carried full-access JWTs
+				// in URLs. Removed; the message tells legitimate consumers
+				// (EventSource/downloads) to mint a stream ticket instead.
+				neutron.WriteError(w, r, neutron.ErrUnauthorized(
+					"query-string tokens are no longer accepted - mint a stream ticket via POST /api/v1/auth/stream-ticket"))
+				return
 			} else if header == "" {
 				neutron.WriteError(w, r, neutron.ErrUnauthorized("missing authorization header"))
 				return
@@ -126,6 +144,26 @@ func JWTAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 				neutron.WriteError(w, r, neutron.ErrUnauthorized(err.Error()))
 				return
 			}
+			aud, _ := claims["aud"].(string)
+
+			if fromQuery {
+				// AUD-008: only single-purpose stream tickets may travel in
+				// the query string, and only on the route prefix they were
+				// minted for.
+				if aud != StreamTicketAudience {
+					neutron.WriteError(w, r, neutron.ErrUnauthorized("normal access tokens are not accepted in the query string"))
+					return
+				}
+				boundRoute, _ := claims["route"].(string)
+				if boundRoute == "" || !strings.HasPrefix(r.URL.Path, boundRoute) {
+					neutron.WriteError(w, r, neutron.ErrUnauthorized("stream ticket is not valid for this route"))
+					return
+				}
+			} else if aud == StreamTicketAudience {
+				// A stream ticket is not a general bearer token.
+				neutron.WriteError(w, r, neutron.ErrUnauthorized("stream tickets are only accepted as ?ticket= on their bound route"))
+				return
+			}
 
 			// OBS-011 + F05: reject a token whose embedded version doesn't
 			// match the principal's current token_version — this is what
@@ -135,7 +173,9 @@ func JWTAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 			// every principal has a row — local and issuer-namespaced OIDC
 			// alike — so the check is unconditional. A sub with no principal
 			// row (a pre-040 "oidc:<sub>" token, or a deleted principal)
-			// fails here and must re-authenticate.
+			// fails here and must re-authenticate. The same check retires
+			// minted stream tickets when the principal's sessions are
+			// revoked (AUD-008).
 			sub, _ := claims["sub"].(string)
 			if sub != "" {
 				tokenTV, _ := claims["tv"].(float64)
@@ -150,14 +190,11 @@ func JWTAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 				}
 			}
 
-			// OBS-016: a query-string token is real bearer material and can
-			// leak via browser history, proxy/access logs, or the Referer
-			// header on any outbound link/subresource the response contains.
-			// It's only accepted at all (queryTokenAllowed, above) because
-			// EventSource/download contexts can't set a custom header — for
-			// exactly those responses, stop this page/response from
-			// propagating a Referer that would carry the token onward.
-			if token == r.URL.Query().Get("token") {
+			// OBS-016 / AUD-008: even a stream ticket in a URL is credential
+			// material and can leak via browser history, proxy/access logs,
+			// or the Referer header on any outbound link/subresource the
+			// response contains - stop this response from propagating one.
+			if fromQuery {
 				w.Header().Set("Referrer-Policy", "no-referrer")
 			}
 

@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/neutron-dev/neutron-go/neutronauth"
+
 	"github.com/useteploy/teploy-observe/internal/ingest"
 )
 
@@ -82,12 +84,11 @@ func TestJWTAuthMiddleware_RevokedTokenRejected(t *testing.T) {
 	}
 }
 
-// TestJWTAuthMiddleware_QueryTokenOnlyOnAllowlistedPaths is the regression
-// for OBS-016 (reinstated, narrowed scope): a dashboard JWT in ?token= must
-// be accepted ONLY on the small set of routes that genuinely can't set an
-// Authorization header (EventSource/download contexts), and rejected
-// everywhere else.
-func TestJWTAuthMiddleware_QueryTokenOnlyOnAllowlistedPaths(t *testing.T) {
+// TestJWTAuthMiddleware_StreamTicketContract is the AUD-008 regression:
+// normal access JWTs are rejected in query strings everywhere; short-lived
+// stream tickets are accepted ONLY as ?ticket= on the route prefix they
+// were minted for; tickets do not work as general bearer tokens.
+func TestJWTAuthMiddleware_StreamTicketContract(t *testing.T) {
 	ctx, db, done := connect(t)
 	defer done()
 	svc := testService(db)
@@ -109,38 +110,81 @@ func TestJWTAuthMiddleware_QueryTokenOnlyOnAllowlistedPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
+	user, err := svc.Principals().LocalByUsername(ctx, username)
+	if err != nil {
+		t.Fatalf("fetch seeded principal: %v", err)
+	}
+	ticket, err := svc.GenerateStreamTicket(neutronauth.Claims{
+		"sub": user.ID, "username": username, "role": RoleAdmin,
+	}, "/api/v1/logs/stream", user.TokenVersion)
+	if err != nil {
+		t.Fatalf("GenerateStreamTicket: %v", err)
+	}
 
 	mw := JWTAuthMiddleware(svc)
 	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	// Allowlisted: /api/v1/export accepts ?token=.
+	// 1. A normal access JWT in the query string is REJECTED, even on the
+	// allowlisted stream routes - the AUD-008 fix proper.
 	req := httptest.NewRequest("GET", "/api/v1/export?token="+token, nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Errorf("allowlisted path with query token: expected 200, got %d", rec.Code)
-	}
-	if got := rec.Header().Get("Referrer-Policy"); got != "no-referrer" {
-		t.Errorf("allowlisted path with query token: expected Referrer-Policy: no-referrer, got %q", got)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("normal JWT in query: expected 401, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	// Not allowlisted: an arbitrary API route must reject ?token=.
-	req2 := httptest.NewRequest("GET", "/api/v1/issues?token="+token, nil)
-	rec2 := httptest.NewRecorder()
-	handler.ServeHTTP(rec2, req2)
-	if rec2.Code != http.StatusUnauthorized {
-		t.Errorf("non-allowlisted path with query token: expected 401, got %d", rec2.Code)
+	// 2. The same JWT works via the header.
+	reqH := httptest.NewRequest("GET", "/api/v1/issues", nil)
+	reqH.Header.Set("Authorization", "Bearer "+token)
+	recH := httptest.NewRecorder()
+	handler.ServeHTTP(recH, reqH)
+	if recH.Code != http.StatusOK {
+		t.Errorf("header token: expected 200, got %d", recH.Code)
 	}
 
-	// The same non-allowlisted route works fine with a real header.
-	req3 := httptest.NewRequest("GET", "/api/v1/issues", nil)
-	req3.Header.Set("Authorization", "Bearer "+token)
-	rec3 := httptest.NewRecorder()
-	handler.ServeHTTP(rec3, req3)
-	if rec3.Code != http.StatusOK {
-		t.Errorf("non-allowlisted path with header token: expected 200, got %d", rec3.Code)
+	// 3. A minted ticket works on its bound route, in ?ticket= only.
+	reqT := httptest.NewRequest("GET", "/api/v1/logs/stream?site_id=x&ticket="+ticket, nil)
+	recT := httptest.NewRecorder()
+	handler.ServeHTTP(recT, reqT)
+	if recT.Code != http.StatusOK {
+		t.Errorf("ticket on bound route: expected 200, got %d: %s", recT.Code, recT.Body.String())
+	}
+	if got := recT.Header().Get("Referrer-Policy"); got != "no-referrer" {
+		t.Errorf("ticket response: expected Referrer-Policy: no-referrer, got %q", got)
+	}
+
+	// 4. The same ticket on a DIFFERENT allowlisted route is rejected -
+	// audience binding is per route, not per mechanism.
+	reqW := httptest.NewRequest("GET", "/api/v1/export?ticket="+ticket, nil)
+	recW := httptest.NewRecorder()
+	handler.ServeHTTP(recW, reqW)
+	if recW.Code != http.StatusUnauthorized {
+		t.Errorf("ticket on non-bound route: expected 401, got %d", recW.Code)
+	}
+
+	// 5. A ticket presented as an Authorization header is rejected: it is
+	// not a general bearer token.
+	reqB := httptest.NewRequest("GET", "/api/v1/issues", nil)
+	reqB.Header.Set("Authorization", "Bearer "+ticket)
+	recB := httptest.NewRecorder()
+	handler.ServeHTTP(recB, reqB)
+	if recB.Code != http.StatusUnauthorized {
+		t.Errorf("ticket as bearer header: expected 401, got %d", recB.Code)
+	}
+
+	// 6. Revoking the principal's sessions retires its outstanding tickets
+	// too: the ticket embeds token_version and the middleware checks it
+	// unconditionally.
+	if err := svc.RevokeSessions(ctx, user.ID); err != nil {
+		t.Fatalf("RevokeSessions: %v", err)
+	}
+	reqR := httptest.NewRequest("GET", "/api/v1/logs/stream?ticket="+ticket, nil)
+	recR := httptest.NewRecorder()
+	handler.ServeHTTP(recR, reqR)
+	if recR.Code != http.StatusUnauthorized {
+		t.Errorf("ticket after session revocation: expected 401, got %d", recR.Code)
 	}
 }
 
