@@ -27,6 +27,24 @@ jobs:
         run: sh -n scripts/install.sh
       - name: Test
         run: go test ./...
+      # AUD-056 (round 2): the concurrency-heavy packages get the race
+      # detector — the batch-admission, WAL, replay-lock, and audit-head
+      # regressions from this audit series are exactly the class of bug a
+      # plain `go test` passes.
+      - name: Race regression tests
+        run: go test -race ./internal/ingest/... ./internal/audit/... ./internal/replays/... ./internal/auth/... ./internal/backup/...
+
+  # AUD-056 (round 2): the classic replay tracker is a separately shipped
+  # surface; these contract tests execute the real served script in a vm
+  # sandbox (lifecycle, delivery retention, beacon policy).
+  tracker-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: node --test tests/tracker/*.test.mjs
 
   sdk-go:
     runs-on: ubuntu-latest
@@ -40,7 +58,7 @@ jobs:
         run: go build ./...
       - name: Test SDK
         working-directory: sdk/go
-        run: go test ./...
+        run: go test -race ./...
 
   # Audit F49: the browser and Python SDK contracts were only exercised
   # locally, so transport regressions (F29-F33, F51) passed the required
