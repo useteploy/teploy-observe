@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
+	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -53,6 +56,27 @@ type ReplayService struct {
 	logger   *slog.Logger
 	privacy  PrivacyLookup
 	salt     string
+	// replayLocks stripe serialization per replay ID (AUD-018, round 2).
+	// The session upsert is a read-merge-insert with no engine-side
+	// compare-and-swap: two concurrent first batches could insert different
+	// start_times (forking the replacing-table key so the rows never
+	// collapse), and concurrent later batches could derive the same next
+	// version from the same prior row, losing navigation increments. One
+	// striped lock per replay removes the interleaving within a single
+	// process; a multi-replica deployment needs the stable-key + CAS design
+	// deferred with F03-class schema work.
+	replayLocks [64]sync.Mutex
+}
+
+// lockReplay serializes all writes for one replay ID. NOT keyed by site:
+// the cross-site first-claim check must share the lock with the eventual
+// winner's insert.
+func (s *ReplayService) lockReplay(replayID string) func() {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(replayID))
+	mu := &s.replayLocks[h.Sum32()%uint32(len(s.replayLocks))]
+	mu.Lock()
+	return mu.Unlock
 }
 
 func NewReplayService(db *nucleus.Client) *ReplayService {
@@ -208,11 +232,15 @@ func (s *ReplayService) replayOwner(ctx context.Context, replayID string) (strin
 // accumulates navigations). Collapsing by (tenant, site, start_time,
 // replay_id) keeps one visible row per replay, so there is no claim-then-
 // insert window to orphan (audit F19 — the old KV SetNX guard is gone).
-func (s *ReplayService) upsertSession(ctx context.Context, input *IngestInput, replayID string, agg batchAggregate, distinctID string) error {
+//
+// AUD-019 (round 2): sqlc is the caller's transaction — the session row and
+// the batch's child events commit (or roll back) as ONE unit, so a child
+// insert failure can no longer leave updated session counters behind.
+func (s *ReplayService) upsertSession(ctx context.Context, sqlc *nucleus.SQLModel, input *IngestInput, replayID string, agg batchAggregate, distinctID string) error {
 	// Non-key columns collapse newest-wins via argMax on version — the same
 	// collapse LatestRows applies elsewhere; they cannot be selected bare
 	// next to this GROUP BY (strict-mode engines reject that, 0A000).
-	rows, err := nucleus.Query[existingSession](ctx, s.db.SQL(),
+	rows, err := nucleus.Query[existingSession](ctx, sqlc,
 		`SELECT site_id, start_time,
 		        CAST(argMax(duration_ms, version) AS BIGINT) AS duration_ms,
 		        CAST(argMax(page_count, version) AS BIGINT) AS page_count,
@@ -270,7 +298,7 @@ func (s *ReplayService) upsertSession(ctx context.Context, input *IngestInput, r
 		hasErrStr = "true"
 	}
 
-	_, err = s.db.SQL().Exec(ctx,
+	_, err = sqlc.Exec(ctx,
 		`INSERT INTO replay_sessions (replay_id, tenant_id, site_id, session_id, start_time,
 			duration_ms, page_count, url, browser, os, device, has_error, distinct_id, version)
 		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
@@ -286,6 +314,13 @@ func (s *ReplayService) upsertSession(ctx context.Context, input *IngestInput, r
 }
 
 // Ingest stores a batch of replay events.
+//
+// AUD-018 (round 2): the owner check, session upsert, and child inserts
+// run under the per-replay striped lock, so concurrent batches for the
+// same replay serialize. AUD-019 (round 2): the session row and every
+// child event commit in ONE transaction — a mid-batch child failure
+// rolls the session metadata back with the children instead of leaving
+// updated counters behind a failed batch.
 func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, error) {
 	if len(input.Events) == 0 {
 		return "", nil
@@ -295,6 +330,9 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 	if replayID == "" {
 		replayID = genID()
 	}
+
+	unlock := s.lockReplay(replayID)
+	defer unlock()
 
 	// Audit F08: the replay's owning site (from its session row) is
 	// authoritative. A key valid for site A must not append child events to
@@ -311,8 +349,6 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 	}
 
 	agg := aggregateBatch(&input)
-
-	sql := s.db.SQL()
 
 	// Resolve and hash the user-supplied distinct_id (if any).
 	distinctID := ""
@@ -345,7 +381,14 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 		}
 	}
 
-	if err := s.upsertSession(ctx, &input, replayID, agg, distinctID); err != nil {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("replays: begin ingest tx: %w", err)
+	}
+	defer tx.Rollback(ctx) // no-op once Commit has succeeded
+	sqlc := tx.SQL()
+
+	if err := s.upsertSession(ctx, sqlc, &input, replayID, agg, distinctID); err != nil {
 		return "", err
 	}
 
@@ -354,7 +397,11 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 	// re-emit window size on every click. ViewportWidth defaults to the
 	// session's `viewport_width` field if the SDK supplied it, else 0.
 	currentVW := input.ViewportWidth
-	clickEvents := make([]heatmaps.RawEvent, 0)
+	type attributedClick struct {
+		page string
+		raw  heatmaps.RawEvent
+	}
+	clickEvents := make([]attributedClick, 0)
 
 	for _, ev := range input.Events {
 		eventID := genID()
@@ -366,7 +413,7 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 		}
 		// Audit F08: child events carry the authenticated site so two sites
 		// reusing the same client-generated replay ID stay disjoint.
-		_, err := sql.Exec(ctx,
+		_, err := sqlc.Exec(ctx,
 			`INSERT INTO replay_events (event_id, tenant_id, site_id, replay_id, timestamp, event_type, data)
 			 VALUES ($1, 'default', $2, $3, $4, $5, $6)`,
 			eventID, input.SiteID, replayID, ev.Timestamp, ev.Type, dataJSON,
@@ -381,29 +428,80 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (string, 
 				currentVW = w
 			}
 		case "click":
-			clickEvents = append(clickEvents, heatmaps.RawEvent{
-				Type:          ev.Type,
-				Data:          ev.Data,
-				ViewportWidth: currentVW,
+			// AUD-033 (round 2): a click is attributed to the page it
+			// happened on (captured per-click by current trackers), not
+			// the URL observed at flush time — a click followed by SPA
+			// navigation used to be credited to the post-navigation page.
+			// Legacy clicks without page context fall back to the batch URL.
+			page := input.URL
+			if raw, ok := ev.Data.(map[string]any); ok {
+				if pu, ok := raw["page_url"].(string); ok {
+					if cleaned := telemetryPageURL(pu); cleaned != "" {
+						page = cleaned
+					}
+				}
+				if w, ok := readIntField(ev.Data, "viewport_width"); ok {
+					currentVW = w
+				}
+			}
+			clickEvents = append(clickEvents, attributedClick{
+				page: page,
+				raw: heatmaps.RawEvent{
+					Type:          ev.Type,
+					Data:          ev.Data,
+					ViewportWidth: currentVW,
+				},
 			})
 		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return replayID, fmt.Errorf("replays: commit ingest tx (outcome may be unknown — batch is not idempotent yet, see F12/F19): %w", err)
 	}
 
 	// Write the per-bucket heatmap rollups. Best-effort: a heatmap write
 	// failure must not fail the underlying replay ingest because the raw
 	// event rows are already durable. Pattern matches tracing rollups
-	// (see internal/tracing/ingest.go).
-	if len(clickEvents) > 0 && input.URL != "" {
-		clicks := heatmaps.ExtractClicks(clickEvents)
-		if len(clicks) > 0 {
-			if err := s.heatmaps.Aggregate(ctx, input.SiteID, input.URL, clicks); err != nil {
-				s.logger.Warn("heatmaps: aggregate failed",
-					"site", input.SiteID, "url", input.URL, "err", err)
-			}
+	// (see internal/tracing/ingest.go). A durable derived-work outbox
+	// remains deferred with F19's idempotency work.
+	byPage := make(map[string][]heatmaps.RawEvent, 1)
+	for _, c := range clickEvents {
+		if c.page == "" {
+			continue
+		}
+		byPage[c.page] = append(byPage[c.page], c.raw)
+	}
+	for page, raws := range byPage {
+		clicks := heatmaps.ExtractClicks(raws)
+		if len(clicks) == 0 {
+			continue
+		}
+		if err := s.heatmaps.Aggregate(ctx, input.SiteID, page, clicks); err != nil {
+			s.logger.Warn("heatmaps: aggregate failed",
+				"site", input.SiteID, "url", page, "err", err)
 		}
 	}
 
 	return replayID, nil
+}
+
+// telemetryPageURL sanitizes a tracker-captured page URL for heatmap
+// bucketing: origin + path only — no userinfo, query, or fragment
+// (AUD-030/F41 containment for replay-side URLs).
+func telemetryPageURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return ""
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	u.RawFragment = ""
+	u.ForceQuery = false
+	return u.String()
 }
 
 // readIntField is the same defensive numeric extractor used by the
@@ -462,7 +560,12 @@ func (s *ReplayService) ListReplays(ctx context.Context, siteID string, from, to
 
 // GetReplayEvents returns the events of one replay, scoped to the site that
 // owns it (audit F08). Legacy rows written before the site column existed
-// carry site_id=” and still belong to the owning session's site.
+// carry site_id='' and still belong to the owning session's site.
+//
+// AUD-020 (round 2): event_id is the deterministic tiebreak — timestamp
+// alone left equal-timestamp events in storage order, which shifts between
+// reads. Full keyset pagination (+ UI support for windows) stays deferred
+// with the player protocol work (F39).
 func (s *ReplayService) GetReplayEvents(ctx context.Context, replayID string) ([]ReplayEvent, error) {
 	if replayID == "" {
 		return nil, fmt.Errorf("replays: replay_id is required")
@@ -478,7 +581,7 @@ func (s *ReplayService) GetReplayEvents(ctx context.Context, replayID string) ([
 			COALESCE(data, '') AS data
 		 FROM replay_events
 		 WHERE replay_id = $1 AND (site_id = $2 OR site_id = '')
-		 ORDER BY timestamp ASC`,
+		 ORDER BY timestamp ASC, event_id ASC`,
 		replayID, owner,
 	)
 }
