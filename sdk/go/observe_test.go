@@ -1,10 +1,12 @@
 package observe
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -130,4 +132,113 @@ func TestConcurrentCloseIsSafe(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// AUD-038 (round 2): a failed flush leaves the queue intact — the old code
+// detached everything up front and dropped failed chunks, so Close later
+// saw an empty queue and reported success over lost logs.
+func TestFlushFailureRetainsQueue(t *testing.T) {
+	var fail = true
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		f := fail
+		mu.Unlock()
+		if f {
+			w.WriteHeader(503)
+			return
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	c, err := New(Options{Endpoint: srv.URL, LogBatchSize: 100, LogFlushInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Info("kept")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := c.Flush(ctx); err == nil {
+		t.Fatal("flush against a 503 endpoint must fail")
+	}
+	cancel()
+	c.mu.Lock()
+	queued := c.logsN
+	c.mu.Unlock()
+	if queued != 1 {
+		t.Fatalf("failed flush must retain the queue, got %d queued", queued)
+	}
+	mu.Lock()
+	fail = false
+	mu.Unlock()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	if err := c.Flush(ctx2); err != nil {
+		t.Fatalf("retry after recovery must succeed: %v", err)
+	}
+	_ = c.Close()
+}
+
+// AUD-036 (round 2): entries are frozen at admission — caller mutation
+// after log() cannot change the delivered body.
+func TestQueuedEntriesAreImmutableSnapshots(t *testing.T) {
+	var got map[string]any
+	var bodyMu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/logs/batch" {
+			var body struct {
+				Logs []map[string]any `json:"logs"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			bodyMu.Lock()
+			if len(body.Logs) > 0 {
+				got = body.Logs[0]
+			}
+			bodyMu.Unlock()
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	c, err := New(Options{Endpoint: srv.URL, LogBatchSize: 100, LogFlushInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attrs := map[string]any{"k": "original"}
+	c.Info("m", Field{Key: "attrs", Value: attrs})
+	attrs["k"] = "mutated"
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	bodyMu.Lock()
+	defer bodyMu.Unlock()
+	inner, _ := got["attributes"].(map[string]any)
+	nested, _ := inner["attrs"].(map[string]any)
+	if nested["k"] != "original" {
+		t.Fatalf("delivered entry must be the admission-time snapshot, got %v", nested)
+	}
+}
+
+// AUD-038: admission is byte-bounded.
+func TestLogQueueByteLimitDropsNewEntries(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	var errs atomic.Int32
+	c, err := New(Options{
+		Endpoint: srv.URL, LogBatchSize: 1 << 30, LogFlushInterval: time.Hour,
+		OnError: func(error) { errs.Add(1) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	big := strings.Repeat("x", 64*1024-128)
+	for i := 0; i < 200; i++ {
+		c.Info(big) // each ~64 KiB; the 8 MiB cap rejects well before 200
+	}
+	if errs.Load() == 0 {
+		t.Fatal("byte-bounded admission must report drops")
+	}
 }

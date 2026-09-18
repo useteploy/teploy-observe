@@ -59,6 +59,11 @@ type Options struct {
 	// LogFlushInterval is the cadence for flushing buffered logs.
 	// Default: 2 seconds.
 	LogFlushInterval time.Duration
+
+	// OnError, when set, receives transport/admission failures (dropped
+	// oversized entries, failed background flushes). Never called from
+	// inside the client's locks; must not call back into the Client.
+	OnError func(error)
 }
 
 // Client submits events, errors, logs, traces, and metrics to Observe.
@@ -66,7 +71,12 @@ type Client struct {
 	opts    Options
 	http    *http.Client
 	mu      sync.Mutex
-	logs    []LogEntry
+	// logs holds entries serialized AT ADMISSION (AUD-036, round 2): the
+	// old code stored the caller's LogEntry with its live map attributes,
+	// so mutation after log() changed the eventual body and one
+	// unmarshalable attribute poisoned the whole detached batch.
+	logs    []json.RawMessage
+	logsN   int
 	spans   []pendingSpan
 	metrics *metricsBuf
 	closed  chan struct{}
@@ -76,6 +86,13 @@ type Client struct {
 	// waited for).
 	flushWake chan struct{}
 	closing   bool
+	// pendingLogBytes bounds total queued log bytes (AUD-038, round 2) —
+	// the count cap alone let a slow endpoint grow memory without limit.
+	pendingLogBytes int64
+	// logFlushMu serializes public Flush and worker flushes so one owner
+	// sends at a time and a failed chunk leaves its queue prefix intact
+	// (AUD-038).
+	logFlushMu sync.Mutex
 	// closeOnce + closeErr make Close safe under concurrent callers (audit
 	// F35: the select/default + close pair let two closers both take the
 	// default path and the second close panicked).
@@ -211,12 +228,19 @@ func (c *Client) loop() {
 			return
 		case <-c.flushWake:
 			// One bounded attempt per wakeup; a failing flush is retried
-			// by the ticker rather than a tight loop.
-			_ = c.flushLogs(context.Background())
+			// by the ticker rather than a tight loop. AUD-038 (round 2):
+			// failures are REPORTED through the hook, not ignored — a
+			// silently dropped chunk used to look identical to success at
+			// Close time.
+			if err := c.flushLogs(context.Background()); err != nil {
+				c.reportError(err)
+			}
 			_ = c.flushSpans(context.Background())
 			_ = c.FlushMetrics(context.Background())
 		case <-t.C:
-			_ = c.flushLogs(context.Background())
+			if err := c.flushLogs(context.Background()); err != nil {
+				c.reportError(err)
+			}
 			_ = c.flushSpans(context.Background())
 			_ = c.FlushMetrics(context.Background())
 		}
@@ -263,12 +287,28 @@ func (c *Client) log(level, msg string, fields []Field) {
 	for _, f := range fields {
 		attrs[f.Key] = f.Value
 	}
-	entry := LogEntry{
+	c.admitLog(LogEntry{
 		SiteID:      c.opts.SiteID,
 		Level:       level,
 		Message:     msg,
 		ServiceName: c.opts.ServiceName,
 		Attributes:  attrs,
+	})
+}
+
+// admitLog serializes one entry NOW, owns the bytes, and queues it under
+// the byte budget (AUD-036/AUD-038, round 2). json.Marshal used to run
+// after the batch was detached, so a caller-mutated map changed the body
+// (or raced it), one unsupported value failed the entire batch, and the
+// queue had no bound at all.
+func (c *Client) admitLog(entry LogEntry) {
+	raw, err := json.Marshal(entry)
+	if err != nil || len(raw) > maxLogEntryBytes {
+		if err == nil {
+			err = fmt.Errorf("log entry exceeds %d bytes", maxLogEntryBytes)
+		}
+		c.reportError(fmt.Errorf("observe: dropping unserializable log entry: %w", err))
+		return
 	}
 	c.mu.Lock()
 	if c.closing {
@@ -277,8 +317,17 @@ func (c *Client) log(level, msg string, fields []Field) {
 		c.mu.Unlock()
 		return
 	}
-	c.logs = append(c.logs, entry)
-	full := len(c.logs) >= c.opts.LogBatchSize
+	// AUD-038: bounded admission — a stalled endpoint must not turn the
+	// queue into unbounded memory.
+	if c.pendingLogBytes+int64(len(raw)) > maxPendingLogBytes {
+		c.mu.Unlock()
+		c.reportError(errors.New("observe: log queue byte limit reached — entry dropped"))
+		return
+	}
+	c.logs = append(c.logs, raw)
+	c.logsN++
+	c.pendingLogBytes += int64(len(raw))
+	full := c.logsN >= c.opts.LogBatchSize
 	c.mu.Unlock()
 	if full {
 		// Wake the owned worker; never spawn an untracked goroutine.
@@ -289,40 +338,96 @@ func (c *Client) log(level, msg string, fields []Field) {
 	}
 }
 
+// reportError routes a failure to the configured hook without panicking on
+// a nil hook or a hook that itself fails.
+func (c *Client) reportError(err error) {
+	if c.opts.OnError == nil {
+		return
+	}
+	func() {
+		defer func() { _ = recover() }()
+		c.opts.OnError(err)
+	}()
+}
+
 // Flush immediately sends any buffered logs.
 func (c *Client) Flush(ctx context.Context) error { return c.flushLogs(ctx) }
 
 // serverLogBatchCap mirrors the server's /logs/batch limit.
 const serverLogBatchCap = 200
 
-// flushLogs sends buffered entries through the batch endpoint in bounded
-// chunks (audit F35: one HTTP request per log amplified shutdown latency).
-func (c *Client) flushLogs(ctx context.Context) error {
-	c.mu.Lock()
-	if len(c.logs) == 0 {
-		c.mu.Unlock()
-		return nil
-	}
-	batch := c.logs
-	c.logs = nil
-	c.mu.Unlock()
+// maxLogEntryBytes caps one serialized log entry at admission.
+const maxLogEntryBytes = 64 << 10
 
-	var firstErr error
-	for start := 0; start < len(batch); start += serverLogBatchCap {
-		end := start + serverLogBatchCap
-		if end > len(batch) {
-			end = len(batch)
+// maxPendingLogBytes bounds total queued log bytes (AUD-038).
+const maxPendingLogBytes = 8 << 20
+
+// maxLogRequestBytes packs request bodies by encoded bytes (AUD-026,
+// round 2): 200 near-64-KiB entries exceeded the route's 2 MiB cap and the
+// whole batch was rejected. 1 MiB leaves envelope headroom.
+const maxLogRequestBytes = 1 << 20
+
+// flushLogs sends buffered entries through the batch endpoint as bounded
+// chunks (audit F35: one HTTP request per log amplified shutdown latency).
+//
+// AUD-038 (round 2): the queue prefix stays intact until its request
+// SUCCEEDS — the old code detached everything up front and dropped failed
+// chunks on the floor, so a 503 lost the batch while a later Close saw an
+// empty queue and reported success. Serialized by logFlushMu so public
+// Flush and the worker cannot double-send.
+func (c *Client) flushLogs(ctx context.Context) error {
+	c.logFlushMu.Lock()
+	defer c.logFlushMu.Unlock()
+
+	c.mu.Lock()
+	remaining := c.logsN // fixed watermark: continuous producers cannot extend this flush forever
+	c.mu.Unlock()
+	for remaining > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		if err := c.post(ctx, "/api/v1/logs/batch", logBatchWire{Logs: batch[start:end]}); err != nil && firstErr == nil {
-			firstErr = err
+		c.mu.Lock()
+		n, size := 0, len(`{"logs":[]}`)
+		for n < remaining && n < c.logsN && n < serverLogBatchCap {
+			extra := len(c.logs[n])
+			if n > 0 {
+				extra++
+			}
+			if size+extra > maxLogRequestBytes && n > 0 {
+				break
+			}
+			size += extra
+			n++
 		}
+		batch := c.logs[:n]
+		c.mu.Unlock()
+		if n == 0 {
+			return errors.New("observe: single log entry exceeds the request byte budget")
+		}
+		if err := c.post(ctx, "/api/v1/logs/batch", logBatchWire{Logs: batch}); err != nil {
+			return err // the same queue prefix stays queued for the next attempt
+		}
+		c.mu.Lock()
+		var sent int64
+		for _, raw := range c.logs[:n] {
+			sent += int64(len(raw))
+		}
+		c.pendingLogBytes -= sent
+		if c.pendingLogBytes < 0 {
+			c.pendingLogBytes = 0
+		}
+		c.logs = c.logs[n:]
+		c.logsN -= n
+		remaining -= n
+		c.mu.Unlock()
 	}
-	return firstErr
+	return nil
 }
 
-// logBatchWire is the /logs/batch request shape.
+// logBatchWire is the /logs/batch request shape. Logs holds pre-encoded
+// entries (AUD-036) — the wire JSON per element is unchanged.
 type logBatchWire struct {
-	Logs []LogEntry `json:"logs"`
+	Logs []json.RawMessage `json:"logs"`
 }
 
 func (c *Client) post(ctx context.Context, path string, body any) error {
@@ -335,12 +440,18 @@ func (c *Client) post(ctx context.Context, path string, body any) error {
 }
 
 // postRaw is the underlying HTTP call, used by post() and the OTLP trace path.
+// AUD-039 (round 2): every request carries its own deadline even when the
+// caller supplied a custom HTTPClient with no Timeout — Close used to be
+// able to wait forever on a stuck worker request that ctx.Background()
+// would never cancel.
 func (c *Client) postRaw(ctx context.Context, url string, body any, extraHeaders map[string]string) error {
+	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("observe: marshal: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return fmt.Errorf("observe: new request: %w", err)
 	}
