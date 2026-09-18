@@ -24,7 +24,16 @@ Pass record (2026-09-17 audit, remediation session same day):
 - False positives: none — every finding verified against source before
   fixing or deferring.
 
-Open items: 15 (2 P1 product/schema decisions, 11 P2 designs, 2 CI/ops)
+Trust-close session (2026-09-18): F12 (idempotency half) and F19 (full
+batch idempotency) FIXED; AUD-008 FIXED; F49 FIXED (ui-freshness gate);
+AUD-056 remainder CLOSED for its requested scope (pinned-Nucleus fixture
+job + e2e smoke; the fuller browser suite remains future work); F32's
+client-retry half is now UNBLOCKED by producer IDs but stays deferred as
+SDK feature work. Two NEW upstream engine reports filed (2026-09-18, see
+the Upstream section below). F45's app half (KV srcmap in backups) is
+unchanged — it waits on the Nucleus snapshot API.
+
+Open items: 12 (1 P1 product/schema decision, 9 P2 designs/halves, 2 hardening/producer notes)
 
 ## F02 - P1 - Open (design decision): first-run grace authorizes administration
 
@@ -84,15 +93,37 @@ Covered by TestF05OIDCSessionsRevocableAndIssuerScoped,
 TestF05SubjectIDIssuerNamespaced, and TestF05Pre040OIDCTokenShapeRejected
 against live Nucleus.
 
-## F12 - P1 - Partially fixed: batch admission atomic, stable producer IDs deferred
+## F12 - P1 - Fixed 2026-09-18 (idempotency half; admission half landed 2026-09-17)
 
-All-or-nothing batch admission landed (Buffer.Avail pre-check; the only
-mid-batch failure mode was buffer-full after a partially accepted prefix).
-Still open: stable producer-side event IDs + a durable idempotency boundary
-so a client retry after an ambiguous response-loss cannot double-count. A KV
-SetNX followed by SQL INSERT is NOT atomic on Nucleus; this needs the same
-backend-proven-atomicity analysis as F19. Deferred as a wire-protocol
-version bump (SDKs ship with the server).
+The full idempotency boundary for the events path landed with F19 (same
+session, see below): producers assign stable event ids at record time and
+keep them through requeue/retry (protocol v2: `v`, `producer_id`,
+`batch_id`, per-event `event_id` — sdk/browser, observe.js, observe-replay.js
+and the Python SDK's event path all ship it; the Go SDK has no
+analytics-event producer, so nothing to bump there). Server side has two
+layers:
+
+1. Admission cache (in-process, TTL 10 min, bounded): a v2 batch this
+   process already admitted is acked `{ok, deduped:true}` without
+   re-buffering — the response-lost retry never re-enters the pipeline.
+   The key is recorded only after successful admission, so a 429'd first
+   attempt stays retryable.
+2. Flush-time event-id existence filter (durable): every flush chunk is
+   filtered against already-committed event ids inside the chunk's own
+   transaction, serialized by the single flush lock — the boundary that
+   covers restarts, WAL replay, admission-cache misses, and concurrent
+   duplicate submits. Fail-open on lookup error (a possible duplicate
+   beats certain loss); the lookup is bounded by a 24 h dedupe horizon
+   (a retry's events carry fresh server timestamps, so the original is
+   older — the floor reaches 24 h below the retry's own timestamps).
+
+This is deliberately NOT the KV SetNX + SQL INSERT pair the audit rejected:
+the final arbiter is a write-shaped existence check at the serialized
+flush, with no non-atomic claim anywhere. Multi-replica deployments keep
+the standing single-process boundary (same as AUD-018). Proofs:
+internal/ingest dedupe unit tests + live-Nucleus integration tests
+(duplicate batch -> single count; mixed duplicate+fresh -> only fresh).
+Wire-protocol version bumped to v2 with the SDKs, as the audit allowed.
 
 ## F16 - P2 - Open (design, previously deferred): WAL disk high-water and bounded streaming replay
 
@@ -104,23 +135,50 @@ explicit operator policy for limits and breach behavior. F14's sticky
 degradation + admission refusal (landed) means an ailing WAL now fails loud
 instead of growing quietly, which lowers the urgency but does not close it.
 
-## F19 - P1 - Fixed for sessions; batch idempotency open
+## F19 - P1 - Fixed 2026-09-18 (batch idempotency; sessions half landed 2026-09-17)
 
-The claim-then-insert orphan window is gone (replay_sessions is a replacing
-table keyed on the replay; sessions upsert as merged versions; migration
-039). Still open: deterministic child IDs derived from (site, replay,
-batch, index) so a partially committed event batch retries without
-duplicating children or heatmap contributions. Same idempotency design
-constraint as F12; tracked together.
+Deterministic child IDs + a durable batch ledger close the replay-side
+idempotency gap. Protocol v2 replay batches carry (producer_id, batch_id,
+client-generated replay_id). Server side:
 
-## F32 - P1/P2 - Partially fixed: transports no longer drop silently; bounded client retry deferred
+- `replay_batches` ledger (migration 041, ReplacingMergeTree keyed on the
+  full identity) records event count + sha256 of the batch's event list.
+  It is written INSIDE the same transaction as the session upsert and the
+  child inserts — the claim IS a row in the same atomic SQL unit, closing
+  the audit's core objection (KV SetNX then INSERT).
+- Retry of a committed batch: ledger hit + digest match -> `{ok,
+  replay_id, deduped:true}`, zero writes — children, session aggregates,
+  and heatmap rollups cannot double-count because none of them run.
+- Retry of a rolled-back batch: no ledger row AND no children (one tx),
+  full reprocess with child ids re-derived deterministically from
+  (site, replay, batch, index) — identical rows land.
+- Same (producer, batch) with different content -> 409 ErrBatchIDReuse;
+  v2 identity without a client replay_id -> 409 (the key would never be
+  stable). v1 payloads keep today's semantics exactly.
+
+The in-process boundary is the striped replay lock + transaction (same
+single-process posture as AUD-018); the deterministic child ids make the
+children of any cross-process duplicate bit-identical, so a future
+unique-key/CAS scheme collapses them retroactively. Proofs:
+internal/replays retries integration tests (live Nucleus): duplicate batch
+-> no double children/page_count/heatmap; interrupted-batch retry ->
+identical child ids; batch-id reuse -> 409. NOTE: the engine's
+ReplacingMergeTree has an intermittent committed-upsert-loss defect on
+accumulated data (see Upstream below) — the F20 metadata test
+(TestIngest_LaterBatchesExtendMetadata) flakes on it; the F12/F19
+idempotency tests themselves are unaffected (children and the ledger
+write path do not hit the defect).
+
+## F32 - P1/P2 - Partially fixed: transports no longer drop silently; bounded client retry deferred (now UNBLOCKED)
 
 Landed: res.ok checks, byte-bounded keepalive, beacon-return checks, chunked
 batches, failed-chunk retention (bounded), onError hook, reinit disposal.
-Deferred: automatic client retries beyond the retained-buffer retry, because
-retrying without producer IDs can double-count — unblocked by F12/F19.
-Oversized individual replay snapshots need a chunking protocol or a normal
-foreground request (tracked with F39's protocol work).
+Deferred: automatic client retries beyond the retained-buffer retry —
+UNBLOCKED 2026-09-18 by the F12/F19 producer-side identity (a retried batch
+now carries stable event/batch ids and the server dedupes it), but the
+retry POLICY in each SDK (backoff, budget, giving up) is still unbuilt
+feature work. Oversized individual replay snapshots need a chunking
+protocol or a normal foreground request (tracked with F39's protocol work).
 
 ## F37 - P1 - Fixed for form controls/contenteditable/data-*; default-text-mask policy open
 
@@ -187,13 +245,16 @@ mutable row in the same DB is not independent); deferred with design notes
 in the audit report. Streaming/paginated verification is part of the same
 work.
 
-## F49 - P2 - Partially fixed: SDK CI jobs added; embedded-UI freshness gate open
+## F49 - P2 - Fixed 2026-09-18: embedded-UI freshness gate in CI
 
-sdk-browser and sdk-python are now required CI jobs. The
-`git diff --exit-code -- cmd/observe/ui/dist` freshness gate stays deferred
-until the UI build environment (Neutron TS workspace) is reproducibly
-provisioned in CI — until then ui-sync remains a documented local step
-(the 5402af4 UI fixes were synced in 5fbf61f, 2026-09-17).
+The `ui-freshness` job clones Neutron at THIS repo's pinned submodule
+revision (resolved per-run from `git ls-tree HEAD Neutron`), provisions the
+TS workspace (`pnpm install --frozen-lockfile`), runs scripts/ui-sync.sh,
+and fails on `git diff --exit-code -- cmd/observe/ui/dist`. A source edit
+without a ui-sync run can no longer ship a stale dashboard silently.
+First push may need provisioning fixes on the runner — the flow is
+verified locally (ui-sync is byte-idempotent against the working tree),
+but the job itself has not executed on GitHub's runners yet.
 
 ## Resolution log (2026-09-12 — prior register, closed)
 
@@ -368,22 +429,58 @@ AUD-049 = F46, AUD-050 = F47, AUD-055 = F49. (AUD-004/AUD-006 closed
 
 New deferrals from this round:
 
-- AUD-008 - P2 - Open (protocol): normal access JWTs accepted in query
-  strings for EventSource/download prefixes. EventSource cannot set
-  headers, so removing the fallback breaks live logs/exports; the fix is
-  a short-lived single-purpose stream-ticket mint with audience + route
-  binding, or fetch-stream consumers. Referrer-Policy: no-referrer is set
-  on those responses as the interim mitigation.
+- AUD-008 - P2 - Fixed 2026-09-18: normal access JWTs are REJECTED in
+  query strings everywhere (the old `?token=` fallback is gone, with a
+  pointing error message). EventSource/download consumers mint a
+  short-lived single-purpose stream ticket: `POST /api/v1/auth/stream-ticket`
+  (JWT-header auth) returns a 2-minute token bound to ONE route prefix
+  (aud "observe-stream" + route claim). The middleware accepts tickets only
+  as `?ticket=` on their bound prefix, rejects them as bearer headers, and
+  applies the standard token_version revocation check to ticket use (a
+  revoked session's tickets die with it). UI consumers switched (logs live
+  tail re-mints on EventSource reconnect instead of retrying a dead
+  credential forever; dashboard CSV export mints per click). Verified live:
+  bound route 200 / non-bound route 401 / ticket-as-header 401 / normal
+  JWT in query 401 / invalid route mint 400, plus the middleware unit
+  suite. Share-token (`share_token=`) machine reads are a separate,
+  designed mechanism and unchanged.
 - AUD-017 - Low - Open (hardening): WAL final-component symlink refusal
   and an exclusive writer lock need O_NOFOLLOW/flock build-tagged files;
   local deployment hardening, not remotely reachable.
 - AUD-054 (site half) - P2 - Open: audit events default site "default"
   because the outer middleware cannot see downstream-bound context; needs
   the route-level producer migration sketched in the report.
-- AUD-056 (remainder) - P2 - Open: required Nucleus integration fixture,
-  missing-dependency-fails-required-CI, and browser-level tests of the
-  served dashboard/player remain unbuilt.
+- AUD-056 (remainder) - P2 - Closed 2026-09-18 for its requested scope:
+  the `nucleus-integration` CI job runs the full suite against a pinned
+  published engine image (see the engine-selection rationale in ci.yml and
+  the upstream notes below), fresh per run, serially (`-p 1`, the known
+  Migrate TOCTOU), after a migration boot; the `e2e-smoke` job boots the
+  real binary + engine + demo seed and runs a Playwright smoke
+  (login -> dashboard renders -> one replay plays), skipping cleanly when
+  no instance is at baseURL. Remaining future work (not audit blockers):
+  the fuller 27-spec e2e suite is still local-only, and the fixture image
+  carries the two engine defects recorded below.
 
-Upstream: no NEW Nucleus/Neutron defects were confirmed this round; no
-framework edits were made from this session. The standing F45
-snapshot-boundary report remains the only open upstream item.
+Upstream (2026-09-18, from the trust-close session; both logged in
+Tyler's `Teploy/_internal/UPSTREAM_BUGS.md` with standalone reproducers;
+no Neutron/Nucleus edits made from this session):
+
+- Fresh-install migration failure: engines built from the CURRENT Neutron
+  tree AND from this repo's pinned submodule fail the migration ladder on
+  an empty database at 027 — a table renamed earlier in a multi-statement
+  script is invisible to the script's later statements (the runner sends
+  whole files as one Exec), and the engine's error text is double-wrapped.
+  The published v0.1.5 image fails one step later (028). The v0.1.8 image
+  applies the whole 001-041 ladder — which is why the CI fixture pins it
+  and why nucleustest's documented scratch-engine invocation was updated
+  to v0.1.8.
+- Intermittent committed-upsert loss (v0.1.8 image, accumulated data):
+  a same-key ReplacingMergeTree insert inside a multi-table transaction
+  (the exact replay_sessions upsert shape since 039) commits successfully
+  but never becomes visible, roughly 1-in-3 once prior rows accumulate.
+  Reproduced with pure SQL (no observe code). This makes the pre-existing
+  F20 metadata test flaky on v0.1.8; the F12/F19 idempotency proofs are
+  unaffected. If the new CI job flakes, this is the first suspect.
+
+Earlier standing upstream item: F45's snapshot-boundary primitive
+(2026-09-17 entry) remains the only other open one.

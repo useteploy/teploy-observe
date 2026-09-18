@@ -96,3 +96,152 @@ jobs:
           python -m pip install pytest
           python -m pip install -e .
           python -m pytest tests -q
+
+  # F49: embedded-UI freshness gate. The UI is embedded into the Go binary
+  # from cmd/observe/ui/dist, so a source edit without a ui-sync run ships a
+  # stale dashboard. This job provisions the Neutron TS workspace at the
+  # PINNED submodule revision (the same pin the go.mod replace points the
+  # working tree at), runs scripts/ui-sync.sh, and fails on any drift.
+  ui-freshness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Resolve pinned Neutron revision
+        id: pin
+        run: echo "sha=$(git ls-tree HEAD Neutron | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+      - name: Clone Neutron at the pinned revision
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/neutron-build/neutron ../Neutron
+          git -C ../Neutron checkout "${{ steps.pin.outputs.sha }}"
+      - name: Install pnpm
+        run: corepack enable && corepack prepare pnpm@latest --activate
+      - name: Provision TS workspace
+        run: pnpm -C ../Neutron/typescript install --frozen-lockfile
+      - name: ui-sync (build + embed)
+        run: sh scripts/ui-sync.sh
+        env:
+          OBSERVE_BIN: /tmp/observe-ui-sync
+      - name: Embedded dist must be fresh
+        run: git diff --exit-code -- cmd/observe/ui/dist
+
+  # AUD-056 remainder: the DB-backed suites ran only when a developer had a
+  # local Nucleus. This job runs them against a pinned published Nucleus
+  # image, fresh per run.
+  #
+  # Why the published image and not a from-source build of the pinned
+  # Neutron submodule: a repo-built engine (working tree AND the pinned
+  # submodule revision) currently FAILS observe's migration ladder on a
+  # fresh database at migration 027 - a table renamed earlier in a
+  # multi-statement script is invisible to the script's later statements
+  # (upstream report filed 2026-09-18, see AUDIT_OPEN.md). The v0.1.8 image
+  # applies the whole 001-041 ladder cleanly, so it is the fixture. A
+  # from-source build also costs 15-30 min of cold Rust CI per push for the
+  # same coverage. Known flake: v0.1.8 intermittently drops a committed
+  # same-key ReplacingMergeTree upsert in a multi-table tx once data
+  # accumulates (same upstream report); if this job flakes, that is the
+  # first suspect - rerun before bisecting.
+  nucleus-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Start pinned Nucleus
+        run: |
+          docker run -d --name nucleus -p 55432:5432 \
+            -e NUCLEUS_ALLOW_NO_AUTH=1 \
+            -e NUCLEUS_ALLOW_INSECURE_CLUSTER=1 \
+            -e NUCLEUS_ALLOW_INSECURE_REPLICATION=1 \
+            ghcr.io/neutron-build/nucleus:v0.1.8 \
+            start --host 0.0.0.0 --port 5432 --cluster-port 5433 --data /data --max-memory 512
+          for i in $(seq 1 60); do
+            if (exec 3<>/dev/tcp/127.0.0.1/55432) 2>/dev/null; then exec 3>&-; exit 0; fi
+            sleep 1
+          done
+          echo "nucleus did not come up" >&2
+          docker logs nucleus >&2 || true
+          exit 1
+      - name: Build observe
+        run: go build -o /tmp/observe ./cmd/observe
+      - name: Boot once to apply migrations
+        run: |
+          OBSERVE_NUCLEUS_URL='postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable' \
+          OBSERVE_ADMIN_PASSWORD=ci-migration-boot \
+          OBSERVE_JWT_SECRET=ci-migration-secret \
+          /tmp/observe &
+          OBS_PID=$!
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:3000/healthz >/dev/null 2>&1; then
+              kill "$OBS_PID" 2>/dev/null || true
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "observe did not become healthy" >&2
+          kill "$OBS_PID" 2>/dev/null || true
+          exit 1
+      - name: Full suite against live Nucleus
+        env:
+          OBSERVE_NUCLEUS_URL: postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable
+        # Serial: concurrent packages racing schema.Apply trip the known
+        # upstream Migrate ledger TOCTOU (documented in AUDIT_OPEN.md).
+        run: go test -p 1 ./...
+
+  # e2e smoke (AUD-056 remainder): login -> dashboard renders -> one replay
+  # plays, against the real binary + real Nucleus. The fuller e2e suite is
+  # still local-only; this is the minimal honest browser-level check.
+  e2e-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Start pinned Nucleus
+        run: |
+          docker run -d --name nucleus -p 55432:5432 \
+            -e NUCLEUS_ALLOW_NO_AUTH=1 \
+            -e NUCLEUS_ALLOW_INSECURE_CLUSTER=1 \
+            -e NUCLEUS_ALLOW_INSECURE_REPLICATION=1 \
+            ghcr.io/neutron-build/nucleus:v0.1.8 \
+            start --host 0.0.0.0 --port 5432 --cluster-port 5433 --data /data --max-memory 512
+          for i in $(seq 1 60); do
+            if (exec 3<>/dev/tcp/127.0.0.1/55432) 2>/dev/null; then exec 3>&-; exit 0; fi
+            sleep 1
+          done
+          echo "nucleus did not come up" >&2
+          docker logs nucleus >&2 || true
+          exit 1
+      - name: Build observe
+        run: go build -o /tmp/observe ./cmd/observe
+      - name: Boot observe (seeded)
+        run: |
+          OBSERVE_NUCLEUS_URL='postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable' \
+          OBSERVE_ADMIN_PASSWORD=observe-e2e-pass \
+          OBSERVE_JWT_SECRET=ci-e2e-secret \
+          OBSERVE_SEED_DEMO=true \
+          /tmp/observe &
+          for i in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:3000/healthz >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          echo "observe did not become healthy" >&2
+          exit 1
+      - name: Playwright smoke
+        working-directory: e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npx playwright test tests/smoke.spec.ts
+        env:
+          OBSERVE_URL: http://127.0.0.1:3000

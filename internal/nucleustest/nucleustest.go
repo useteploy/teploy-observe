@@ -14,8 +14,15 @@ import (
 // running Postgres the old default connected to it happily.
 //
 //	docker run -d --platform linux/amd64 --name nucleus-test -p 55432:5432 \
-//	  -e NUCLEUS_ALLOW_NO_AUTH=1 ghcr.io/neutron-build/nucleus:v0.1.5 \
+//	  -e NUCLEUS_ALLOW_NO_AUTH=1 -e NUCLEUS_ALLOW_INSECURE_CLUSTER=1 \
+//	  -e NUCLEUS_ALLOW_INSECURE_REPLICATION=1 \
+//	  ghcr.io/neutron-build/nucleus:v0.1.8 \
 //	  start --host 0.0.0.0 --port 5432 --cluster-port 5433 --data /data --max-memory 512
+//
+// v0.1.8, not a repo-built binary: engines built from the current Neutron
+// tree (and from this repo's pinned submodule) fail observe's migration
+// ladder on a fresh database at 027 - see AUDIT_OPEN.md 2026-09-18 and the
+// matching upstream report. The v0.1.8 image applies the full ladder.
 const DefaultDSN = "postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable"
 
 // DSN returns the DSN for the test engine, skipping the test unless something
