@@ -183,3 +183,99 @@ test("properties are capped at the server limit of 50", async () => {
   assert.equal(e.properties.k00, 0);
   assert.equal(e.properties.k79, undefined);
 });
+
+// AUD-021 (round 2): a failed send must REJECT so flushClient retains the
+// batch — the old transport swallowed the rejection and the events were
+// deleted as if delivered.
+test("failed batch is retained and reported, not deleted", async () => {
+  const errors: string[] = [];
+  init({ endpoint: "https://observe.example.com", siteId: "s1", onError: (e) => errors.push(e.message) });
+  (globalThis as any).fetch = () => Promise.resolve({ ok: false, status: 503 });
+
+  track("kept-event");
+  await flush();
+  // Re-deliver with a working transport: the retained event must arrive.
+  (globalThis as any).fetch = (url: string, opts: any) => {
+    sent.push({ url, body: JSON.parse(opts.body) });
+    return Promise.resolve({ ok: true });
+  };
+  await flush();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].body.events[0].event_type, "kept-event");
+  assert.ok(errors.some((m) => m.includes("503")), "onError must fire for the failed send");
+});
+
+// AUD-022 (round 2): overlapping flush calls must not send duplicate
+// prefixes or delete events neither call sent.
+test("overlapping flushes send each event exactly once", async () => {
+  init({ endpoint: "https://observe.example.com", siteId: "s1" });
+  const pending: Array<() => void> = [];
+  let first = true;
+  (globalThis as any).fetch = (url: string, opts: any) => {
+    sent.push({ url, body: JSON.parse(opts.body) });
+    if (first) {
+      first = false;
+      return new Promise((resolve) => pending.push(() => resolve({ ok: true })));
+    }
+    return Promise.resolve({ ok: true });
+  };
+
+  track("e1");
+  const a = flush();
+  const b = flush(); // overlaps while a's request is pending
+  track("e2");
+  // b must be the same single-flight promise — no second concurrent send.
+  assert.strictEqual(a, b);
+  await new Promise((r) => setTimeout(r, 0)); // let the flush owner issue its request
+  assert.equal(sent.length, 1, "only one request may be in flight");
+  pending[0]();
+  await a;
+  const types = sent.flatMap((s) => s.body.events.map((e: any) => e.event_type));
+  assert.deepEqual([...new Set(types)], types, "no event may be sent twice");
+  assert.ok(types.includes("e1") && types.includes("e2"), "both events must be delivered");
+});
+
+// AUD-023 (round 2): re-init sends the old client's events as flat arrays,
+// never a nested events[][] payload.
+test("reinit flushes old buffer with flat event objects", async () => {
+  init({ endpoint: "https://observe.example.com", siteId: "s1" });
+  track("legacy-1");
+  track("legacy-2");
+  init({ endpoint: "https://observe.example.com", siteId: "s2" });
+  await new Promise((r) => setTimeout(r, 20));
+  const bodies = sent.map((s) => s.body);
+  assert.ok(bodies.length >= 1);
+  for (const body of bodies) {
+    assert.ok(Array.isArray(body.events));
+    for (const ev of body.events) {
+      assert.equal(typeof ev, "object", `events entries must be objects, got ${JSON.stringify(ev)}`);
+      assert.ok(!Array.isArray(ev), "events entries must not be arrays");
+    }
+  }
+  assert.ok(bodies.some((b) => b.events.some((e: any) => e.event_type === "legacy-1")));
+});
+
+// AUD-026 (round 2): chunk packing respects the encoded-byte budget.
+test("oversized events are dropped individually, valid neighbors delivered", async () => {
+  init({ endpoint: "https://observe.example.com", siteId: "s1" });
+  const errors: string[] = [];
+  (globalThis as any).fetch = (url: string, opts: any) => {
+    sent.push({ url, body: JSON.parse(opts.body) });
+    return Promise.resolve({ ok: true });
+  };
+  // Build a client-level monster via properties bigger than 1 MiB; the
+  // old client's onError must report the drop when re-init flushes it.
+  const errs: string[] = [];
+  init({ endpoint: "https://observe.example.com", siteId: "s1", onError: (e) => errs.push(e.message) });
+  const huge = "x".repeat(1100 * 1024);
+  track("small-neighbor");
+  track("monster", { blob: huge });
+  track("after");
+  const { init: reinit } = await import("../src/index.js");
+  reinit({ endpoint: "https://observe.example.com", siteId: "s1" });
+  await new Promise((r) => setTimeout(r, 20));
+  const delivered = sent.flatMap((s) => s.body.events.map((e: any) => e.event_type));
+  assert.ok(delivered.includes("small-neighbor") && delivered.includes("after"), "valid events must survive");
+  assert.ok(!delivered.includes("monster"), "the oversized event must be dropped");
+  assert.ok(errs.some((m) => m.includes("byte budget")), "the drop must be reported");
+});

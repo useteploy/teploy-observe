@@ -104,6 +104,10 @@ interface Client {
   timer: number | null;
   userId: string | null;
   sessionId: string | null;
+  /** Single-flight flush owner (AUD-022): overlapping flushes used to send
+   * duplicate prefixes and then slice differing lengths off a mutated
+   * queue, deleting events neither request had sent. */
+  flushing: Promise<void> | null;
   /** Removes this client's interval and DOM listeners (audit F31). */
   dispose: () => void;
 }
@@ -123,6 +127,12 @@ function makeId(): string {
 const MAX_EVENTS_PER_REQUEST = 100;
 const MAX_KEEPALIVE_BYTES = 48 * 1024;
 
+// AUD-026 (round 2): batches are packed by ENCODED BYTES as well as event
+// count — a count-only cap let a batch of large events exceed the server's
+// 2 MiB body limit (or the keepalive budget) and be rejected whole. 1 MiB
+// leaves room for envelope overhead under the route cap.
+const MAX_REQUEST_BYTES = 1024 * 1024;
+
 // Retained events on a failed send (audit F32): keep the batch for the next
 // flush instead of silently erasing it, but bound the retention so a long
 // outage cannot grow memory without limit. Beyond the cap, oldest events
@@ -131,22 +141,63 @@ const MAX_BUFFERED_ON_ERROR = 200;
 
 const textEncoder = new TextEncoder();
 
+/** Measure the encoded byte length of a candidate `{events: [...]}` body. */
+function eventsBodyBytes(events: EventPayload[]): number {
+  return textEncoder.encode(JSON.stringify({ events })).byteLength;
+}
+
 /**
- * Send one JSON payload. Reports failures through the reject path (audit
- * F32): the old transport resolved on any fetch completion regardless of
- * status and swallowed network errors, so 4xx/5xx and offline transitions
- * silently erased telemetry. `keepalive` is only used for small final
- * sends while the page is unloading — the fetch standard fails any
- * keepalive request whose body exceeds the browser's 64 KiB in-flight
- * budget, which large snapshots used to hit.
+ * Pack events into server-legal chunks by BOTH count and encoded body size
+ * (AUD-026): no emitted body may exceed MAX_REQUEST_BYTES. A single event
+ * that cannot fit alone is rejected loudly rather than silently poisoning
+ * every batch that contains it.
+ */
+function packEventChunks(events: EventPayload[]): { chunks: EventPayload[][]; oversized: EventPayload[] } {
+  const chunks: EventPayload[][] = [];
+  const oversized: EventPayload[] = [];
+  let batch: EventPayload[] = [];
+  let size = eventsBodyBytes([]);
+  for (const ev of events) {
+    const candidate = eventsBodyBytes([...batch, ev]);
+    if (candidate > MAX_REQUEST_BYTES || batch.length >= MAX_EVENTS_PER_REQUEST) {
+      if (batch.length === 0) {
+        oversized.push(ev);
+        continue;
+      }
+      chunks.push(batch);
+      batch = [];
+      size = eventsBodyBytes([]);
+    }
+    // Re-measure with the event alone in the fresh batch: it may still be
+    // oversized on its own.
+    const solo = eventsBodyBytes([ev]);
+    if (solo > MAX_REQUEST_BYTES) {
+      oversized.push(ev);
+      continue;
+    }
+    batch.push(ev);
+    size = solo;
+  }
+  if (batch.length) chunks.push(batch);
+  return { chunks, oversized };
+}
+
+/**
+ * Send one JSON payload. STRICT (AUD-021, round 2): this rejects on any
+ * transport failure (non-2xx, network error) and on unserializable
+ * payloads — the previous version swallowed every rejection between the
+ * transport and its retry owner, so flushClient saw fulfilled promises and
+ * deleted the batch it believed had been delivered. Fire-and-forget PUBLIC
+ * boundaries (captureException, log, unload sends) catch and report; the
+ * flush owner consumes the rejection to drive retention. `keepalive` is
+ * only used for small final sends while the page is unloading.
  */
 function sendJSON(target: Client, path: string, payload: unknown, unloading = false): Promise<void> {
   let raw: string;
   try {
     raw = JSON.stringify(payload);
   } catch (err) {
-    reportError(target, err instanceof Error ? err : new Error("observe: payload not serializable"));
-    return Promise.resolve();
+    return Promise.reject(err instanceof Error ? err : new Error("observe: payload not serializable"));
   }
   const url = target.opts.endpoint.replace(/\/+$/, "") + path;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -157,10 +208,6 @@ function sendJSON(target: Client, path: string, payload: unknown, unloading = fa
     fetch(url, { method: "POST", headers, body: raw, credentials: "omit", keepalive })
       .then((res) => {
         if (!res.ok) throw new Error(`observe: ingest returned ${res.status}`);
-      })
-      .catch((err) => {
-        reportError(target, err instanceof Error ? err : new Error(String(err)));
-        throw err;
       });
 
   if (unloading && bytes <= MAX_KEEPALIVE_BYTES) {
@@ -176,14 +223,12 @@ function sendJSON(target: Client, path: string, payload: unknown, unloading = fa
         /* fall through to fetch */
       }
     }
-    return viaFetch(true).catch(() => undefined); // best effort on unload
+    return viaFetch(true).catch((err) => {
+      reportError(target, err instanceof Error ? err : new Error(String(err)));
+    }); // best effort on unload — no retry is possible
   }
-  if (bytes > MAX_KEEPALIVE_BYTES) {
-    // An oversized body can never go out keepalive; an explicit, reported
-    // failure beats a silent network error the browser will log anyway.
-    return viaFetch(false).catch(() => undefined);
-  }
-  return viaFetch(false).catch(() => undefined);
+  // Oversized or normal sends: strict rejection for the flush owner.
+  return viaFetch(false);
 }
 
 /** Route a transport failure to the configured hook without throwing into
@@ -208,9 +253,20 @@ export function init(options: InitOptions): void {
     previous.dispose();
     // Best-effort final flush of the old client's events to the old
     // endpoint under the old key — never redirected to the new config.
+    // AUD-023 (round 2): each chunk is sent as its own FLAT events array;
+    // the old nested `{events: EventPayload[][]}` shape was rejected by
+    // the server and silently discarded the replaced client's buffer.
     if (previous.buffer.length > 0) {
       const batch = previous.buffer.splice(0);
-      sendJSON(previous, "/api/v1/events/batch", { events: chunkEvents(batch) }).catch(() => undefined);
+      const { chunks, oversized } = packEventChunks(batch);
+      for (const ev of oversized) {
+        reportError(previous, new Error("observe: dropped an event exceeding the request byte budget on re-init"));
+      }
+      for (const chunk of chunks) {
+        sendJSON(previous, "/api/v1/events/batch", { events: chunk }).catch((err) => {
+          reportError(previous, err instanceof Error ? err : new Error(String(err)));
+        });
+      }
     }
   }
 
@@ -230,6 +286,7 @@ export function init(options: InitOptions): void {
     timer: null,
     userId: null,
     sessionId: makeId(),
+    flushing: null,
     dispose: () => {},
   };
   client = instance;
@@ -406,7 +463,9 @@ export interface CaptureContext {
   spanId?: string;
 }
 
-/** Submit an error. Sends immediately — not buffered. */
+/** Submit an error. Sends immediately — not buffered. Never rejects into
+ * application code (AUD-021: the strict transport's rejection is reported
+ * through onError instead). */
 export function captureException(err: Error, ctx?: CaptureContext): Promise<void> {
   if (!client) return Promise.resolve();
   return captureExceptionFor(client, err, ctx);
@@ -438,7 +497,10 @@ function captureExceptionFor(target: Client, err: Error, ctx?: CaptureContext): 
   const replayId = activeReplayId();
   if (replayId) payload.replay_id = replayId;
   if (target.userId) payload.distinct_id = target.userId;
-  return sendJSON(target, "/api/v1/errors", payload);
+  // Fire-and-forget public boundary (AUD-021): report, don't reject.
+  return sendJSON(target, "/api/v1/errors", payload).catch((sendErr) => {
+    reportError(target, sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
+  });
 }
 
 function activeReplayId(): string | null {
@@ -455,42 +517,67 @@ function activeReplayId(): string | null {
   return null;
 }
 
-/** Submit a log entry. */
+/** Submit a log entry. Fire-and-forget: failures are reported through
+ * onError, never rejected into application code (AUD-021). */
 export function log(entry: Omit<LogPayload, "site_id">): Promise<void> {
-  if (!client) return Promise.resolve();
-  return sendJSON(client, "/api/v1/logs", { site_id: client.opts.siteId, ...entry });
+  const target = client;
+  if (!target) return Promise.resolve();
+  return sendJSON(target, "/api/v1/logs", { site_id: target.opts.siteId, ...entry })
+    .catch((err) => {
+      reportError(target, err instanceof Error ? err : new Error(String(err)));
+    });
 }
 
-/** Split events into server-legal chunks (max 100 per request). */
+/** Split events into server-legal chunks by count and encoded bytes
+ * (AUD-026). */
 function chunkEvents(events: EventPayload[]): EventPayload[][] {
-  const chunks: EventPayload[][] = [];
-  for (let i = 0; i < events.length; i += MAX_EVENTS_PER_REQUEST) {
-    chunks.push(events.slice(i, i + MAX_EVENTS_PER_REQUEST));
-  }
-  return chunks;
+  return packEventChunks(events).chunks;
 }
 
-/** Flush a specific client's buffer. Events are only removed from the
- * buffer once a chunk is accepted; a rejected chunk is retained (bounded)
- * for the next flush instead of being dropped (audit F32). */
-async function flushClient(target: Client, unloading = false): Promise<void> {
-  while (target.buffer.length > 0) {
-    const batch = target.buffer.slice(0, MAX_EVENTS_PER_REQUEST);
-    try {
-      await sendJSON(target, "/api/v1/events/batch", { events: batch }, unloading);
-    } catch {
-      // Delivery failed: retain this chunk (up to the bounded cap) and
-      // stop — the next interval/visibility flush retries it.
-      target.buffer = target.buffer.slice(batch.length);
-      target.buffer = [...batch.slice(0, MAX_BUFFERED_ON_ERROR), ...target.buffer].slice(0, MAX_BUFFERED_ON_ERROR);
-      if (batch.length > MAX_BUFFERED_ON_ERROR) {
-        reportError(target, new Error(`observe: dropped ${batch.length - MAX_BUFFERED_ON_ERROR} buffered events (send failing and retention cap reached)`));
+/** Flush a specific client's buffer.
+ *
+ * AUD-022 (round 2): ONE flush owner per client. The flush detaches its
+ * OWNED batch (splice) before awaiting the transport and prepends exactly
+ * that batch on failure — the old slice-then-await-then-slice-by-length
+ * flow let two overlapping flushes send duplicate prefixes and delete
+ * newly queued events neither had sent. Bounded work per wakeup so one
+ * signal cannot spin forever. */
+function flushClient(target: Client, unloading = false): Promise<void> {
+  if (target.flushing) return target.flushing;
+  const work = Promise.resolve().then(async () => {
+    for (let units = 0; target.buffer.length && units < 8; units++) {
+      const { chunks, oversized } = packEventChunks(target.buffer);
+      if (oversized.length) {
+        // Permanently undeliverable records: drop only these, never the
+        // valid neighbors sharing their batch (AUD-021).
+        const bad = new Set(oversized);
+        target.buffer = target.buffer.filter((e) => !bad.has(e));
+        reportError(target, new Error(`observe: dropped ${oversized.length} event(s) exceeding the request byte budget`));
+        if (!target.buffer.length) return;
       }
-      return;
+      const batch = target.buffer.splice(0, chunks[0]?.length ?? target.buffer.length);
+      try {
+        await sendJSON(target, "/api/v1/events/batch", { events: batch }, unloading);
+      } catch (err) {
+        // Delivery failed: prepend exactly THIS batch (bounded) and stop —
+        // the next interval/visibility flush retries it.
+        target.buffer = [...batch, ...target.buffer];
+        const dropped = Math.max(0, target.buffer.length - MAX_BUFFERED_ON_ERROR);
+        if (dropped > 0) {
+          target.buffer = target.buffer.slice(0, MAX_BUFFERED_ON_ERROR);
+          reportError(target, new Error(`observe: dropped ${dropped} oldest queued events (send failing and retention cap reached)`));
+        }
+        reportError(target, err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
+      if (unloading) return; // one best-effort batch per unload
     }
-    target.buffer = target.buffer.slice(batch.length);
-    if (unloading) return; // one best-effort chunk per unload
-  }
+  });
+  const owned = work.finally(() => {
+    if (target.flushing === owned) target.flushing = null;
+  });
+  target.flushing = owned;
+  return owned;
 }
 
 /** Force an immediate flush of buffered events. */
