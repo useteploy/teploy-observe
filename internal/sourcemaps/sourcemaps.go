@@ -3,6 +3,7 @@ package sourcemaps
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -56,9 +57,15 @@ const DefaultKeepReleases = 10
 // opposite of what is wanted for multi-megabyte blobs. Without one they are
 // free to spill to disk under pressure and are bounded instead by the release
 // retention below.
+//
+// AUD-046 (round 2): new writes use the v2 injectively-encoded key
+// (base64url per component) — the raw `srcmap:{site}:{release}:{filename}`
+// scheme let release `a:b` + file `c` collide with release `a` + file
+// `b:c`, silently overwriting another logical map. Reads fall back to the
+// legacy key so pre-upgrade maps stay resolvable until pruned.
 func (s *SourceMapService) Upload(ctx context.Context, siteID, release, filename string, mapData []byte) error {
 	kv := s.db.KV()
-	key := kvKey(siteID, release, filename)
+	key := kvKeyV2(siteID, release, filename)
 	if err := kv.Set(ctx, key, mapData); err != nil {
 		return err
 	}
@@ -151,9 +158,13 @@ func (s *SourceMapService) PruneReleases(ctx context.Context, siteID string, kee
 // deleteRelease removes every source map belonging to one release, plus its
 // index entries.
 //
-// Files are found by key prefix rather than from a stored file list, so this
-// also cleans up releases uploaded before any index existed — which is the case
-// for every release currently on disk.
+// AUD-046 (round 2): membership is decided per key against BOTH the v2
+// injective encoding and the legacy raw encoding — the scan pattern is the
+// site's whole srcmap namespace, because a raw release name interpolated
+// into a glob also matched unrelated releases whose names begin with glob
+// metacharacters or that share a prefix. Retained-release protection
+// (longer legacy names win) still applies to legacy keys, whose ambiguity
+// is unfixable after the fact.
 func (s *SourceMapService) deleteRelease(ctx context.Context, siteID, release string, retained []string) error {
 	kv := s.db.KV()
 	// KV_KEYS is issued directly rather than through the SDK: this repo vendors
@@ -163,7 +174,7 @@ func (s *SourceMapService) deleteRelease(ctx context.Context, siteID, release st
 	// upstream). Reconciling that is worth doing, and is not this change.
 	var raw string
 	if err := s.db.Pool().QueryRow(ctx, "SELECT KV_KEYS($1)",
-		kvKey(siteID, release, "")+"*").Scan(&raw); err != nil {
+		"srcmap:*").Scan(&raw); err != nil {
 		return fmt.Errorf("listing source maps for %s: %w", release, err)
 	}
 	var keys []string
@@ -172,10 +183,13 @@ func (s *SourceMapService) deleteRelease(ctx context.Context, siteID, release st
 			return fmt.Errorf("decoding source map keys for %s: %w", release, err)
 		}
 	}
-	// Release names come from the upload request, so one can be a prefix of
-	// another: deleting "v1" by prefix would also take "v1:beta" with it. Skip
-	// any key that belongs to a release being kept.
 	for _, k := range keys {
+		if !keyBelongsToRelease(k, siteID, release) {
+			continue
+		}
+		// Legacy keys of a retained longer release name must survive a
+		// prefix collision with the pruned release (v2 keys cannot
+		// collide, but protect them with the same rule for symmetry).
 		if belongsToOther(k, siteID, release, retained) {
 			continue
 		}
@@ -190,6 +204,17 @@ func (s *SourceMapService) deleteRelease(ctx context.Context, siteID, release st
 		return fmt.Errorf("untracking release: %w", err)
 	}
 	return nil
+}
+
+// keyBelongsToRelease reports whether a KV key is a source-map blob of
+// (siteID, release) in either the v2 or the legacy encoding.
+func keyBelongsToRelease(key, siteID, release string) bool {
+	if strings.HasPrefix(key, "srcmap:v2:"+sourceMapComponent(siteID)+":"+sourceMapComponent(release)+":") {
+		return true
+	}
+	// Legacy: raw components. Scoped by the site prefix first so a release
+	// name containing ':' cannot reach into another site's namespace.
+	return strings.HasPrefix(key, "srcmap:"+siteID+":"+release+":")
 }
 
 // ListReleases returns all releases that have source maps for a site.
@@ -234,26 +259,59 @@ func releasesSetKey(siteID string) string {
 }
 
 // ResolveFrame attempts to map a minified stack frame to its original source.
-// Returns the original frame info or nil if no source map is available.
+// Returns the original frame info, or nil when no source map covers the file.
+//
+// AUD-048 (round 2): a KV read FAILURE is an error, not "no map" — an
+// unavailable store used to look identical to an unsymbolicated stack, so
+// outages produced silently wrong output instead of a diagnosable one.
 func (s *SourceMapService) ResolveFrame(ctx context.Context, siteID, release, filename string, line, col int) (*SourceMapping, error) {
 	kv := s.db.KV()
-	key := kvKey(siteID, release, filename)
-	data, err := kv.Get(ctx, key)
-	if err != nil || data == nil {
-		return nil, nil // no source map available
+	meta, err := loadSourceMap(ctx, kv, siteID, release, filename)
+	if err != nil || meta == nil {
+		return nil, err
 	}
-
-	var meta SourceMapMeta
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return nil, fmt.Errorf("parse source map: %w", err)
-	}
-
-	// Decode VLQ mappings and find the closest match
+	// Decode VLQ mappings and find the covering match
 	mapping := decodeMappings(meta.Mappings, meta.Sources, meta.Names, line, col)
 	return mapping, nil
 }
 
+// maxSourceMapBytes bounds one parsed map (AUD-048): an attacker-supplied
+// multi-gigabyte "map" must not be decoded at all.
+const maxSourceMapBytes = 8 << 20
+
+// loadSourceMap fetches and parses the map for one (site, release, file),
+// trying the v2 key first and falling back to the legacy raw key.
+func loadSourceMap(ctx context.Context, kv *nucleus.KVModel, siteID, release, filename string) (*SourceMapMeta, error) {
+	data, err := kv.Get(ctx, kvKeyV2(siteID, release, filename))
+	if err != nil {
+		return nil, fmt.Errorf("read source map: %w", err)
+	}
+	if data == nil {
+		if legacy, lerr := kv.Get(ctx, kvKey(siteID, release, filename)); lerr == nil && legacy != nil {
+			data = legacy
+		}
+	}
+	if data == nil {
+		return nil, nil
+	}
+	if len(data) > maxSourceMapBytes {
+		return nil, fmt.Errorf("source map exceeds the %d byte parse budget", maxSourceMapBytes)
+	}
+	var meta SourceMapMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, fmt.Errorf("parse source map: %w", err)
+	}
+	if meta.Version != 3 {
+		return nil, fmt.Errorf("unsupported source map version %d", meta.Version)
+	}
+	return &meta, nil
+}
+
 // ResolveStackTrace resolves all frames in a stack trace JSON string.
+//
+// AUD-048 (round 2): maps are loaded and parsed at most ONCE per distinct
+// file within one stack request (a 50-frame stack used to fetch and decode
+// the same map 50 times), with failures memoized for the request.
 func (s *SourceMapService) ResolveStackTrace(ctx context.Context, siteID, release, stackJSON string) (string, error) {
 	if stackJSON == "" || release == "" {
 		return stackJSON, nil
@@ -272,9 +330,31 @@ func (s *SourceMapService) ResolveStackTrace(ctx context.Context, siteID, releas
 		return stackJSON, nil
 	}
 
+	type mapResult struct {
+		meta *SourceMapMeta
+		err  error
+	}
+	cache := make(map[string]mapResult)
+	kv := s.db.KV()
+
 	for i, f := range frames {
-		mapping, err := s.ResolveFrame(ctx, siteID, release, f.Filename, f.Lineno, f.Colno)
-		if err != nil || mapping == nil {
+		hit, cached := cache[f.Filename]
+		if !cached {
+			meta, err := loadSourceMap(ctx, kv, siteID, release, f.Filename)
+			if err != nil {
+				// A store/parse failure is observable but must not discard
+				// the raw frame — record it and keep the stack readable.
+				hit = mapResult{err: err}
+			} else {
+				hit = mapResult{meta: meta}
+			}
+			cache[f.Filename] = hit
+		}
+		if hit.err != nil || hit.meta == nil {
+			continue
+		}
+		mapping := decodeMappings(hit.meta.Mappings, hit.meta.Sources, hit.meta.Names, f.Lineno, f.Colno)
+		if mapping == nil {
 			continue
 		}
 		frames[i].Filename = mapping.OriginalFile
@@ -289,18 +369,37 @@ func (s *SourceMapService) ResolveStackTrace(ctx context.Context, siteID, releas
 	return string(result), nil
 }
 
+// sourceMapComponent injectively encodes one key component (AUD-046):
+// base64url bytes cannot contain ':' or glob metacharacters, so no
+// (release, filename) pair can collide with another.
+func sourceMapComponent(s string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(s))
+}
+
+// kvKeyV2 is the versioned source-map blob key (AUD-046).
+func kvKeyV2(siteID, release, filename string) string {
+	return "srcmap:v2:" + sourceMapComponent(siteID) + ":" +
+		sourceMapComponent(release) + ":" + sourceMapComponent(filename)
+}
+
 func kvKey(siteID, release, filename string) string {
 	return fmt.Sprintf("srcmap:%s:%s:%s", siteID, release, filename)
 }
 
-// decodeMappings parses VLQ-encoded source map mappings and finds the closest
-// mapping on the target line. The source index, source line, source column and
-// name index are deltas that accumulate across ALL preceding lines — only the
-// generated column resets at each line (';'). The previous version decoded the
-// target line in isolation with all accumulators starting at 0, producing wrong
-// original positions for every frame past the first mappings line. This walks
-// from line 0, advancing the accumulators on every segment, and only does the
-// closest-column match once it reaches the target line.
+// decodeMappings parses VLQ-encoded source map mappings and selects the
+// mapping that covers the requested generated position (AUD-047, round 2).
+//
+// The source index, source line, source column and name index are deltas
+// that accumulate across ALL preceding lines — only the generated column
+// resets at each line (';'). This walks from line 0, advancing the
+// accumulators on every segment.
+//
+// Selection: the segment with the GREATEST generated column not exceeding
+// the requested column — i.e. the mapping that covers the position, per
+// the source-map spec. The previous smallest-absolute-distance choice
+// could pick a segment to the RIGHT of the requested column (a future
+// mapping), and generated-column-only segments were skipped instead of
+// terminating their (explicitly unmapped) region.
 func decodeMappings(mappings string, sources, names []string, targetLine, targetCol int) *SourceMapping {
 	if mappings == "" {
 		return nil
@@ -313,64 +412,88 @@ func decodeMappings(mappings string, sources, names []string, targetLine, target
 
 	// Accumulators carried across lines.
 	var srcIdx, srcLine, srcCol, nameIdx int
-	var bestMapping *SourceMapping
 
 	for li := 0; li < targetLine; li++ {
 		genCol := 0 // generated column resets at each line
 		isTarget := li == targetLine-1
-		bestDist := int(^uint(0) >> 1) // max int
+		// Candidate: the last segment at or left of the requested column.
+		type candidate struct {
+			mapped                  bool
+			genCol                  int
+			srcIdx, srcLine, srcCol int
+			nameIdx                 int
+			hasName                 bool
+		}
+		var cand *candidate
 
-		if lines[li] == "" {
+		if lines[li] != "" {
+			for _, seg := range strings.Split(lines[li], ",") {
+				if seg == "" {
+					continue
+				}
+				values := decodeVLQ(seg)
+				if len(values) == 0 {
+					continue
+				}
+				genCol += values[0]
+				if len(values) < 4 {
+					// Generated-column-only segment: explicitly unmapped.
+					if isTarget && genCol <= targetCol-1 {
+						cand = &candidate{mapped: false, genCol: genCol}
+					}
+					continue
+				}
+				srcIdx += values[1]
+				srcLine += values[2]
+				srcCol += values[3]
+				hasName := len(values) >= 5
+				if hasName {
+					nameIdx += values[4]
+				}
+				if !isTarget {
+					continue
+				}
+				if genCol <= targetCol-1 {
+					cand = &candidate{
+						mapped:  true,
+						genCol:  genCol,
+						srcIdx:  srcIdx,
+						srcLine: srcLine,
+						srcCol:  srcCol,
+						nameIdx: nameIdx,
+						hasName: hasName,
+					}
+				}
+			}
+		}
+		if !isTarget {
 			continue
 		}
-		for _, seg := range strings.Split(lines[li], ",") {
-			if seg == "" {
-				continue
-			}
-			values := decodeVLQ(seg)
-			if len(values) == 0 {
-				continue
-			}
-			genCol += values[0]
-			if len(values) < 4 {
-				// Generated-column-only segment: no source mapping.
-				continue
-			}
-			srcIdx += values[1]
-			srcLine += values[2]
-			srcCol += values[3]
-			hasName := len(values) >= 5
-			if hasName {
-				nameIdx += values[4]
-			}
-
-			if !isTarget {
-				continue
-			}
-			dist := abs(genCol - (targetCol - 1))
-			if dist < bestDist {
-				bestDist = dist
-				src := ""
-				if srcIdx >= 0 && srcIdx < len(sources) {
-					src = sources[srcIdx]
-				}
-				name := ""
-				if hasName && nameIdx >= 0 && nameIdx < len(names) {
-					name = names[nameIdx]
-				}
-				bestMapping = &SourceMapping{
-					GeneratedLine:   targetLine,
-					GeneratedColumn: genCol + 1,
-					OriginalFile:    src,
-					OriginalLine:    srcLine + 1,
-					OriginalColumn:  srcCol + 1,
-					OriginalName:    name,
-				}
-			}
+		if cand == nil || !cand.mapped {
+			// Before the first segment, or inside an explicitly unmapped
+			// region: no mapping. Invalid source coordinates also resolve
+			// to "unmapped" rather than a misleading nominal mapping.
+			return nil
+		}
+		if cand.srcIdx < 0 || cand.srcIdx >= len(sources) ||
+			cand.srcLine < 0 || cand.srcCol < 0 {
+			return nil
+		}
+		name := ""
+		if cand.hasName && cand.nameIdx >= 0 && cand.nameIdx < len(names) {
+			name = names[cand.nameIdx]
+		}
+		return &SourceMapping{
+			GeneratedLine:   targetLine,
+			GeneratedColumn: cand.genCol + 1,
+			OriginalFile:    sources[cand.srcIdx],
+			OriginalLine:    cand.srcLine + 1,
+			OriginalColumn:  cand.srcCol + 1,
+			OriginalName:    name,
 		}
 	}
 
-	return bestMapping
+	return nil
 }
 
 func abs(x int) int {
@@ -437,18 +560,22 @@ func genID() string {
 var _ = strconv.Itoa
 var _ = time.Now
 
-// belongsToOther reports whether a key matched by `release`'s prefix in fact
-// belongs to a longer release name that is being retained.
+// belongsToOther reports whether a key matched by `release`'s membership
+// test in fact belongs to a longer release name that is being retained.
 //
 // `srcmap:site:v1:*` matches `srcmap:site:v1:beta:app.js`, so a prefix match
 // alone would delete a retained release's maps as a side effect of pruning an
-// older one whose name happens to be a prefix of it.
+// older one whose name happens to be a prefix of it. Both encodings are
+// checked (AUD-046).
 func belongsToOther(key, siteID, release string, retained []string) bool {
 	for _, other := range retained {
 		if other == release || len(other) <= len(release) {
 			continue
 		}
 		if strings.HasPrefix(key, kvKey(siteID, other, "")) {
+			return true
+		}
+		if strings.HasPrefix(key, "srcmap:v2:"+sourceMapComponent(siteID)+":"+sourceMapComponent(other)+":") {
 			return true
 		}
 	}

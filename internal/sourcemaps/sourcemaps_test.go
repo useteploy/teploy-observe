@@ -96,3 +96,96 @@ func TestReleaseKeysAreDistinctPerRelease(t *testing.T) {
 		t.Fatal("age index must not collide with the releases set")
 	}
 }
+
+// AUD-047 (round 2): the selected mapping must COVER the requested column
+// (greatest generated column <= target), never a future one to the right.
+// "AAAA,EAAA" on line 1: segments at generated columns 0 and 4 (VLQ 'E'=-1?
+// no: A=0, C=1 -> "AACA" would be col +1). Build explicit vectors instead.
+func TestDecodeMappings_SelectsCoveringSegment(t *testing.T) {
+	sources := []string{"app.ts"}
+	// Segments on line 1: genCol 0 -> src line 1; genCol 10 -> src line 2.
+	// VLQ: col delta 10 encodes as 'U'; line delta 1 as 'C'.
+	mappings := "AAAA,UACA"
+	// Column 8 (1-based) = zero-based 7: must select the column-0 segment.
+	m := decodeMappings(mappings, sources, nil, 1, 8)
+	if m == nil || m.OriginalLine != 1 {
+		t.Fatalf("col 8 must map through the covering segment at gen col 0: %+v", m)
+	}
+	// Column 11 (1-based) = zero-based 10: selects the column-10 segment.
+	m = decodeMappings(mappings, sources, nil, 1, 11)
+	if m == nil || m.OriginalLine != 2 {
+		t.Fatalf("col 11 must select the gen col 10 segment: %+v", m)
+	}
+	// Column 1 (zero-based 0): the first segment.
+	m = decodeMappings(mappings, sources, nil, 1, 1)
+	if m == nil || m.GeneratedColumn != 1 {
+		t.Fatalf("col 1 must select the first segment: %+v", m)
+	}
+}
+
+// AUD-047: a generated-column-only segment explicitly marks its region
+// unmapped — requests inside it return no mapping.
+func TestDecodeMappings_GeneratedOnlySegmentUnmaps(t *testing.T) {
+	sources := []string{"app.ts"}
+	// Line 1: mapped at genCol 0, unmapped marker at genCol 5 ('K' = 5),
+	// mapped again at genCol 10 ('KACA' = [5, 0, 1, 0] — deltas accumulate).
+	mappings := "AAAA,K,KACA"
+	for col := 6; col <= 10; col++ {
+		if m := decodeMappings(mappings, sources, nil, 1, col); m != nil {
+			t.Fatalf("col %d lies in the explicitly unmapped region, got %+v", col, m)
+		}
+	}
+	if m := decodeMappings(mappings, sources, nil, 1, 11); m == nil {
+		t.Fatal("col 11 is past the remapped segment at gen col 10 and must map")
+	}
+	if m := decodeMappings(mappings, sources, nil, 1, 4); m == nil {
+		t.Fatal("col 4 is still covered by the first mapped segment")
+	}
+}
+
+// AUD-047: an invalid source index resolves to unmapped, not a nominal
+// mapping with an empty filename.
+func TestDecodeMappings_InvalidSourceIndexIsUnmapped(t *testing.T) {
+	// Segment [0,1,0,0]: source index 1 with a one-entry sources table.
+	m := decodeMappings("ACAA", []string{"only.ts"}, nil, 1, 1)
+	if m != nil {
+		t.Fatalf("invalid source index must not produce a mapping, got %+v", m)
+	}
+}
+
+// AUD-046 (round 2): the v2 key encoding is injective across components —
+// (a:b, c) and (a, b:c) must not collide, unlike the legacy raw key.
+func TestKVKeyV2_NoComponentCollisions(t *testing.T) {
+	if kvKeyV2("s", "a:b", "c") == kvKeyV2("s", "a", "b:c") {
+		t.Fatal("(a:b,c) and (a,b:c) must occupy distinct v2 keys")
+	}
+	if kvKeyV2("s", "v1*", "app.js") == kvKeyV2("s", "v1?", "app.js") {
+		t.Fatal("glob metacharacters must not collide in v2 keys")
+	}
+	if kvKeyV2("s", "", "x") == kvKeyV2("s", "x", "") {
+		t.Fatal("empty components must not collide in v2 keys")
+	}
+	// Legacy proves the ambiguity the v2 scheme removes.
+	if kvKey("s", "a:b", "c") != kvKey("s", "a", "b:c") {
+		t.Fatal("legacy key precondition: these two DO collide raw")
+	}
+}
+
+// AUD-046: membership tests recognize both encodings and reject strangers.
+func TestKeyBelongsToRelease_BothEncodings(t *testing.T) {
+	if !keyBelongsToRelease(kvKeyV2("s", "v1", "app.js"), "s", "v1") {
+		t.Fatal("v2 key of the release must be matched")
+	}
+	if !keyBelongsToRelease(kvKey("s", "v1", "app.js"), "s", "v1") {
+		t.Fatal("legacy key of the release must be matched")
+	}
+	if keyBelongsToRelease(kvKeyV2("s", "v2", "app.js"), "s", "v1") {
+		t.Fatal("another release's key must not match")
+	}
+	if keyBelongsToRelease(kvKey("s", "av1", "app.js"), "s", "v1") {
+		t.Fatal("release name embedded in another release must not match")
+	}
+	if keyBelongsToRelease("srcmap:releases:s", "s", "v1") {
+		t.Fatal("index keys are not blob keys")
+	}
+}
