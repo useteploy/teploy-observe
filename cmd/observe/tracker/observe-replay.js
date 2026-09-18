@@ -4,26 +4,49 @@
   var script = document.currentScript;
   if (!script) return;
 
+  function boundedInteger(raw, fallback, min, max) {
+    var n = parseInt(raw, 10);
+    if (!isFinite(n) || n < min) return fallback;
+    if (n > max) return max;
+    return n;
+  }
+
   var origin = script.src ? new URL(script.src).origin : '';
   var endpoint = script.getAttribute('data-endpoint') || origin + '/api/v1/replays';
   var errorsEndpoint = script.getAttribute('data-errors-endpoint') || origin + '/api/v1/errors';
   var siteId = script.getAttribute('data-site-id') || '';
-  // Required once a site has any API key registered — APIKeyAuthMiddleware's
-  // no-keys grace period closes permanently the moment one key exists
-  // anywhere on the instance, and /api/v1/replays + /api/v1/errors both sit
-  // behind it. Without this, every send() call below silently 401s and no
-  // replay or rage-click data ever lands, on any site with a key configured.
+  // Required once a site has any API key registered — APIKeyAuthMiddleware
+  // requires a valid key for every ingest request (the old no-keys grace
+  // path is gone, AUD-002), and /api/v1/replays + /api/v1/errors both sit
+  // behind it.
   var apiKey = script.getAttribute('data-api-key') || '';
-  var maxEvents = parseInt(script.getAttribute('data-max-events') || '5000', 10);
-  var flushInterval = parseInt(script.getAttribute('data-flush-interval') || '10000', 10);
+  // AUD-034: numeric attributes are parsed with explicit bounds — a typo'd
+  // data-max-events="lots" used to yield NaN, which disabled every cap.
+  var maxEvents = boundedInteger(script.getAttribute('data-max-events'), 5000, 1, 50000);
+  var flushInterval = boundedInteger(script.getAttribute('data-flush-interval'), 10000, 500, 600000);
   // Rage click: N clicks on the same target within W ms.
-  var rageThreshold = parseInt(script.getAttribute('data-rage-threshold') || '4', 10);
-  var rageWindowMs = parseInt(script.getAttribute('data-rage-window') || '1000', 10);
+  var rageThreshold = boundedInteger(script.getAttribute('data-rage-threshold'), 4, 1, 100);
+  var rageWindowMs = boundedInteger(script.getAttribute('data-rage-window'), 1000, 100, 60000);
 
   var events = [];
   var flushTimer = null;
   var sessionId = '';
   var hasError = false;
+
+  // AUD-027: explicit lifecycle. `active` gates every capture path — a
+  // stopped recorder's listeners/wrappers become inert instead of quietly
+  // continuing to record, and repeated start() cannot stack duplicate
+  // listeners, observers, wrappers, and timers.
+  var active = false;
+  var listeners = [];       // [target, type, fn] triples to remove on stop
+  var observer = null;      // MutationObserver to disconnect on stop
+  var origPush = null, wrappedPush = null;
+  var origReplace = null, wrappedReplace = null;
+
+  function addListener(target, type, fn, opts) {
+    target.addEventListener(type, fn, opts);
+    listeners.push([target, type, fn]);
+  }
 
   // Local replay id — generated client-side so observe-errors.js can attach
   // it to errors captured before the first replay batch reaches the server.
@@ -59,8 +82,16 @@
   // decision recorded in AUDIT_OPEN.md, not something to slip into a bug
   // fix. A subtree can opt into masking with data-observe-block; there is
   // deliberately no opt-OUT from blocking.
+  //
+  // AUD-031 (round 2): the serializer is bounded — total nodes, depth, and
+  // text length — so a huge or pathologically deep page cannot stall the
+  // recorder. Bounds are enforced per snapshot, not per element.
 
   var PRIVATE_TAG = /^(input|textarea|select|option|script|noscript|iframe|object|embed|style)$/;
+
+  var MAX_SNAPSHOT_NODES = 15000;
+  var MAX_SNAPSHOT_DEPTH = 32;
+  var MAX_TEXT_LENGTH = 2048;
 
   function isPrivateElement(el) {
     var tag = el.tagName.toLowerCase();
@@ -70,12 +101,19 @@
     return false;
   }
 
-  function serializeNode(node) {
+  var snapshotBudget = 0;
+
+  function serializeNode(node, depth) {
+    if (snapshotBudget <= 0 || depth > MAX_SNAPSHOT_DEPTH) return null;
     if (node.nodeType === 3) {
-      return { type: 'text', value: node.textContent };
+      snapshotBudget--;
+      var text = node.textContent || '';
+      if (text.length > MAX_TEXT_LENGTH) text = text.slice(0, MAX_TEXT_LENGTH);
+      return { type: 'text', value: text };
     }
     if (node.nodeType !== 1) return null;
 
+    snapshotBudget--;
     var tag = node.tagName.toLowerCase();
     if (tag === 'script' || tag === 'noscript') return null;
 
@@ -97,7 +135,7 @@
 
     var children = [];
     for (var j = 0; j < node.childNodes.length && children.length < 200; j++) {
-      var child = serializeNode(node.childNodes[j]);
+      var child = serializeNode(node.childNodes[j], depth + 1);
       if (child) children.push(child);
     }
 
@@ -105,15 +143,19 @@
   }
 
   function takeSnapshot() {
+    snapshotBudget = MAX_SNAPSHOT_NODES;
     return {
       doctype: document.doctype ? '<!DOCTYPE ' + document.doctype.name + '>' : '',
-      html: serializeNode(document.documentElement)
+      html: serializeNode(document.documentElement, 0)
     };
   }
 
   // --- Event Recording ---
 
   function record(type, data) {
+    // AUD-027: capture is gated on `active` — a stopped recorder must not
+    // accept events from wrappers still unwinding in the stack.
+    if (!active) return;
     if (events.length >= maxEvents) return;
     events.push({
       type: type,
@@ -122,13 +164,32 @@
     });
   }
 
+  // AUD-033 (round 2): clicks carry the page URL and viewport captured AT
+  // CLICK TIME — the server groups heatmap attribution by this, so a click
+  // followed by SPA navigation is no longer credited to the post-navigation
+  // page observed at flush time. Sanitized to origin+path (no query or
+  // fragment material ever leaves the page).
+  function pageContext() {
+    try {
+      return {
+        page_url: location.origin + location.pathname,
+        viewport_width: window.innerWidth || 0
+      };
+    } catch (e) {
+      return { page_url: '', viewport_width: 0 };
+    }
+  }
+
   // Full snapshot on start
   function init() {
+    if (active) return; // AUD-027: idempotent start
+    active = true;
+
     record('snapshot', takeSnapshot());
 
     // Mouse moves (throttled)
     var lastMove = 0;
-    document.addEventListener('mousemove', function(e) {
+    addListener(document, 'mousemove', function(e) {
       var now = Date.now();
       if (now - lastMove < 50) return;
       lastMove = now;
@@ -137,26 +198,32 @@
 
     // Clicks (with rage-click detection: N clicks on same target within W ms).
     var rageState = { selector: '', clicks: [], reported: false };
-    document.addEventListener('click', function(e) {
+    addListener(document, 'click', function(e) {
       var target = e.target;
       var tag = target.tagName ? target.tagName.toLowerCase() : '';
       var id = target.id ? '#' + target.id : '';
       var cls = target.className ? '.' + String(target.className).split(' ')[0] : '';
       var sel = tag + id + cls;
-      record('click', { x: e.clientX, y: e.clientY, target: sel });
+      var ctx = pageContext();
+      record('click', { x: e.clientX, y: e.clientY, target: sel, page_url: ctx.page_url, viewport_width: ctx.viewport_width });
 
+      // AUD-034 (round 2): an emptied time window starts a NEW burst — the
+      // `reported` flag used to reset only on a selector change, so a
+      // second independent rage burst on the same element was never
+      // reported, and threshold=1 never fired on its first click.
       var now = Date.now();
       if (rageState.selector !== sel) {
         rageState.selector = sel;
-        rageState.clicks = [now];
+        rageState.clicks = [];
         rageState.reported = false;
-        return;
       }
-      // Drop clicks outside the rage window.
       rageState.clicks.push(now);
       var cutoff = now - rageWindowMs;
       while (rageState.clicks.length && rageState.clicks[0] < cutoff) {
         rageState.clicks.shift();
+      }
+      if (!rageState.clicks.length) {
+        rageState.reported = false;
       }
       if (rageState.clicks.length >= rageThreshold && !rageState.reported) {
         rageState.reported = true;
@@ -167,7 +234,7 @@
 
     // Scrolls (throttled)
     var lastScroll = 0;
-    document.addEventListener('scroll', function() {
+    addListener(document, 'scroll', function() {
       var now = Date.now();
       if (now - lastScroll < 100) return;
       lastScroll = now;
@@ -175,7 +242,7 @@
     }, { passive: true });
 
     // Input changes (mask values for privacy)
-    document.addEventListener('input', function(e) {
+    addListener(document, 'input', function(e) {
       var target = e.target;
       if (!target || !target.tagName) return;
       var tag = target.tagName.toLowerCase();
@@ -185,28 +252,31 @@
     }, true);
 
     // Viewport resize
-    window.addEventListener('resize', function() {
+    addListener(window, 'resize', function() {
       record('resize', { w: window.innerWidth, h: window.innerHeight });
     });
 
-    // Navigation
-    var origPush = history.pushState;
-    var origReplace = history.replaceState;
-    history.pushState = function() {
+    // Navigation. Wrappers check `active` and restore the originals on
+    // stop without clobbering a wrapper another library installed later.
+    origPush = history.pushState;
+    origReplace = history.replaceState;
+    wrappedPush = function() {
       origPush.apply(this, arguments);
-      record('navigation', { url: location.href });
+      record('navigation', { url: location.origin + location.pathname });
     };
-    history.replaceState = function() {
+    wrappedReplace = function() {
       origReplace.apply(this, arguments);
-      record('navigation', { url: location.href });
+      record('navigation', { url: location.origin + location.pathname });
     };
-    window.addEventListener('popstate', function() {
-      record('navigation', { url: location.href });
+    history.pushState = wrappedPush;
+    history.replaceState = wrappedReplace;
+    addListener(window, 'popstate', function() {
+      record('navigation', { url: location.origin + location.pathname });
     });
 
     // DOM mutations (simplified)
     if (typeof MutationObserver !== 'undefined') {
-      var observer = new MutationObserver(function(mutations) {
+      observer = new MutationObserver(function(mutations) {
         for (var i = 0; i < Math.min(mutations.length, 10); i++) {
           var m = mutations[i];
           if (m.type === 'childList' && m.addedNodes.length > 0) {
@@ -228,93 +298,175 @@
     }
 
     // Error detection
-    window.addEventListener('error', function() { hasError = true; });
-    window.addEventListener('unhandledrejection', function() { hasError = true; });
+    addListener(window, 'error', function() { hasError = true; });
+    addListener(window, 'unhandledrejection', function() { hasError = true; });
 
     // Periodic flush
     flushTimer = setInterval(flush, flushInterval);
 
     // Final flush on page hide
-    document.addEventListener('visibilitychange', function() {
+    addListener(document, 'visibilitychange', function() {
       if (document.visibilityState === 'hidden') flush();
     });
   }
 
-  // sendBeacon can't carry custom headers, so it can never attach
-  // X-API-Key — on any site with a key configured (the normal case once a
-  // site is past the anonymous grace period) a beacon-only send would
-  // silently 401 and the data would just vanish. fetch's keepalive flag is
-  // the modern replacement: same "survives page unload" guarantee as
-  // sendBeacon, but supports headers. Only fall back to sendBeacon when no
-  // key is configured, matching the original behavior for grace-period
-  // (single-tenant, no-keys-yet) installs.
+  // --- Transport ---
   //
-  // Audit F32: keepalive is only set for small bodies (the browser fails
-  // any keepalive request over its 64 KiB in-flight budget, which large
-  // snapshots used to hit), beacon queuing refusals fall through to fetch,
-  // and fetch rejections are handled so they never surface as unhandled
-  // promise rejections.
-  function send(url, payload) {
+  // AUD-024 (round 2): batches are detached only when the request they
+  // belong to is actually accepted. The fetch branch never checked res.ok,
+  // the XHR branch had no completion handling at all, and sendBeacon's
+  // "queued" return was treated as server acceptance — 401/413/429/5xx and
+  // offline all used to lose the already-spliced records. Failed chunks
+  // are requeued (bounded by maxEvents) and reported through the
+  // error hook.
+  //
+  // AUD-025 (round 2): sendBeacon can NEVER carry X-API-Key, so it is only
+  // attempted for keyless installs — an authenticated configuration goes
+  // straight to fetch/XHR when fetch is unavailable instead of silently
+  // 401ing through a beacon.
+  //
+  // AUD-026 (round 2): chunk boundaries are computed from encoded BYTES,
+  // not event counts or UTF-16 code units — a snapshot alone can exceed
+  // the route's 2 MiB cap.
+
+  var onErrorHook = function(err) {
+    try { console.warn('observe-replay delivery failed:', err); } catch (e) { /* noop */ }
+  };
+
+  function byteLength(s) {
+    if (typeof TextEncoder !== 'undefined') {
+      return new TextEncoder().encode(s).length;
+    }
+    try {
+      return new Blob([s]).size;
+    } catch (e) {
+      return s.length * 2; // conservative worst case for non-ASCII
+    }
+  }
+
+  // 1.5 MiB per request: under the ingest route's 2 MiB cap with room for
+  // the envelope metadata every chunk carries.
+  var MAX_REQUEST_BYTES = 1536 * 1024;
+  var MAX_FLUSH_EVENTS = 1000;
+
+  function deliver(url, payload, cb) {
     var body = JSON.stringify(payload);
-    var small = body.length <= 48 * 1024;
-    if (apiKey) {
-      if (typeof fetch === 'function') {
-        try {
-          fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
-            body: body,
-            keepalive: small
-          }).catch(function() { /* best effort; replay batches are not idempotent */ });
-          return;
-        } catch (e) {
-          // fall through to the no-key paths below on very old browsers
-          // without fetch/keepalive support
-        }
+    var small = byteLength(body) <= 48 * 1024;
+    var headers = { 'Content-Type': 'application/json' };
+    if (apiKey) headers['X-API-Key'] = apiKey;
+
+    if (typeof fetch === 'function') {
+      try {
+        fetch(url, {
+          method: 'POST',
+          credentials: 'omit',
+          redirect: 'error',
+          headers: headers,
+          body: body,
+          keepalive: small
+        }).then(function(res) {
+          if (!res.ok) cb(new Error('observe-replay: ingest returned ' + res.status));
+          else cb(null);
+        }, function(err) {
+          cb(err instanceof Error ? err : new Error(String(err)));
+        });
+        return;
+      } catch (e) {
+        // fall through to the beacon/XHR paths on very old browsers
       }
     }
-    if (navigator.sendBeacon) {
+    // Beacon only for keyless installs: it cannot carry the API key
+    // header, so "successfully queued" would still be a guaranteed 401.
+    if (!apiKey && navigator.sendBeacon) {
       try {
         if (navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }))) {
+          cb(null);
           return;
         }
       } catch (e) { /* fall through to XHR */ }
     }
     var xhr = new XMLHttpRequest();
     xhr.open('POST', url, true);
-    xhr.setRequestHeader('Content-Type', 'application/json');
-    if (apiKey) xhr.setRequestHeader('X-API-Key', apiKey);
-    xhr.send(body);
+    for (var h in headers) {
+      if (Object.prototype.hasOwnProperty.call(headers, h)) {
+        try { xhr.setRequestHeader(h, headers[h]); } catch (e) { /* forbidden header name */ }
+      }
+    }
+    xhr.onload = function() {
+      if (xhr.status >= 200 && xhr.status < 300) cb(null);
+      else cb(new Error('observe-replay: ingest returned ' + xhr.status));
+    };
+    xhr.onerror = function() { cb(new Error('observe-replay: network error')); };
+    try { xhr.send(body); } catch (e) { cb(e); }
+  }
+
+  var flushInFlight = false;
+
+  function makePayload(chunk) {
+    var ctx = pageContext();
+    var payload = {
+      site_id: siteId,
+      session_id: sessionId,
+      replay_id: replayId,
+      url: ctx.page_url,
+      browser: navigator.userAgent.substring(0, 128),
+      os: '',
+      device: '',
+      has_error: hasError,
+      viewport_width: ctx.viewport_width,
+      events: chunk
+    };
+    var distinctId = readDistinctID();
+    if (distinctId) payload.distinct_id = distinctId;
+    return payload;
+  }
+
+  // Split a batch into request-legal chunks by encoded bytes AND count.
+  function chunkBatch(batch) {
+    var chunks = [];
+    var cur = [];
+    var curBytes = 512; // envelope overhead floor
+    for (var i = 0; i < batch.length; i++) {
+      var size = byteLength(JSON.stringify(batch[i])) + 1;
+      if (cur.length >= MAX_FLUSH_EVENTS ||
+          (curBytes + size > MAX_REQUEST_BYTES && cur.length > 0)) {
+        chunks.push(cur);
+        cur = [];
+        curBytes = 512;
+      }
+      curBytes += size;
+      cur.push(batch[i]);
+    }
+    if (cur.length) chunks.push(cur);
+    return chunks;
+  }
+
+  function sendChunks(chunks, idx, done) {
+    if (idx >= chunks.length) { done(null); return; }
+    deliver(endpoint, makePayload(chunks[idx]), function(err) {
+      if (err) {
+        // Requeue this chunk and every chunk not yet attempted; already
+        // accepted chunks stay sent. Bounded by maxEvents via record().
+        var requeue = [];
+        for (var k = idx; k < chunks.length; k++) requeue = requeue.concat(chunks[k]);
+        events = requeue.concat(events);
+        onErrorHook(err);
+        done(err);
+        return;
+      }
+      sendChunks(chunks, idx + 1, done);
+    });
   }
 
   function flush() {
     if (events.length === 0) return;
-    // Audit F32: the ingest route caps request bodies at 2 MiB; a long
-    // session's batch (up to maxEvents records with DOM snapshots) could
-    // exceed it and be rejected whole. Flush in bounded chunks.
-    var MAX_FLUSH_EVENTS = 1000;
+    if (flushInFlight) return; // one owned batch at a time
     var batch = events.splice(0, MAX_FLUSH_EVENTS);
-
-    var makePayload = function(chunk) {
-      var payload = {
-        site_id: siteId,
-        session_id: sessionId,
-        replay_id: replayId,
-        url: location.href,
-        browser: navigator.userAgent.substring(0, 128),
-        os: '',
-        device: '',
-        has_error: hasError,
-        viewport_width: window.innerWidth || 0,
-        events: chunk
-      };
-      var distinctId = readDistinctID();
-      if (distinctId) payload.distinct_id = distinctId;
-      return payload;
-    };
-
-    send(endpoint, makePayload(batch));
-    // Any remainder rides the regular interval tick set up in init().
+    flushInFlight = true;
+    sendChunks(chunkBatch(batch), 0, function() {
+      flushInFlight = false;
+    });
+    // Any remainder rides the interval tick set up in init().
   }
 
   // Read the distinct_id set by observe.js's identify(). Lives in
@@ -353,7 +505,7 @@
       mechanism: 'rage_click',
       handled: false,
       level: 'warning',
-      url: location.href,
+      url: location.origin + location.pathname,
       browser: (navigator.userAgent || '').substring(0, 256),
       os: '',
       device: '',
@@ -363,18 +515,42 @@
     };
     var distinctId = readDistinctID();
     if (distinctId) payload.distinct_id = distinctId;
-    send(errorsEndpoint, payload);
+    deliver(errorsEndpoint, payload, onErrorHook);
   }
 
   // --- Public API ---
+
   window.observeReplay = {
     start: init,
-    stop: function() {
-      if (flushTimer) clearInterval(flushTimer);
-      flush();
+    // AUD-027: stop actually stops collection — listeners removed,
+    // observer disconnected, history wrappers restored, timer cleared.
+    // stop({discard: true}) withdraws pending capture entirely (consent
+    // withdrawal); plain stop() flushes what was recorded.
+    stop: function(options) {
+      if (!active) return;
+      active = false; // first: wrappers/observers still in the stack go inert
+      for (var i = 0; i < listeners.length; i++) {
+        try { listeners[i][0].removeEventListener(listeners[i][1], listeners[i][2]); }
+        catch (e) { /* already gone */ }
+      }
+      listeners = [];
+      if (observer) {
+        try { observer.disconnect(); } catch (e) { /* noop */ }
+        observer = null;
+      }
+      if (flushTimer !== null) clearInterval(flushTimer);
+      flushTimer = null;
+      if (history.pushState === wrappedPush) history.pushState = origPush;
+      if (history.replaceState === wrappedReplace) history.replaceState = origReplace;
+      if (options && options.discard) {
+        events.length = 0;
+      } else {
+        flush();
+      }
     },
     setSessionId: function(id) { sessionId = id; },
-    getReplayId: function() { return replayId; }
+    getReplayId: function() { return replayId; },
+    onError: function(fn) { if (typeof fn === 'function') onErrorHook = fn; }
   };
 
   init();
