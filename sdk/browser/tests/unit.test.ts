@@ -189,7 +189,7 @@ test("properties are capped at the server limit of 50", async () => {
 // deleted as if delivered.
 test("failed batch is retained and reported, not deleted", async () => {
   const errors: string[] = [];
-  init({ endpoint: "https://observe.example.com", siteId: "s1", onError: (e) => errors.push(e.message) });
+  init({ endpoint: "https://observe.example.com", siteId: "s1", retryBackoffMs: 0, onError: (e) => errors.push(e.message) });
   (globalThis as any).fetch = () => Promise.resolve({ ok: false, status: 503 });
 
   track("kept-event");
@@ -300,7 +300,7 @@ test("events carry stable producer ids and a v2 batch envelope", async () => {
 // same event ids), so the server recognizes the retry instead of
 // double-counting it.
 test("retried batch reuses its batch id and event ids", async () => {
-  init({ endpoint: "https://observe.example.com", siteId: "s1" });
+  init({ endpoint: "https://observe.example.com", siteId: "s1", retryBackoffMs: 0 });
   let failedBody: any = null;
   (globalThis as any).fetch = (_url: string, opts: any) => {
     failedBody = JSON.parse(opts.body);
@@ -322,4 +322,114 @@ test("retried batch reuses its batch id and event ids", async () => {
     sent[0].body.events.map((e: any) => e.event_id),
     failedBody.events.map((e: any) => e.event_id),
   );
+});
+
+// F32 (retry half): a failed batch is retried automatically with a
+// doubling backoff — nothing is sent before the delay elapses, and the
+// retry that does go out keeps the batch identity intact.
+test("failed batch retries after backoff with intact identity", async () => {
+  const retries: Array<{ attempt: number; delayMs: number; batchSize: number }> = [];
+  init({
+    endpoint: "https://observe.example.com",
+    siteId: "s1",
+    retryBackoffMs: 40,
+    onRetry: (info) => retries.push({ attempt: info.attempt, delayMs: info.delayMs, batchSize: info.batchSize }),
+  });
+  let failedBody: any = null;
+  let attempts = 0;
+  (globalThis as any).fetch = (_url: string, opts: any) => {
+    failedBody = JSON.parse(opts.body);
+    attempts++;
+    return Promise.resolve({ ok: false, status: 503 });
+  };
+  track("backoff-event");
+  await flush();
+  assert.equal(attempts, 1, "the first flush makes exactly one attempt");
+
+  // While the backoff gate is held, flushes are no-ops.
+  await flush();
+  assert.equal(attempts, 1, "a flush inside the backoff window must not send");
+
+  await new Promise((r) => setTimeout(r, 60));
+  (globalThis as any).fetch = (url: string, opts: any) => {
+    attempts++;
+    sent.push({ url, body: JSON.parse(opts.body) });
+    return Promise.resolve({ ok: true });
+  };
+  await flush();
+  assert.equal(sent.length, 1, "the retry after the window delivers the batch");
+  assert.equal(sent[0].body.batch_id, failedBody.batch_id, "retry keeps the batch id");
+  assert.equal(retries.length, 1, "onRetry fired for the scheduled retry");
+  assert.equal(retries[0].attempt, 1);
+  assert.equal(retries[0].delayMs, 40);
+  assert.equal(retries[0].batchSize, 1);
+});
+
+// F32: the backoff doubles per consecutive failure of the same batch.
+test("retry backoff doubles across attempts", async () => {
+  const delays: number[] = [];
+  init({
+    endpoint: "https://observe.example.com",
+    siteId: "s1",
+    retryBackoffMs: 10,
+    onRetry: (info) => delays.push(info.delayMs),
+  });
+  (globalThis as any).fetch = () => Promise.resolve({ ok: false, status: 500 });
+  track("doubling");
+  await flush(); // attempt 1 -> delay 10
+  await new Promise((r) => setTimeout(r, 15));
+  await flush(); // attempt 2 -> delay 20
+  assert.deepEqual(delays, [10, 20]);
+});
+
+// F32: after maxRetryAttempts the batch is dropped with a loud report, the
+// buffer moves on, and a later healthy flush delivers NEW events.
+test("retry budget exhausts, drops the batch, and recovers", async () => {
+  const errors: string[] = [];
+  init({
+    endpoint: "https://observe.example.com",
+    siteId: "s1",
+    retryBackoffMs: 5,
+    maxRetryAttempts: 2,
+    onError: (e) => errors.push(e.message),
+  });
+  (globalThis as any).fetch = () => Promise.resolve({ ok: false, status: 503 });
+  track("doomed");
+  await flush(); // attempt 1, delay 5
+  await new Promise((r) => setTimeout(r, 10));
+  await flush(); // attempt 2, delay 10
+  await new Promise((r) => setTimeout(r, 15));
+  await flush(); // attempt 3 > budget: give up and drop
+  assert.ok(errors.some((m) => m.includes("gave up on a batch after 2 attempts")), `expected the give-up report, got ${JSON.stringify(errors)}`);
+
+  // The dropped batch must not poison the client: a new event goes through.
+  (globalThis as any).fetch = (url: string, opts: any) => {
+    sent.push({ url, body: JSON.parse(opts.body) });
+    return Promise.resolve({ ok: true });
+  };
+  track("after-recovery");
+  await new Promise((r) => setTimeout(r, 10)); // past any residual gate
+  await flush();
+  const delivered = sent.flatMap((s) => s.body.events.map((e: any) => e.event_type));
+  assert.ok(delivered.includes("after-recovery"), `new events must deliver after recovery, got ${JSON.stringify(delivered)}`);
+  assert.ok(!delivered.includes("doomed"), "the given-up batch must not resurrect");
+});
+
+// F32: under sustained failure the retention cap still bounds memory and
+// reports the drop-oldest, and the queue drains in order once healthy.
+test("sustained failure bounds retention and drop-oldest is reported", async () => {
+  const errors: string[] = [];
+  init({
+    endpoint: "https://observe.example.com",
+    siteId: "s1",
+    retryBackoffMs: 5,
+    maxRetryAttempts: 50,
+    onError: (e) => errors.push(e.message),
+  });
+  (globalThis as any).fetch = () => Promise.resolve({ ok: false, status: 503 });
+  // Queue far beyond the 200-event retention cap.
+  for (let i = 0; i < 230; i++) track(`flood-${i}`);
+  await new Promise((r) => setTimeout(r, 10)); // past the backoff gate
+  await flush();
+  assert.ok(errors.some((m) => m.includes("retention cap reached")), `expected the retention-cap report, got ${JSON.stringify(errors.slice(0, 3))}`);
 });

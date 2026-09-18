@@ -40,6 +40,16 @@ export interface InitOptions {
    * network failure, payload rejected as oversized). The SDK never throws
    * into application code, so this is the only drop signal. */
   onError?: (err: Error) => void;
+  /** Max automatic retry attempts per batch before it is dropped and
+   * reported through onError (audit F32's retry budget). Default: 5. */
+  maxRetryAttempts?: number;
+  /** Base delay for the retry backoff after a failed send; doubles per
+   * attempt up to 60 s (audit F32). Default: 1000 ms. */
+  retryBackoffMs?: number;
+  /** Visibility hook for the automatic retry policy (audit F32): fires
+   * each time a failed batch is scheduled for a retry, before the backoff
+   * sleep. Never throws into application code. */
+  onRetry?: (info: { attempt: number; delayMs: number; batchSize: number; error: Error }) => void;
 }
 
 export interface EventPayload {
@@ -101,11 +111,12 @@ export interface LogPayload {
 }
 
 interface Client {
-  opts: Required<Omit<InitOptions, "apiKey" | "release" | "environment" | "onError">> & {
+  opts: Required<Omit<InitOptions, "apiKey" | "release" | "environment" | "onError" | "onRetry">> & {
     apiKey?: string;
     release?: string;
     environment?: string;
     onError?: (err: Error) => void;
+    onRetry?: (info: { attempt: number; delayMs: number; batchSize: number; error: Error }) => void;
   };
   buffer: EventPayload[];
   timer: number | null;
@@ -118,6 +129,12 @@ interface Client {
    * duplicate prefixes and then slice differing lengths off a mutated
    * queue, deleting events neither request had sent. */
   flushing: Promise<void> | null;
+  /** F32: retry attempts per detached batch, keyed by the batch head's
+   * stable event_id (the same identity the server dedupes on). */
+  retryCounts: Map<string, number>;
+  /** F32: earliest wall-clock time (ms) at which a flush may send again —
+   * the retry backoff gate. Set after each failed attempt. */
+  retryAfter: number;
   /** Removes this client's interval and DOM listeners (audit F31). */
   dispose: () => void;
 }
@@ -148,6 +165,9 @@ const MAX_REQUEST_BYTES = 1024 * 1024;
 // outage cannot grow memory without limit. Beyond the cap, oldest events
 // are dropped and reported.
 const MAX_BUFFERED_ON_ERROR = 200;
+
+// F32 retry policy: the backoff doubles per attempt up to this ceiling.
+const MAX_RETRY_DELAY_MS = 60_000;
 
 const textEncoder = new TextEncoder();
 
@@ -267,6 +287,15 @@ function reportError(target: Client, err: Error): void {
   }
 }
 
+/** Route a scheduled retry to the visibility hook (audit F32). */
+function reportRetry(target: Client, info: { attempt: number; delayMs: number; batchSize: number; error: Error }): void {
+  try {
+    target.opts.onRetry?.(info);
+  } catch {
+    /* an onRetry hook that throws must not break the SDK */
+  }
+}
+
 /** Initialize the SDK. Re-init disposes the previous client's timer and
  * listeners and flushes its buffer under the OLD configuration (audit F31);
  * previously each init() leaked one interval plus three listeners and
@@ -307,6 +336,9 @@ export function init(options: InitOptions): void {
       release: options.release,
       environment: options.environment,
       onError: options.onError,
+      onRetry: options.onRetry,
+      maxRetryAttempts: options.maxRetryAttempts ?? 5,
+      retryBackoffMs: options.retryBackoffMs ?? 1000,
     },
     buffer: [],
     timer: null,
@@ -314,6 +346,8 @@ export function init(options: InitOptions): void {
     sessionId: makeId(),
     producerId: makeId(),
     flushing: null,
+    retryCounts: new Map(),
+    retryAfter: 0,
     dispose: () => {},
   };
   client = instance;
@@ -570,9 +604,18 @@ function chunkEvents(events: EventPayload[]): EventPayload[][] {
  * that batch on failure — the old slice-then-await-then-slice-by-length
  * flow let two overlapping flushes send duplicate prefixes and delete
  * newly queued events neither had sent. Bounded work per wakeup so one
- * signal cannot spin forever. */
+ * signal cannot spin forever.
+ *
+ * F32 retry policy: a failed batch is re-sent automatically with a
+ * doubling backoff (retryAfter gate below) until maxRetryAttempts, then
+ * dropped with an onError report. Retried batches keep their stable
+ * event/batch ids (F12), so the server dedupes any redelivery. */
 function flushClient(target: Client, unloading = false): Promise<void> {
   if (target.flushing) return target.flushing;
+  // Backoff gate: during the retry sleep, wakeups (timer, visibility,
+  // explicit flush()) do not send. The unload path is exempt — it is a
+  // last-gasp best effort with nothing left to wait for.
+  if (!unloading && Date.now() < target.retryAfter) return Promise.resolve();
   const work = Promise.resolve().then(async () => {
     for (let units = 0; target.buffer.length && units < 8; units++) {
       const { chunks, oversized } = packEventChunks(target.buffer);
@@ -585,18 +628,37 @@ function flushClient(target: Client, unloading = false): Promise<void> {
         if (!target.buffer.length) return;
       }
       const batch = target.buffer.splice(0, chunks[0]?.length ?? target.buffer.length);
+      const headId: string | undefined = batch[0]?.event_id;
       try {
         await sendJSON(target, "/api/v1/events/batch", batchEnvelope(batch), unloading);
+        target.retryCounts.delete(headId ?? "");
       } catch (err) {
-        // Delivery failed: prepend exactly THIS batch (bounded) and stop —
-        // the next interval/visibility flush retries it.
-        target.buffer = [...batch, ...target.buffer];
-        const dropped = Math.max(0, target.buffer.length - MAX_BUFFERED_ON_ERROR);
-        if (dropped > 0) {
-          target.buffer = target.buffer.slice(0, MAX_BUFFERED_ON_ERROR);
-          reportError(target, new Error(`observe: dropped ${dropped} oldest queued events (send failing and retention cap reached)`));
+        const sendErr = err instanceof Error ? err : new Error(String(err));
+        const attempts = (headId ? target.retryCounts.get(headId) ?? 0 : 0) + 1;
+        if (headId && attempts > target.opts.maxRetryAttempts) {
+          // Retry budget exhausted: give up on THIS batch only. The
+          // identity-stable events behind it stay queued for their own
+          // flush.
+          target.retryCounts.delete(headId);
+          reportError(target, new Error(`observe: gave up on a batch after ${target.opts.maxRetryAttempts} attempts — dropped ${batch.length} event(s)`));
+        } else {
+          if (headId) target.retryCounts.set(headId, attempts);
+          const delayMs = Math.min(target.opts.retryBackoffMs * 2 ** (attempts - 1), MAX_RETRY_DELAY_MS);
+          target.retryAfter = Date.now() + delayMs;
+          // Delivery failed: prepend exactly THIS batch (bounded) and stop —
+          // the backoff gate above holds the next attempt until the retry
+          // moment; the interval/visibility flushes then re-send it.
+          target.buffer = [...batch, ...target.buffer];
+          const dropped = Math.max(0, target.buffer.length - MAX_BUFFERED_ON_ERROR);
+          if (dropped > 0) {
+            const removed = target.buffer.slice(MAX_BUFFERED_ON_ERROR);
+            target.buffer = target.buffer.slice(0, MAX_BUFFERED_ON_ERROR);
+            for (const ev of removed) target.retryCounts.delete(ev.event_id ?? "");
+            reportError(target, new Error(`observe: dropped ${dropped} oldest queued events (send failing and retention cap reached)`));
+          }
+          reportRetry(target, { attempt: attempts, delayMs, batchSize: batch.length, error: sendErr });
         }
-        reportError(target, err instanceof Error ? err : new Error(String(err)));
+        reportError(target, sendErr);
         return;
       }
       if (unloading) return; // one best-effort batch per unload

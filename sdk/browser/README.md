@@ -53,6 +53,10 @@ try {
 | `disableAutoPageview` | `false` | Skip auto pageview on init. |
 | `batchSize` | `50` | Buffer size before auto-flush. |
 | `flushIntervalMs` | `2000` | Time-based flush interval. |
+| `maxRetryAttempts` | `5` | Automatic retries per failed batch before it is dropped and reported via `onError`. |
+| `retryBackoffMs` | `1000` | Base delay for the retry backoff; doubles per attempt up to 60 s. |
+| `onError` | — | Called with every delivery failure or drop (the SDK never throws). |
+| `onRetry` | — | Called each time a failed batch is scheduled for an automatic retry. |
 
 ## License
 
