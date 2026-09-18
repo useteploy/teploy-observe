@@ -7,6 +7,7 @@ import CodeBlock from "../components/shared/CodeBlock.js";
 import Pagination from "../components/shared/Pagination.js";
 import ExportButton from "../components/shared/ExportButton.js";
 import EmptyState from "../components/shared/EmptyState.js";
+import { streamTicketQuery } from "../api/helpers.js";
 import "../styles/logs.css";
 import { useFilters } from "../hooks/useFilters.js";
 
@@ -259,24 +260,45 @@ export default function LogsPage() {
     fetchLogs();
   }, [fetchLogs]);
 
-  // Live tail via SSE. EventSource doesn't send auth headers, so attach the
-  // token as a query param (the server middleware will accept either).
+  // Live tail via SSE. EventSource doesn't send auth headers, and normal
+  // JWTs are no longer accepted in query strings (AUD-008) - mint a
+  // short-lived stream ticket bound to this route instead. Tickets expire,
+  // so a dropped connection re-mints rather than letting EventSource retry
+  // a dead credential forever.
   useEffect(() => {
     if (!live) return;
-    const token = typeof window !== "undefined" ? localStorage.getItem("obs_token") : "";
-    const url = `/api/v1/logs/stream?site_id=${encodeURIComponent(siteId)}${token ? `&token=${encodeURIComponent(token)}` : ""}`;
-    const es = new EventSource(url, { withCredentials: false });
-    es.onmessage = (e) => {
-      try {
-        const entry = JSON.parse(e.data) as LogEntry;
-        // Respect active level / service filters on the client.
-        if (activeLevel !== "ALL" && entry.level?.toLowerCase() !== activeLevel.toLowerCase()) return;
-        if (service.trim() && entry.service_name !== service.trim()) return;
-        setLogs((prev) => [entry, ...prev].slice(0, 200));
-      } catch { /* ignore */ }
+    let cancelled = false;
+    let es: EventSource | null = null;
+    let retryTimer: number | null = null;
+    const connect = async () => {
+      const ticket = await streamTicketQuery("/api/v1/logs/stream");
+      if (cancelled) return;
+      const url = `/api/v1/logs/stream?site_id=${encodeURIComponent(siteId)}${ticket}`;
+      es = new EventSource(url, { withCredentials: false });
+      es.onmessage = (e) => {
+        try {
+          const entry = JSON.parse(e.data) as LogEntry;
+          // Respect active level / service filters on the client.
+          if (activeLevel !== "ALL" && entry.level?.toLowerCase() !== activeLevel.toLowerCase()) return;
+          if (service.trim() && entry.service_name !== service.trim()) return;
+          setLogs((prev) => [entry, ...prev].slice(0, 200));
+        } catch { /* ignore */ }
+      };
+      es.onerror = () => {
+        // Close and reconnect with a FRESH ticket: the old one may have
+        // expired (2-minute lifetime) and EventSource would otherwise
+        // retry the dead credential forever.
+        es?.close();
+        es = null;
+        if (!cancelled) retryTimer = window.setTimeout(() => { void connect(); }, 2000);
+      };
     };
-    es.onerror = () => { /* fail silently; browser will retry */ };
-    return () => es.close();
+    void connect();
+    return () => {
+      cancelled = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      es?.close();
+    };
   }, [live, siteId, activeLevel, service]);
 
   const handleSearch = () => {

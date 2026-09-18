@@ -1,5 +1,6 @@
 import { useFilters } from "../hooks/useFilters.js";
 import { api } from "../api.js";
+import { streamTicketQuery } from "../api/helpers.js";
 import StatsCards from "./StatsCards.js";
 import TimeSeriesChart from "./TimeSeriesChart.js";
 import DatePicker from "./DatePicker.js";
@@ -13,14 +14,16 @@ import "../styles/dashboard.css";
 
 function ExportButton() {
   const { state } = useFilters();
-  const handleExport = (format: string) => {
-    const token = localStorage.getItem("obs_token");
-    const url = `/api/v1/export?site_id=${state.siteId}&from=${state.from}&to=${state.to}&format=${format}${token ? `&token=${token}` : ""}`;
+  const handleExport = async (format: string) => {
+    // AUD-008: downloads cannot set headers and normal JWTs are rejected in
+    // query strings - carry a short-lived ticket minted for this route.
+    const ticket = await streamTicketQuery("/api/v1/export");
+    const url = `/api/v1/export?site_id=${state.siteId}&from=${state.from}&to=${state.to}&format=${format}${ticket}`;
     window.open(url, "_blank");
   };
   return (
     <div style={{ position: "relative", display: "inline-block" }}>
-      <button class="obs-btn obs-btn--sm" onClick={() => handleExport("csv")}
+      <button class="obs-btn obs-btn--sm" onClick={() => void handleExport("csv")}
         title="Export data as CSV">
         Export
       </button>

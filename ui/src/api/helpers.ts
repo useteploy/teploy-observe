@@ -142,3 +142,25 @@ export async function del<T = { ok: boolean }>(path: string): Promise<T | undefi
   }
   return readResponse<T>(res);
 }
+
+/**
+ * AUD-008: mint a short-lived single-purpose stream ticket for one route
+ * prefix. EventSource and download links cannot set Authorization headers,
+ * and normal access JWTs are no longer accepted in query strings - the
+ * ticket is the only credential those consumers may carry in a URL. It
+ * lives two minutes and is bound to this route on the server.
+ *
+ * Returns the "&ticket=..." query fragment (empty string when no session
+ * token exists, e.g. shared-read mode - callers then connect bare, exactly
+ * as before).
+ */
+export async function streamTicketQuery(route: string): Promise<string> {
+  const token = typeof window !== "undefined" ? localStorage.getItem("obs_token") : "";
+  if (!token) return "";
+  try {
+    const res = await post<{ ticket: string }>("/api/v1/auth/stream-ticket", { route });
+    return `&ticket=${encodeURIComponent(res.ticket)}`;
+  } catch {
+    return "";
+  }
+}
