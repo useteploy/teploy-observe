@@ -5,138 +5,122 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"strconv"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/useteploy/teploy-observe/internal/principals"
 )
-
-type UserService struct {
-	db *nucleus.Client
-}
-
-func NewUserService(db *nucleus.Client) *UserService {
-	return &UserService{db: db}
-}
-
-type User struct {
-	UserID       string    `json:"user_id" db:"user_id"`
-	TenantID     string    `json:"-" db:"tenant_id"`
-	Username     string    `json:"username"`
-	Email        string    `json:"email"`
-	PasswordHash string    `json:"-" db:"password_hash"`
-	Role         string    `json:"role"`
-	CreatedAt    time.Time `json:"created_at" db:"created_at"`
-	InvitedBy    string    `json:"invited_by" db:"invited_by"`
-}
-
-func (s *UserService) Create(ctx context.Context, username, email, password, role, invitedBy string) (*User, error) {
-	if role != "admin" && role != "editor" && role != "viewer" {
-		role = "viewer"
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		return nil, fmt.Errorf("hash password: %w", err)
-	}
-	userID := genID()
-	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
-
-	_, err = s.db.SQL().Exec(ctx,
-		`INSERT INTO users (user_id, tenant_id, username, email, password_hash, role, created_at, invited_by)
-		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7)`,
-		userID, username, email, string(hash), role, now, invitedBy,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create user: %w", err)
-	}
-
-	nowMs, _ := strconv.ParseInt(now, 10, 64)
-	return &User{
-		UserID:    userID,
-		Username:  username,
-		Email:     email,
-		Role:      role,
-		CreatedAt: time.UnixMilli(nowMs).UTC(),
-		InvitedBy: invitedBy,
-	}, nil
-}
-
-func (s *UserService) List(ctx context.Context) ([]User, error) {
-	return nucleus.Query[User](ctx, s.db.SQL(),
-		`SELECT user_id, tenant_id, username, email, password_hash, role, created_at, invited_by
-		 FROM users ORDER BY created_at ASC`)
-}
-
-func (s *UserService) Get(ctx context.Context, userID string) (*User, error) {
-	rows, err := nucleus.Query[User](ctx, s.db.SQL(),
-		`SELECT user_id, tenant_id, username, email, password_hash, role, created_at, invited_by
-		 FROM users WHERE user_id = $1`, userID)
-	if err != nil || len(rows) == 0 {
-		return nil, err
-	}
-	return &rows[0], nil
-}
-
-// UpdateRole changes a user's role.
-//
-// `users` is a PLAIN mergetree: it has no version column, so there is nothing
-// to collapse by and the argMax pattern the replacing tables use does not
-// apply. The previous shape —
-//
-//	INSERT INTO users (...) SELECT ..., $2, $3, ... FROM users WHERE user_id = $1
-//
-// — appended one row per row already present, so the physical count for a user
-// DOUBLED on every role change, and List/Get read the raw table with no dedup
-// at all: after one demotion the table holds both an 'admin' and a 'viewer' row
-// for the same person and whichever comes back first decides what the UI (and
-// any check reading Get) believes. That is an authorization result, not a
-// cosmetic one.
-//
-// The only shape that leaves exactly one row on a table with no version column
-// is a real replace: delete the id, then insert the new row — in one
-// transaction, so a crash between the two cannot lose the user. This also
-// collapses any duplicates an earlier UpdateRole already wrote, and preserves
-// created_at, which the old statement overwrote with the edit time.
-func (s *UserService) UpdateRole(ctx context.Context, userID, role string) error {
-	if role != "admin" && role != "editor" && role != "viewer" {
-		return fmt.Errorf("invalid role: %s", role)
-	}
-	tx, err := s.db.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	// created_at DESC picks the newest of any duplicates the old statement left.
-	rows, err := nucleus.Query[User](ctx, tx.SQL(),
-		`SELECT user_id, tenant_id, username, email, password_hash, role, created_at, invited_by
-		 FROM users WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, userID)
-	if err != nil {
-		return err
-	}
-	if len(rows) == 0 {
-		return fmt.Errorf("user %s not found", userID)
-	}
-	u := rows[0]
-
-	if _, err := tx.SQL().Exec(ctx, `DELETE FROM users WHERE user_id = $1`, userID); err != nil {
-		return err
-	}
-	if _, err := tx.SQL().Exec(ctx,
-		`INSERT INTO users (user_id, tenant_id, username, email, password_hash, role, created_at, invited_by)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		u.UserID, u.TenantID, u.Username, u.Email, u.PasswordHash, role,
-		strconv.FormatInt(u.CreatedAt.UnixMilli(), 10), u.InvitedBy,
-	); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
-}
 
 func genID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// UserService manages user records. Since audit F03 (migration 040) it writes
+// the same principals store authentication reads from — before that, users
+// created here landed in a separate `users` table no login path consulted, so
+// managed users could never sign in and role changes never revoked their
+// (hypothetical) tokens.
+type UserService struct {
+	store *principals.Store
+}
+
+// NewUserService returns a UserService over the shared principal store. Pass
+// the same *principals.Store the AuthService uses (authSvc.Principals()) so
+// credential mutations and profile mutations serialize under one lock.
+func NewUserService(store *principals.Store) *UserService {
+	return &UserService{store: store}
+}
+
+// User is the user-management API DTO. Field shapes are unchanged from the
+// pre-040 API; kind is additive (local accounts and SSO identities share the
+// list now, and an admin needs to tell them apart to revoke SSO sessions).
+type User struct {
+	UserID    string    `json:"user_id"`
+	Kind      string    `json:"kind"`
+	Username  string    `json:"username"`
+	Email     string    `json:"email"`
+	Role      string    `json:"role"`
+	CreatedAt time.Time `json:"created_at"`
+	InvitedBy string    `json:"invited_by"`
+}
+
+func toUser(p *principals.Principal) User {
+	return User{
+		UserID:    p.ID,
+		Kind:      p.Kind,
+		Username:  p.Username,
+		Email:     p.Email,
+		Role:      p.Role,
+		CreatedAt: time.UnixMilli(p.CreatedAtMs()).UTC(),
+		InvitedBy: p.InvitedBy,
+	}
+}
+
+// normalizeRole collapses anything unrecognized to viewer, matching the
+// pre-040 Create behaviour.
+func normalizeRole(role string) string {
+	switch role {
+	case "admin", "editor", "viewer":
+		return role
+	default:
+		return "viewer"
+	}
+}
+
+// Create provisions a local user who can log in immediately — the F03 fix.
+// The username must be unique among local principals; a duplicate would
+// leave one of the two passwords silently dead now that both authenticate.
+func (s *UserService) Create(ctx context.Context, username, email, password, role, invitedBy string) (*User, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, fmt.Errorf("hash password: %w", err)
+	}
+	p, err := s.store.CreateLocal(ctx, username, email, string(hash), normalizeRole(role), invitedBy, principals.OriginCreated)
+	if err != nil {
+		return nil, fmt.Errorf("create user: %w", err)
+	}
+	u := toUser(p)
+	return &u, nil
+}
+
+// List returns every principal — local accounts and SSO identities — oldest
+// first, in a total order.
+func (s *UserService) List(ctx context.Context) ([]User, error) {
+	rows, err := s.store.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	users := make([]User, 0, len(rows))
+	for i := range rows {
+		users = append(users, toUser(&rows[i]))
+	}
+	return users, nil
+}
+
+// Get returns one principal by id.
+func (s *UserService) Get(ctx context.Context, userID string) (*User, error) {
+	p, err := s.store.ByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	u := toUser(p)
+	return &u, nil
+}
+
+// UpdateRole changes a principal's role. Since F03 this also bumps
+// token_version, so every JWT issued under the old role — including one
+// minted seconds ago — stops authenticating on its next use; the acceptance
+// gate is create -> login -> promote -> old token invalid.
+func (s *UserService) UpdateRole(ctx context.Context, userID, role string) error {
+	if role != "admin" && role != "editor" && role != "viewer" {
+		return fmt.Errorf("invalid role: %s", role)
+	}
+	_, err := s.store.SetRole(ctx, userID, role)
+	if err != nil {
+		return fmt.Errorf("user %s not found: %w", userID, err)
+	}
+	return nil
 }

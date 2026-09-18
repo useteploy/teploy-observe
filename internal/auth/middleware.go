@@ -127,16 +127,17 @@ func JWTAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 				return
 			}
 
-			// OBS-011: reject a token whose embedded version doesn't match the
-			// user's current token_version — this is what makes a password
-			// change actually revoke previously issued tokens instead of
-			// leaving them valid until their 24-hour expiry. OIDC-issued
-			// subjects ("oidc:<subject>") have no admin_users row to version
-			// (see oidc.go's GenerateToken call, always tv=0) and are skipped;
-			// their session freshness comes from re-authenticating with the
-			// IdP, not from this check.
+			// OBS-011 + F05: reject a token whose embedded version doesn't
+			// match the principal's current token_version — this is what
+			// makes a password change, role change, or session revocation
+			// actually retire previously issued tokens instead of leaving
+			// them valid until their 24-hour expiry. Since migration 040
+			// every principal has a row — local and issuer-namespaced OIDC
+			// alike — so the check is unconditional. A sub with no principal
+			// row (a pre-040 "oidc:<sub>" token, or a deleted principal)
+			// fails here and must re-authenticate.
 			sub, _ := claims["sub"].(string)
-			if sub != "" && !strings.HasPrefix(sub, "oidc:") {
+			if sub != "" {
 				tokenTV, _ := claims["tv"].(float64)
 				currentTV, err := authSvc.CurrentTokenVersion(r.Context(), sub)
 				if err != nil {

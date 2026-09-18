@@ -63,6 +63,10 @@ var replacingKeys = map[string][]string{
 	"sso_configs": {"tenant_id", "sso_id"},
 	// 009_llm_infra
 	"log_pipelines": {"tenant_id", "site_id", "pipeline_id"},
+	// 040_unified_principals — the one principal store backing local users,
+	// managed users, and issuer-namespaced OIDC identities (audit F03/F05).
+	// Keyed on id alone: ids are globally unique across all three origins.
+	"principals": {"id"},
 }
 
 // Keys returns the registered ORDER BY key of a replacing table, or nil.

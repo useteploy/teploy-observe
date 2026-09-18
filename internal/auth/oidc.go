@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -564,16 +565,27 @@ func (o *OIDCAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	role := o.resolveRole(claims)
 
-	// Mint the same JWT password login issues. The user ID is the IdP subject,
-	// namespaced so it never collides with a local admin_users row ID.
-	// tokenVersion is 0 — OIDC-issued sessions have no admin_users row to
-	// version, so JWTAuthMiddleware skips the revocation check for them (see
-	// its "oidc:" prefix check). Re-authenticating with the IdP on next login
-	// remains the way an OIDC session's role gets refreshed; there is
-	// currently no way to proactively revoke one still-valid token before
-	// its 24-hour expiry, unlike a local admin password change.
-	userID := "oidc:" + idToken.Subject
-	jwt, err := o.authSvc.GenerateToken(userID, username, role, 0)
+	// F05: the principal id is namespaced by issuer — <sub> is only unique
+	// within one issuer, so "oidc:<sub>" alone conflated identities across
+	// IdPs. The issuer is hashed (sha256, first 16 hex chars) to keep ids
+	// bounded and ASCII. The principal row this id keys is what makes an SSO
+	// session revocable: UpsertOIDC creates it on first login (or refreshes
+	// username/email/role from the IdP's current claims on later ones, the
+	// IdP staying authoritative for role) while PRESERVING token_version, so
+	// one device signing in does not retire another's still-valid session.
+	// The minted JWT embeds the row's current token_version, and
+	// JWTAuthMiddleware version-checks every token against the store — an
+	// admin can now revoke a live SSO session via the revoke-sessions
+	// operation instead of rotating OBSERVE_JWT_SECRET.
+	userID := OIDCSubjectID(o.issuer, idToken.Subject)
+	email := strings.ToLower(strings.TrimSpace(claimString(claims["email"])))
+	tokenVersion, err := o.authSvc.Principals().UpsertOIDC(ctx, userID, username, email, role)
+	if err != nil {
+		o.logger.Error("OIDC principal upsert failed", "err", err)
+		o.failAudit(w, r, username, auditResultFailure, "principal_store_failed", "SSO sign-in failed — please try again")
+		return
+	}
+	jwt, err := o.authSvc.GenerateToken(userID, username, role, tokenVersion)
 	if err != nil {
 		o.logger.Error("OIDC token mint failed", "err", err)
 		o.failAudit(w, r, username, auditResultFailure, "token_mint_failed", "SSO sign-in failed — please try again")
@@ -581,6 +593,14 @@ func (o *OIDCAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	o.recordAudit(r, username, auditResultSuccess, "role="+role)
 	o.deliverToken(w, jwt)
+}
+
+// OIDCSubjectID builds the principal id for an SSO identity: issuer-namespaced
+// (audit F05), because <sub> is unique only within one issuer. sha256 keeps
+// the namespace fixed-width and ASCII regardless of the issuer URL.
+func OIDCSubjectID(issuer, sub string) string {
+	sum := sha256.Sum256([]byte(issuer))
+	return "oidc:" + hex.EncodeToString(sum[:8]) + ":" + sub
 }
 
 // failAudit records the outcome to the audit trail, then redirects the user

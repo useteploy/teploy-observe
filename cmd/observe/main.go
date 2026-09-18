@@ -53,6 +53,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/monitoring"
 	"github.com/useteploy/teploy-observe/internal/persons"
 	"github.com/useteploy/teploy-observe/internal/platform"
+	"github.com/useteploy/teploy-observe/internal/principals"
 	"github.com/useteploy/teploy-observe/internal/query"
 	"github.com/useteploy/teploy-observe/internal/replays"
 	"github.com/useteploy/teploy-observe/internal/reports"
@@ -309,7 +310,7 @@ func main() {
 	statsSvc.WithCohortResolver(cohortsSvc.MembersForFilter)
 
 	// Platform services
-	userSvc := platform.NewUserService(db)
+	userSvc := platform.NewUserService(authSvc.Principals())
 	webhookSvc := platform.NewWebhookService(db, logger)
 	alertSvc := platform.NewAlertService(db, logger, webhookSvc)
 
@@ -815,6 +816,8 @@ func main() {
 		neutron.WithTags("platform"), neutron.WithSummary("Create/invite user"))
 	neutron.Post(platformAdmin, "/users/{user_id}/role", updateUserRoleHandler(userSvc),
 		neutron.WithTags("platform"), neutron.WithSummary("Update user role"))
+	neutron.Post(platformAdmin, "/users/{user_id}/revoke-sessions", revokeSessionsHandler(authSvc),
+		neutron.WithTags("platform"), neutron.WithSummary("Revoke all sessions for a user (local or SSO)"))
 	neutron.Get(platformGroup, "/alerts/rules", listAlertRulesHandler(alertSvc),
 		neutron.WithTags("platform"), neutron.WithSummary("List alert rules"))
 	neutron.Post(platformAdmin, "/alerts/rules", createAlertRuleHandler(alertSvc),
@@ -4501,8 +4504,17 @@ func createUserHandler(svc *platform.UserService) neutron.HandlerFunc[createUser
 		if input.Username == "" || input.Password == "" {
 			return platform.User{}, neutron.ErrBadRequest("username and password required")
 		}
+		// AUD-009 extended to invites by F03: these accounts could not log in
+		// before, so a weak invited password was invisible; every password
+		// entry point shares the one policy now that they authenticate.
+		if err := auth.ValidatePassword(input.Password); err != nil {
+			return platform.User{}, neutron.ErrBadRequest(err.Error())
+		}
 		user, err := svc.Create(ctx, input.Username, input.Email, input.Password, input.Role, "")
 		if err != nil {
+			if errors.Is(err, principals.ErrUsernameTaken) {
+				return platform.User{}, neutron.ErrBadRequest("username already exists")
+			}
 			return platform.User{}, err
 		}
 		return *user, nil
@@ -4520,6 +4532,27 @@ func updateUserRoleHandler(svc *platform.UserService) neutron.HandlerFunc[update
 			return neutron.Empty{}, neutron.ErrBadRequest("user_id and role required")
 		}
 		return neutron.Empty{}, svc.UpdateRole(ctx, input.UserID, input.Role)
+	}
+}
+
+type revokeSessionsInput struct {
+	UserID string `path:"user_id"`
+}
+
+// revokeSessionsHandler is audit F05's admin operation: retire every
+// outstanding JWT for one principal — a local account or an SSO identity —
+// by bumping its token_version. Before the principal store an SSO session
+// could only be killed by rotating OBSERVE_JWT_SECRET (all sessions, all
+// users); this scopes the emergency to one row.
+func revokeSessionsHandler(authSvc *auth.AuthService) neutron.HandlerFunc[revokeSessionsInput, neutron.Empty] {
+	return func(ctx context.Context, input revokeSessionsInput) (neutron.Empty, error) {
+		if input.UserID == "" {
+			return neutron.Empty{}, neutron.ErrBadRequest("user_id required")
+		}
+		if err := authSvc.RevokeSessions(ctx, input.UserID); err != nil {
+			return neutron.Empty{}, neutron.ErrBadRequest(err.Error())
+		}
+		return neutron.Empty{}, nil
 	}
 }
 

@@ -14,15 +14,20 @@ import (
 	"github.com/neutron-dev/neutron-go/neutronauth"
 	"github.com/neutron-dev/neutron-go/nucleus"
 
-	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/principals"
 )
 
-// AuthService handles JWT token management, admin user authentication,
+// AuthService handles JWT token management, local principal authentication,
 // and API key validation.
+//
+// Since audit F03/F05 (migration 040) every identity - the bootstrap admin,
+// managed users, and issuer-namespaced OIDC subjects - lives in the single
+// principals store; this service mints and validates tokens against it.
 type AuthService struct {
-	db          *nucleus.Client
-	jwtSecret   string
-	logger      *slog.Logger
+	db        *nucleus.Client
+	store     *principals.Store
+	jwtSecret string
+	logger    *slog.Logger
 	oidcEnabled bool
 	// credentialMu serializes credential mutations (bootstrap, password
 	// change, administrative reset). AUD-005 (round 2): the read-verify-write
@@ -34,23 +39,19 @@ type AuthService struct {
 	credentialMu sync.Mutex
 }
 
+// Principals exposes the shared principal store so services that manage user
+// records (platform user management) mutate the same store, under the same
+// write serialization, that authentication reads from.
+func (s *AuthService) Principals() *principals.Store { return s.store }
+
 // SetOIDCEnabled records whether OIDC SSO is configured. When it is, the
-// first-run grace period (open access while no admin_users exist) is disabled —
-// SSO provides a way to authenticate, so the surface must not be left open.
+// first-run grace period (open access while no local principals exist) is
+// disabled — SSO provides a way to authenticate, so the surface must not be
+// left open.
 func (s *AuthService) SetOIDCEnabled(v bool) { s.oidcEnabled = v }
 
 // OIDCEnabled reports whether OIDC SSO is configured.
 func (s *AuthService) OIDCEnabled() bool { return s.oidcEnabled }
-
-// adminUserRow maps to the admin_users table.
-type adminUserRow struct {
-	ID           string `db:"id"`
-	Username     string `db:"username"`
-	PasswordHash string `db:"password_hash"`
-	CreatedAt    string `db:"created_at"`
-	Role         string `db:"role"`
-	TokenVersion int64  `db:"token_version"`
-}
 
 // Role constants.
 const (
@@ -85,6 +86,7 @@ func NewAuthService(db *nucleus.Client, jwtSecret string, logger *slog.Logger) *
 	}
 	return &AuthService{
 		db:        db,
+		store:     principals.NewStore(db),
 		jwtSecret: jwtSecret,
 		logger:    logger,
 	}
@@ -93,11 +95,10 @@ func NewAuthService(db *nucleus.Client, jwtSecret string, logger *slog.Logger) *
 // GenerateToken creates a signed JWT with a 24-hour expiry. role is stored
 // in the token so middleware can enforce RBAC without hitting the database
 // on every request. tokenVersion is embedded so JWTAuthMiddleware can detect
-// revocation (OBS-011): a password change bumps the admin_users row's
-// token_version, and any token minted before that bump is rejected on its
-// next use even though it hasn't expired. Pass 0 for identities that have no
-// admin_users row to version — OIDC-issued sessions ("oidc:<subject>") are
-// the current case; see middleware.go for how that's handled on validation.
+// revocation: any credential or role change on the principal bumps its
+// token_version in the principals store, and any token minted before that
+// bump is rejected on its next use even though it hasn't expired. Every
+// principal - local and OIDC - is versioned since migration 040 (F05).
 func (s *AuthService) GenerateToken(userID, username, role string, tokenVersion int64) (string, error) {
 	claims := neutronauth.Claims{
 		"sub":      userID,
@@ -108,17 +109,12 @@ func (s *AuthService) GenerateToken(userID, username, role string, tokenVersion 
 	return neutronauth.GenerateToken(claims, s.jwtSecret, 24*time.Hour)
 }
 
-// CurrentTokenVersion returns the live token_version for a local admin_users
-// row. Used by JWTAuthMiddleware to check a token's embedded "tv" claim
-// against current state on every request — the actual revocation check.
+// CurrentTokenVersion returns the live token_version for a principal. Used by
+// JWTAuthMiddleware to check a token's embedded "tv" claim against current
+// state on every request — the actual revocation check. A principal with no
+// row (a pre-040 "oidc:<sub>" token) is an error, i.e. revoked.
 func (s *AuthService) CurrentTokenVersion(ctx context.Context, userID string) (int64, error) {
-	row, err := nucleus.QueryOne[struct {
-		TokenVersion int64 `db:"token_version"`
-	}](ctx, s.db.SQL(), "SELECT token_version FROM admin_users WHERE id = $1", userID)
-	if err != nil {
-		return 0, err
-	}
-	return row.TokenVersion, nil
+	return s.store.TokenVersionByID(ctx, userID)
 }
 
 // ValidateToken verifies a JWT and returns the claims.
@@ -130,20 +126,21 @@ func (s *AuthService) ValidateToken(tokenStr string) (neutronauth.Claims, error)
 // inserting the first admin row.
 const bootstrapClaimKey = "auth:bootstrap_admin_claimed"
 
-// EnsureAdmin creates the initial admin user if the admin_users table is empty.
-// It returns true if it created one. The caller is responsible for surfacing a
-// generated password — EnsureAdmin never logs the password itself.
+// EnsureAdmin creates the initial admin principal if no local principal
+// exists yet. It returns true if it created one. The caller is responsible
+// for surfacing a generated password — EnsureAdmin never logs the password
+// itself. The id is freshly generated (pre-040 admin_users ids were carried
+// across by the migration's backfill; this path only runs on an unclaimed
+// install, so there is nothing to carry).
 func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string) (bool, error) {
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
 
-	sql := s.db.SQL()
-
-	rows, err := nucleus.Query[countRow](ctx, sql, "SELECT COUNT(*) AS count FROM admin_users")
+	count, err := s.store.CountLocal(ctx)
 	if err != nil {
 		return false, fmt.Errorf("auth: check admin users: %w", err)
 	}
-	if len(rows) > 0 && rows[0].Count > 0 {
+	if count > 0 {
 		return false, nil
 	}
 
@@ -169,7 +166,6 @@ func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string
 		return false, nil
 	}
 
-	id := generateID()
 	hash, err := hashPassword(password)
 	if err != nil {
 		// Never insert an empty hash — that would create an admin nobody can
@@ -177,13 +173,8 @@ func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string
 		s.releaseBootstrapClaim("hash failure")
 		return false, err
 	}
-	now := dbutil.IntParam(time.Now().UnixMilli())
 
-	_, err = sql.Exec(ctx,
-		"INSERT INTO admin_users (id, username, password_hash, created_at, role) VALUES ($1, $2, $3, $4, $5)",
-		id, username, hash, now, RoleAdmin,
-	)
-	if err != nil {
+	if _, err := s.store.CreateLocal(ctx, username, "", hash, RoleAdmin, "", principals.OriginAdmin); err != nil {
 		s.releaseBootstrapClaim("insert failure")
 		return false, fmt.Errorf("auth: create default admin: %w", err)
 	}
@@ -192,42 +183,42 @@ func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string
 	return true, nil
 }
 
-// Login validates credentials and returns a JWT token.
+// Login validates credentials and returns a JWT token. Any local principal —
+// the bootstrap admin and, since migration 040, managed users too — can
+// authenticate here (audit F03: managed users previously landed in a separate
+// table no login path read).
 func (s *AuthService) Login(ctx context.Context, username, password string) (string, error) {
-	sql := s.db.SQL()
-
-	user, err := nucleus.QueryOne[adminUserRow](ctx, sql,
-		"SELECT id, username, password_hash, created_at, role, token_version FROM admin_users WHERE username = $1",
-		username,
-	)
+	p, err := s.store.LocalByUsername(ctx, username)
 	if err != nil {
-		// Run a bcrypt comparison against a fixed dummy hash even when the user
-		// doesn't exist, so the response time doesn't leak username existence.
+		// Run a bcrypt comparison against a fixed dummy hash even when the
+		// user doesn't exist, so the response time doesn't leak username
+		// existence.
 		checkPassword(password, dummyBcryptHash)
 		return "", fmt.Errorf("auth: invalid credentials")
 	}
 
-	if !checkPassword(password, user.PasswordHash) {
+	if !checkPassword(password, p.PasswordHash) {
 		return "", fmt.Errorf("auth: invalid credentials")
 	}
 
-	return s.GenerateToken(user.ID, user.Username, user.Role, user.TokenVersion)
+	return s.GenerateToken(p.ID, p.Username, p.Role, p.TokenVersion)
 }
 
-// HasAdminUsers reports whether at least one admin user exists. The error is
-// returned (not swallowed as false) so callers can fail CLOSED on a DB outage —
-// treating a query failure as "no admins → grace period" previously let a
-// Nucleus outage bypass authentication entirely.
+// HasAdminUsers reports whether at least one local principal exists. The
+// error is returned (not swallowed as false) so callers can fail CLOSED on a
+// DB outage — treating a query failure as "no admins → grace period"
+// previously let a Nucleus outage bypass authentication entirely.
 func (s *AuthService) HasAdminUsers(ctx context.Context) (bool, error) {
-	sql := s.db.SQL()
-	rows, err := nucleus.Query[countRow](ctx, sql, "SELECT COUNT(*) AS count FROM admin_users")
+	count, err := s.store.CountLocal(ctx)
 	if err != nil {
 		return false, err
 	}
-	return len(rows) > 0 && rows[0].Count > 0, nil
+	return count > 0, nil
 }
 
-// ChangePassword updates the password for the given user ID.
+// ChangePassword updates the password for the given principal ID and revokes
+// every outstanding token (the version bump). OIDC principals have no
+// password and are refused.
 func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPassword, newPassword string) error {
 	// AUD-005: the whole read-verify-write sequence runs under the shared
 	// credential mutex so a concurrent change/reset cannot derive its
@@ -235,13 +226,11 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
 
-	user, err := nucleus.QueryOne[adminUserRow](ctx, s.db.SQL(),
-		"SELECT id, username, password_hash, created_at, role, token_version FROM admin_users WHERE id = $1", userID,
-	)
-	if err != nil {
+	p, err := s.store.ByID(ctx, userID)
+	if err != nil || p.Kind != principals.KindLocal {
 		return fmt.Errorf("user not found")
 	}
-	if !checkPassword(currentPassword, user.PasswordHash) {
+	if !checkPassword(currentPassword, p.PasswordHash) {
 		return fmt.Errorf("current password is incorrect")
 	}
 	if err := ValidatePassword(newPassword); err != nil {
@@ -252,45 +241,20 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 		return err
 	}
 
-	tx, err := s.db.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("auth: change password begin: %w", err)
-	}
-	defer tx.Rollback(ctx) // no-op once Commit has succeeded
-
-	// Nucleus finding #30: UPDATE does not reliably invalidate the server-side
-	// query result cache. DELETE + INSERT ensures the next SELECT sees a fresh
-	// physical row, bypassing any stale cache entry for the old hash. Both run
-	// in one transaction — previously they were two independent statements, so
-	// an insert failure (outage, timeout, schema error) after the delete
-	// succeeded deleted the account with no way back; for the sole admin that
-	// locks out the entire instance. The transaction rolls the delete back too.
-	//
-	// token_version is incremented (OBS-011) so JWTs issued before this change
-	// stop working on their next use, even though they haven't expired yet —
-	// otherwise a compromised token, or a session that should have been cut
-	// off, remains valid for up to 24 more hours after the password changes.
-	// AUD-005: created_at is preserved from the read row — the replacement
-	// used to stamp "now", erasing account-creation history on every change.
-	if _, err = tx.SQL().Exec(ctx, "DELETE FROM admin_users WHERE id = $1", user.ID); err != nil {
-		return fmt.Errorf("auth: change password delete: %w", err)
-	}
-	if _, err = tx.SQL().Exec(ctx,
-		"INSERT INTO admin_users (id, username, password_hash, created_at, role, token_version) VALUES ($1, $2, $3, $4, $5, $6)",
-		user.ID, user.Username, newHash, user.CreatedAt, user.Role, user.TokenVersion+1,
-	); err != nil {
-		return fmt.Errorf("auth: change password insert: %w", err)
-	}
-	return tx.Commit(ctx)
+	// The store's DELETE+INSERT replacement runs in one transaction with a
+	// monotonic version stamp and bumps token_version, so JWTs issued before
+	// this change stop working on their next use (OBS-011) and an insert
+	// failure can no longer leave the account deleted (the sole admin locked
+	// out of the entire instance). expectHash is the row this change
+	// verified against; a concurrent writer that moved it is refused loudly
+	// instead of being silently overwritten.
+	_, err = s.store.ReplacePassword(ctx, userID, p.PasswordHash, newHash)
+	return err
 }
 
-// ForceResetAdminPassword replaces the first admin user's password.
-// Used by the OBSERVE_RESET_ADMIN_PASSWORD startup escape hatch.
-//
-// Nucleus finding #30: UPDATE does not invalidate the server-side query result
-// cache, so a plain UPDATE is not visible to subsequent SELECTs on the same SQL
-// text. We DELETE + INSERT instead — the INSERT lands as a new physical row and
-// bypasses the stale cache entry for the prior row.
+// ForceResetAdminPassword replaces the first local admin's password. Used by
+// the OBSERVE_RESET_ADMIN_PASSWORD startup escape hatch. Token revocation
+// (token_version bump) comes with the replacement, as in ChangePassword.
 func (s *AuthService) ForceResetAdminPassword(ctx context.Context, password string) error {
 	// AUD-005: serialized against ChangePassword/EnsureAdmin for the same
 	// lost-update reason.
@@ -305,33 +269,20 @@ func (s *AuthService) ForceResetAdminPassword(ctx context.Context, password stri
 		return err
 	}
 
-	user, err := nucleus.QueryOne[adminUserRow](ctx, s.db.SQL(),
-		"SELECT id, username, password_hash, created_at, role, token_version FROM admin_users WHERE role = $1",
-		RoleAdmin,
-	)
+	p, err := s.store.FirstLocalAdmin(ctx)
 	if err != nil {
 		return fmt.Errorf("auth: no admin user found to reset: %w", err)
 	}
 
-	tx, err := s.db.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("auth: force reset begin: %w", err)
-	}
-	defer tx.Rollback(ctx) // no-op once Commit has succeeded
+	_, err = s.store.ReplacePassword(ctx, p.ID, "", hash)
+	return err
+}
 
-	if _, err = tx.SQL().Exec(ctx, "DELETE FROM admin_users WHERE id = $1", user.ID); err != nil {
-		return fmt.Errorf("auth: force reset delete: %w", err)
-	}
-
-	// token_version bumped for the same reason as ChangePassword (OBS-011).
-	// AUD-005: created_at preserved from the read row, not re-stamped.
-	if _, err = tx.SQL().Exec(ctx,
-		"INSERT INTO admin_users (id, username, password_hash, created_at, role, token_version) VALUES ($1, $2, $3, $4, $5, $6)",
-		user.ID, user.Username, hash, user.CreatedAt, user.Role, user.TokenVersion+1,
-	); err != nil {
-		return fmt.Errorf("auth: force reset insert: %w", err)
-	}
-	return tx.Commit(ctx)
+// RevokeSessions retires every outstanding JWT for a principal — local or
+// OIDC — by bumping its token_version (audit F05's admin operation; before
+// the principal store there was no row behind an SSO session to revoke).
+func (s *AuthService) RevokeSessions(ctx context.Context, userID string) error {
+	return s.store.RevokeSessions(ctx, userID)
 }
 
 // maxPasswordBytes is bcrypt's hard input ceiling — GenerateFromPassword errors
@@ -346,7 +297,8 @@ const maxPasswordBytes = 72
 const minPasswordBytes = 8
 
 // ValidatePassword is the single password policy for setup, environment
-// provisioning, password changes, and administrative reset (AUD-009).
+// provisioning, password changes, administrative reset, and (since F03 made
+// them login-capable) user-management invites (AUD-009).
 func ValidatePassword(password string) error {
 	if len(password) < minPasswordBytes {
 		return fmt.Errorf("password must be at least %d characters", minPasswordBytes)
@@ -362,7 +314,8 @@ func ValidatePassword(password string) error {
 // delete with the request context, which may already be canceled by the
 // time the insert fails — leaving the claim set with no admin row and
 // setup permanently "already claimed". The full atomic fix (claim record
-// containing the account) is deferred with the F03 principal store.
+// containing the account) stays deferred with the F03 principal store's
+// follow-ups.
 func (s *AuthService) releaseBootstrapClaim(reason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

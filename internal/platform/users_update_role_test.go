@@ -9,6 +9,7 @@ import (
 	"github.com/neutron-dev/neutron-go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/nucleustest"
+	"github.com/useteploy/teploy-observe/internal/principals"
 	"github.com/useteploy/teploy-observe/internal/schema"
 )
 
@@ -36,7 +37,8 @@ func TestUpdateRoleReplacesTheRow(t *testing.T) {
 		t.Fatalf("apply schema: %v", err)
 	}
 
-	svc := NewUserService(db)
+	store := principals.NewStore(db)
+	svc := NewUserService(store)
 	username := "role_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 
 	u, err := svc.Create(ctx, username, username+"@example.com", "hunter2hunter2", "admin", "bootstrap")
@@ -44,7 +46,7 @@ func TestUpdateRoleReplacesTheRow(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = db.SQL().Exec(context.Background(), `DELETE FROM users WHERE user_id = $1`, u.UserID)
+		_, _ = db.SQL().Exec(context.Background(), `DELETE FROM principals WHERE id = $1`, u.UserID)
 	})
 	createdAt := u.CreatedAt.UnixMilli()
 
@@ -68,7 +70,13 @@ func TestUpdateRoleReplacesTheRow(t *testing.T) {
 		if got.CreatedAt.UnixMilli() != createdAt {
 			t.Fatalf("created_at moved from %d to %d — a role change is not a signup", createdAt, got.CreatedAt.UnixMilli())
 		}
-		if got.PasswordHash != u.PasswordHash && got.PasswordHash == "" {
+		// The DTO no longer carries the hash; read the store directly to
+		// prove the replacement kept the credential intact.
+		p, err := store.ByID(ctx, u.UserID)
+		if err != nil {
+			t.Fatalf("store get: %v", err)
+		}
+		if p.PasswordHash == "" {
 			t.Fatal("the replacement dropped the password hash")
 		}
 
@@ -101,7 +109,7 @@ func TestUpdateRoleRejectsUnknownUser(t *testing.T) {
 	if err := schema.Apply(ctx, db); err != nil {
 		t.Fatalf("apply schema: %v", err)
 	}
-	if err := NewUserService(db).UpdateRole(ctx, "no-such-user", "admin"); err == nil {
+	if err := NewUserService(principals.NewStore(db)).UpdateRole(ctx, "no-such-user", "admin"); err == nil {
 		t.Fatal("UpdateRole on an unknown user returned nil")
 	}
 }
@@ -112,7 +120,7 @@ func userRows(ctx context.Context, t *testing.T, db *nucleus.Client, userID stri
 		N int64 `db:"n"`
 	}
 	rows, err := nucleus.Query[row](ctx, db.SQL(),
-		`SELECT COUNT(*) AS n FROM users WHERE user_id = $1`, userID)
+		`SELECT COUNT(*) AS n FROM principals WHERE id = $1`, userID)
 	if err != nil {
 		t.Fatalf("count: %v", err)
 	}

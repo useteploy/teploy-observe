@@ -48,6 +48,7 @@ import (
 var Tables = []string{
 	"sites",
 	"admin_users",
+	"principals",
 	"api_keys",
 	"users",
 	"groups",

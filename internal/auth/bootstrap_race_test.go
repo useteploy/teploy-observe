@@ -20,8 +20,8 @@ func TestEnsureAdminConcurrentRace(t *testing.T) {
 
 	// Start from a clean slate: a prior run (or prior finding's own bootstrap)
 	// may have already claimed the KV key or inserted rows.
-	if _, err := db.SQL().Exec(ctx, "DELETE FROM admin_users"); err != nil {
-		t.Fatalf("cleanup admin_users: %v", err)
+	if _, err := db.SQL().Exec(ctx, "DELETE FROM principals"); err != nil {
+		t.Fatalf("cleanup principals: %v", err)
 	}
 	if _, err := db.KV().Delete(ctx, bootstrapClaimKey); err != nil {
 		t.Fatalf("cleanup bootstrap claim: %v", err)
@@ -57,19 +57,19 @@ func TestEnsureAdminConcurrentRace(t *testing.T) {
 		t.Errorf("expected exactly 1 caller to win the bootstrap race, got %d", createdCount)
 	}
 
-	rows, err := nucleus.Query[countRow](ctx, db.SQL(), "SELECT COUNT(*) AS count FROM admin_users")
+	rows, err := nucleus.Query[countRow](ctx, db.SQL(), "SELECT COUNT(*) AS count FROM principals")
 	if err != nil {
-		t.Fatalf("count admin_users: %v", err)
+		t.Fatalf("count principals: %v", err)
 	}
 	if len(rows) == 0 || rows[0].Count != 1 {
 		got := int64(-1)
 		if len(rows) > 0 {
 			got = rows[0].Count
 		}
-		t.Errorf("expected exactly 1 admin_users row after the race, got %d", got)
+		t.Errorf("expected exactly 1 local principal row after the race, got %d", got)
 	}
 
 	// Cleanup so this test is repeatable and doesn't leave state for others.
-	db.SQL().Exec(context.Background(), "DELETE FROM admin_users")
+	db.SQL().Exec(context.Background(), "DELETE FROM principals")
 	db.KV().Delete(context.Background(), bootstrapClaimKey)
 }

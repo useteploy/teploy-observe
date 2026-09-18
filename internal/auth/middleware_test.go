@@ -5,8 +5,6 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
-
 	"github.com/useteploy/teploy-observe/internal/ingest"
 )
 
@@ -18,12 +16,12 @@ func TestJWTAuthMiddleware_RevokedTokenRejected(t *testing.T) {
 	defer done()
 	svc := testService(db)
 
-	if _, err := db.SQL().Exec(ctx, "DELETE FROM admin_users"); err != nil {
+	if _, err := db.SQL().Exec(ctx, "DELETE FROM principals"); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
 	db.KV().Delete(ctx, bootstrapClaimKey)
 	defer func() {
-		db.SQL().Exec(ctx, "DELETE FROM admin_users")
+		db.SQL().Exec(ctx, "DELETE FROM principals")
 		db.KV().Delete(ctx, bootstrapClaimKey)
 	}()
 
@@ -37,10 +35,9 @@ func TestJWTAuthMiddleware_RevokedTokenRejected(t *testing.T) {
 		t.Fatalf("Login: %v", err)
 	}
 
-	user, err := nucleus.QueryOne[adminUserRow](ctx, db.SQL(),
-		"SELECT id, username, password_hash, created_at, role, token_version FROM admin_users WHERE username = $1", username)
+	user, err := svc.Principals().LocalByUsername(ctx, username)
 	if err != nil {
-		t.Fatalf("fetch seeded user: %v", err)
+		t.Fatalf("fetch seeded principal: %v", err)
 	}
 
 	mw := JWTAuthMiddleware(svc)
@@ -95,12 +92,12 @@ func TestJWTAuthMiddleware_QueryTokenOnlyOnAllowlistedPaths(t *testing.T) {
 	defer done()
 	svc := testService(db)
 
-	if _, err := db.SQL().Exec(ctx, "DELETE FROM admin_users"); err != nil {
+	if _, err := db.SQL().Exec(ctx, "DELETE FROM principals"); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
 	db.KV().Delete(ctx, bootstrapClaimKey)
 	defer func() {
-		db.SQL().Exec(ctx, "DELETE FROM admin_users")
+		db.SQL().Exec(ctx, "DELETE FROM principals")
 		db.KV().Delete(ctx, bootstrapClaimKey)
 	}()
 
