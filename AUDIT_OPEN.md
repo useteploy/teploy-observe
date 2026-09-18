@@ -3,8 +3,11 @@
 Unresolved findings for this repository from the ChatGPT-led audit series.
 Register: teploy-observe audit 2026-09-17 (51 findings, pinned at
 `6d49fcc380781e64e85b30b2d227ee45cd343f0c`; report lives outside the repo).
-Earlier sweeps (2026-09-09 through 2026-09-11, passes 1-5) are closed
-history; their one surviving item is folded into F16 below.
+Round 2: audit 2026-09-17 (56 findings AUD-001..AUD-056, pinned at
+`bbd2fe9038863db0447ac1335554451feb89735a`; report lives outside the repo)
+— remediation record below. Earlier sweeps (2026-09-09 through 2026-09-11,
+passes 1-5) are closed history; their one surviving item is folded into F16
+below.
 
 Pass record (2026-09-17 audit, remediation session same day):
 
@@ -21,7 +24,7 @@ Pass record (2026-09-17 audit, remediation session same day):
 - False positives: none — every finding verified against source before
   fixing or deferring.
 
-Open items: 14 (2 P1-adjacent design decisions, 11 P2 designs, 1 CI gate)
+Open items: 17 (3 P1 product/schema decisions, 12 P2 designs, 2 CI/ops)
 
 ## F02 - P1 - Open (design decision): first-run grace authorizes administration
 
@@ -210,3 +213,153 @@ self-skip without a live Nucleus), sdk/go `go test -race`, sdk/browser
 all green. Not run: Nucleus-backed integration suites, e2e, embedded UI
 rebuild (needs the Neutron TS workspace; run scripts/ui-sync.sh before
 release).
+
+## Round-2 register (2026-09-17 audit, 56 findings AUD-001..AUD-056)
+
+Audited revision `bbd2fe9` (post-round-1 state incl. rebuilt UI dist and
+the live-Nucleus close-out fixes). Every finding was verified against
+local source before disposition; none was a false positive. Several
+restate round-1 deferrals against the remediated code — those keep their
+standing F-numbers and rationales below unless materially new evidence
+appeared (none did).
+
+Fixed this round (with the residual, where a contained fix landed but the
+architectural half stays open):
+
+- AUD-002: the no-API-key ingest grace path is GONE — keyless requests
+  401 regardless of key-table state; caller-chosen X-Observe-Site/body
+  sites can no longer route writes. Behavior change: fresh installs accept
+  no telemetry until an admin provisions a key.
+- AUD-003 (contained): bootstrap-claim release runs on a detached,
+  time-boxed context. Atomic claim-as-record stays deferred with F03.
+- AUD-005: credential mutations serialized (EnsureAdmin/ChangePassword/
+  ForceReset); created_at preserved on the DELETE+INSERT replacement.
+- AUD-007: partial OIDC config is a startup error; issuer URL validated
+  (absolute, no userinfo/query/fragment, https unless
+  OBSERVE_OIDC_ALLOW_HTTP_ISSUER=true).
+- AUD-009 (contained): one exported auth.ValidatePassword behind setup,
+  env provisioning, change, reset; flush-ms range-checked pre-multiply;
+  length floors for explicitly set JWT/audit secrets. Persistent
+  operator-owned key store stays open (folded into F46-class work).
+- AUD-010: Buffer.PushBatch — whole-batch admission under one lock
+  (count + byte budget) writing ONE versioned WAL frame; BatchHandler
+  prepares side-effect-free then admits atomically. Pending decodes both
+  frame shapes.
+- AUD-012 (contained): unattached-but-created queue closed on attach
+  failure; Pending flushes userspace-buffered appends so in-process
+  replay is honest. Strict fsync-per-ack (group commit) deferred as a
+  throughput contract decision — the async model is documented in
+  queue.go.
+- AUD-014: corrupt-complete-record replay is an ERROR (was skip-then-
+  checkpoint-away); identity-less records rejected; in-range mid-record
+  checkpoints refused at open.
+- AUD-015 (contained): serialized-byte budget across queued+in-flight
+  (OBSERVE_MAX_BUFFERED_BYTES, default 256 MiB), 64 KiB per-event stored
+  cap, unserializable properties rejected at admission, UTF-8-safe
+  truncation.
+- AUD-016: started/stopped/workerErr lifecycle; post-Stop admission
+  refused; double-Start can't race Stop; panicked flush worker latched
+  and surfaced via /healthz.
+- AUD-018 (single-process): striped per-replay locks around owner-check +
+  upsert + children. Multi-replica needs the stable-key/CAS design.
+- AUD-019 (transactional half): session row + child events commit in ONE
+  tx. Stable batch IDs + durable heatmap outbox stay deferred (F12/F19).
+- AUD-020 (contained): deterministic ORDER BY timestamp, event_id.
+  Keyset pagination + UI window loading stay deferred with F39's player
+  protocol work.
+- AUD-021: browser SDK transport is strict; fire-and-forget boundaries
+  catch and report; the retention path is live code again.
+- AUD-022: single-flight flush with owned, spliced batches; exact
+  prepend on failure.
+- AUD-023: re-init sends flat per-chunk events arrays.
+- AUD-024: classic tracker detaches only on acceptance (res.ok / XHR
+  status); failed chunks requeued (bounded) and reported via onError.
+- AUD-025: sendBeacon never used when an API key is configured.
+- AUD-026: byte-aware packing (1 MiB budgets) in browser SDK, classic
+  tracker, Python, and Go.
+- AUD-027: tracker start/stop lifecycle — listeners removed, observer
+  disconnected, history restored, capture gated on active;
+  stop({discard}) withdraws pending capture.
+- AUD-028: constant trusted document envelope (doctype + CSP-first head)
+  for every replay path; untrusted doctype never emitted; legacy path
+  CSP prepended at byte zero.
+- AUD-030 (contained): referrer fail-closed + userinfo strip server-side;
+  tracker sends origin+path for clicks/navigation/batch URL. The full
+  URL-capture policy stays deferred (F41).
+- AUD-031: bounded shape-validating snapshot renderer with explicit
+  placeholder; playback guards non-object data/non-finite timestamps;
+  tracker serialization budgeted (nodes/depth/text).
+- AUD-032 (player half): parsed derived from prop; keyframe selection at
+  playhead; cursor/ripple/scroll reset. Mutation protocol stays F39.
+- AUD-033: clicks carry page_url + viewport captured at click time;
+  server groups heatmap attribution per click page (legacy fallback to
+  batch URL).
+- AUD-034: rage window empties into a fresh burst; threshold=1 fires;
+  numeric script attributes bounded.
+- AUD-035: Python flush retains failed batches under a flush lock and
+  reports via on_error; the worker no longer swallows exceptions.
+- AUD-036: Python + Go queues store admission-time-encoded bytes.
+- AUD-037: Python options validated pre-thread; open/closing/closed
+  states; TimeoutError on incomplete close; post-close log() raises.
+- AUD-038: Go queue byte-bounded (8 MiB); flushLogs leaves the prefix
+  queued until its request succeeds; failures reported via OnError.
+- AUD-039 (contained): 10s per-request deadline in postRaw even for
+  timeout-free custom clients. Context-aware exception/close APIs remain
+  deferred design work.
+- AUD-040: declared-to-result coverage bijection; undeclared results and
+  negative counts rejected.
+- AUD-041: strict shared row decoder (UseNumber, trailing reject,
+  nonempty); numeric lexemes exact.
+- AUD-044: restore refuses a nonempty target before writing — isolated
+  restore is now the enforced default (merge mode is future work).
+- AUD-045: archive entries 0600.
+- AUD-046: v2 base64url-injective source-map keys (legacy keys still
+  readable; prune matches both encodings per key, no raw glob over the
+  release name).
+- AUD-047: covering-segment selection (greatest generated column <=
+  target); generated-only segments unmap their region; invalid source
+  indices are unmapped, not nominal.
+- AUD-048: KV read failures are errors, not absent maps; 8 MiB parse
+  budget + version check; per-request map cache with memoized failures.
+- AUD-051: Verify keyset-pages through a captured watermark in 500-row
+  batches.
+- AUD-052 (contained): failed audit append drops the cached head so the
+  next Record re-derives seq/prev-hash from storage. Durable intent
+  reconciliation stays deferred with F47-class work.
+- AUD-053: audit middleware records on a detached 2s context and logs
+  failures.
+- AUD-054 (contained): survey create/activate audited again; only the
+  public POST /surveys/respond excluded (exact match). Site attribution
+  from downstream handlers remains open (producer migration).
+- AUD-056 (partial): CI race-detector gate for the concurrency-heavy
+  packages, tracker contract job (node --test over the real script),
+  sdk-go under -race. Required pinned-Nucleus fixture and the embedded-UI
+  freshness gate remain deferred (F49/AUD-055).
+
+Deferred, standing round-1 items restated by this audit (unchanged
+rationales below): AUD-001 = F02, AUD-004 = F03, AUD-006 = F05,
+AUD-011 = F12/F19, AUD-013 = F16, AUD-029 = F37, AUD-042 = F45 (app
+half), AUD-043 = F45 (upstream half), AUD-049 = F46, AUD-050 = F47,
+AUD-055 = F49.
+
+New deferrals from this round:
+
+- AUD-008 - P2 - Open (protocol): normal access JWTs accepted in query
+  strings for EventSource/download prefixes. EventSource cannot set
+  headers, so removing the fallback breaks live logs/exports; the fix is
+  a short-lived single-purpose stream-ticket mint with audience + route
+  binding, or fetch-stream consumers. Referrer-Policy: no-referrer is set
+  on those responses as the interim mitigation.
+- AUD-017 - Low - Open (hardening): WAL final-component symlink refusal
+  and an exclusive writer lock need O_NOFOLLOW/flock build-tagged files;
+  local deployment hardening, not remotely reachable.
+- AUD-054 (site half) - P2 - Open: audit events default site "default"
+  because the outer middleware cannot see downstream-bound context; needs
+  the route-level producer migration sketched in the report.
+- AUD-056 (remainder) - P2 - Open: required Nucleus integration fixture,
+  missing-dependency-fails-required-CI, and browser-level tests of the
+  served dashboard/player remain unbuilt.
+
+Upstream: no NEW Nucleus/Neutron defects were confirmed this round; no
+framework edits were made from this session. The standing F45
+snapshot-boundary report remains the only open upstream item.
