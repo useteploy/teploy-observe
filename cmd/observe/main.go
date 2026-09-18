@@ -603,7 +603,7 @@ func main() {
 			}
 			u, _ := claims["username"].(string)
 			return u, u != ""
-		})),
+		}, logger)),
 		neutron.WithNucleusChecker(db),
 		neutron.WithOpenAPIInfo("Teploy Observe", version),
 		// /docs is reserved for the in-product docs page; Swagger UI lives at /api/docs.

@@ -147,13 +147,66 @@ type VerifyResult struct {
 // Verify walks the whole chain in order and recomputes each hash. It detects a
 // modified row (hash mismatch), a deleted row (sequence gap), and a relinked or
 // inserted row (prev_hash mismatch). Returns the first break, if any.
+//
+// AUD-051 (round 2): verification pages through the chain in keyset batches
+// instead of materializing the entire unbounded history in memory — a
+// long-lived installation's Verify used to load every row at once, and
+// concurrent verifications compounded the spike. The watermark is captured
+// once so concurrent appends cannot extend the scan. This assumes the
+// engine enforces one row per sequence (Record is the only writer and is
+// serialized behind mu).
 func (s *Service) Verify(ctx context.Context) (VerifyResult, error) {
-	rows, err := nucleus.Query[AuditEvent](ctx, s.db.SQL(),
-		"SELECT "+auditColumns+" FROM audit_events ORDER BY CAST(seq AS BIGINT) ASC")
+	const pageSize = 500
+
+	// Capture the watermark before scanning: appends past this point belong
+	// to the next verification, not this one.
+	head, err := nucleus.Query[struct {
+		Seq int64 `db:"seq"`
+	}](ctx, s.db.SQL(), "SELECT CAST(seq AS BIGINT) AS seq FROM audit_events ORDER BY CAST(seq AS BIGINT) DESC LIMIT 1")
 	if err != nil {
 		return VerifyResult{}, err
 	}
-	return verifyChain(rows, s.computeHash), nil
+	var through int64
+	if len(head) > 0 {
+		through = head[0].Seq
+	}
+
+	prev := ""
+	var expectSeq int64 = 1
+	checked := 0
+	var last int64
+	for last < through {
+		rows, err := nucleus.Query[AuditEvent](ctx, s.db.SQL(),
+			"SELECT "+auditColumns+" FROM audit_events "+
+				"WHERE CAST(seq AS BIGINT) > $1 AND CAST(seq AS BIGINT) <= $2 "+
+				"ORDER BY CAST(seq AS BIGINT) ASC LIMIT "+strconv.Itoa(pageSize),
+			dbutil.IntParam(last), dbutil.IntParam(through))
+		if err != nil {
+			return VerifyResult{}, err
+		}
+		if len(rows) == 0 {
+			return VerifyResult{Count: checked, BrokenAtSeq: last + 1,
+				Detail: fmt.Sprintf("missing records before verification watermark %d", through)}, nil
+		}
+		for _, ev := range rows {
+			if ev.Seq != expectSeq || ev.PrevHash != prev || s.computeHash(ev) != ev.Hash {
+				detail := "sequence gap: expected %d, got %d (record deleted or reordered)"
+				switch {
+				case ev.Seq != expectSeq:
+				case ev.PrevHash != prev:
+					detail = "prev_hash mismatch (record inserted or chain relinked)"
+				default:
+					detail = "hash mismatch (record contents modified)"
+				}
+				return VerifyResult{Count: checked, BrokenAtSeq: ev.Seq, Detail: fmt.Sprintf(detail, expectSeq, ev.Seq)}, nil
+			}
+			prev = ev.Hash
+			expectSeq++
+			checked++
+			last = ev.Seq
+		}
+	}
+	return VerifyResult{Intact: true, Count: checked}, nil
 }
 
 // verifyChain is the pure chain-verification core (DB-less, unit-tested). Rows
@@ -243,7 +296,14 @@ func (s *Service) Record(ctx context.Context, ev AuditEvent) error {
 		ev.SourceIP, ev.UserAgent, ev.Metadata,
 		dbutil.IntParam(ev.Seq), ev.PrevHash, ev.Hash)
 	if err != nil {
-		return err
+		// AUD-052 (round 2): the commit outcome is ambiguous — a transport
+		// error can follow an accepted insert. Drop the cached head so the
+		// next append re-derives lastSeq/lastHash from storage instead of
+		// reusing this sequence number for a different event (which forks
+		// the chain or duplicates the sequence). A durable intent/reconcile
+		// protocol remains deferred with the F47-class anchor work.
+		s.loaded = false
+		return fmt.Errorf("audit: append failed for %s (outcome may be unknown; head will be re-derived): %w", ev.AuditID, err)
 	}
 	s.lastSeq = ev.Seq
 	s.lastHash = ev.Hash

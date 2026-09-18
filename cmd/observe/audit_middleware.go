@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/neutron-dev/neutron-go/neutron"
 	"github.com/useteploy/teploy-observe/internal/audit"
@@ -20,18 +22,29 @@ type auditRecorder interface {
 // with the attempted username even on failure), and the audit endpoints
 // themselves (the POST producer path would double-record; reads aren't
 // mutations).
+//
+// AUD-054 (round 2): "/api/v1/surveys" was removed from this list — the
+// survey CREATE and ACTIVATE admin mutations live under it and were being
+// hidden from the trail. Only the public telemetry write is excluded, via
+// auditSkipExact below.
 var auditSkipPrefixes = []string{
 	"/api/v1/ingest",
 	"/api/v1/track",
 	"/api/v1/event",
 	"/api/v1/checkin",
 	"/api/v1/feedback",
-	"/api/v1/surveys",
 	"/api/v1/flags/evaluate",
 	"/api/v1/sourcemaps",
 	"/api/v1/infra/report",
 	"/api/v1/auth",
 	"/api/v1/audit",
+}
+
+// auditSkipExact is the (method, path) telemetry write excluded from the
+// trail without swallowing the survey administration routes that share its
+// prefix (AUD-054).
+var auditSkipExact = map[string]bool{
+	"POST /api/v1/surveys/respond": true,
 }
 
 // parseActorFunc resolves the acting username from a bearer token. It returns
@@ -41,14 +54,18 @@ type parseActorFunc func(bearerToken string) (username string, ok bool)
 // auditMiddleware records every mutating (non-GET) admin API call — actor,
 // action, target, result, source — so the "who did what" trail is comprehensive
 // without wiring each handler. Denied attempts (401/403) are recorded too.
-// Recording is best-effort and happens after the response, so a slow or failing
-// audit write can never block or break the request it describes.
 //
 // The actor is resolved by parsing the request's own bearer token, NOT from the
 // context: this middleware runs OUTSIDE the per-route JWT middleware, so the
 // authenticated claims aren't in its context — parsing the token directly is
 // what lets the trail attribute the real user instead of "system".
-func auditMiddleware(store auditRecorder, parseActor parseActorFunc) neutron.Middleware {
+//
+// AUD-053 (round 2): the post-response Record runs on a context DETACHED from
+// the request (a client disconnect after a committed mutation used to cancel
+// the audit write through r.Context()) under a bounded deadline, and failures
+// are logged instead of silently discarded. Best-effort remains best-effort —
+// a mandatory transactional outbox is deferred design work.
+func auditMiddleware(store auditRecorder, parseActor parseActorFunc, logger *slog.Logger) neutron.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !auditableRequest(r.Method, r.URL.Path) {
@@ -59,7 +76,9 @@ func auditMiddleware(store auditRecorder, parseActor parseActorFunc) neutron.Mid
 			next.ServeHTTP(rec, r)
 
 			actor, actorType := auditActor(r, parseActor)
-			_ = store.Record(r.Context(), audit.AuditEvent{
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
+			defer cancel()
+			if err := store.Record(ctx, audit.AuditEvent{
 				Actor:     actor,
 				ActorType: actorType,
 				Action:    deriveAction(r.Method, r.URL.Path),
@@ -67,7 +86,9 @@ func auditMiddleware(store auditRecorder, parseActor parseActorFunc) neutron.Mid
 				Result:    auditResult(rec.status),
 				SourceIP:  ingest.ClientIPFromContext(r.Context()),
 				UserAgent: r.UserAgent(),
-			})
+			}); err != nil && logger != nil {
+				logger.Error("audit event recording failed", "action", deriveAction(r.Method, r.URL.Path), "path", r.URL.Path, "err", err)
+			}
 		})
 	}
 }
@@ -78,6 +99,9 @@ func auditableRequest(method, path string) bool {
 		return false
 	}
 	if !strings.HasPrefix(path, "/api/v1/") {
+		return false
+	}
+	if auditSkipExact[method+" "+path] {
 		return false
 	}
 	for _, p := range auditSkipPrefixes {

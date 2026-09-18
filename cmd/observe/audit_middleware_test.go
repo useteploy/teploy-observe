@@ -84,7 +84,7 @@ func fakeParseActor(tok string) (string, bool) {
 
 func TestAuditMiddleware_RecordsMutationNotReads(t *testing.T) {
 	store := &recordingStore{}
-	mw := auditMiddleware(store, fakeParseActor)
+	mw := auditMiddleware(store, fakeParseActor, nil)
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	h := mw(next)
 
@@ -122,11 +122,25 @@ func TestAuditMiddleware_RecordsDenied(t *testing.T) {
 	// A handler that 403s (e.g. requireAdmin rejecting a non-admin). No token →
 	// actor is system, result denied.
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(403) })
-	auditMiddleware(store, fakeParseActor)(next).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/api/v1/users", nil))
+	auditMiddleware(store, fakeParseActor, nil)(next).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/api/v1/users", nil))
 	if len(store.events) != 1 || store.events[0].Result != audit.ResultDenied {
 		t.Fatalf("denied mutation should be recorded as denied: %+v", store.events)
 	}
 	if store.events[0].Actor != "" || store.events[0].ActorType != audit.ActorSystem {
 		t.Errorf("no-token attempt should be system: %+v", store.events[0])
+	}
+}
+
+// AUD-054 (round 2): survey administration mutations are audited; only the
+// public response submission is excluded.
+func TestAuditableRequest_SurveyRoutes(t *testing.T) {
+	if !auditableRequest(http.MethodPost, "/api/v1/surveys") {
+		t.Fatal("survey create must be audited")
+	}
+	if !auditableRequest(http.MethodPost, "/api/v1/surveys/1/activate") {
+		t.Fatal("survey activate must be audited")
+	}
+	if auditableRequest(http.MethodPost, "/api/v1/surveys/respond") {
+		t.Fatal("public survey response is telemetry and must be skipped")
 	}
 }
