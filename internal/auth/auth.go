@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -23,6 +24,14 @@ type AuthService struct {
 	jwtSecret   string
 	logger      *slog.Logger
 	oidcEnabled bool
+	// credentialMu serializes credential mutations (bootstrap, password
+	// change, administrative reset). AUD-005 (round 2): the read-verify-write
+	// sequences derived token_version+1 from a row read outside any
+	// serialization boundary, so two concurrent changes could both write the
+	// same version — a token minted between them then survived the second
+	// revocation. A process-wide mutex is the documented single-writer
+	// mitigation; observe runs one instance per database.
+	credentialMu sync.Mutex
 }
 
 // SetOIDCEnabled records whether OIDC SSO is configured. When it is, the
@@ -125,6 +134,9 @@ const bootstrapClaimKey = "auth:bootstrap_admin_claimed"
 // It returns true if it created one. The caller is responsible for surfacing a
 // generated password — EnsureAdmin never logs the password itself.
 func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string) (bool, error) {
+	s.credentialMu.Lock()
+	defer s.credentialMu.Unlock()
+
 	sql := s.db.SQL()
 
 	rows, err := nucleus.Query[countRow](ctx, sql, "SELECT COUNT(*) AS count FROM admin_users")
@@ -133,6 +145,10 @@ func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string
 	}
 	if len(rows) > 0 && rows[0].Count > 0 {
 		return false, nil
+	}
+
+	if err := ValidatePassword(password); err != nil {
+		return false, err
 	}
 
 	// The COUNT-then-INSERT above is a classic check-then-act race: two
@@ -158,7 +174,7 @@ func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string
 	if err != nil {
 		// Never insert an empty hash — that would create an admin nobody can
 		// log into (and that fails open in any "no real hash" check).
-		s.db.KV().Delete(ctx, bootstrapClaimKey)
+		s.releaseBootstrapClaim("hash failure")
 		return false, err
 	}
 	now := dbutil.IntParam(time.Now().UnixMilli())
@@ -168,7 +184,7 @@ func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string
 		id, username, hash, now, RoleAdmin,
 	)
 	if err != nil {
-		s.db.KV().Delete(ctx, bootstrapClaimKey)
+		s.releaseBootstrapClaim("insert failure")
 		return false, fmt.Errorf("auth: create default admin: %w", err)
 	}
 
@@ -213,6 +229,12 @@ func (s *AuthService) HasAdminUsers(ctx context.Context) (bool, error) {
 
 // ChangePassword updates the password for the given user ID.
 func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPassword, newPassword string) error {
+	// AUD-005: the whole read-verify-write sequence runs under the shared
+	// credential mutex so a concurrent change/reset cannot derive its
+	// replacement from the same prior row.
+	s.credentialMu.Lock()
+	defer s.credentialMu.Unlock()
+
 	user, err := nucleus.QueryOne[adminUserRow](ctx, s.db.SQL(),
 		"SELECT id, username, password_hash, created_at, role, token_version FROM admin_users WHERE id = $1", userID,
 	)
@@ -222,13 +244,8 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 	if !checkPassword(currentPassword, user.PasswordHash) {
 		return fmt.Errorf("current password is incorrect")
 	}
-	if len(newPassword) < 8 {
-		return fmt.Errorf("new password must be at least 8 characters")
-	}
-	if len(newPassword) > maxPasswordBytes {
-		// bcrypt errors past 72 bytes; the old code stored the resulting empty
-		// hash and locked the account out. Reject loudly instead.
-		return fmt.Errorf("new password must be at most %d bytes", maxPasswordBytes)
+	if err := ValidatePassword(newPassword); err != nil {
+		return err
 	}
 	newHash, err := hashPassword(newPassword)
 	if err != nil {
@@ -253,13 +270,14 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 	// stop working on their next use, even though they haven't expired yet —
 	// otherwise a compromised token, or a session that should have been cut
 	// off, remains valid for up to 24 more hours after the password changes.
+	// AUD-005: created_at is preserved from the read row — the replacement
+	// used to stamp "now", erasing account-creation history on every change.
 	if _, err = tx.SQL().Exec(ctx, "DELETE FROM admin_users WHERE id = $1", user.ID); err != nil {
 		return fmt.Errorf("auth: change password delete: %w", err)
 	}
-	now := dbutil.IntParam(time.Now().UnixMilli())
 	if _, err = tx.SQL().Exec(ctx,
 		"INSERT INTO admin_users (id, username, password_hash, created_at, role, token_version) VALUES ($1, $2, $3, $4, $5, $6)",
-		user.ID, user.Username, newHash, now, user.Role, user.TokenVersion+1,
+		user.ID, user.Username, newHash, user.CreatedAt, user.Role, user.TokenVersion+1,
 	); err != nil {
 		return fmt.Errorf("auth: change password insert: %w", err)
 	}
@@ -274,11 +292,13 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 // text. We DELETE + INSERT instead — the INSERT lands as a new physical row and
 // bypasses the stale cache entry for the prior row.
 func (s *AuthService) ForceResetAdminPassword(ctx context.Context, password string) error {
-	if len(password) < 8 {
-		return fmt.Errorf("password must be at least 8 characters")
-	}
-	if len(password) > maxPasswordBytes {
-		return fmt.Errorf("password must be at most %d bytes", maxPasswordBytes)
+	// AUD-005: serialized against ChangePassword/EnsureAdmin for the same
+	// lost-update reason.
+	s.credentialMu.Lock()
+	defer s.credentialMu.Unlock()
+
+	if err := ValidatePassword(password); err != nil {
+		return err
 	}
 	hash, err := hashPassword(password)
 	if err != nil {
@@ -303,11 +323,11 @@ func (s *AuthService) ForceResetAdminPassword(ctx context.Context, password stri
 		return fmt.Errorf("auth: force reset delete: %w", err)
 	}
 
-	now := dbutil.IntParam(time.Now().UnixMilli())
 	// token_version bumped for the same reason as ChangePassword (OBS-011).
+	// AUD-005: created_at preserved from the read row, not re-stamped.
 	if _, err = tx.SQL().Exec(ctx,
 		"INSERT INTO admin_users (id, username, password_hash, created_at, role, token_version) VALUES ($1, $2, $3, $4, $5, $6)",
-		user.ID, user.Username, hash, now, user.Role, user.TokenVersion+1,
+		user.ID, user.Username, hash, user.CreatedAt, user.Role, user.TokenVersion+1,
 	); err != nil {
 		return fmt.Errorf("auth: force reset insert: %w", err)
 	}
@@ -318,6 +338,39 @@ func (s *AuthService) ForceResetAdminPassword(ctx context.Context, password stri
 // beyond it. Callers must reject longer passwords rather than store the empty
 // hash the error path used to produce (which silently locked accounts out).
 const maxPasswordBytes = 72
+
+// minPasswordBytes is the shared minimum. AUD-009 (round 2): the setup
+// handler enforced a minimum EnsureAdmin did not, so env-provisioned and
+// startup-reset paths accepted weaker passwords than the wizard. One
+// policy function now backs every password entry point.
+const minPasswordBytes = 8
+
+// ValidatePassword is the single password policy for setup, environment
+// provisioning, password changes, and administrative reset (AUD-009).
+func ValidatePassword(password string) error {
+	if len(password) < minPasswordBytes {
+		return fmt.Errorf("password must be at least %d characters", minPasswordBytes)
+	}
+	if len(password) > maxPasswordBytes {
+		return fmt.Errorf("password must be at most %d bytes", maxPasswordBytes)
+	}
+	return nil
+}
+
+// releaseBootstrapClaim deletes the bootstrap claim key with a context
+// detached from the caller's. AUD-003 (round 2): the error paths used to
+// delete with the request context, which may already be canceled by the
+// time the insert fails — leaving the claim set with no admin row and
+// setup permanently "already claimed". The full atomic fix (claim record
+// containing the account) is deferred with the F03 principal store.
+func (s *AuthService) releaseBootstrapClaim(reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := s.db.KV().Delete(ctx, bootstrapClaimKey); err != nil {
+		s.logger.Error("auth: releasing bootstrap claim failed — setup may need the "+
+			"`auth:bootstrap_admin_claimed` KV key deleted by hand", "reason", reason, "err", err)
+	}
+}
 
 // dummyBcryptHash is a valid bcrypt hash (of a random string) used to spend the
 // same CPU on a nonexistent-user login as a real one, removing the timing

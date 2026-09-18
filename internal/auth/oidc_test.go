@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"log/slog"
 	"testing"
 	"time"
 )
@@ -191,5 +192,80 @@ func TestAllowedRequiresVerifiedEmail(t *testing.T) {
 	bare := newTestOIDC()
 	if !bare.allowed(map[string]any{"email": "anyone@anywhere.test"}) {
 		t.Fatal("no allowlist configured must admit any authenticated identity")
+	}
+}
+
+// AUD-007 (round 2): partial OIDC configuration must be a startup error,
+// never a silent "SSO disabled". The grace period reopens on an unclaimed
+// instance when SSO silently turns off, so every one-field configuration
+// is refused.
+func TestNewOIDCAuth_PartialConfigIsError(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+	}{
+		{"issuer only", map[string]string{"OBSERVE_OIDC_ISSUER": "https://sso.example.com"}},
+		{"client id only", map[string]string{"OBSERVE_OIDC_CLIENT_ID": "observe"}},
+		{"secret only", map[string]string{"OBSERVE_OIDC_CLIENT_SECRET": "s3cr3t"}},
+		{"redirect only", map[string]string{"OBSERVE_OIDC_REDIRECT_URL": "https://observe.example.com/api/v1/auth/oidc/callback"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			o, err := NewOIDCAuth(nil, slog.Default())
+			if err == nil || o != nil {
+				t.Fatalf("partial OIDC config must error, got (%v, %v)", o, err)
+			}
+		})
+	}
+}
+
+func TestNewOIDCAuth_FullConfigOK(t *testing.T) {
+	t.Setenv("OBSERVE_OIDC_ISSUER", "https://sso.example.com")
+	t.Setenv("OBSERVE_OIDC_CLIENT_ID", "observe")
+	o, err := NewOIDCAuth(nil, slog.Default())
+	if err != nil || o == nil {
+		t.Fatalf("full config must succeed, got (%v, %v)", o, err)
+	}
+}
+
+func TestNewOIDCAuth_UnsetMeansDisabled(t *testing.T) {
+	o, err := NewOIDCAuth(nil, slog.Default())
+	if o != nil || err != nil {
+		t.Fatalf("no OIDC env must mean disabled with no error, got (%v, %v)", o, err)
+	}
+}
+
+func TestNewOIDCAuth_IssuerURLValidation(t *testing.T) {
+	t.Setenv("OBSERVE_OIDC_CLIENT_ID", "observe")
+	cases := []struct {
+		name    string
+		issuer  string
+		wantErr bool
+	}{
+		{"https absolute", "https://sso.example.com", false},
+		{"https with path", "https://sso.example.com/realms/main", false},
+		{"http rejected", "http://localhost:8080", true},
+		{"userinfo rejected", "https://user:pw@sso.example.com", true},
+		{"query rejected", "https://sso.example.com?a=b", true},
+		{"fragment rejected", "https://sso.example.com#frag", true},
+		{"relative rejected", "sso.example.com", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OBSERVE_OIDC_ISSUER", tc.issuer)
+			_, err := NewOIDCAuth(nil, slog.Default())
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("issuer %q: err = %v, wantErr %v", tc.issuer, err, tc.wantErr)
+			}
+		})
+	}
+	// Narrow dev override.
+	t.Setenv("OBSERVE_OIDC_ISSUER", "http://localhost:8080")
+	t.Setenv("OBSERVE_OIDC_ALLOW_HTTP_ISSUER", "true")
+	if _, err := NewOIDCAuth(nil, slog.Default()); err != nil {
+		t.Fatalf("http issuer with explicit dev override must pass, got %v", err)
 	}
 }

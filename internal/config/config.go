@@ -92,6 +92,12 @@ func Load() Config {
 	set("OBSERVE_RATE_LIMIT", 1000, &c.RateLimit)
 	flushMs := 2000
 	set("OBSERVE_FLUSH_INTERVAL_MS", 2000, &flushMs)
+	if err == nil && (flushMs < 1 || flushMs > 60000) {
+		// AUD-009: bound the raw milliseconds BEFORE multiplying into a
+		// duration — a huge value can overflow int64 during multiplication
+		// and wrap into something the post-hoc range check misreads.
+		err = fmt.Errorf("OBSERVE_FLUSH_INTERVAL_MS must be in [1, 60000] milliseconds, got %d", flushMs)
+	}
 	if err == nil {
 		c.FlushInterval = time.Duration(flushMs) * time.Millisecond
 	} else {
@@ -148,6 +154,16 @@ func (c Config) Validate() error {
 	}
 	if c.HourlyRetentionDays < 1 {
 		return fmt.Errorf("OBSERVE_HOURLY_RETENTION_DAYS must be >= 1, got %d", c.HourlyRetentionDays)
+	}
+	// AUD-009: weak explicitly-configured secrets were accepted silently.
+	// Unset still means "generate per process" (logged at startup); a value
+	// an operator DID set must carry real entropy. Length floors, not
+	// composition rules — these are operator-chosen machine secrets.
+	if c.JWTSecret != "" && len(c.JWTSecret) < 16 {
+		return fmt.Errorf("OBSERVE_JWT_SECRET must be at least 16 characters when set (unset generates a random per-process secret)")
+	}
+	if c.AuditKey != "" && len(c.AuditKey) < 32 {
+		return fmt.Errorf("OBSERVE_AUDIT_KEY must be at least 32 characters when set (unset falls back with a startup warning)")
 	}
 	return nil
 }

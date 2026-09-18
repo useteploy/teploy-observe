@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/ingest"
 )
 
 // TestJWTAuthMiddleware_RevokedTokenRejected is the regression for OBS-011: a
@@ -142,5 +144,32 @@ func TestJWTAuthMiddleware_QueryTokenOnlyOnAllowlistedPaths(t *testing.T) {
 	handler.ServeHTTP(rec3, req3)
 	if rec3.Code != http.StatusOK {
 		t.Errorf("non-allowlisted path with header token: expected 200, got %d", rec3.Code)
+	}
+}
+
+// AUD-002 (round 2): the no-API-key grace path is gone. A keyless request
+// is rejected before any database lookup, so an instance with zero keys
+// refuses telemetry rather than trusting caller-selected sites.
+func TestAPIKeyAuthMiddleware_RejectsKeylessRequests(t *testing.T) {
+	svc := &AuthService{}
+	mw := APIKeyAuthMiddleware(svc)
+	called := false
+	h := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/events", nil)
+	req.Header.Set("X-Observe-Site", "forged-site")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("keyless request must 401, got %d", rec.Code)
+	}
+	if called {
+		t.Fatal("handler must not run for a keyless request")
+	}
+	if ctx := ingest.SiteIDFromContext(req.Context()); ctx != "" {
+		t.Fatal("no site may be bound from caller headers without a validated key")
 	}
 }

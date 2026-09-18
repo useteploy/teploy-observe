@@ -164,7 +164,14 @@ func main() {
 
 	// Optional OIDC single sign-on. When configured, it also disables the
 	// first-run grace period (auth becomes required) via SetOIDCEnabled.
-	oidcAuth := auth.NewOIDCAuth(authSvc, logger)
+	// AUD-007 (round 2): partial OIDC configuration is a startup error, not
+	// a silent "SSO disabled" — refusing the boundary loss instead of
+	// running unauthenticated by accident.
+	oidcAuth, err := auth.NewOIDCAuth(authSvc, logger)
+	if err != nil {
+		logger.Error("invalid OIDC configuration", "err", err)
+		os.Exit(1)
+	}
 	authSvc.SetOIDCEnabled(oidcAuth.Enabled())
 
 	// CLI escape hatch: OBSERVE_RESET_ADMIN_PASSWORD force-updates the admin's
@@ -634,7 +641,7 @@ func main() {
 	// Auth runs before the limiter so the limiter can key on site_id. BodyLimit
 	// rejects oversized payloads with 413 before they are buffered/decoded
 	// (batch is capped at 100 events, so 2 MiB is ample).
-	apiKeyMW := auth.APIKeyAuthMiddleware(authSvc, cfg.SiteID)
+	apiKeyMW := auth.APIKeyAuthMiddleware(authSvc)
 	ingestGroup := r.Group("/api/v1", ingestCORS, apiKeyMW, rateLimiter.Middleware, neutron.BodyLimit(2<<20))
 	neutron.Post(ingestGroup, "/events", ingest.Handler(buf, cfg.SessionSalt, siteSvc),
 		neutron.WithTags("ingest"),
@@ -1826,9 +1833,12 @@ func setupCreateHandler(authSvc *auth.AuthService) http.HandlerFunc {
 			w.Write([]byte(`{"error":"username and password required"}`))
 			return
 		}
-		if len(input.Password) < 8 {
+		// AUD-009: the setup wizard previously enforced its own minimum;
+		// every password entry point now shares auth.ValidatePassword.
+		if err := auth.ValidatePassword(input.Password); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"error":"password must be at least 8 characters"}`))
+			msg, _ := json.Marshal(map[string]string{"error": err.Error()})
+			w.Write(msg)
 			return
 		}
 		created, err := authSvc.EnsureAdmin(req.Context(), input.Username, input.Password)

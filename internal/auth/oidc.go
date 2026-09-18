@@ -100,21 +100,39 @@ type oidcFlow struct {
 	exp      time.Time
 }
 
-// NewOIDCAuth reads SSO configuration from the environment. It returns nil (SSO
-// disabled) unless at least the issuer and client ID are set.
-func NewOIDCAuth(authSvc *AuthService, logger *slog.Logger) *OIDCAuth {
+// NewOIDCAuth reads SSO configuration from the environment. It returns nil
+// (SSO disabled) when no OIDC variable is set at all.
+//
+// AUD-007 (round 2): partial configuration used to return nil — "SSO
+// disabled" — instead of an error, so an operator who supplied only the
+// issuer (or dropped a variable on redeploy) silently lost the security
+// boundary, and on an unclaimed instance the anonymous grace path came
+// back with it. OIDC is now all-or-none: any set variable requires both
+// issuer and client ID, and the issuer must be an absolute URL without
+// credentials/query/fragment. HTTPS is required unless
+// OBSERVE_OIDC_ALLOW_HTTP_ISSUER=true (narrow local-development override).
+func NewOIDCAuth(authSvc *AuthService, logger *slog.Logger) (*OIDCAuth, error) {
 	issuer := strings.TrimSpace(os.Getenv("OBSERVE_OIDC_ISSUER"))
 	clientID := strings.TrimSpace(os.Getenv("OBSERVE_OIDC_CLIENT_ID"))
+	clientSecret := strings.TrimSpace(os.Getenv("OBSERVE_OIDC_CLIENT_SECRET"))
+	redirectURL := strings.TrimSpace(os.Getenv("OBSERVE_OIDC_REDIRECT_URL"))
+	configured := issuer != "" || clientID != "" || clientSecret != "" || redirectURL != ""
+	if !configured {
+		return nil, nil
+	}
 	if issuer == "" || clientID == "" {
-		return nil
+		return nil, fmt.Errorf("OIDC requires both OBSERVE_OIDC_ISSUER and OBSERVE_OIDC_CLIENT_ID when any OIDC variable is set — refusing to start with SSO silently disabled")
+	}
+	if err := validateOIDCIssuer(issuer); err != nil {
+		return nil, err
 	}
 	o := &OIDCAuth{
 		authSvc:        authSvc,
 		logger:         logger,
 		issuer:         issuer,
 		clientID:       clientID,
-		clientSecret:   strings.TrimSpace(os.Getenv("OBSERVE_OIDC_CLIENT_SECRET")),
-		redirectURL:    strings.TrimSpace(os.Getenv("OBSERVE_OIDC_REDIRECT_URL")),
+		clientSecret:   clientSecret,
+		redirectURL:    redirectURL,
 		scopes:         parseOIDCScopes(os.Getenv("OBSERVE_OIDC_SCOPES")),
 		label:          orDefault(strings.TrimSpace(os.Getenv("OBSERVE_OIDC_LABEL")), "Single sign-on"),
 		usernameClaim:  orDefault(strings.TrimSpace(os.Getenv("OBSERVE_OIDC_USERNAME_CLAIM")), "preferred_username"),
@@ -129,7 +147,23 @@ func NewOIDCAuth(authSvc *AuthService, logger *slog.Logger) *OIDCAuth {
 		flows:          make(map[string]*oidcFlow),
 	}
 	logger.Info("OIDC SSO enabled", "issuer", issuer)
-	return o
+	return o, nil
+}
+
+// validateOIDCIssuer enforces an absolute issuer URL without userinfo,
+// query, or fragment, over https (or http with the explicit dev override).
+func validateOIDCIssuer(issuer string) error {
+	u, err := url.Parse(issuer)
+	if err != nil {
+		return fmt.Errorf("OBSERVE_OIDC_ISSUER is not a valid URL: %w", err)
+	}
+	if u.Scheme != "https" && !(u.Scheme == "http" && strings.EqualFold(os.Getenv("OBSERVE_OIDC_ALLOW_HTTP_ISSUER"), "true")) {
+		return fmt.Errorf("OBSERVE_OIDC_ISSUER must be an absolute HTTPS URL (set OBSERVE_OIDC_ALLOW_HTTP_ISSUER=true only for local development)")
+	}
+	if u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.RawFragment != "" {
+		return fmt.Errorf("OBSERVE_OIDC_ISSUER must be an absolute URL without credentials, query, or fragment")
+	}
+	return nil
 }
 
 // Audit result vocabulary, mirroring the audit package's constants. Duplicated

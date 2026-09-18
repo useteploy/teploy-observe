@@ -177,31 +177,20 @@ func JWTAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 
 // APIKeyAuthMiddleware returns middleware that validates API keys from the
 // X-API-Key header. If the key is valid, the associated site_id is stored
-// in the request context. If no API keys exist in the system (first-run
-// grace period), the request is allowed with the default site ID.
-func APIKeyAuthMiddleware(authSvc *AuthService, defaultSiteID string) neutron.Middleware {
+// in the request context.
+//
+// AUD-002 (round 2): the former no-keys grace period trusted
+// caller-selected sites (X-Observe-Site / body site_id) on any instance
+// with zero API-key rows — a global state-based exception, independent of
+// whether a dashboard administrator already existed. Ingestion now
+// requires a valid key by default: a fresh install accepts no telemetry
+// until an admin provisions one, and a validated key's site is the only
+// site its requests can write to.
+func APIKeyAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			key := r.Header.Get("X-API-Key")
-
+			key := strings.TrimSpace(r.Header.Get("X-API-Key"))
 			if key == "" {
-				// No key provided — check grace period. Fail closed on a DB
-				// error instead of falling into the no-keys grace path.
-				hasKeys, err := authSvc.HasAPIKeys(r.Context())
-				if err != nil {
-					neutron.WriteError(w, r, neutron.ErrInternal("auth check unavailable"))
-					return
-				}
-				if !hasKeys {
-					// Grace period: no keys in system, use default site
-					siteID := r.Header.Get("X-Observe-Site")
-					if siteID == "" {
-						siteID = defaultSiteID
-					}
-					ctx := ingest.WithSiteID(r.Context(), siteID)
-					next.ServeHTTP(w, r.WithContext(ctx))
-					return
-				}
 				neutron.WriteError(w, r, neutron.ErrUnauthorized("missing API key"))
 				return
 			}
