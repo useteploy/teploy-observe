@@ -110,7 +110,18 @@ func TestRestore_LenientEraEmptyJSONB(t *testing.T) {
 	}
 	manifest, _ := json.Marshal(Manifest{Version: manifestVersion, CreatedAt: time.Now(), Tables: Tables})
 	write(manifestName, manifest)
-	results, _ := json.Marshal([]TableResult{{Table: "error_events", Rows: 1, OK: true}})
+	// AUD-040: every manifest-declared table needs a completion result, so
+	// the synthetic archive carries OK/zero-row records for all of them and
+	// the real single row only for error_events.
+	allResults := make([]TableResult, 0, len(Tables))
+	for _, tbl := range Tables {
+		r := TableResult{Table: tbl, Rows: 0, OK: true}
+		if tbl == "error_events" {
+			r.Rows = 1
+		}
+		allResults = append(allResults, r)
+	}
+	results, _ := json.Marshal(allResults)
 	write(resultsName, results)
 	// A lenient-era row: JSONB columns serialized as empty strings.
 	row, _ := json.Marshal(map[string]any{
@@ -120,6 +131,16 @@ func TestRestore_LenientEraEmptyJSONB(t *testing.T) {
 	})
 	write("error_events.jsonl", row)
 	tw.Close()
+
+	// Restore appends and refuses a non-empty target; on the shared scratch
+	// engine other packages' tests leave rows behind, so clear every
+	// restorable table first (the same hygiene the auth tests apply to
+	// admin_users/principals).
+	for _, tbl := range Tables {
+		if _, err := db.SQL().Exec(ctx, "DELETE FROM "+tbl); err != nil {
+			t.Fatalf("clear %s before restore: %v", tbl, err)
+		}
+	}
 
 	if err := Restore(ctx, db, &buf); err != nil {
 		t.Fatalf("restore of lenient-era archive failed: %v", err)
