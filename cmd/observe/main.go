@@ -230,6 +230,16 @@ func main() {
 		}
 	}
 	buf := ingest.NewBuffer(db, cfg.BufferSize, cfg.FlushSize, cfg.FlushInterval, logger)
+	// AUD-015 (round 2): serialized-byte budget across queued + in-flight
+	// events, so individually legal large events cannot exhaust memory while
+	// the database stalls. Count caps alone did not bound bytes.
+	if raw := strings.TrimSpace(os.Getenv("OBSERVE_MAX_BUFFERED_BYTES")); raw != "" {
+		if n, perr := strconv.ParseInt(raw, 10, 64); perr == nil {
+			buf.WithMaxBufferedBytes(n)
+		} else {
+			logger.Warn("OBSERVE_MAX_BUFFERED_BYTES is not an integer — using the default byte budget", "err", perr)
+		}
+	}
 	maxQueueBytes := int64(64 * 1024 * 1024) // 64 MiB per WAL file before compaction
 	// OBS-009: a WAL init/attach failure used to silently downgrade to
 	// memory-only ingestion — the project documents durable ingestion via the
@@ -245,6 +255,12 @@ func main() {
 	if err == nil {
 		if err := buf.AttachQueue(eventsQ); err != nil {
 			walDegraded = true
+			// AUD-012 (round 2): close the created-but-unattached queue —
+			// its fsync worker and file handle otherwise outlive the buffer
+			// that will never checkpoint them.
+			if cerr := eventsQ.Close(); cerr != nil {
+				logger.Warn("ingest queue: closing unattached queue failed", "err", cerr)
+			}
 			logger.Warn("ingest queue: attach failed, running in-memory only", "err", err)
 		}
 	} else {
@@ -1340,6 +1356,10 @@ func main() {
 		durability := "wal"
 		if walDegraded {
 			durability = "memory-only"
+		} else if buf.WorkerErr() != nil {
+			// AUD-016 (round 2): a dead flush worker leaves a process that
+			// acknowledges nothing and flushes nothing — report it.
+			durability = "flush-worker-failed"
 		} else if eventsQ != nil && eventsQ.LastError() != nil {
 			// Audit F14: a WAL failure after healthy startup (disk full,
 			// I/O error) latches in the queue; ingestion is refused while

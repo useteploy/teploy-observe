@@ -60,14 +60,18 @@ type Event struct {
 // crash recovery: events pushed since the last successful flush are replayed
 // after a restart.
 type Buffer struct {
-	mu            sync.Mutex
-	events        []Event
-	maxSize       int
-	flushSize     int
-	flushInterval time.Duration
-	db            *nucleus.Client
-	logger        *slog.Logger
-	stopCh        chan struct{}
+	mu               sync.Mutex
+	events           []Event
+	eventBytes       []int
+	bufferedBytes    int64
+	inFlightBytes    int64
+	maxSize          int
+	maxBufferedBytes int64
+	flushSize        int
+	flushInterval    time.Duration
+	db               *nucleus.Client
+	logger           *slog.Logger
+	stopCh           chan struct{}
 	// flushCh coalesces size-triggered flush wakeups: capacity one, so any
 	// number of above-threshold Pushes while an insertion is in flight
 	// collapse into a single pending wakeup instead of piling up goroutines
@@ -75,6 +79,14 @@ type Buffer struct {
 	flushCh chan struct{}
 	wg      sync.WaitGroup
 	queue   *DiskQueue
+	// Lifecycle state (AUD-016, round 2), all guarded by mu:
+	// started latches on the first Start so a duplicate Start cannot race
+	// wg.Add against Stop's wg.Wait; stopped rejects admissions after
+	// shutdown; workerErr latches a dead flush goroutine so admission stops
+	// acknowledging events nothing will ever flush.
+	started   bool
+	stopped   bool
+	workerErr error
 	// lastOffset is the WAL offset after the most recently appended event,
 	// guarded by mu. It is the checkpoint target for the current batch: every
 	// event in the buffer was WAL-appended at or below it, and no later event
@@ -90,19 +102,36 @@ type Buffer struct {
 	stopOnce sync.Once
 }
 
+// defaultMaxBufferedBytes bounds the queued+in-flight serialized bytes
+// (AUD-015, round 2). Count-based caps alone let many individually legal
+// large events exhaust memory while the database stalls.
+const defaultMaxBufferedBytes = 256 << 20
+
+// WithMaxBufferedBytes overrides the serialized-byte budget (queued plus
+// in-flight). Zero or negative restores the default.
+func (b *Buffer) WithMaxBufferedBytes(n int64) *Buffer {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if n > 0 {
+		b.maxBufferedBytes = n
+	}
+	return b
+}
+
 // NewBuffer creates a new ingestion buffer. If queue is non-nil, every Push
 // is also written to the WAL and any events surviving a crash are replayed
 // into memory at construction time.
 func NewBuffer(db *nucleus.Client, maxSize, flushSize int, flushInterval time.Duration, logger *slog.Logger) *Buffer {
 	return &Buffer{
-		events:        make([]Event, 0, flushSize),
-		maxSize:       maxSize,
-		flushSize:     flushSize,
-		flushInterval: flushInterval,
-		db:            db,
-		logger:        logger,
-		stopCh:        make(chan struct{}),
-		flushCh:       make(chan struct{}, 1),
+		events:           make([]Event, 0, flushSize),
+		maxSize:          maxSize,
+		maxBufferedBytes: defaultMaxBufferedBytes,
+		flushSize:        flushSize,
+		flushInterval:    flushInterval,
+		db:               db,
+		logger:           logger,
+		stopCh:           make(chan struct{}),
+		flushCh:          make(chan struct{}, 1),
 	}
 }
 
@@ -144,12 +173,30 @@ func (b *Buffer) AttachQueue(q *DiskQueue) error {
 	b.lastOffset = q.Offset()
 	if len(pending) > 0 {
 		b.events = append(b.events, pending...)
+		// AUD-015: replayed events count against the byte budget too — a
+		// large backlog must not restart with an unaccounted memory spike.
+		for _, e := range pending {
+			n := approxEventBytes(e)
+			b.eventBytes = append(b.eventBytes, n)
+			b.bufferedBytes += int64(n)
+		}
 	}
 	if len(pending) > 0 {
 		b.logger.Info("ingest queue: replayed", "count", len(pending))
 	}
 	b.queue = q
 	return nil
+}
+
+// approxEventBytes returns the serialized size of one event for the byte
+// budget. Marshal failures count as a floor so accounting never undercounts
+// a storable event.
+func approxEventBytes(e Event) int {
+	raw, err := json.Marshal(e)
+	if err != nil {
+		return 256
+	}
+	return len(raw)
 }
 
 // dropAlreadyCommitted returns the subset of events whose event_id is NOT
@@ -218,14 +265,28 @@ func (b *Buffer) dropAlreadyCommitted(pending []Event) []Event {
 	return out
 }
 
-// Start begins the periodic flush loop.
+// Start begins the periodic flush loop. Idempotent-safe: a second Start is
+// refused so it cannot race Stop's wg.Wait with a late wg.Add (AUD-016).
 func (b *Buffer) Start() {
-	b.wg.Add(1)
+	b.mu.Lock()
+	if b.started || b.stopped {
+		b.mu.Unlock()
+		return
+	}
+	b.started = true
+	b.wg.Add(1) // before Stop can begin waiting
+	b.mu.Unlock()
 	go func() {
 		defer b.wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
-				b.logger.Error("buffer flush goroutine panicked", "err", r)
+				// AUD-016: latch the death instead of logging it away — a
+				// panicked flush worker left an apparently running process
+				// that acknowledged events nothing would ever flush.
+				b.mu.Lock()
+				b.workerErr = fmt.Errorf("buffer flush goroutine panicked: %v", r)
+				b.mu.Unlock()
+				b.logger.Error("buffer flush goroutine panicked — admission refused until restart", "err", r)
 			}
 		}()
 		ticker := time.NewTicker(b.flushInterval)
@@ -255,46 +316,86 @@ func (b *Buffer) Start() {
 // Stop signals the flush loop to exit and waits for the final flush.
 // Idempotent — safe under concurrent or repeated shutdown paths.
 func (b *Buffer) Stop() {
-	b.stopOnce.Do(func() { close(b.stopCh) })
-	b.wg.Wait()
-	if b.queue != nil {
-		if err := b.queue.Close(); err != nil {
-			b.logger.Warn("ingest queue: close failed", "err", err)
+	b.stopOnce.Do(func() {
+		b.mu.Lock()
+		b.stopped = true
+		close(b.stopCh)
+		b.mu.Unlock()
+		b.wg.Wait()
+		b.Flush() // covers a buffer that was never Started
+		if b.queue != nil {
+			if err := b.queue.Close(); err != nil {
+				b.logger.Warn("ingest queue: close failed", "err", err)
+			}
 		}
-	}
+	})
+}
+
+// WorkerErr reports a latched flush-worker failure (nil while healthy), for
+// readiness surfacing (AUD-016).
+func (b *Buffer) WorkerErr() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.workerErr
 }
 
 // Push adds an event to the buffer. Returns false if the buffer is full
-// (backpressure signal), or if a WAL append failed while the WAL is attached
+// (backpressure signal), if a WAL append failed while the WAL is attached
 // (audit F14: a WAL-backed deployment must not acknowledge events as
 // crash-safe when the log write failed — silent fallback to memory-only
-// ingestion turned disk-full into data loss with healthy-looking acks).
+// ingestion turned disk-full into data loss with healthy-looking acks), or
+// if the buffer is stopped / its flush worker has died (AUD-016).
 func (b *Buffer) Push(e Event) bool {
+	return b.PushBatch([]Event{e})
+}
+
+// PushBatch admits a WHOLE batch under one lock hold — the reservation the
+// old Avail-then-Push loop only pretended to make (AUD-010, round 2). Two
+// concurrent requests can no longer both pass a capacity snapshot and then
+// interleave pushes that accept a prefix and refuse the tail: either every
+// event in events is admitted (memory + ONE WAL frame) or none is.
+func (b *Buffer) PushBatch(events []Event) bool {
+	if len(events) == 0 {
+		return true
+	}
 	b.mu.Lock()
-	if len(b.events) >= b.maxSize {
+	if b.stopped || b.workerErr != nil {
 		b.mu.Unlock()
 		return false
 	}
-	b.events = append(b.events, e)
-	// WAL under mu so the on-disk order matches b.events order; lastOffset then
-	// tracks the offset of the final buffered event. The bufio write is
-	// in-memory (fsync is on the background loop), so holding mu here does
-	// not block on disk I/O.
+	if len(events) > b.maxSize-len(b.events) {
+		b.mu.Unlock()
+		return false
+	}
+	// AUD-015: acquire the whole batch's serialized-byte credit (queued +
+	// in-flight) before journaling it.
+	var cost int64
+	for _, e := range events {
+		cost += int64(approxEventBytes(e))
+	}
+	if b.bufferedBytes+b.inFlightBytes+cost > b.maxBufferedBytes {
+		b.mu.Unlock()
+		return false
+	}
 	if b.queue != nil {
-		off, err := b.queue.Append(e)
+		off, err := b.queue.AppendBatch(events)
 		if err != nil {
-			// Roll the event back out: the WAL is the durability contract,
-			// and accepting the event anyway would ack data the process
-			// promised is crash-safe but is not. The queue latches the error
-			// (see DiskQueue.Append); admission stays refused until it
-			// recovers, and /healthz reports the degradation.
-			b.events = b.events[:len(b.events)-1]
+			// Nothing was appended to memory: the WAL is the durability
+			// contract, and accepting the events anyway would ack data the
+			// process promised is crash-safe but is not. The queue latches
+			// the error (see DiskQueue.AppendBatch); admission stays refused
+			// until it recovers, and /healthz reports the degradation.
 			b.mu.Unlock()
 			b.logger.Error("ingest queue: append failed — refusing admission (WAL-backed durability unavailable)", "err", err)
 			return false
 		}
 		b.lastOffset = off
 	}
+	b.events = append(b.events, events...)
+	for _, e := range events {
+		b.eventBytes = append(b.eventBytes, approxEventBytes(e))
+	}
+	b.bufferedBytes += cost
 	shouldFlush := len(b.events) >= b.flushSize
 	b.mu.Unlock()
 
@@ -332,6 +433,14 @@ func (b *Buffer) Flush() {
 		return
 	}
 	batch := b.events
+	batchBytes := b.eventBytes
+	batchCost := b.bufferedBytes
+	// AUD-015: detached batches stay on the byte budget as in-flight credit
+	// until their commit outcome is known — released on success, returned to
+	// the queued side on requeue.
+	b.bufferedBytes = 0
+	b.inFlightBytes += batchCost
+	b.eventBytes = nil
 	// Checkpoint target captured with the batch: every buffered event was
 	// WAL-appended at or below lastOffset, so this offset covers exactly this
 	// batch. New pushes after we release mu get a higher offset and a later batch.
@@ -347,12 +456,22 @@ func (b *Buffer) Flush() {
 		// Only the unsubmitted tail is re-queued; already-committed chunks are
 		// dropped from the retry set so a later flush cannot double-insert them.
 		unsent := batch[committed:]
+		var unsentBytes int64
+		for _, n := range batchBytes[committed:] {
+			unsentBytes += int64(n)
+		}
 		b.logger.Error("flush failed", "committed", committed, "requeue", len(unsent), "err", err)
 		// We deliberately do NOT checkpoint, so these events stay in the WAL and
 		// a later successful flush checkpoints them via lastOffset.
-		b.requeueFailed(unsent)
+		b.requeueFailed(unsent, unsentBytes, batchCost)
 		return
 	}
+	b.mu.Lock()
+	b.inFlightBytes -= batchCost
+	if b.inFlightBytes < 0 {
+		b.inFlightBytes = 0
+	}
+	b.mu.Unlock()
 	b.logger.Info("flushed events OK", "count", len(batch))
 	if b.queue != nil {
 		if err := b.queue.Checkpoint(target); err != nil {
@@ -368,9 +487,21 @@ func (b *Buffer) Flush() {
 // checkpointed PAST them and they were lost for good, restart included.
 // Retaining them can temporarily push the buffer over maxSize; Push refuses
 // new events until the retry drains it back down.
-func (b *Buffer) requeueFailed(unsent []Event) {
+func (b *Buffer) requeueFailed(unsent []Event, unsentBytes, batchCost int64) {
 	b.mu.Lock()
 	b.events = append(unsent, b.events...)
+	sizes := make([]int, len(unsent))
+	for i := range unsent {
+		sizes[i] = approxEventBytes(unsent[i])
+	}
+	b.eventBytes = append(sizes, b.eventBytes...)
+	// In-flight credit for the whole detached batch returns to the queued
+	// side: unsent becomes queued again, committed cost is released.
+	b.inFlightBytes -= batchCost
+	if b.inFlightBytes < 0 {
+		b.inFlightBytes = 0
+	}
+	b.bufferedBytes += unsentBytes
 	b.mu.Unlock()
 }
 

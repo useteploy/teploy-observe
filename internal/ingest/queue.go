@@ -133,6 +133,13 @@ func NewDiskQueue(dir, name string, fsyncInterval time.Duration, maxBytes int64,
 		}
 		cp = 0
 	}
+	// AUD-014 (round 2): an in-range checkpoint that does not sit on a
+	// record boundary makes replay seek into the middle of a frame — the
+	// same silent-skip corruption as above, just entered differently.
+	if err := validateCheckpointBoundary(f, cp); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("ingest queue: %w", err)
+	}
 
 	q := &DiskQueue{
 		dir:           full,
@@ -150,6 +157,52 @@ func NewDiskQueue(dir, name string, fsyncInterval time.Duration, maxBytes int64,
 	return q, nil
 }
 
+// walBatchFrame is the versioned multi-event WAL record written by
+// AppendBatch (AUD-010, round 2). A whole admitted batch is one frame, so
+// a mid-batch write failure can never leave a partially accepted prefix
+// on disk. Pending decodes both this shape and the legacy one-event-per-
+// line records older binaries wrote.
+type walBatchFrame struct {
+	WALVersion int     `json:"wal_version"`
+	Events     []Event `json:"events"`
+}
+
+const (
+	walBatchVersion    = 1
+	walMaxFrameBytes   = 8 << 20 // 100 events x 64 KiB event cap, plus envelope
+	legacyFrameVersion = 0
+)
+
+// decodeWALLine decodes one newline-delimited WAL record, accepting both
+// legacy single-event lines and versioned batch frames.
+func decodeWALLine(line []byte) ([]Event, error) {
+	var probe struct {
+		WALVersion *int    `json:"wal_version"`
+		Events     []Event `json:"events"`
+	}
+	if err := json.Unmarshal(line, &probe); err != nil {
+		return nil, err
+	}
+	if probe.WALVersion == nil {
+		// Legacy line: the whole record is one Event. Re-decode to surface
+		// type mismatches the probe struct tolerated.
+		var e Event
+		if err := json.Unmarshal(line, &e); err != nil {
+			return nil, err
+		}
+		return []Event{e}, nil
+	}
+	switch *probe.WALVersion {
+	case walBatchVersion:
+		if probe.Events == nil {
+			return nil, errors.New("batch frame carries no events")
+		}
+		return probe.Events, nil
+	default:
+		return nil, fmt.Errorf("unsupported WAL frame version %d", *probe.WALVersion)
+	}
+}
+
 // Append writes one event to the write-ahead log and returns the WAL byte
 // offset immediately after the written record. The caller must hold this
 // offset and pass the batch's maximum offset to Checkpoint after the batch
@@ -159,10 +212,30 @@ func NewDiskQueue(dir, name string, fsyncInterval time.Duration, maxBytes int64,
 // The caller should still push the event into its in-memory buffer as well —
 // DiskQueue is only for durability on crash recovery.
 func (q *DiskQueue) Append(e Event) (int64, error) {
-	raw, err := json.Marshal(e)
+	return q.AppendBatch([]Event{e})
+}
+
+// AppendBatch writes a whole batch as ONE versioned WAL frame and returns
+// the offset after it (AUD-010, round 2). Callers that admitted a batch
+// atomically must also be able to journal it atomically: appending events
+// one line at a time left a partial batch on disk when a write failed
+// mid-batch, so a client retry of the "failed" batch duplicated the
+// prefix that had in fact survived.
+func (q *DiskQueue) AppendBatch(events []Event) (int64, error) {
+	if len(events) == 0 {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		return q.offset, nil
+	}
+	frame := walBatchFrame{WALVersion: walBatchVersion, Events: events}
+	raw, err := json.Marshal(frame)
 	if err != nil {
 		return 0, err
 	}
+	if len(raw) > walMaxFrameBytes {
+		return 0, fmt.Errorf("ingest queue: WAL frame too large (%d bytes)", len(raw))
+	}
+	raw = append(raw, '\n')
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.stopped {
@@ -175,18 +248,18 @@ func (q *DiskQueue) Append(e Event) (int64, error) {
 		return q.offset, fmt.Errorf("ingest queue: degraded since earlier failure: %w", q.lastErr)
 	}
 	n, err := q.writer.Write(raw)
-	if err == nil {
-		err = q.writer.WriteByte('\n')
+	if err == nil && n != len(raw) {
+		err = io.ErrShortWrite
 	}
 	if err != nil {
-		// A partial line may sit in the bufio buffer; the offset only ever
+		// A partial frame may sit in the bufio buffer; the offset only ever
 		// advanced by fully-written bytes, and the torn-tail repair on next
 		// open truncates whatever did reach the file. Latch so no further
 		// record is appended behind a known-bad write.
 		q.offset += int64(n)
 		return q.offset, q.setErrLocked(fmt.Errorf("WAL append: %w", err))
 	}
-	q.offset += int64(n) + 1
+	q.offset += int64(n)
 	q.dirtySinceFlush = true
 	return q.offset, nil
 }
@@ -354,6 +427,13 @@ func syncDir(dir string) error {
 
 // Pending reads events appended after the last checkpoint and returns
 // them. Used at boot to replay unflushed events into the in-memory buffer.
+//
+// AUD-014 (round 2): a complete-but-corrupt record is a replay ERROR, not
+// a skip. The old log-and-continue let AttachQueue seed the high-water
+// mark to the WAL end, so the first successful flush checkpointed past
+// the unread record — converting a recoverable backlog into permanent
+// loss while the process looked healthy. Torn final lines are still
+// repaired at open (that is a crash artifact, not corruption).
 func (q *DiskQueue) Pending() ([]Event, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -363,29 +443,43 @@ func (q *DiskQueue) Pending() ([]Event, error) {
 	if q.checkpoint >= q.offset {
 		return nil, nil
 	}
+	// Appends land in a userspace bufio buffer; replay must see every
+	// logically-appended record, so push them to the file before scanning.
+	// (Crash-recovery still only promises what the fsync loop durable-wrote;
+	// this flush covers in-process replay, which Pending also serves.)
+	if err := q.writer.Flush(); err != nil {
+		return nil, fmt.Errorf("ingest queue: flushing buffered appends for replay (queue %s): %w", q.name, err)
+	}
 	if _, err := q.file.Seek(q.checkpoint, io.SeekStart); err != nil {
 		return nil, err
 	}
 	scanner := bufio.NewScanner(q.file)
-	scanner.Buffer(make([]byte, 1<<20), 1<<22)
+	scanner.Buffer(make([]byte, 1<<20), walMaxFrameBytes+1<<20)
 	var out []Event
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
 		}
-		var e Event
-		if err := json.Unmarshal(line, &e); err != nil {
-			q.logger.Warn("ingest queue: skipping corrupt record", "err", err, "queue", q.name)
-			continue
+		events, err := decodeWALLine(line)
+		if err != nil {
+			return nil, fmt.Errorf("ingest queue: WAL corruption — refusing to skip a complete record (queue %s): %w", q.name, err)
 		}
-		out = append(out, e)
+		for _, e := range events {
+			if e.EventID == "" || e.SiteID == "" {
+				return nil, fmt.Errorf("ingest queue: WAL record is missing its event/site identity (queue %s)", q.name)
+			}
+			out = append(out, e)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("ingest queue: reading WAL (queue %s): %w", q.name, err)
 	}
 	// Rewind file handle to end so subsequent Appends stay in append mode.
 	if _, err := q.file.Seek(0, io.SeekEnd); err != nil {
-		return out, err
+		return nil, err
 	}
-	return out, scanner.Err()
+	return out, nil
 }
 
 // Close stops the fsync goroutine and fsyncs any buffered writes.
@@ -445,7 +539,7 @@ func (q *DiskQueue) fsyncLoop() {
 // torn record: without this repair the next append continues the partial
 // line and the two records merge into one unparseable JSON line, losing
 // BOTH on replay. A newline-terminated tail is left alone; corrupt but
-// complete lines are already skipped at replay.
+// complete lines fail replay loudly (see Pending).
 func repairTornTail(f *os.File, size int64, logger *slog.Logger, name string) (int64, error) {
 	if size == 0 {
 		return 0, nil
@@ -490,6 +584,23 @@ func repairTornTail(f *os.File, size int64, logger *slog.Logger, name string) (i
 	logger.Warn("ingest queue: truncated torn tail from crashed append",
 		"queue", name, "droppedBytes", size)
 	return 0, nil
+}
+
+// validateCheckpointBoundary verifies that a nonzero checkpoint offset
+// lands immediately after a newline — i.e. on a WAL record boundary
+// (AUD-014, round 2).
+func validateCheckpointBoundary(f *os.File, checkpoint int64) error {
+	if checkpoint <= 0 {
+		return nil
+	}
+	var prev [1]byte
+	if _, err := f.ReadAt(prev[:], checkpoint-1); err != nil {
+		return fmt.Errorf("checkpoint boundary read: %w", err)
+	}
+	if prev[0] != '\n' {
+		return fmt.Errorf("checkpoint %d is not at a WAL record boundary (corrupt or foreign checkpoint file)", checkpoint)
+	}
+	return nil
 }
 
 func readCheckpoint(path string) (int64, error) {

@@ -445,3 +445,115 @@ func equal(a, b []string) bool {
 	}
 	return true
 }
+
+// AUD-010 (round 2): a whole batch is one WAL frame — a corrupt record is
+// never a partially accepted batch prefix.
+func TestDiskQueue_AppendBatchIsAtomicUnit(t *testing.T) {
+	q := testQueue(t)
+	defer q.Close()
+
+	events := []Event{ev("b1"), ev("b2"), ev("b3")}
+	if _, err := q.AppendBatch(events); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	pending, err := q.Pending()
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if len(pending) != 3 || pending[0].EventID != "b1" || pending[2].EventID != "b3" {
+		t.Fatalf("batch frame must replay as its exact events, got %v", pending)
+	}
+}
+
+// Legacy one-event-per-line records (written by older binaries) still replay.
+func TestDiskQueue_PendingDecodesLegacyLines(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := os.MkdirAll(filepath.Join(dir, "events"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"event_id":"L1","site_id":"s1","timestamp":1}` + "\n" +
+		`{"event_id":"L2","site_id":"s1","timestamp":2}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "events", "current.log"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	q, err := NewDiskQueue(dir, "events", time.Hour, 1<<30, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	pending, err := q.Pending()
+	if err != nil {
+		t.Fatalf("legacy replay: %v", err)
+	}
+	if len(pending) != 2 || pending[0].EventID != "L1" {
+		t.Fatalf("legacy lines must replay, got %v", pending)
+	}
+}
+
+// AUD-014 (round 2): a complete-but-corrupt record must fail replay, not be
+// skipped and later checkpointed away.
+func TestDiskQueue_CorruptCompleteRecordFailsReplay(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := os.MkdirAll(filepath.Join(dir, "events"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bad := `{"event_id":"ok1","site_id":"s1","timestamp":1}` + "\n" +
+		`{"event_id":` + "\n" + // complete line, invalid JSON
+		`{"event_id":"ok2","site_id":"s1","timestamp":2}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "events", "current.log"), []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	q, err := NewDiskQueue(dir, "events", time.Hour, 1<<30, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if _, err := q.Pending(); err == nil {
+		t.Fatal("corrupt complete record must fail replay, not skip")
+	}
+}
+
+// AUD-014: a syntactically valid record without event/site identity fails.
+func TestDiskQueue_IdentitylessRecordFailsReplay(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := os.MkdirAll(filepath.Join(dir, "events"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bad := `{"event_id":"ok1","site_id":"s1","timestamp":1}` + "\n" +
+		`{"timestamp":2}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "events", "current.log"), []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	q, err := NewDiskQueue(dir, "events", time.Hour, 1<<30, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if _, err := q.Pending(); err == nil {
+		t.Fatal("identity-less record must fail replay")
+	}
+}
+
+// AUD-014: an in-range checkpoint that is not on a record boundary is
+// refused at open — replay would otherwise seek mid-record and skip.
+func TestDiskQueue_MidRecordCheckpointRefusedAtOpen(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := os.MkdirAll(filepath.Join(dir, "events"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"event_id":"ok1","site_id":"s1","timestamp":1}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "events", "current.log"), []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Offset 5 is inside the first record.
+	if err := os.WriteFile(filepath.Join(dir, "events", "checkpoint"), []byte("5"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewDiskQueue(dir, "events", time.Hour, 1<<30, logger); err == nil {
+		t.Fatal("mid-record checkpoint must be refused at open")
+	}
+}

@@ -6,6 +6,9 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,7 +90,7 @@ func TestBuffer_FlushFailureRequeueKeepsAllUnderPressure(t *testing.T) {
 		buf.events = append(buf.events, ev(id))
 	}
 
-	buf.requeueFailed([]Event{ev("e1"), ev("e2"), ev("e3")})
+	buf.requeueFailed([]Event{ev("e1"), ev("e2"), ev("e3")}, 0, 0)
 
 	if got := buf.Len(); got != 7 {
 		t.Fatalf("all failed-batch events must survive under pressure: %d of 7", got)
@@ -253,5 +256,62 @@ func TestAttachQueueFailsLeavesQueueUnattached(t *testing.T) {
 	buf.mu.Unlock()
 	if attached != nil {
 		t.Fatal("a failed AttachQueue must not leave the queue installed")
+	}
+}
+
+// AUD-010 (round 2): concurrent batches against a tight capacity — exactly
+// one whole batch may be admitted, never an accepted prefix from the loser.
+func TestBuffer_PushBatchAtomicUnderConcurrency(t *testing.T) {
+	buf := NewBuffer(nil, 10, 100, time.Hour, nil)
+	var wg sync.WaitGroup
+	var successes atomic.Int32
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			batch := make([]Event, 6)
+			for j := range batch {
+				batch[j] = ev(fmt.Sprintf("g%d", j))
+			}
+			if buf.PushBatch(batch) {
+				successes.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := successes.Load(); got != 1 {
+		t.Fatalf("with capacity 10 and 8 racing batches of 6, exactly one must win, got %d", got)
+	}
+	if got := buf.Len(); got != 6 {
+		t.Fatalf("winner's whole batch must be admitted atomically, len = %d", got)
+	}
+}
+
+// AUD-016 (round 2): post-stop admission is refused; a never-started
+// buffer still flushes on Stop.
+func TestBuffer_RejectsAdmissionAfterStop(t *testing.T) {
+	buf := NewBuffer(nil, 10, 100, time.Hour, nil)
+	buf.Start()
+	buf.Stop()
+	if buf.Push(ev("late")) {
+		t.Fatal("push after Stop must be refused")
+	}
+	if batch := []Event{ev("a"), ev("b")}; buf.PushBatch(batch) {
+		t.Fatal("pushBatch after Stop must be refused")
+	}
+}
+
+// AUD-015 (round 2): the serialized-byte budget refuses admission even
+// when the count cap has headroom.
+func TestBuffer_ByteBudgetRefusesOversizedAdmission(t *testing.T) {
+	buf := NewBuffer(nil, 100, 100, time.Hour, nil).WithMaxBufferedBytes(1024)
+	big := ev("big")
+	big.Title = strings.Repeat("x", 900)
+	if buf.Push(big) {
+		t.Fatal("event exceeding the byte budget must be refused")
+	}
+	small := ev("small")
+	if !buf.Push(small) {
+		t.Fatal("small event must be admitted")
 	}
 }

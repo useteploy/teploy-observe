@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"sort"
 	"time"
+	"unicode/utf8"
 
 	"github.com/neutron-dev/neutron-go/neutron"
 
@@ -114,6 +115,26 @@ type IngestResponse struct {
 	Rejected int `json:"rejected,omitempty"`
 }
 
+// maxStoredEventBytes caps the serialized size of one stored event
+// (AUD-015, round 2). The HTTP body cap bounds a single request, not the
+// aggregate of many individually legal large events.
+const maxStoredEventBytes = 64 << 10
+
+// truncateUTF8 shortens s to at most limit bytes without splitting a
+// multi-byte character (AUD-015).
+func truncateUTF8(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(s) <= limit {
+		return s
+	}
+	for limit > 0 && !utf8.RuneStart(s[limit]) {
+		limit--
+	}
+	return s[:limit]
+}
+
 // Handler returns the typed Neutron handler for event ingestion.
 //
 // `siteSvc` is used to look up per-site privacy config for hashing
@@ -121,170 +142,200 @@ type IngestResponse struct {
 // useful in tests.
 func Handler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.HandlerFunc[IngestInput, IngestResponse] {
 	return func(ctx context.Context, input IngestInput) (IngestResponse, error) {
-		now := time.Now().UTC()
-		ip := ClientIPFromContext(ctx)
-		ua := UserAgentFromContext(ctx)
-
-		// Drop bot traffic silently — return OK so bots don't retry
-		if IsBot(ua) {
+		e, err := prepareEvent(ctx, input, salt, siteSvc)
+		if err != nil {
+			return IngestResponse{}, err
+		}
+		if e == nil {
+			// Bot traffic: dropped silently with OK so bots don't retry.
 			return IngestResponse{OK: true}, nil
 		}
-
-		// Input validation
-		if len(input.URL) > 2048 {
-			return IngestResponse{}, neutron.ErrBadRequest("url too long (max 2048)")
-		}
-		if len(input.Title) > 512 {
-			input.Title = input.Title[:512]
-		}
-		if len(input.Referrer) > 2048 {
-			input.Referrer = input.Referrer[:2048]
-		}
-		if input.Properties != nil && len(input.Properties) > maxProperties {
-			return IngestResponse{}, neutron.ErrBadRequest("too many properties (max 50)")
-		}
-
-		// Site scoping: when the request is authenticated by an API key, that
-		// key's site (bound into the context by APIKeyAuthMiddleware) is
-		// AUTHORITATIVE. A body site_id that disagrees is a cross-tenant write
-		// attempt and is rejected — otherwise a holder of any one valid key
-		// could forge/poison events under any other site. Only fall back to the
-		// body site_id when there is no key-bound context site (the no-keys
-		// grace period on a fresh/single-tenant install).
-		ctxSite := SiteIDFromContext(ctx)
-		siteID := ctxSite
-		if ctxSite != "" {
-			if input.SiteID != "" && input.SiteID != ctxSite {
-				return IngestResponse{}, neutron.ErrForbidden("site_id does not match API key")
-			}
-		} else {
-			siteID = input.SiteID
-		}
-		if siteID == "" {
-			return IngestResponse{}, neutron.ErrBadRequest("missing site_id")
-		}
-
-		sessionID := session.ID(siteID, ip, ua, salt)
-		visitID := session.VisitID(sessionID, now)
-		eventID := generateID()
-		parsed := ParseUA(ua)
-		country := geo.Lookup(ip)
-
-		// Hash the user-supplied distinct_id (if any) with the per-site
-		// session_salt — falls back to the global salt if the site is
-		// unknown or the SiteService isn't wired (tests).
-		distinctID := ""
-		if input.DistinctID != "" {
-			privSalt := salt
-			rawOptIn := false
-			if siteSvc != nil {
-				if s, raw, ok := siteSvc.PrivacyConfig(ctx, siteID); ok {
-					privSalt = s
-					rawOptIn = raw
-				}
-			}
-			distinctID = identity.MaybeHashDistinctID(input.DistinctID, privSalt, rawOptIn)
-		}
-
-		eventType := input.EventType
-		if eventType == "" {
-			eventType = "pageview"
-		}
-
-		var hostname, pathname string
-		if input.URL != "" {
-			if u, err := url.Parse(input.URL); err == nil {
-				hostname = u.Hostname()
-				pathname = u.Path
-			}
-		}
-
-		// Clean referrer: strip query params, keep scheme+host+path
-		referrer := cleanReferrer(input.Referrer, hostname)
-
-		var sw, sh int
-		if input.Screen != "" {
-			// Require both fields to parse and clamp to a sane range so
-			// negative/oversized/partial ("1920x0") garbage never reaches the
-			// INTEGER columns or the rollups.
-			if n, _ := fmt.Sscanf(input.Screen, "%dx%d", &sw, &sh); n != 2 ||
-				sw <= 0 || sw > 65535 || sh <= 0 || sh > 65535 {
-				sw, sh = 0, 0
-			}
-		}
-
-		// Extract UTM params from URL
-		var utmSource, utmMedium, utmCampaign, utmTerm, utmContent string
-		if input.URL != "" {
-			if u, err := url.Parse(input.URL); err == nil {
-				q := u.Query()
-				utmSource = q.Get("utm_source")
-				utmMedium = q.Get("utm_medium")
-				utmCampaign = q.Get("utm_campaign")
-				utmTerm = q.Get("utm_term")
-				utmContent = q.Get("utm_content")
-			}
-		}
-
-		e := Event{
-			EventID:        eventID,
-			TenantID:       "default",
-			SiteID:         siteID,
-			SessionID:      sessionID,
-			VisitID:        visitID,
-			EventType:      eventType,
-			Timestamp:      now.UnixMilli(),
-			URL:            input.URL,
-			Referrer:       referrer,
-			Title:          input.Title,
-			Hostname:       hostname,
-			Pathname:       pathname,
-			Language:       input.Language,
-			Country:        country,
-			Browser:        parsed.Browser,
-			BrowserVersion: parsed.BrowserVersion,
-			OS:             parsed.OS,
-			OSVersion:      parsed.OSVersion,
-			Device:         parsed.Device,
-			ScreenWidth:    sw,
-			ScreenHeight:   sh,
-			UTMSource:      utmSource,
-			UTMMedium:      utmMedium,
-			UTMCampaign:    utmCampaign,
-			UTMTerm:        utmTerm,
-			UTMContent:     utmContent,
-			Properties:     input.Properties,
-			DistinctID:     distinctID,
-			ReleaseTag:     input.Release,
-		}
-
-		if !buf.Push(e) {
+		if !buf.Push(*e) {
 			return IngestResponse{}, neutron.ErrRateLimited("buffer full, try again later")
 		}
-
 		return IngestResponse{OK: true}, nil
 	}
 }
 
+// prepareEvent validates and normalizes one input into a storage-ready
+// Event WITHOUT any admission side effect (AUD-010, round 2): BatchHandler
+// prepares every event first, then admits the survivors in ONE atomic
+// Buffer.PushBatch, so a mid-batch admission failure can never leave an
+// accepted prefix behind. A nil Event means "silently skip" (bot traffic).
+func prepareEvent(ctx context.Context, input IngestInput, salt string, siteSvc *sites.SiteService) (*Event, error) {
+	now := time.Now().UTC()
+	ip := ClientIPFromContext(ctx)
+	ua := UserAgentFromContext(ctx)
+
+	if IsBot(ua) {
+		return nil, nil
+	}
+
+	// Input validation
+	if len(input.URL) > 2048 {
+		return nil, neutron.ErrBadRequest("url too long (max 2048)")
+	}
+	input.Title = truncateUTF8(input.Title, 512)
+	input.Referrer = truncateUTF8(input.Referrer, 2048)
+	if input.Properties != nil && len(input.Properties) > maxProperties {
+		return nil, neutron.ErrBadRequest("too many properties (max 50)")
+	}
+	// AUD-015: reject unserializable properties at admission instead of
+	// letting propertiesJSON silently store "{}" — a silent data swap.
+	if raw, err := json.Marshal(input.Properties); err != nil || (input.Properties != nil && len(raw) > maxStoredEventBytes) {
+		return nil, neutron.ErrBadRequest("properties must be JSON-serializable and under 64 KiB")
+	}
+
+	// Site scoping: when the request is authenticated by an API key, that
+	// key's site (bound into the context by APIKeyAuthMiddleware) is
+	// AUTHORITATIVE. A body site_id that disagrees is a cross-tenant write
+	// attempt and is rejected — otherwise a holder of any one valid key
+	// could forge/poison events under any other site. The body site_id is
+	// only honored when no key-bound context site exists (direct/test
+	// callers; the middleware itself always requires a key — AUD-002).
+	ctxSite := SiteIDFromContext(ctx)
+	siteID := ctxSite
+	if ctxSite != "" {
+		if input.SiteID != "" && input.SiteID != ctxSite {
+			return nil, neutron.ErrForbidden("site_id does not match API key")
+		}
+	} else {
+		siteID = input.SiteID
+	}
+	if siteID == "" {
+		return nil, neutron.ErrBadRequest("missing site_id")
+	}
+
+	sessionID := session.ID(siteID, ip, ua, salt)
+	visitID := session.VisitID(sessionID, now)
+	eventID := generateID()
+	parsed := ParseUA(ua)
+	country := geo.Lookup(ip)
+
+	// Hash the user-supplied distinct_id (if any) with the per-site
+	// session_salt — falls back to the global salt if the site is
+	// unknown or the SiteService isn't wired (tests).
+	distinctID := ""
+	if input.DistinctID != "" {
+		privSalt := salt
+		rawOptIn := false
+		if siteSvc != nil {
+			if s, raw, ok := siteSvc.PrivacyConfig(ctx, siteID); ok {
+				privSalt = s
+				rawOptIn = raw
+			}
+		}
+		distinctID = identity.MaybeHashDistinctID(input.DistinctID, privSalt, rawOptIn)
+	}
+
+	eventType := input.EventType
+	if eventType == "" {
+		eventType = "pageview"
+	}
+
+	var hostname, pathname string
+	if input.URL != "" {
+		if u, err := url.Parse(input.URL); err == nil {
+			hostname = u.Hostname()
+			pathname = u.Path
+		}
+	}
+
+	// Clean referrer: strip userinfo, query params, and fragments
+	referrer := cleanReferrer(input.Referrer, hostname)
+
+	var sw, sh int
+	if input.Screen != "" {
+		// Require both fields to parse and clamp to a sane range so
+		// negative/oversized/partial ("1920x0") garbage never reaches the
+		// INTEGER columns or the rollups.
+		if n, _ := fmt.Sscanf(input.Screen, "%dx%d", &sw, &sh); n != 2 ||
+			sw <= 0 || sw > 65535 || sh <= 0 || sh > 65535 {
+			sw, sh = 0, 0
+		}
+	}
+
+	// Extract UTM params from URL
+	var utmSource, utmMedium, utmCampaign, utmTerm, utmContent string
+	if input.URL != "" {
+		if u, err := url.Parse(input.URL); err == nil {
+			q := u.Query()
+			utmSource = q.Get("utm_source")
+			utmMedium = q.Get("utm_medium")
+			utmCampaign = q.Get("utm_campaign")
+			utmTerm = q.Get("utm_term")
+			utmContent = q.Get("utm_content")
+		}
+	}
+
+	e := &Event{
+		EventID:        eventID,
+		TenantID:       "default",
+		SiteID:         siteID,
+		SessionID:      sessionID,
+		VisitID:        visitID,
+		EventType:      eventType,
+		Timestamp:      now.UnixMilli(),
+		URL:            input.URL,
+		Referrer:       referrer,
+		Title:          input.Title,
+		Hostname:       hostname,
+		Pathname:       pathname,
+		Language:       input.Language,
+		Country:        country,
+		Browser:        parsed.Browser,
+		BrowserVersion: parsed.BrowserVersion,
+		OS:             parsed.OS,
+		OSVersion:      parsed.OSVersion,
+		Device:         parsed.Device,
+		ScreenWidth:    sw,
+		ScreenHeight:   sh,
+		UTMSource:      utmSource,
+		UTMMedium:      utmMedium,
+		UTMCampaign:    utmCampaign,
+		UTMTerm:        utmTerm,
+		UTMContent:     utmContent,
+		Properties:     input.Properties,
+		DistinctID:     distinctID,
+		ReleaseTag:     input.Release,
+	}
+
+	// AUD-015: one final whole-event size gate so every admitted record is
+	// bounded, whatever combination of fields got it here.
+	if raw, err := json.Marshal(e); err != nil || len(raw) > maxStoredEventBytes {
+		return nil, neutron.ErrBadRequest("event too large after normalization (max 64 KiB)")
+	}
+	return e, nil
+}
+
 // cleanReferrer normalizes a referrer URL:
-//   - Strips query parameters and fragments
+//   - Strips user info, query parameters, and fragments
 //   - Returns empty string for self-referrals (same hostname)
 //   - Returns just scheme+host+path
+//
+// AUD-030 containment (round 2): a referrer that cannot be parsed is
+// dropped (fail closed) rather than stored verbatim — malformed URLs are
+// exactly where userinfo-style material hides — and URL user info is
+// stripped even on a successful parse. The full URL-capture policy
+// (top-level url field, replay payloads) stays deferred with F41.
 func cleanReferrer(raw, selfHost string) string {
 	if raw == "" {
 		return ""
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return raw
+		return ""
 	}
 	// Drop self-referrals
 	if selfHost != "" && u.Hostname() == selfHost {
 		return ""
 	}
-	// Strip query and fragment
+	// Strip userinfo, query, and fragment
+	u.User = nil
 	u.RawQuery = ""
 	u.Fragment = ""
+	u.RawFragment = ""
+	u.ForceQuery = false
 	// Remove trailing slash for consistency
 	result := u.String()
 	if len(result) > 1 && result[len(result)-1] == '/' {
@@ -302,7 +353,6 @@ type BatchInput struct {
 // This is the preferred ingestion path — the tracker sends all queued
 // events as one POST instead of one request per event.
 func BatchHandler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.HandlerFunc[BatchInput, IngestResponse] {
-	singleHandler := Handler(buf, salt, siteSvc)
 	return func(ctx context.Context, input BatchInput) (IngestResponse, error) {
 		if len(input.Events) > 100 {
 			return IngestResponse{}, neutron.ErrBadRequest("batch too large (max 100 events)")
@@ -310,25 +360,22 @@ func BatchHandler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.
 		if len(input.Events) == 0 {
 			return IngestResponse{OK: true}, nil
 		}
-		// Audit F12: reserve capacity for the WHOLE batch before processing
-		// any entry. The only mid-batch admission failure is backpressure
-		// (per-event errors after this point are pure validation, counted as
-		// rejected); admitting a prefix and then refusing the tail made a
-		// client retry duplicate the already-accepted prefix. All-or-nothing
-		// admission removes that mixed state.
-		if avail := buf.Avail(); len(input.Events) > avail {
-			return IngestResponse{}, neutron.ErrRateLimited(
-				fmt.Sprintf("buffer capacity %d below batch size %d, retry the whole batch later", avail, len(input.Events)))
-		}
+		// AUD-010 (round 2): prepare EVERY event side-effect-free first,
+		// then admit the survivors in one atomic Buffer.PushBatch under the
+		// buffer lock. The old Avail-snapshot + per-event Push loop let two
+		// requests interleave, accept a prefix, and refuse the tail — a 429
+		// that concealed already-admitted events, duplicating them on retry.
+		prepared := make([]Event, 0, len(input.Events))
 		accepted, rejected := 0, 0
 		for _, ev := range input.Events {
-			if _, err := singleHandler(ctx, ev); err != nil {
+			e, err := prepareEvent(ctx, ev, salt, siteSvc)
+			if err != nil {
 				// A permanent per-event client error (4xx, e.g. a malformed
 				// event) must not fail the whole batch — that previously left
 				// earlier events ingested and made the client retry the lot,
-				// duplicating them. Skip the bad event and count it. Transient
-				// errors (429 buffer-full / 5xx) still abort so the client
-				// retries the remainder.
+				// duplicating them. Skip the bad event and count it. The
+				// only remaining transient failure after preparation is the
+				// single atomic admission below.
 				var appErr *neutron.AppError
 				if errors.As(err, &appErr) && appErr.Status >= 400 && appErr.Status < 500 && appErr.Status != http.StatusTooManyRequests {
 					rejected++
@@ -336,8 +383,19 @@ func BatchHandler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.
 				}
 				return IngestResponse{}, err
 			}
-			accepted++
+			if e == nil {
+				// Bot traffic: silently skipped, reported accepted so bots
+				// don't retry.
+				accepted++
+				continue
+			}
+			prepared = append(prepared, *e)
 		}
+		if !buf.PushBatch(prepared) {
+			return IngestResponse{}, neutron.ErrRateLimited(
+				fmt.Sprintf("buffer capacity below batch size %d, retry the whole batch later", len(prepared)))
+		}
+		accepted += len(prepared)
 		return IngestResponse{OK: true, Accepted: accepted, Rejected: rejected}, nil
 	}
 }

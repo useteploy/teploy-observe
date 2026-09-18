@@ -5,8 +5,10 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/neutron-dev/neutron-go/neutron"
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -59,5 +61,52 @@ func TestHandler_RejectsCrossTenantSiteID(t *testing.T) {
 	if _, err := h(siteCtx("siteA"),
 		IngestInput{SiteID: "", EventType: "pageview", URL: "https://x/p"}); err != nil {
 		t.Fatalf("empty body site_id under a key should inherit the key site: %v", err)
+	}
+}
+
+// AUD-030 containment (round 2): referrer sanitization strips userinfo and
+// fails closed on malformed input instead of storing it verbatim.
+func TestCleanReferrer_FailClosedAndStripsUserinfo(t *testing.T) {
+	if got := cleanReferrer("https://user:secret@external.example/path?q=1#f", "self.example"); got != "https://external.example/path" {
+		t.Fatalf("userinfo/query/fragment must be stripped, got %q", got)
+	}
+	if got := cleanReferrer("http://[::1:not-a-url", ""); got != "" {
+		t.Fatalf("malformed referrer must be dropped (fail closed), got %q", got)
+	}
+	if got := cleanReferrer("%zz://broken", ""); got != "" {
+		t.Fatalf("unparseable referrer must be dropped, got %q", got)
+	}
+	if got := cleanReferrer("https://self.example/page", "self.example"); got != "" {
+		t.Fatalf("self-referral must be dropped, got %q", got)
+	}
+}
+
+// AUD-015 (round 2): truncation never splits a multi-byte character.
+func TestTruncateUTF8_NeverSplitsRunes(t *testing.T) {
+	s := "日本語テキスト"
+	for limit := 1; limit <= len(s); limit++ {
+		got := truncateUTF8(s, limit)
+		if !utf8.ValidString(got) {
+			t.Fatalf("limit %d produced invalid UTF-8: %q", limit, got)
+		}
+	}
+	if got := truncateUTF8("short", 100); got != "short" {
+		t.Fatalf("under-limit string must pass through, got %q", got)
+	}
+}
+
+// AUD-015: unserializable properties are rejected at admission rather
+// than silently stored as {}.
+func TestPrepareEvent_RejectsUnserializableProperties(t *testing.T) {
+	_, err := prepareEvent(context.Background(), IngestInput{
+		SiteID:     "s1",
+		Properties: map[string]any{"chan": make(chan int)},
+	}, "salt", nil)
+	if err == nil {
+		t.Fatal("unserializable properties must be rejected")
+	}
+	var appErr *neutron.AppError
+	if !errors.As(err, &appErr) || appErr.Status != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %v", err)
 	}
 }
