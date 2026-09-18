@@ -150,8 +150,15 @@ func TestRestore_RejectsManifestOnlyArchive(t *testing.T) {
 // TestRestore_RejectsRowCountMismatch: a completion record claiming rows the
 // archive does not hold (reassembled or edited archive) is rejected.
 func TestRestore_RejectsRowCountMismatch(t *testing.T) {
+	manifest := func(t *testing.T) []byte {
+		raw, err := json.Marshal(Manifest{Version: manifestVersion, CreatedAt: time.Now(), Tables: []string{"sites"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}(t)
 	archive := writeTarArchive(t, map[string][]byte{
-		manifestName:  validManifest(t),
+		manifestName:  manifest,
 		"sites.jsonl": []byte(`{"site_id": "a"}` + "\n"),
 		resultsName:   validResults(t, []TableResult{{Table: "sites", Rows: 7, OK: true}}),
 	})
@@ -164,8 +171,15 @@ func TestRestore_RejectsRowCountMismatch(t *testing.T) {
 // TestRestore_RejectsMissingTableWithClaimedRows: the completion record says
 // a table was dumped with rows, but the archive lacks the entry.
 func TestRestore_RejectsMissingTableWithClaimedRows(t *testing.T) {
+	manifest := func(t *testing.T) []byte {
+		raw, err := json.Marshal(Manifest{Version: manifestVersion, CreatedAt: time.Now(), Tables: []string{"sites"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}(t)
 	archive := writeTarArchive(t, map[string][]byte{
-		manifestName: validManifest(t),
+		manifestName: manifest,
 		resultsName:  validResults(t, []TableResult{{Table: "sites", Rows: 3, OK: true}}),
 	})
 	err := Restore(context.Background(), nil, bytes.NewReader(archive))
@@ -221,5 +235,98 @@ func TestRestore_RejectsUndeclaredTable(t *testing.T) {
 	err := Restore(context.Background(), nil, bytes.NewReader(archive))
 	if err == nil || !strings.Contains(err.Error(), "does not declare") {
 		t.Fatalf("expected undeclared-table rejection, got %v", err)
+	}
+}
+
+func miniManifest(t *testing.T, tables ...string) []byte {
+	t.Helper()
+	raw, err := json.Marshal(Manifest{Version: manifestVersion, CreatedAt: time.Now(), Tables: tables})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// AUD-040 (round 2): a manifest declaring sites and admin_users with only
+// sites' data/results used to pass validation — the declared-to-result
+// direction was missing, so the omitted table restored as a silent no-op.
+func TestRestore_RejectsDeclaredTableWithoutResult(t *testing.T) {
+	archive := writeTarArchive(t, map[string][]byte{
+		manifestName:  miniManifest(t, "sites", "admin_users"),
+		"sites.jsonl": []byte(`{"site_id": "a"}` + "\n"),
+		resultsName:   validResults(t, []TableResult{{Table: "sites", Rows: 1, OK: true}}),
+	})
+	err := Restore(context.Background(), nil, bytes.NewReader(archive))
+	if err == nil || !strings.Contains(err.Error(), "admin_users") {
+		t.Fatalf("expected declared-table-without-result rejection naming admin_users, got %v", err)
+	}
+}
+
+// AUD-040: a result for a table the manifest does not declare is a
+// reassembled/edited archive.
+func TestRestore_RejectsUndeclaredResult(t *testing.T) {
+	archive := writeTarArchive(t, map[string][]byte{
+		manifestName:  miniManifest(t, "sites"),
+		"sites.jsonl": []byte(`{"site_id": "a"}` + "\n"),
+		resultsName: validResults(t, []TableResult{
+			{Table: "sites", Rows: 1, OK: true},
+			{Table: "admin_users", Rows: 0, OK: true},
+		}),
+	})
+	err := Restore(context.Background(), nil, bytes.NewReader(archive))
+	if err == nil || !strings.Contains(err.Error(), "does not declare") {
+		t.Fatalf("expected undeclared-result rejection, got %v", err)
+	}
+}
+
+// AUD-040: negative row counts are corruption, not data.
+func TestRestore_RejectsNegativeRowCount(t *testing.T) {
+	archive := writeTarArchive(t, map[string][]byte{
+		manifestName:  miniManifest(t, "sites"),
+		"sites.jsonl": []byte(`{"site_id": "a"}` + "\n"),
+		resultsName:   validResults(t, []TableResult{{Table: "sites", Rows: -3, OK: true}}),
+	})
+	err := Restore(context.Background(), nil, bytes.NewReader(archive))
+	if err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("expected negative-count rejection, got %v", err)
+	}
+}
+
+// AUD-041 (round 2): null, empty objects, and trailing documents are
+// rejected in preflight — they used to decode successfully and fail only
+// mid-apply, after earlier tables had committed.
+func TestRestore_RejectsMalformedRowShapes(t *testing.T) {
+	for name, line := range map[string]string{
+		"null row":        "null\n",
+		"empty object":    "{}\n",
+		"trailing doc":    `{"site_id":"a"} {"site_id":"b"}` + "\n",
+		"array row":       `[1,2]` + "\n",
+		"unsafe column":   `{"site_id\":\"a\",\"x-y\":1}` + "\n",
+	} {
+		archive := writeTarArchive(t, map[string][]byte{
+			manifestName:  miniManifest(t, "sites"),
+			"sites.jsonl": []byte(line),
+			resultsName:   validResults(t, []TableResult{{Table: "sites", Rows: 1, OK: true}}),
+		})
+		err := Restore(context.Background(), nil, bytes.NewReader(archive))
+		if err == nil {
+			t.Fatalf("%s must be rejected in preflight", name)
+		}
+	}
+}
+
+// AUD-041: numeric lexemes survive decode exactly (float64 used to round
+// BIGINT-scale literals).
+func TestDecodeRestoreRow_PreservesBigNumbers(t *testing.T) {
+	row, err := decodeRestoreRow([]byte(`{"n": 9007199254740993, "s": "x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, ok := row["n"].(json.Number)
+	if !ok || n.String() != "9007199254740993" {
+		t.Fatalf("big integer must round-trip exactly, got %#v", row["n"])
+	}
+	if got := formatValue(row["n"], false); got != "9007199254740993" {
+		t.Fatalf("formatValue must emit the exact lexeme, got %#v", got)
 	}
 }

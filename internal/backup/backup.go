@@ -315,8 +315,11 @@ func dumpTable(ctx context.Context, db *nucleus.Client, tw *tar.Writer, table st
 		return 0, fmt.Errorf("stat temp file: %w", err)
 	}
 	hdr := &tar.Header{
-		Name:    table + ".jsonl",
-		Mode:    0644,
+		Name: table + ".jsonl",
+		// AUD-045 (round 2): SQL exports carry password hashes and other
+		// sensitive records; an ordinary extraction must not leave them
+		// group/world-readable.
+		Mode:    0o600,
 		Size:    info.Size(),
 		ModTime: time.Now(),
 	}
@@ -335,7 +338,7 @@ func dumpTable(ctx context.Context, db *nucleus.Client, tw *tar.Writer, table st
 func writeEntry(tw *tar.Writer, name string, data []byte) error {
 	hdr := &tar.Header{
 		Name:    name,
-		Mode:    0644,
+		Mode:    0o600, // AUD-045: manifest/results are metadata, same posture
 		Size:    int64(len(data)),
 		ModTime: time.Now(),
 	}

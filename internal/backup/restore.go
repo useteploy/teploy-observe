@@ -3,8 +3,10 @@ package backup
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -85,7 +87,38 @@ func RestoreWithKey(ctx context.Context, db *nucleus.Client, r io.Reader, key []
 	if err := validateArchive(spoolPath); err != nil {
 		return fmt.Errorf("archive rejected — nothing was written to the database: %w", err)
 	}
+	// AUD-044 (round 2): restore APPENDS. Applied over a populated target it
+	// mixes old and new state and duplicates append-only data, and a rerun
+	// after a partial apply doubles everything again. Refuse any nonempty
+	// restore table up front — restore into a fresh/isolated database (the
+	// documented safe procedure), verify, then cut over.
+	if err := requireEmptyRestoreTarget(ctx, db); err != nil {
+		return fmt.Errorf("restore target is not empty — nothing was written: %w", err)
+	}
 	return applyArchive(ctx, db, spoolPath)
+}
+
+// requireEmptyRestoreTarget fails when any restorable table already holds
+// rows (AUD-044). A count check races concurrent writers; restore is an
+// offline operation run against a quiesced instance, which the emptiness
+// requirement now makes explicit rather than accidental.
+func requireEmptyRestoreTarget(ctx context.Context, db *nucleus.Client) error {
+	for _, table := range Tables {
+		rows, err := nucleus.Query[struct {
+			N int64 `db:"n"`
+		}](ctx, db.SQL(), "SELECT COUNT(*) AS n FROM "+table)
+		if err != nil {
+			// A table the migrations do not create here cannot hold data.
+			if strings.Contains(err.Error(), "does not exist") || strings.Contains(err.Error(), "unknown table") {
+				continue
+			}
+			return fmt.Errorf("inspect target %s: %w", table, err)
+		}
+		if len(rows) > 0 && rows[0].N > 0 {
+			return fmt.Errorf("table %s holds %d rows — restore appends and must run against an empty (isolated) target", table, rows[0].N)
+		}
+	}
+	return nil
 }
 
 // spoolToTemp copies r to a local temp file so the archive can be read twice
@@ -198,17 +231,42 @@ func validateArchive(path string) error {
 	var failed []string
 	byTable := make(map[string]TableResult, len(results))
 	for _, r := range results {
-		if !r.OK {
-			failed = append(failed, r.Table)
-			continue
+		if !restorableTables[r.Table] {
+			return fmt.Errorf("completion record names unknown table %q", r.Table)
+		}
+		if !declared[r.Table] {
+			// AUD-040 (round 2): a result for a table the manifest does not
+			// declare means the archive was reassembled or edited.
+			return fmt.Errorf("completion record lists table %q which the manifest does not declare", r.Table)
+		}
+		if r.Rows < 0 {
+			return fmt.Errorf("completion record for %q has a negative row count (%d)", r.Table, r.Rows)
 		}
 		if _, dup := byTable[r.Table]; dup {
 			return fmt.Errorf("completion record lists table %q twice", r.Table)
+		}
+		if !r.OK {
+			failed = append(failed, r.Table)
+			// A failed table has no usable entry — still record it so the
+			// declared-coverage check below sees the result and the failed
+			// list is reported instead of a confusing missing-result error.
+			byTable[r.Table] = r
+			continue
 		}
 		byTable[r.Table] = r
 	}
 	if len(failed) > 0 {
 		return fmt.Errorf("backup is partial — these tables failed to dump and are missing: %s", strings.Join(failed, ", "))
+	}
+
+	// AUD-040 (round 2): every manifest-declared table must carry a
+	// completion result — a manifest declaring sites and admin_users with
+	// only sites' data/results used to pass, silently leaving
+	// admin_users untouched while restore reported success.
+	for _, name := range manifest.Tables {
+		if _, ok := byTable[name]; !ok {
+			return fmt.Errorf("declared table %q has no completion result — the archive is incomplete", name)
+		}
 	}
 
 	// Observed tables must be declared, and row counts must reconcile with
@@ -253,17 +311,39 @@ func validateTableRows(r io.Reader) (int64, error) {
 			continue
 		}
 		n++
-		var row map[string]any
-		if err := json.Unmarshal(line, &row); err != nil {
+		if _, err := decodeRestoreRow(line); err != nil {
 			return n, fmt.Errorf("decode row: %w", err)
-		}
-		for k := range row {
-			if !validIdent.MatchString(k) {
-				return n, fmt.Errorf("row has unsafe column name %q", k)
-			}
 		}
 	}
 	return n, scanner.Err()
+}
+
+// decodeRestoreRow decodes one restore line with the STRICT decoder shared
+// by the validation and apply passes (AUD-041, round 2): json.Number keeps
+// numeric lexemes exact (float64 decoding silently rounded BIGINT-scale
+// literals), trailing JSON is rejected, and null/empty/non-object rows are
+// rejected instead of surfacing as mid-apply failures after earlier tables
+// have already committed.
+func decodeRestoreRow(line []byte) (map[string]any, error) {
+	dec := json.NewDecoder(bytes.NewReader(line))
+	dec.UseNumber()
+	var row map[string]any
+	if err := dec.Decode(&row); err != nil {
+		return nil, err
+	}
+	if len(row) == 0 {
+		return nil, errors.New("restore row must be a nonempty object (null and {} are not rows)")
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, errors.New("trailing JSON after restore row")
+	}
+	for k := range row {
+		if !validIdent.MatchString(k) {
+			return nil, fmt.Errorf("row has unsafe column name %q", k)
+		}
+	}
+	return row, nil
 }
 
 // applyArchive re-reads the already-validated spooled archive and performs
@@ -337,8 +417,8 @@ func restoreTable(ctx context.Context, db *nucleus.Client, r io.Reader, table st
 		if len(line) == 0 {
 			continue
 		}
-		var row map[string]any
-		if err := json.Unmarshal(line, &row); err != nil {
+		row, err := decodeRestoreRow(line)
+		if err != nil {
 			// Already checked in the validation pass — the spool file is a
 			// local temp file this process owns exclusively for the duration
 			// of Restore, so this should be unreachable. Fail loudly rather
@@ -427,12 +507,16 @@ func insertRow(ctx context.Context, sqlc *nucleus.SQLModel, table string, row ma
 }
 
 func formatValue(v any, isJSONB bool) any {
-	// Nucleus's pgwire wants text for BIGINT/JSONB columns. json.Unmarshal
-	// gives us string|float64|bool|map|slice|nil — map/slice need JSON text.
+	// Nucleus's pgwire wants text for BIGINT/JSONB columns. decodeRestoreRow
+	// (UseNumber) gives us string|json.Number|bool|map|slice|nil — map/slice
+	// need JSON text, and json.Number passes through as its exact lexeme
+	// (AUD-041: float64 decoding used to round BIGINT-scale literals).
 	switch val := v.(type) {
 	case map[string]any, []any:
 		raw, _ := json.Marshal(val)
 		return string(raw)
+	case json.Number:
+		return val.String()
 	case string:
 		// Lenient-era archives carry '' for JSONB columns; strict engines
 		// reject it. Restore as NULL (the modern write path's equivalent).
