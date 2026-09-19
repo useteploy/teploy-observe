@@ -150,6 +150,22 @@ type Manifest struct {
 	// archives from engines predating the lease, whose dumps are
 	// independent per-table reads — the downgrade is stated, not hidden.
 	Lease *LeaseInfo `json:"lease,omitempty"`
+	// AuditKey records the NON-SECRET availability state of the local
+	// audit signing key at dump time (TO-045): the key itself lives on
+	// the observe host (data/audit.key) and is deliberately NOT part of
+	// the archive — an operator restoring only this archive onto a fresh
+	// machine must also restore that file (or its OBSERVE_AUDIT_KEYRING
+	// entry) or keyed audit history stops verifying. This field makes
+	// that external dependency explicit per archive instead of implicit.
+	AuditKey *AuditKeyInfo `json:"audit_key,omitempty"`
+}
+
+// AuditKeyInfo is the non-secret audit-key fingerprint recorded in the
+// manifest (TO-045). KeyID is the signer's public id (8 hex chars); Status
+// names how the key was resolved. No key material ever appears here.
+type AuditKeyInfo struct {
+	Status string `json:"status"`
+	KeyID  string `json:"key_id,omitempty"`
 }
 
 // TableResult records the outcome of dumping one table, written to a trailing
@@ -184,21 +200,27 @@ func DumpWithLog(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io
 // (see LoadBackupEncryptionKey), the tar stream is wrapped in AES-256-GCM
 // chunked encryption — see crypto.go.
 func DumpWithKey(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io.Writer, key []byte) error {
+	return DumpWithOptions(ctx, db, w, errLog, key, nil)
+}
+
+// DumpWithOptions is DumpWithKey plus the non-secret audit-key
+// availability fingerprint for the manifest (TO-045).
+func DumpWithOptions(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io.Writer, key []byte, auditKey *AuditKeyInfo) error {
 	if key != nil {
 		ew, err := newEncryptWriter(w, key)
 		if err != nil {
 			return fmt.Errorf("setting up backup encryption: %w", err)
 		}
-		if err := dumpTar(ctx, db, ew, errLog); err != nil {
+		if err := dumpTar(ctx, db, ew, errLog, auditKey); err != nil {
 			_ = ew.Close()
 			return err
 		}
 		return ew.Close()
 	}
-	return dumpTar(ctx, db, w, errLog)
+	return dumpTar(ctx, db, w, errLog, auditKey)
 }
 
-func dumpTar(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io.Writer) (retErr error) {
+func dumpTar(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io.Writer, auditKey *AuditKeyInfo) (retErr error) {
 	tw := tar.NewWriter(w)
 	// Audit F43: a tar writer buffers the final padding blocks for Close.
 	// The deferred Close's error was dropped, so a broken pipe or full
@@ -242,6 +264,7 @@ func dumpTar(ctx context.Context, db *nucleus.Client, w io.Writer, errLog io.Wri
 		Tables:     Tables,
 		KVSections: []string{kvSrcmapSection},
 		Lease:      &leaseInfo,
+		AuditKey:   auditKey,
 	}
 	raw, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {

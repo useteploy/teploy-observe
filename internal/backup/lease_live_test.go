@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,22 @@ import (
 
 	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
+
+// requireLeaseOrSkip (TO-047): lease-specific live tests SKIP on engines
+// predating the snapshot lease — unless this run explicitly REQUIRES the
+// capability (OBSERVE_REQUIRE_SNAPSHOT_LEASE=1, the CI capability job).
+// Under the requirement a missing lease is a FAILURE, not a skip: a green
+// capability job must mean the consistent-backup path actually ran.
+func requireLeaseOrSkip(t *testing.T, held bool, dsn string) {
+	t.Helper()
+	if held {
+		return
+	}
+	if os.Getenv("OBSERVE_REQUIRE_SNAPSHOT_LEASE") == "1" {
+		t.Fatalf("snapshot lease required by this CI job but unavailable on %s — the engine fixture predates the capability or rejected the acquire", dsn)
+	}
+	t.Skipf("engine at %s predates the snapshot lease — no cross-domain consistency claim to prove", dsn)
+}
 
 // F45's consistency claim, proven live: while a dump holds the snapshot
 // lease, a concurrent writer committing atomic cross-domain units — one
@@ -168,7 +185,7 @@ func TestDump_LeaseConsistentMomentUnderConcurrentWrites(t *testing.T) {
 		t.Fatalf("manifest carries no lease record:\n%s", mustJSON(t, manifest))
 	}
 	if !manifest.Lease.Held {
-		t.Skipf("engine at %s predates the snapshot lease (manifest lease.held=false) — no cross-domain consistency claim to prove", dsn)
+		requireLeaseOrSkip(t, false, dsn)
 	}
 
 	// Per-unit presence, not per-domain counts: for every unit id below the
@@ -332,7 +349,7 @@ func TestLease_BlocksConcurrentMutationsUntilRelease(t *testing.T) {
 	defer holder.Rollback(ctx)
 	if _, err := holder.Exec(ctx, "ACQUIRE SNAPSHOT LEASE TIMEOUT 20000"); err != nil {
 		if isLeaseUnsupported(err) {
-			t.Skipf("engine at %s predates the snapshot lease: %v", dsn, err)
+			requireLeaseOrSkip(t, false, dsn)
 		}
 		t.Fatalf("acquire: %v", err)
 	}
@@ -398,7 +415,7 @@ func TestLease_KVScalarWritesBypassTheGate(t *testing.T) {
 	defer holder.Rollback(ctx)
 	if _, err := holder.Exec(ctx, "ACQUIRE SNAPSHOT LEASE TIMEOUT 10000"); err != nil {
 		if isLeaseUnsupported(err) {
-			t.Skipf("engine at %s predates the snapshot lease: %v", dsn, err)
+			requireLeaseOrSkip(t, false, dsn)
 		}
 		t.Fatalf("acquire: %v", err)
 	}
@@ -489,7 +506,7 @@ func TestLease_AcquireExcludesInFlightWriters(t *testing.T) {
 	defer holder2.Rollback(ctx)
 	if _, err := holder2.Exec(ctx, "ACQUIRE SNAPSHOT LEASE TIMEOUT 10000"); err != nil {
 		if isLeaseUnsupported(err) {
-			t.Skipf("engine at %s predates the snapshot lease: %v", dsn, err)
+			requireLeaseOrSkip(t, false, dsn)
 		}
 		t.Fatalf("acquire after the writer resolved: %v", err)
 	}

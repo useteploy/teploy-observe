@@ -1645,8 +1645,30 @@ func runBackup(cfg config.Config, logger *slog.Logger) {
 	if key == nil {
 		logger.Warn("backup is unencrypted and contains sensitive data — set OBSERVE_BACKUP_ENCRYPTION_KEY")
 	}
+	// TO-045: record the audit signing key's NON-SECRET fingerprint in
+	// the manifest so a restore onto a fresh machine knows the archive's
+	// keyed audit history needs data/audit.key (or its OBSERVE_AUDIT_KEYRING
+	// entry) restored alongside it — the key itself is deliberately not
+	// archived (it must not live in the database it protects).
+	var auditKeyInfo *backup.AuditKeyInfo
+	cliKeyring, kerr := audit.LoadKeyring(audit.KeyEnv{
+		Dedicated:   cfg.AuditKey,
+		KeyringSpec: os.Getenv("OBSERVE_AUDIT_KEYRING"),
+		Fallback:    cfg.JWTSecret,
+		File:        filepath.Join(effectiveDataDir(), "audit.key"),
+	})
+	if kerr != nil {
+		logger.Warn("audit key state could not be resolved for the backup manifest — keyed audit history may not verify after a restore without the host's data/audit.key",
+			"err", kerr)
+		auditKeyInfo = &backup.AuditKeyInfo{Status: "unresolvable"}
+	} else {
+		auditKeyInfo = &backup.AuditKeyInfo{Status: string(cliKeyring.Status)}
+		if cliKeyring.Keyed() {
+			auditKeyInfo.KeyID = cliKeyring.Signer.ID
+		}
+	}
 	// Tar goes to stdout; per-table errors to stderr so the tar stream stays pristine.
-	if err := backup.DumpWithKey(ctx, db, os.Stdout, os.Stderr, key); err != nil {
+	if err := backup.DumpWithOptions(ctx, db, os.Stdout, os.Stderr, key, auditKeyInfo); err != nil {
 		fmt.Fprintf(os.Stderr, "backup completed with errors: %v\n", err)
 		os.Exit(2)
 	}

@@ -68,9 +68,15 @@ type leaseState struct {
 // minutes; override with OBSERVE_BACKUP_LEASE_TIMEOUT_MS.
 const defaultLeaseTimeoutMillis = 600_000
 
+// maxLeaseTimeoutMillis bounds the configurable lease window (TO-046):
+// values beyond a day add nothing (the dump would long have failed its own
+// consistency checks) and large values risk time.Duration arithmetic
+// surprises.
+const maxLeaseTimeoutMillis = 24 * 60 * 60 * 1000
+
 func leaseTimeoutMillis() int64 {
 	if raw := strings.TrimSpace(os.Getenv("OBSERVE_BACKUP_LEASE_TIMEOUT_MS")); raw != "" {
-		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n >= 1000 {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n >= 1000 && n <= maxLeaseTimeoutMillis {
 			return n
 		}
 	}
@@ -88,9 +94,22 @@ var errLeaseHeld = fmt.Errorf("a snapshot lease is already held by another sessi
 // the archive recording the downgrade. Any other failure is fatal: a backup
 // that cannot tell which moment it read must not pretend to be one.
 func acquireDumpLease(ctx context.Context, tx pgx.Tx, timeoutMillis int64, errLog io.Writer) (*leaseState, error) {
+	// TO-046: the local window starts BEFORE the acquisition round trip.
+	// The engine may start the lease before its reply reaches this
+	// process; measuring from after the Exec would extend the assumed
+	// validity past the engine's expiry by the full response latency —
+	// more than the 250 ms margin covers on anything but a fast loopback.
+	started := time.Now()
 	_, err := tx.Exec(ctx, "ACQUIRE SNAPSHOT LEASE TIMEOUT "+strconv.FormatInt(timeoutMillis, 10))
 	if err == nil {
-		return &leaseState{timeoutMillis: timeoutMillis, deadline: time.Now().Add(time.Duration(timeoutMillis) * time.Millisecond)}, nil
+		state := &leaseState{
+			timeoutMillis: timeoutMillis,
+			deadline:      started.Add(time.Duration(timeoutMillis) * time.Millisecond),
+		}
+		if cerr := checkLeaseWindow(state); cerr != nil {
+			return nil, cerr
+		}
+		return state, nil
 	}
 	if strings.Contains(err.Error(), "already held by another session") {
 		return nil, errLeaseHeld

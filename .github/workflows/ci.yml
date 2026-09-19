@@ -120,7 +120,19 @@ jobs:
           git clone --filter=blob:none --no-checkout https://github.com/neutron-build/neutron ../Neutron
           git -C ../Neutron checkout "${{ steps.pin.outputs.sha }}"
       - name: Install pnpm
-        run: corepack enable && corepack prepare pnpm@latest --activate
+        # TO-048: pinned to the exact version the Neutron workspace
+        # declares (its packageManager field); an unpinned pnpm@latest
+        # made this otherwise source-pinned rebuild depend on whatever
+        # the package manager did that week.
+        run: |
+          set -eu
+          version=$(cat .ci/pnpm-version)
+          case "$version" in
+            ''|*[!0-9.]*) echo 'invalid pinned pnpm version in .ci/pnpm-version' >&2; exit 1 ;;
+          esac
+          corepack enable
+          corepack prepare "pnpm@$version" --activate
+          pnpm --version
       - name: Provision TS workspace
         run: pnpm -C ../Neutron/typescript install --frozen-lockfile
       - name: ui-sync (build + embed)
@@ -135,17 +147,15 @@ jobs:
   # image, fresh per run.
   #
   # Why the published image and not a from-source build of the pinned
-  # Neutron submodule: a repo-built engine (working tree AND the pinned
-  # submodule revision) currently FAILS observe's migration ladder on a
-  # fresh database at migration 027 - a table renamed earlier in a
-  # multi-statement script is invisible to the script's later statements
-  # (upstream report filed 2026-09-18, see AUDIT_OPEN.md). The v0.1.8 image
-  # applies the whole 001-041 ladder cleanly, so it is the fixture. A
-  # from-source build also costs 15-30 min of cold Rust CI per push for the
-  # same coverage. Known flake: v0.1.8 intermittently drops a committed
-  # same-key ReplacingMergeTree upsert in a multi-table tx once data
-  # accumulates (same upstream report); if this job flakes, that is the
-  # first suspect - rerun before bisecting.
+  # Neutron submodule: reproducibility and CI cost. The from-source ladder
+  # breakage this comment used to document (rename visibility, migration
+  # 027) was fixed upstream on 2026-09-18 (Neutron 6286531a) and
+  # repo-built engines pass the full migration ladder again — the
+  # lease-capability job below builds from the pin and relies on it. This
+  # job keeps the published v0.1.8 fixture for compatibility coverage;
+  # its known flake (intermittent committed-upsert loss on accumulated
+  # data, also fixed in the tree) is why the capability job exists
+  # separately rather than replacing this one.
   nucleus-integration:
     runs-on: ubuntu-latest
     steps:
@@ -246,3 +256,72 @@ jobs:
           npx playwright test tests/smoke.spec.ts tests/core.spec.ts
         env:
           OBSERVE_URL: http://127.0.0.1:3000
+
+  # TO-047: the lease capability job. The pinned v0.1.8 image predates
+  # ACQUIRE SNAPSHOT LEASE, so its green runs prove nothing about the
+  # consistent-backup path (lease live tests legitimately skip there).
+  # This job builds the engine from the SAME pinned Neutron revision the
+  # go.mod replace points the working tree at, boots it, applies the
+  # migration ladder, and runs the backup/lease suites with
+  # OBSERVE_REQUIRE_SNAPSHOT_LEASE=1 — a missing lease FAILS instead of
+  # skipping, so a green run means the snapshot-lease guarantee actually
+  # executed against the source the product compiles against.
+  nucleus-lease:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve pinned Neutron revision
+        id: pin
+        run: echo "sha=$(git ls-tree HEAD Neutron | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ../Neutron/nucleus/target
+          key: nucleus-lease-${{ steps.pin.outputs.sha }}
+      - name: Clone Neutron at the pinned revision
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/neutron-build/neutron ../Neutron
+          git -C ../Neutron checkout "${{ steps.pin.outputs.sha }}"
+      - name: Build engine
+        run: cargo build --release --manifest-path ../Neutron/nucleus/Cargo.toml --bin nucleus
+      - name: Start pinned-revision engine
+        run: |
+          ../Neutron/nucleus/target/release/nucleus start \
+            --host 127.0.0.1 --port 55432 --cluster-port 55433 \
+            --data /tmp/nucleus-lease-data --max-memory 512 &
+          for i in $(seq 1 60); do
+            if (exec 3<>/dev/tcp/127.0.0.1/55432) 2>/dev/null; then exec 3>&-; exit 0; fi
+            sleep 1
+          done
+          echo "nucleus did not come up" >&2
+          exit 1
+      - name: Build observe
+        run: go build -o /tmp/observe ./cmd/observe
+      - name: Boot once to apply migrations
+        run: |
+          OBSERVE_NUCLEUS_URL='postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable' \
+          OBSERVE_ADMIN_PASSWORD=ci-lease-migration-boot \
+          OBSERVE_JWT_SECRET=ci-lease-secret \
+          /tmp/observe &
+          OBS_PID=$!
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:3000/healthz >/dev/null 2>&1; then
+              kill "$OBS_PID" 2>/dev/null || true
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "observe did not become healthy" >&2
+          kill "$OBS_PID" 2>/dev/null || true
+          exit 1
+      - name: Lease-required backup suite
+        env:
+          OBSERVE_NUCLEUS_URL: postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable
+          OBSERVE_REQUIRE_SNAPSHOT_LEASE: "1"
+        run: go test -p 1 -count=1 ./internal/backup/... ./internal/audit/... ./internal/replays/...
