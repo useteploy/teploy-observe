@@ -1373,6 +1373,17 @@ func main() {
 	neutron.Get(replayGroup, "/{replay_id}/issues", replayIssuesHandler(issueSvc),
 		neutron.WithTags("replays"), neutron.WithSummary("List issues with events linked to this replay"))
 
+	// F38: replay asset proxy — the player rewrites allowlisted snapshot
+	// image srcs through this same-origin route (stream-ticket auth: <img>
+	// cannot carry headers). Disabled unless OBSERVE_REPLAY_ASSET_HOSTS
+	// lists destination hosts; see internal/replays/assets.go for the
+	// constraint set (bounded size, sniffed MIME, private caching, no
+	// redirects, dial-time egress confinement).
+	replayAssetProxy := replays.NewAssetProxy(
+		replays.ParseAssetHosts(os.Getenv("OBSERVE_REPLAY_ASSET_HOSTS")),
+		0, 0, logger)
+	r.Handle("GET /api/v1/replay-assets", jwtMW(replayAssetProxy))
+
 	// --- Click heatmaps (JWT auth) ---
 	heatmapGroup := r.Group("/api/v1/heatmaps", jwtMW)
 	neutron.Get(heatmapGroup, "", queryHeatmapHandler(heatmapsSvc),

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "preact/hooks";
 import type { ReplayEvent } from "../api/replays.js";
 import { heatmapsApi, type Click } from "../api/heatmaps.js";
+import { streamTicketQuery } from "../api/helpers.js";
 import HeatmapOverlay from "./HeatmapOverlay.js";
 
 type SerializedNode =
@@ -48,10 +49,14 @@ const SAFE_TAGS = new Set([
   "h1", "h2", "h3", "h4", "h5", "h6", "strong", "em", "b", "i", "u", "s",
   "small", "mark", "abbr", "cite", "blockquote", "pre", "code", "kbd", "samp",
   "sub", "sup", "figure", "figcaption", "details", "summary", "label",
+  // F38: img renders through the same-origin asset proxy (see
+  // rewriteAssetSrc) — never by letting the operator's browser dial the
+  // recorded page's origins directly.
+  "img",
 ]);
-const SAFE_ATTRS = new Set(["class", "id", "colspan", "rowspan", "dir", "lang"]);
+const SAFE_ATTRS = new Set(["class", "id", "colspan", "rowspan", "dir", "lang", "alt", "width", "height"]);
 const REPLAY_CSP =
-  "default-src 'none'; script-src 'none'; connect-src 'none'; img-src 'none'; " +
+  "default-src 'none'; script-src 'none'; connect-src 'none'; img-src 'self'; " +
   "style-src 'none'; media-src 'none'; frame-src 'none'; object-src 'none'; " +
   "base-uri 'none'; form-action 'none'";
 
@@ -64,7 +69,35 @@ const MAX_RENDER_DEPTH = 32;
 const MAX_RENDER_CHARS = 128 * 1024;
 const MAX_RENDER_ATTRS = 32;
 
-function renderSnapshotBody(root: unknown): string {
+/**
+ * F38: the credential fragment the player appends to proxied asset URLs.
+ * Re-minted per snapshot write (tickets live 2 minutes and bind to the
+ * asset route); empty when no session token exists (share view) or minting
+ * failed — then srcs are simply not rewritten and images do not load.
+ */
+let assetTicket = "";
+
+/**
+ * Rewrite a snapshot image src to the same-origin asset proxy. Returns ""
+ * for anything that cannot be proxied (the attr is then dropped, exactly
+ * the pre-F38 behavior). Relative srcs resolve against the session's
+ * recorded base URL when one is known.
+ */
+function rewriteAssetSrc(src: string, baseURL: string): string {
+  if (!src || src.startsWith("data:") || src.startsWith("blob:")) return "";
+  let abs = src;
+  if (baseURL && !/^https?:\/\//i.test(src)) {
+    try {
+      abs = new URL(src, baseURL).toString();
+    } catch {
+      return "";
+    }
+  }
+  if (!/^https?:\/\//i.test(abs)) return "";
+  return `/api/v1/replay-assets?u=${encodeURIComponent(abs)}${assetTicket}`;
+}
+
+function renderSnapshotBody(root: unknown, baseURL: string): string {
   let remainingNodes = MAX_RENDER_NODES;
   let remainingChars = MAX_RENDER_CHARS;
   const walk = (value: unknown, depth: number): string => {
@@ -92,9 +125,18 @@ function renderSnapshotBody(root: unknown): string {
       if (entries.length > MAX_RENDER_ATTRS) throw new Error("snapshot attribute count limit");
       for (const [k, v] of entries) {
         if (!SAFE_ATTRS.has(k) || typeof v !== "string" || v.length > 256) continue;
+        // F38: img src never passes through — either the asset proxy URL
+        // or nothing. Every other URL-bearing attr was already outside
+        // SAFE_ATTRS.
+        let value = v;
+        if (k === "src") {
+          if (tag !== "img") continue;
+          value = rewriteAssetSrc(v, baseURL);
+          if (!value) continue;
+        }
         remainingChars -= v.length;
         if (remainingChars < 0) throw new Error("snapshot attribute limit");
-        attrs += ` ${k}="${escapeAttr(v)}"`;
+        attrs += ` ${k}="${escapeAttr(value)}"`;
       }
     }
     return tag === "br" ? "<br>" : `<${tag}${attrs}>${inner}</${tag}>`;
@@ -106,8 +148,8 @@ function renderSnapshotBody(root: unknown): string {
   }
 }
 
-function nodeToHTML(node: SerializedNode): string {
-  return renderSnapshotBody(node);
+function nodeToHTML(node: SerializedNode, baseURL: string): string {
+  return renderSnapshotBody(node, baseURL);
 }
 
 function escapeText(s: string): string {
@@ -125,14 +167,14 @@ function escapeAttr(s: string): string {
 // legacy raw-HTML path prepends the CSP at byte zero so no resource-bearing
 // markup can precede it (best-effort — the hardened path is the structured
 // one, tracked with F38's legacy work).
-function snapshotToHTML(snap: Snapshot): string {
+function snapshotToHTML(snap: Snapshot, baseURL: string): string {
   const csp = `<meta http-equiv="Content-Security-Policy" content="${REPLAY_CSP}">`;
   const head = `<!DOCTYPE html><html><head>${csp}</head><body>`;
   if (typeof snap.html === "string") {
     return `${head}${snap.html}</body></html>`;
   }
   if (snap.html && typeof snap.html === "object") {
-    return `${head}${renderSnapshotBody(snap.html)}</body></html>`;
+    return `${head}${renderSnapshotBody(snap.html, baseURL)}</body></html>`;
   }
   return `${head}<div style="padding:32px;color:#888;font-family:system-ui;">No DOM snapshot available.</div></body></html>`;
 }
@@ -184,19 +226,22 @@ export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerPro
     return selected;
   }, [keyframes, startTs, elapsed]);
 
-  const loadSnapshot = useCallback(() => {
+  const loadSnapshot = useCallback(async () => {
     const iframe = iframeRef.current;
     if (!iframe || !iframe.contentDocument) return;
-    const html = snapshotEvent ? snapshotToHTML(snapshotEvent.data as Snapshot)
+    // F38: (re)mint the asset-route ticket for this snapshot's <img> load —
+    // tickets live 2 minutes and every seek rewrites the DOM anyway.
+    assetTicket = await streamTicketQuery("/api/v1/replay-assets");
+    const html = snapshotEvent ? snapshotToHTML(snapshotEvent.data as Snapshot, url || "")
       : '<!DOCTYPE html><html><body style="padding:32px;color:#888;font-family:system-ui;">No snapshot recorded for this session.</body></html>';
     iframe.contentDocument.open();
     iframe.contentDocument.write(html);
     iframe.contentDocument.close();
     setSnapshotReady(true);
-  }, [snapshotEvent]);
+  }, [snapshotEvent, url]);
 
   useEffect(() => {
-    loadSnapshot();
+    void loadSnapshot();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
       if (e.key === " ") { e.preventDefault(); setPlaying((p) => !p); }

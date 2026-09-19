@@ -74,6 +74,7 @@ var queryTokenAllowedPaths = []string{
 	"/api/v1/logs/stream",
 	"/api/v1/live",
 	"/api/v1/stats/live",
+	"/api/v1/replay-assets",
 }
 
 func queryTokenAllowed(r *http.Request) bool {

@@ -145,6 +145,9 @@ var StreamTicketRoutes = []string{
 	"/api/v1/logs/stream",
 	"/api/v1/live",
 	"/api/v1/stats/live",
+	// F38: the replay player's <img> elements cannot carry headers; they
+	// ride a per-snapshot ticket minted for the asset proxy route.
+	"/api/v1/replay-assets",
 }
 
 // StreamTicketRouteValid reports whether route is a mintable stream route.
