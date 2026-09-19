@@ -18,7 +18,7 @@ func controlByID(cs []controlStatus, id string) controlStatus {
 func TestEvaluateControls_Healthy(t *testing.T) {
 	cs := evaluateControls(complianceInputs{
 		HasRecentAudit: true,
-		Verify:         audit.VerifyResult{Intact: true, Count: 10},
+		Verify:         audit.VerifyResult{Intact: true, Authenticated: true, Count: 10},
 		AuthRequired:   true,
 		DemoMode:       false,
 		TamperKeyState: "dedicated",
@@ -30,6 +30,20 @@ func TestEvaluateControls_Healthy(t *testing.T) {
 	}
 	if summarize(cs)["fail"] != 0 {
 		t.Errorf("healthy config should have no failures: %+v", summarize(cs))
+	}
+}
+
+// TO-001: an intact chain whose rows verify only under the empty key is
+// not tamper-evident — the control warns even when the signer is keyed.
+func TestEvaluateControls_UnauthenticatedHistoryWarns(t *testing.T) {
+	cs := evaluateControls(complianceInputs{
+		HasRecentAudit: true,
+		Verify:         audit.VerifyResult{Intact: true, Authenticated: false, UnkeyedCount: 4, Detail: "4 record(s) verify only under the EMPTY key"},
+		AuthRequired:   true,
+		TamperKeyState: "persistent",
+	})
+	if got := controlByID(cs, "audit_tamper_evidence").Status; got != "warn" {
+		t.Errorf("unkeyed-verified history should warn under a keyed signer, got %q", got)
 	}
 }
 
@@ -81,7 +95,7 @@ func TestEvaluateControls_KeyStates(t *testing.T) {
 	} {
 		cs := evaluateControls(complianceInputs{
 			HasRecentAudit: true,
-			Verify:         audit.VerifyResult{Intact: true},
+			Verify:         audit.VerifyResult{Intact: true, Authenticated: true},
 			AuthRequired:   true,
 			TamperKeyState: tc.state,
 		})

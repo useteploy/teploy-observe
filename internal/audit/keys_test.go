@@ -3,6 +3,9 @@ package audit
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -263,5 +266,158 @@ func TestKeyring_RotationVerifiesLive_Integration(t *testing.T) {
 	}
 	if !res.Intact {
 		t.Fatalf("chain must verify across rotation: %+v", res)
+	}
+}
+
+// TO-001: a database writer who rewrites the chain, blanks every key id,
+// and recomputes the MACs with the public empty key must NOT come out as
+// authenticated history — the row classifies as unkeyed, never as a
+// legacy-secret match.
+func TestRowMatch_EmptyKeyForgeryIsNotAuthenticated(t *testing.T) {
+	realKey := []byte(strings.Repeat("s", 32))
+	kr := &Keyring{
+		Status: KeyStatusDedicated,
+		Signer: KeyMaterial{ID: keyID(realKey), Key: realKey},
+		verify: map[string][]byte{keyID(realKey): realKey},
+		legacy: dedupKeys([][]byte{realKey}),
+	}
+	svc := NewServiceWithKeys(nil, kr)
+
+	// The attacker's product: blank id, empty-key MAC.
+	forged := AuditEvent{Seq: 1, PrevHash: "", Timestamp: 1, AuditID: genID(),
+		Actor: "attacker", Action: "admin.wipe", Result: "success"}
+	forged.Hash = computeHashWith(nil, forged)
+	if got := svc.rowMatchKind(forged); got != matchUnkeyed {
+		t.Fatalf("blank-id empty-key row must classify as matchUnkeyed, got %v", got)
+	}
+	// Chain continuity is still reported (rowHashMatches) so an entirely
+	// pre-F46 unkeyed install keeps verifying — the classification, not
+	// the boolean, carries the authenticity verdict.
+	if !svc.rowHashMatches(forged) {
+		t.Fatal("empty-key row still counts for chain continuity")
+	}
+
+	// A row signed with the real secret classifies as a legacy match.
+	legit := forged
+	legit.Hash = computeHashWith(realKey, legit)
+	if got := svc.rowMatchKind(legit); got != matchLegacy {
+		t.Fatalf("secret-signed blank-id row must classify as matchLegacy, got %v", got)
+	}
+
+	// LoadKeyring must not offer the empty key as a candidate at all.
+	env, err := LoadKeyring(KeyEnv{Dedicated: b64key(5)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range env.LegacyCandidates() {
+		if len(k) == 0 {
+			t.Fatal("LoadKeyring must never include the empty key among legacy candidates")
+		}
+	}
+}
+
+// TO-007: a corrupt persistent key file is fatal — the signer must not
+// silently downgrade to the JWT fallback (or unkeyed) while the install's
+// history stays keyed by the unreadable key.
+func TestLoadKeyring_CorruptKeyFileIsFatal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.key")
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadKeyring(KeyEnv{File: path, Fallback: "fallback-secret-value-32-bytes!!"}); err == nil {
+		t.Fatal("a corrupt key file must refuse startup, not fall back")
+	}
+	// A key file whose id does not match its material is equally fatal.
+	bad := persistentKeyFile{KeyID: "00112233", Key: b64key(7)}
+	raw, _ := json.Marshal(bad)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadKeyring(KeyEnv{File: path}); err == nil {
+		t.Fatal("mismatched key file id must refuse startup")
+	}
+}
+
+// TO-007: concurrent creators cannot overwrite each other's winner — every
+// loader after the race returns the key that is actually on disk.
+func TestLoadKeyring_ConcurrentCreateSingleWinner(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.key")
+	const racers = 8
+	errs := make(chan error, racers)
+	ids := make(chan string, racers)
+	for i := 0; i < racers; i++ {
+		go func() {
+			kr, err := LoadKeyring(KeyEnv{File: path})
+			if err != nil {
+				errs <- err
+				return
+			}
+			// The returned key must equal what a fresh read sees on disk.
+			finalRaw, rerr := os.ReadFile(path)
+			if rerr != nil {
+				errs <- rerr
+				return
+			}
+			final, perr := parseKeyFile(path, finalRaw)
+			if perr != nil {
+				errs <- perr
+				return
+			}
+			if final.ID != kr.Signer.ID || string(final.Key) != string(kr.Signer.Key) {
+				errs <- fmt.Errorf("returned key %s does not match the on-disk winner %s", kr.Signer.ID, final.ID)
+				return
+			}
+			ids <- kr.Signer.ID
+		}()
+	}
+	first := <-ids
+	for i := 1; i < racers; i++ {
+		select {
+		case err := <-errs:
+			t.Fatal(err)
+		case id := <-ids:
+			if id != first {
+				t.Fatalf("racers disagree on the key: %s vs %s", id, first)
+			}
+		}
+	}
+}
+
+// TO-008: a historical keyring secret verifies the pre-042 rows it signed
+// even after the active signer moved on — the rotation procedure works.
+func TestLoadKeyring_HistoricalKeyVerifiesLegacyRows(t *testing.T) {
+	oldKey := []byte(strings.Repeat("h", 32))
+	spec := keyID(oldKey) + ":" + base64.StdEncoding.EncodeToString(oldKey)
+	kr, err := LoadKeyring(KeyEnv{Dedicated: b64key(3), KeyringSpec: spec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, k := range kr.LegacyCandidates() {
+		if string(k) == string(oldKey) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("a historical keyring secret must be a legacy verification candidate")
+	}
+}
+
+// TO-009: two different keys deriving the same id must be refused, not
+// silently overwrite each other in the verification map.
+func TestLoadKeyring_CollidingKeyIDsRefused(t *testing.T) {
+	a := []byte(strings.Repeat("a", 32))
+	b := []byte(strings.Repeat("b", 32))
+	kr := &Keyring{verify: map[string][]byte{}}
+	if err := kr.putVerificationKey("cccccccc", a); err != nil {
+		t.Fatal(err)
+	}
+	if err := kr.putVerificationKey("cccccccc", b); err == nil {
+		t.Fatal("a colliding id naming different key bytes must be refused")
+	}
+	if err := kr.putVerificationKey("cccccccc", a); err != nil {
+		t.Fatal("re-inserting the same bytes must be harmless")
 	}
 }

@@ -49,6 +49,11 @@ func evaluateControls(in complianceInputs) []controlStatus {
 		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "info", "chain could not be verified"})
 	case !in.Verify.Intact:
 		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "fail", in.Verify.Detail})
+	case !in.Verify.Authenticated:
+		// TO-001: internally consistent history that verifies only under
+		// the empty (public) key is not tamper-evident — never reported
+		// as a pass regardless of how the signer is keyed.
+		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "warn", in.Verify.Detail})
 	case in.TamperKeyState == "dedicated":
 		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "pass", "hash chain intact, keyed by a dedicated key"})
 	case in.TamperKeyState == "persistent":

@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -50,7 +51,17 @@ type Keyring struct {
 	verify  map[string][]byte
 	legacy  [][]byte
 	keyFile string
-	fileErr error
+}
+
+// putVerificationKey inserts one verification key, refusing a silent
+// overwrite when the id already names DIFFERENT bytes (TO-009): a colliding
+// id must never replace historical verification material.
+func (kr *Keyring) putVerificationKey(id string, key []byte) error {
+	if prev, ok := kr.verify[id]; ok && !bytes.Equal(prev, key) {
+		return fmt.Errorf("audit: keyring id %q names two different keys — refusing the ambiguous keyring", id)
+	}
+	kr.verify[id] = bytes.Clone(key)
+	return nil
 }
 
 // KeyEnv is the operator-facing key configuration.
@@ -130,6 +141,11 @@ type persistentKeyFile struct {
 // interpretation), the JWT fallback, and the empty key.
 func LoadKeyring(env KeyEnv) (*Keyring, error) {
 	kr := &Keyring{verify: map[string][]byte{}}
+	// historical collects the OBSERVE_AUDIT_KEYRING secrets: they verify
+	// rows stamped with their id AND, per TO-008, pre-042 key_id='' rows
+	// the then-configured process signed with them (the documented
+	// rotation procedure moves exactly such keys here).
+	var historical [][]byte
 
 	for _, entry := range strings.Split(env.KeyringSpec, ",") {
 		entry = strings.TrimSpace(entry)
@@ -153,7 +169,10 @@ func LoadKeyring(env KeyEnv) (*Keyring, error) {
 			// every row it should cover; the id must BE the derived id.
 			return nil, fmt.Errorf("OBSERVE_AUDIT_KEYRING entry %q: id does not match the key material (derived id is %s)", id, km.ID)
 		}
-		kr.verify[id] = km.Key
+		if err := kr.putVerificationKey(id, km.Key); err != nil {
+			return nil, err
+		}
+		historical = append(historical, km.Key)
 	}
 
 	switch {
@@ -166,18 +185,19 @@ func LoadKeyring(env KeyEnv) (*Keyring, error) {
 		kr.Signer = km
 	case env.File != "":
 		km, err := loadOrCreateKeyFile(env.File)
-		if err == nil {
-			kr.Status = KeyStatusPersistent
-			kr.Signer = km
-			kr.keyFile = env.File
-		} else if env.Fallback != "" {
-			kr.Status = KeyStatusFallback
-			kr.Signer = KeyMaterial{ID: keyID([]byte(env.Fallback)), Key: []byte(env.Fallback)}
-			kr.fileErr = err
-		} else {
-			kr.Status = KeyStatusUnkeyed
-			kr.fileErr = err
+		if err != nil {
+			// TO-007: an existing-but-unusable persistent key is NOT
+			// absence — silently downgrading the signer (to the JWT
+			// fallback or unkeyed) would decouple new rows from the
+			// key the install's history is keyed with. Refuse to
+			// start; recovery is restoring the file (or moving its
+			// key into OBSERVE_AUDIT_KEYRING and configuring
+			// OBSERVE_AUDIT_KEY).
+			return nil, err
 		}
+		kr.Status = KeyStatusPersistent
+		kr.Signer = km
+		kr.keyFile = env.File
 	case env.Fallback != "":
 		kr.Status = KeyStatusFallback
 		kr.Signer = KeyMaterial{ID: keyID([]byte(env.Fallback)), Key: []byte(env.Fallback)}
@@ -186,10 +206,18 @@ func LoadKeyring(env KeyEnv) (*Keyring, error) {
 	}
 
 	if kr.Keyed() {
-		kr.verify[kr.Signer.ID] = kr.Signer.Key
+		if err := kr.putVerificationKey(kr.Signer.ID, kr.Signer.Key); err != nil {
+			return nil, err
+		}
 	}
 	// Legacy candidates for key_id='' rows (pre-042 rows carry no id and
-	// were signed with whatever the process was handed back then).
+	// were signed with whatever the process was handed back then): the
+	// signer, the RAW bytes of OBSERVE_AUDIT_KEY (the pre-F46
+	// interpretation), the JWT fallback, and every historical keyring
+	// secret (TO-008 — a rotated-out key still verifies the unkeyed rows
+	// it signed). The EMPTY key is deliberately absent: an empty-key
+	// match is not authentication, and the verifier reports it as the
+	// unkeyed classification instead (TO-001).
 	candidates := [][]byte{}
 	if kr.Keyed() {
 		candidates = append(candidates, kr.Signer.Key)
@@ -200,7 +228,7 @@ func LoadKeyring(env KeyEnv) (*Keyring, error) {
 	if env.Fallback != "" {
 		candidates = append(candidates, []byte(env.Fallback))
 	}
-	candidates = append(candidates, []byte{})
+	candidates = append(candidates, historical...)
 	kr.legacy = dedupKeys(candidates)
 	return kr, nil
 }
@@ -236,23 +264,18 @@ func dedupKeys(keys [][]byte) [][]byte {
 }
 
 // loadOrCreateKeyFile reads the persistent audit key, generating and
-// persisting a fresh 32-byte key when the file does not exist. The file is
-// written 0600 via temp+fsync+rename+dirsync so a crash never leaves a
-// partially-written key that would silently re-key the chain.
+// persisting a fresh 32-byte key when the file does not exist. Publication
+// is NO-REPLACE (TO-007): the fully-written temp file is linked (or
+// exclusively created) at the destination, so two processes racing the
+// first boot cannot overwrite each other's winner — the loser re-reads and
+// returns the canonical on-disk key. Any error involving an EXISTING file
+// (corrupt JSON, wrong id, short key, unreadable) is returned as an error:
+// the caller refuses to start rather than silently re-keying the chain.
+// The file is written 0600 via temp+fsync+link+dirsync so a crash never
+// leaves a partially-written key.
 func loadOrCreateKeyFile(path string) (KeyMaterial, error) {
 	if raw, err := os.ReadFile(path); err == nil {
-		var pf persistentKeyFile
-		if err := json.Unmarshal(raw, &pf); err != nil {
-			return KeyMaterial{}, fmt.Errorf("audit key file %s is corrupt: %w", path, err)
-		}
-		dec, err := base64.StdEncoding.DecodeString(pf.Key)
-		if err != nil || len(dec) < minAuditKeyBytes {
-			return KeyMaterial{}, fmt.Errorf("audit key file %s does not hold a >=%d-byte key", path, minAuditKeyBytes)
-		}
-		if pf.KeyID != keyID(dec) {
-			return KeyMaterial{}, fmt.Errorf("audit key file %s key_id %q does not match its key material", path, pf.KeyID)
-		}
-		return KeyMaterial{ID: pf.KeyID, Key: dec}, nil
+		return parseKeyFile(path, raw)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return KeyMaterial{}, fmt.Errorf("reading audit key file %s: %w", path, err)
 	}
@@ -269,13 +292,41 @@ func loadOrCreateKeyFile(path string) (KeyMaterial, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return KeyMaterial{}, fmt.Errorf("creating audit key directory: %w", err)
 	}
-	if err := writeKeyFile0600(path, raw); err != nil {
+	if err := publishKeyNoReplace(path, raw); err != nil {
 		return KeyMaterial{}, fmt.Errorf("persisting audit key file %s: %w", path, err)
 	}
-	return km, nil
+	// Always re-read the canonical winner: a concurrent start may have
+	// published first, and both processes must sign with the same key.
+	finalRaw, err := os.ReadFile(path)
+	if err != nil {
+		return KeyMaterial{}, fmt.Errorf("re-reading audit key file %s: %w", path, err)
+	}
+	return parseKeyFile(path, finalRaw)
 }
 
-func writeKeyFile0600(path string, data []byte) error {
+// parseKeyFile validates and decodes the on-disk key form.
+func parseKeyFile(path string, raw []byte) (KeyMaterial, error) {
+	var pf persistentKeyFile
+	if err := json.Unmarshal(raw, &pf); err != nil {
+		return KeyMaterial{}, fmt.Errorf("audit key file %s is corrupt: %w", path, err)
+	}
+	dec, err := base64.StdEncoding.DecodeString(pf.Key)
+	if err != nil || len(dec) < minAuditKeyBytes {
+		return KeyMaterial{}, fmt.Errorf("audit key file %s does not hold a >=%d-byte key", path, minAuditKeyBytes)
+	}
+	if pf.KeyID != keyID(dec) {
+		return KeyMaterial{}, fmt.Errorf("audit key file %s key_id %q does not match its key material", path, pf.KeyID)
+	}
+	return KeyMaterial{ID: pf.KeyID, Key: dec}, nil
+}
+
+// publishKeyNoReplace writes data to a fully-flushed temp file and
+// publishes it at path WITHOUT replacing an existing file. os.Link is the
+// atomic no-replace primitive on the Linux/macOS deployment targets; when
+// the filesystem refuses hard links it falls back to O_EXCL creation.
+// Returns nil regardless of who won the race — the caller re-reads the
+// canonical file either way.
+func publishKeyNoReplace(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	f, err := os.CreateTemp(dir, ".audit-key-*")
 	if err != nil {
@@ -295,9 +346,30 @@ func writeKeyFile0600(path string, data []byte) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
+	if err := os.Link(tmp, path); err == nil {
+		return syncDirKey(filepath.Dir(path))
+	} else if !errors.Is(err, os.ErrExist) {
+		// Filesystems without hard-link support (some network mounts):
+		// exclusive creation is the same no-replace guarantee, at the
+		// cost of a crash window that leaves a partial file the next
+		// start refuses loudly (never a silent overwrite).
+		dst, oerr := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if oerr != nil {
+			if errors.Is(oerr, os.ErrExist) {
+				return nil
+			}
+			return oerr
+		}
+		_, werr := dst.Write(data)
+		if werr == nil {
+			werr = dst.Sync()
+		}
+		return errors.Join(werr, dst.Close())
 	}
+	return nil // another process won the race; caller re-reads the winner
+}
+
+func syncDirKey(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return err
@@ -307,16 +379,15 @@ func writeKeyFile0600(path string, data []byte) error {
 
 // RotationSpec returns the "id:base64key" line an operator pastes into
 // OBSERVE_AUDIT_KEYRING when rotating away from the persistent file key,
-// or "" when no file key is in use.
+// or "" when no file key is in use. Never logged by the application
+// (TO-002): startup logs carry the key id only, and the secret leaves the
+// host exclusively through operator-driven file access.
 func (kr *Keyring) RotationSpec() string {
 	if kr.keyFile == "" || kr.Status != KeyStatusPersistent {
 		return ""
 	}
 	return fmt.Sprintf("%s:%s", kr.Signer.ID, base64.StdEncoding.EncodeToString(kr.Signer.Key))
 }
-
-// FileErr reports why the persistent key file was unusable, if it was.
-func (kr *Keyring) FileErr() error { return kr.fileErr }
 
 // KeyFor returns the verification key for a row's key_id. The second
 // return is false when the id names no configured key — verification must
@@ -330,9 +401,11 @@ func (kr *Keyring) KeyFor(id string) ([]byte, bool) {
 	return k, ok
 }
 
-// LegacyCandidates returns the keys a key_id='' row may have been signed
-// with (pre-042 semantics: the then-configured key, which the row does not
-// record, so each configured candidate is tried).
+// LegacyCandidates returns the SECRET keys a key_id='' row may have been
+// signed with (pre-042 semantics: the then-configured key, which the row
+// does not record, so each configured candidate is tried). The empty key
+// is not among them: a row that matches only the empty key is reported as
+// UNKEYED by the verifier, never as authenticated (TO-001).
 func (kr *Keyring) LegacyCandidates() [][]byte { return kr.legacy }
 
 // Keyed reports whether the signer exists (all statuses but unkeyed).

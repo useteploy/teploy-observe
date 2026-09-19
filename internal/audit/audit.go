@@ -107,7 +107,7 @@ func NewService(db *nucleus.Client, key []byte) *Service {
 		kr.Signer = KeyMaterial{ID: keyID(key), Key: key}
 		kr.verify[kr.Signer.ID] = key
 	}
-	kr.legacy = dedupKeys([][]byte{key, {}})
+	kr.legacy = dedupKeys([][]byte{key})
 	return &Service{db: db, keys: kr}
 }
 
@@ -155,27 +155,59 @@ func (s *Service) computeHash(ev AuditEvent) string {
 	return computeHashWith(key, ev)
 }
 
-// rowHashMatches verifies one row's hash against the key its KeyID selects:
-// '' tries every legacy candidate (the pre-042 rows record no signer), any
-// other id must resolve in the keyring — an unknown id is a verification
-// failure, not a fallback.
-func (s *Service) rowHashMatches(ev AuditEvent) bool {
+// rowMatchKind classifies how (whether) one row's hash verifies (TO-001):
+//
+//   - matchKeyed: the row names a key id that resolves and its MAC matches
+//     — authenticated under that key.
+//   - matchLegacy: a pre-042 key_id='' row whose MAC matches one of the
+//     configured SECRET legacy candidates — authenticated under that key.
+//   - matchUnkeyed: the row verifies only with the EMPTY (public) key —
+//     internally consistent but NOT tamper-evident against a database
+//     writer; Verify reports these separately instead of counting them as
+//     authenticated history.
+//   - matchNone: no candidate verifies.
+func (s *Service) rowMatchKind(ev AuditEvent) rowMatch {
 	if s.keys == nil {
-		return computeHashWith(nil, ev) == ev.Hash
+		if computeHashWith(nil, ev) == ev.Hash {
+			return matchUnkeyed
+		}
+		return matchNone
 	}
 	if ev.KeyID == "" {
 		for _, k := range s.keys.LegacyCandidates() {
-			if computeHashWith(k, ev) == ev.Hash {
-				return true
+			if len(k) > 0 && computeHashWith(k, ev) == ev.Hash {
+				return matchLegacy
 			}
 		}
-		return false
+		if computeHashWith(nil, ev) == ev.Hash {
+			return matchUnkeyed
+		}
+		return matchNone
 	}
 	k, ok := s.keys.KeyFor(ev.KeyID)
 	if !ok {
-		return false
+		return matchNone
 	}
-	return computeHashWith(k, ev) == ev.Hash
+	if computeHashWith(k, ev) == ev.Hash {
+		return matchKeyed
+	}
+	return matchNone
+}
+
+type rowMatch int
+
+const (
+	matchNone rowMatch = iota
+	matchKeyed
+	matchLegacy
+	matchUnkeyed
+)
+
+// rowHashMatches reports whether the row verifies under ANY mode (keyed,
+// legacy-secret, or unkeyed). Chain continuity; authenticity classification
+// is rowMatchKind's job.
+func (s *Service) rowHashMatches(ev AuditEvent) bool {
+	return s.rowMatchKind(ev) != matchNone
 }
 
 // keyKnown reports whether a row's key id resolves (legacy '' always does).
@@ -209,6 +241,15 @@ type VerifyResult struct {
 	Count       int    `json:"count"`
 	BrokenAtSeq int64  `json:"broken_at_seq,omitempty"`
 	Detail      string `json:"detail,omitempty"`
+	// Authenticated (TO-001): false when any verified row matches only the
+	// EMPTY key — internally consistent history a database writer could
+	// recompute, which must never be presented as keyed/tamper-evident.
+	// True when every row verifies under a secret key (keyed or legacy).
+	// False (with Detail) also on a broken chain.
+	Authenticated bool `json:"authenticated"`
+	// UnkeyedCount is how many rows verified only under the empty key
+	// (pre-F46 unkeyed history, or a downgrade attack on it).
+	UnkeyedCount int `json:"unkeyed_count,omitempty"`
 }
 
 // Verify walks the whole chain in order and recomputes each hash. It detects a
@@ -241,12 +282,16 @@ func (s *Service) Verify(ctx context.Context) (VerifyResult, error) {
 	prev := ""
 	var expectSeq int64 = 1
 	checked := 0
+	unkeyed := 0
 	var last int64
 	for last < through {
+		// TO-011: fetch one row PAST the page so a duplicate sequence
+		// straddling the page boundary is caught here instead of being
+		// skipped by the next page's `> last` cursor.
 		rows, err := nucleus.Query[AuditEvent](ctx, s.db.SQL(),
 			"SELECT "+auditColumns+" FROM audit_events "+
 				"WHERE CAST(seq AS BIGINT) > $1 AND CAST(seq AS BIGINT) <= $2 "+
-				"ORDER BY CAST(seq AS BIGINT) ASC LIMIT "+strconv.Itoa(pageSize),
+				"ORDER BY CAST(seq AS BIGINT) ASC LIMIT "+strconv.Itoa(pageSize+1),
 			dbutil.IntParam(last), dbutil.IntParam(through))
 		if err != nil {
 			return VerifyResult{}, err
@@ -255,8 +300,16 @@ func (s *Service) Verify(ctx context.Context) (VerifyResult, error) {
 			return VerifyResult{Count: checked, BrokenAtSeq: last + 1,
 				Detail: fmt.Sprintf("missing records before verification watermark %d", through)}, nil
 		}
+		if len(rows) > pageSize && rows[pageSize-1].Seq == rows[pageSize].Seq {
+			return VerifyResult{Count: checked, BrokenAtSeq: rows[pageSize].Seq,
+				Detail: fmt.Sprintf("duplicate audit sequence %d (record duplicated or chain forked)", rows[pageSize].Seq)}, nil
+		}
+		if len(rows) > pageSize {
+			rows = rows[:pageSize]
+		}
 		for _, ev := range rows {
-			if ev.Seq != expectSeq || ev.PrevHash != prev || !s.keyKnown(ev.KeyID) || !s.rowHashMatches(ev) {
+			kind := s.rowMatchKind(ev)
+			if ev.Seq != expectSeq || ev.PrevHash != prev || !s.keyKnown(ev.KeyID) || kind == matchNone {
 				detail := "sequence gap: expected %d, got %d (record deleted or reordered)"
 				switch {
 				case ev.Seq != expectSeq:
@@ -269,13 +322,20 @@ func (s *Service) Verify(ctx context.Context) (VerifyResult, error) {
 				}
 				return VerifyResult{Count: checked, BrokenAtSeq: ev.Seq, Detail: fmt.Sprintf(detail, expectSeq, ev.Seq)}, nil
 			}
+			if kind == matchUnkeyed {
+				unkeyed++
+			}
 			prev = ev.Hash
 			expectSeq++
 			checked++
 			last = ev.Seq
 		}
 	}
-	return VerifyResult{Intact: true, Count: checked}, nil
+	if unkeyed > 0 {
+		return VerifyResult{Intact: true, Count: checked, Authenticated: false, UnkeyedCount: unkeyed,
+			Detail: fmt.Sprintf("chain is internally consistent, but %d record(s) verify only under the EMPTY key (pre-F46 unkeyed history, or a downgrade of it) — not tamper-evident against a database writer", unkeyed)}, nil
+	}
+	return VerifyResult{Intact: true, Count: checked, Authenticated: true}, nil
 }
 
 // verifyChain is the pure chain-verification core (DB-less, unit-tested). Rows

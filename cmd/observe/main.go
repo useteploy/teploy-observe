@@ -389,18 +389,15 @@ func main() {
 	case audit.KeyStatusDedicated:
 		logger.Info("audit chain keyed by OBSERVE_AUDIT_KEY", "key_id", auditKeyring.Signer.ID)
 	case audit.KeyStatusPersistent:
+		// TO-002: never log RotationSpec() — it is the signing secret in
+		// transportable form. An operator rotating off the file key reads
+		// the protected key file (0600, this host) and builds the
+		// "<id>:<base64>" entry from it; see the audit README section.
 		logger.Info("audit chain keyed by the persistent generated key",
 			"key_id", auditKeyring.Signer.ID, "file", filepath.Join(effectiveDataDir(), "audit.key"))
-		if spec := auditKeyring.RotationSpec(); spec != "" {
-			logger.Info("to rotate to a dedicated key: set OBSERVE_AUDIT_KEY, and put this entry in OBSERVE_AUDIT_KEYRING so existing rows keep verifying",
-				"rotation_entry", spec)
-		}
 	case audit.KeyStatusFallback:
 		logger.Warn("audit chain keyed by the JWT secret fallback — set OBSERVE_AUDIT_KEY so the chain key is not shared with the session domain",
 			"key_id", auditKeyring.Signer.ID)
-		if ferr := auditKeyring.FileErr(); ferr != nil {
-			logger.Warn("persistent audit key file unusable, fell back", "err", ferr)
-		}
 	default:
 		// F46 empty-key warning, now the last resort rather than the default.
 		logger.Warn("audit chain is UNKEYED (empty HMAC key): tamper-evidence detects accidental edits only — set OBSERVE_AUDIT_KEY for a chain a database-level attacker cannot recompute")
