@@ -92,8 +92,13 @@ func TestIngest_PageviewFieldsStayTopLevel(t *testing.T) {
 		"screen": "1920x1080"
 	}`)
 
-	if e.URL != "https://example.com/pricing?utm_source=hn" {
+	// F41: the stored URL is scheme+host+path — query (and credentials and
+	// fragment) never reach storage; attribution rides the UTM fields.
+	if e.URL != "https://example.com/pricing" {
 		t.Fatalf("url = %q", e.URL)
+	}
+	if e.UTMSource != "hn" {
+		t.Fatalf("utm_source = %q, want hn (legacy query extraction)", e.UTMSource)
 	}
 	if e.Title != "Pricing" {
 		t.Fatalf("title = %q", e.Title)

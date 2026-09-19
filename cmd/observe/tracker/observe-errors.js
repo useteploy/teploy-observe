@@ -11,6 +11,12 @@
   var environment = script.getAttribute('data-environment') || '';
   var maxBreadcrumbs = parseInt(script.getAttribute('data-max-breadcrumbs') || '30', 10);
 
+  // F41: URLs leave the page as origin+path only — query, fragment, and
+  // credentials never reach the error ingest from this tracker.
+  function pageURL() {
+    try { return location.origin + location.pathname; } catch (e) { return ''; }
+  }
+
   var breadcrumbs = [];
   var reportedHashes = {};
 
@@ -55,10 +61,10 @@
     addBreadcrumb('user', 'click', tag.toLowerCase() + id + cls, text ? { text: text } : null);
   }, true);
 
-  // Navigation breadcrumbs
-  var lastUrl = location.href;
+  // Navigation breadcrumbs (F41: origin+path only)
+  var lastUrl = pageURL();
   function trackNav() {
-    var url = location.href;
+    var url = pageURL();
     if (url !== lastUrl) {
       addBreadcrumb('navigation', 'navigation', url, { from: lastUrl });
       lastUrl = url;
@@ -190,7 +196,7 @@
       level: 'error',
       release: release,
       environment: environment,
-      url: location.href,
+      url: pageURL(),
       browser: ua.substring(0, 256),
       os: '',
       device: '',

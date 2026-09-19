@@ -181,3 +181,69 @@ test("replay batches carry v2 identity and retry under the same batch id", async
     "retry carries the same events",
   );
 });
+
+// F39 (the smaller step): mid-session re-snapshots. A long session records
+// fresh snapshots periodically and on mutation bursts (throttled), so the
+// player's keyframe selection has something newer than the initial DOM to
+// replay over. Drives the recorder's own MutationObserver callback.
+test("mutation bursts and time trigger throttled re-snapshots", async () => {
+  const bodies = [];
+  let observerCb = null;
+  const listeners = [];
+  const document = {
+    currentScript: {
+      src: "https://observe.test/t/observe-replay.js",
+      getAttribute: (n) => (n === "data-resnapshot-burst" ? "20" : n === "data-resnapshot-min-gap" ? "1000" : n === "data-resnapshot-interval" ? "5000" : null),
+    },
+    addEventListener: (t, fn) => listeners.push(["document", t, fn]),
+    removeEventListener: () => {},
+    visibilityState: "visible",
+    doctype: { name: "html" },
+    documentElement: {
+      nodeType: 1, tagName: "HTML", attributes: [], childNodes: [
+        { nodeType: 1, tagName: "BODY", attributes: [], childNodes: [
+          { nodeType: 3, textContent: "hello" },
+        ] },
+      ],
+    },
+    body: { nodeType: 1, tagName: "BODY", attributes: [], childNodes: [] },
+  };
+  const sandbox = {
+    console,
+    document,
+    history: { pushState: function () {}, replaceState: function () {} },
+    location: { origin: "https://app.test", pathname: "/page", href: "https://app.test/page?q=1" },
+    navigator: { userAgent: "node-test" },
+    setInterval: () => 1,
+    clearInterval: () => {},
+    setTimeout,
+    MutationObserver: class {
+      constructor(cb) { observerCb = cb; }
+      observe() {}
+      disconnect() {}
+    },
+    localStorage: { getItem: () => null },
+    addEventListener: (t, fn) => listeners.push(["window", t, fn]),
+    removeEventListener: () => {},
+    fetch: (_url, opts) => { bodies.push(JSON.parse(opts.body)); return Promise.resolve({ ok: true }); },
+    XMLHttpRequest: function () { throw new Error("no XHR"); },
+    Blob: class { constructor(parts) { this.size = String(parts[0]).length; } },
+    TextEncoder,
+    URL,
+    Date,
+  };
+  sandbox.window = sandbox;
+  vm.runInNewContext(src, sandbox, { filename: "observe-replay.js" });
+  assert.ok(observerCb, "recorder installed a MutationObserver");
+
+  // Cross the min-gap throttle (its parser floor is 1000 ms) before
+  // driving the burst.
+  await new Promise((r) => setTimeout(r, 1100));
+  // 25 mutations: over the data-resnapshot-burst=20 threshold.
+  const muts = Array.from({ length: 25 }, () => ({ type: "childList", addedNodes: { length: 1 } }));
+  observerCb(muts);
+  sandbox.observeReplay.stop();
+  await new Promise((r) => setTimeout(r, 10));
+  const snapshots = bodies.flatMap((b) => (b.events || []).filter((e) => e.type === "snapshot"));
+  assert.ok(snapshots.length >= 2, `expected the initial snapshot plus a burst re-snapshot, got ${snapshots.length}`);
+});

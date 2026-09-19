@@ -35,6 +35,18 @@ type IngestInput struct {
 	Language   string         `json:"language"`
 	Screen     string         `json:"screen"`
 	Properties map[string]any `json:"properties,omitempty"`
+	// F41 URL contract: trackers send location.href minus credentials,
+	// fragment, AND query; campaign attribution rides as the explicit
+	// utm_* fields below (extracted client-side from the allowlisted
+	// query params). Explicit fields win; for legacy producers still
+	// sending a query string, the server extracts the same allowlisted
+	// params from it before sanitizing the stored URL — attribution keeps
+	// working through the upgrade either way.
+	UTMSource   string `json:"utm_source,omitempty"`
+	UTMMedium   string `json:"utm_medium,omitempty"`
+	UTMCampaign string `json:"utm_campaign,omitempty"`
+	UTMTerm     string `json:"utm_term,omitempty"`
+	UTMContent  string `json:"utm_content,omitempty"`
 	// DistinctID, when present, is the user identifier the SDK passed
 	// via identify(userId). The server hashes it with the site's
 	// session_salt before storage (unless the site has raw_distinct_id
@@ -61,6 +73,9 @@ var ingestKnownKeys = map[string]bool{
 	"site_id": true, "event_type": true, "url": true, "referrer": true,
 	"title": true, "language": true, "screen": true, "properties": true,
 	"distinct_id": true, "release": true, "event_id": true,
+	// F41 explicit campaign fields (win over legacy URL-query extraction).
+	"utm_source": true, "utm_medium": true, "utm_campaign": true,
+	"utm_term": true, "utm_content": true,
 	// Transport metadata on the v2 single-event path (batch envelope fields
 	// accepted inline); consumed for tracing context, never stored.
 	"producer_id": true, "v": true,
@@ -272,11 +287,44 @@ func prepareEvent(ctx context.Context, input IngestInput, salt string, siteSvc *
 	}
 
 	var hostname, pathname string
+	sanitizedURL := ""
 	if input.URL != "" {
 		if u, err := url.Parse(input.URL); err == nil {
 			hostname = u.Hostname()
 			pathname = u.Path
 		}
+		sanitizedURL = sanitizeEventURL(input.URL)
+	}
+
+	// F41 UTM resolution: explicit fields first (the new tracker contract);
+	// for a legacy producer still sending the query string, the same
+	// allowlisted params are extracted from it — attribution survives the
+	// upgrade. Nothing outside the allowlist is ever read or stored.
+	var utmSource, utmMedium, utmCampaign, utmTerm, utmContent string
+	if input.URL != "" && hasEmptyUTMField(&input) {
+		if u, err := url.Parse(input.URL); err == nil {
+			q := u.Query()
+			utmSource = q.Get("utm_source")
+			utmMedium = q.Get("utm_medium")
+			utmCampaign = q.Get("utm_campaign")
+			utmTerm = q.Get("utm_term")
+			utmContent = q.Get("utm_content")
+		}
+	}
+	if input.UTMSource != "" {
+		utmSource = input.UTMSource
+	}
+	if input.UTMMedium != "" {
+		utmMedium = input.UTMMedium
+	}
+	if input.UTMCampaign != "" {
+		utmCampaign = input.UTMCampaign
+	}
+	if input.UTMTerm != "" {
+		utmTerm = input.UTMTerm
+	}
+	if input.UTMContent != "" {
+		utmContent = input.UTMContent
 	}
 
 	// Clean referrer: strip userinfo, query params, and fragments
@@ -293,19 +341,6 @@ func prepareEvent(ctx context.Context, input IngestInput, salt string, siteSvc *
 		}
 	}
 
-	// Extract UTM params from URL
-	var utmSource, utmMedium, utmCampaign, utmTerm, utmContent string
-	if input.URL != "" {
-		if u, err := url.Parse(input.URL); err == nil {
-			q := u.Query()
-			utmSource = q.Get("utm_source")
-			utmMedium = q.Get("utm_medium")
-			utmCampaign = q.Get("utm_campaign")
-			utmTerm = q.Get("utm_term")
-			utmContent = q.Get("utm_content")
-		}
-	}
-
 	e := &Event{
 		EventID:        eventID,
 		TenantID:       "default",
@@ -314,7 +349,7 @@ func prepareEvent(ctx context.Context, input IngestInput, salt string, siteSvc *
 		VisitID:        visitID,
 		EventType:      eventType,
 		Timestamp:      now.UnixMilli(),
-		URL:            input.URL,
+		URL:            sanitizedURL,
 		Referrer:       referrer,
 		Title:          input.Title,
 		Hostname:       hostname,
@@ -344,6 +379,35 @@ func prepareEvent(ctx context.Context, input IngestInput, salt string, siteSvc *
 		return nil, neutron.ErrBadRequest("event too large after normalization (max 64 KiB)")
 	}
 	return e, nil
+}
+
+// sanitizeEventURL reduces a tracker-captured page URL to scheme + host +
+// path (F41): credentials, query, and fragment never reach storage — the
+// wire contract has trackers strip them client-side, and this is the
+// server-side backstop for every producer, legacy included. An unparseable
+// or non-http(s) URL is dropped entirely (fail closed, same posture as
+// cleanReferrer).
+func sanitizeEventURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return ""
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	u.RawFragment = ""
+	u.ForceQuery = false
+	return u.String()
+}
+
+// hasEmptyUTMField reports whether any explicit campaign field is unset, so
+// the legacy URL-query extraction only runs when it has something to fill.
+func hasEmptyUTMField(in *IngestInput) bool {
+	return in.UTMSource == "" || in.UTMMedium == "" || in.UTMCampaign == "" ||
+		in.UTMTerm == "" || in.UTMContent == ""
 }
 
 // cleanReferrer normalizes a referrer URL:

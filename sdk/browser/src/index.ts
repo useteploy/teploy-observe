@@ -59,6 +59,8 @@ export interface EventPayload {
    * is recorded, kept through requeue and retry so the server can dedupe a
    * redelivered batch at flush. */
   event_id?: string;
+  /** Page URL as origin+path (F41): query, fragment, and credentials never
+   * leave the browser from this SDK. */
   url?: string;
   referrer?: string;
   title?: string;
@@ -66,6 +68,14 @@ export interface EventPayload {
   distinct_id?: string;
   /** Application release tag from init({ release }). Empty if not set. */
   release?: string;
+  /** Allowlisted campaign params extracted from the current query string
+   * (F41): attribution rides these explicit fields; the server's analytics
+   * read them, not the raw query. */
+  utm_source?: string;
+  utm_medium?: string;
+  utm_campaign?: string;
+  utm_term?: string;
+  utm_content?: string;
   /** Custom event properties. The server only reads properties from here —
    * anything spread at the top level of the payload is not a field it stores. */
   properties?: Record<string, unknown>;
@@ -170,6 +180,31 @@ const MAX_BUFFERED_ON_ERROR = 200;
 const MAX_RETRY_DELAY_MS = 60_000;
 
 const textEncoder = new TextEncoder();
+
+// F41 URL contract: what leaves the browser is origin+path only. Campaign
+// attribution rides the explicit utm_* fields extracted from the
+// allowlisted query params — the raw query string never leaves the page.
+const UTM_KEYS = ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content"] as const;
+
+function pageUrl(): string {
+  if (typeof location === "undefined") return "";
+  return location.origin + location.pathname;
+}
+
+function campaignFields(): Partial<Record<(typeof UTM_KEYS)[number], string>> {
+  const out: Partial<Record<(typeof UTM_KEYS)[number], string>> = {};
+  if (typeof location === "undefined" || !location.search) return out;
+  try {
+    const params = new URLSearchParams(location.search);
+    for (const key of UTM_KEYS) {
+      const v = params.get(key);
+      if (v) out[key] = v.slice(0, 256);
+    }
+  } catch {
+    /* a malformed search string carries no attribution */
+  }
+  return out;
+}
 
 /** Measure the encoded byte length of the v2 batch envelope around events.
  * The batch_id is derived from the first event's stable event_id, so the
@@ -406,13 +441,18 @@ export function init(options: InitOptions): void {
  *
  * `pathname` is only carried as a property: the server derives the stored
  * pathname from `url`, so an explicit one is an annotation, not a field.
+ *
+ * F41: url is origin+path; the allowlisted utm_* campaign params ride as
+ * explicit fields. The full query string and fragment never leave the
+ * browser.
  */
 export function pageview(pathname?: string): void {
   if (!client) return;
   const props: Record<string, unknown> = {
-    url: typeof location !== "undefined" ? location.href : "",
+    url: pageUrl(),
     referrer: typeof document !== "undefined" ? document.referrer : "",
     title: typeof document !== "undefined" ? document.title : "",
+    ...campaignFields(),
   };
   if (pathname) props.pathname = pathname;
   track("pageview", props);
@@ -434,6 +474,12 @@ const RESERVED_FIELDS = new Set([
   "screen",
   "distinct_id",
   "release",
+  // F41 explicit campaign fields.
+  "utm_source",
+  "utm_medium",
+  "utm_campaign",
+  "utm_term",
+  "utm_content",
 ]);
 
 /** Server-side cap on custom properties per event. Exceeding it is a 400. */
@@ -542,7 +588,7 @@ function captureExceptionFor(target: Client, err: Error, ctx?: CaptureContext): 
     release_tag: ctx?.release ?? target.opts.release,
     environment: ctx?.environment ?? target.opts.environment ?? "production",
     mechanism: ctx?.mechanism ?? "manual",
-    url: typeof location !== "undefined" ? location.href : "",
+    url: pageUrl(),
     level: "error",
     stack_trace: parseStack(err.stack),
   };

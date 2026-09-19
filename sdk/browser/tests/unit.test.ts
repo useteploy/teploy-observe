@@ -25,6 +25,7 @@ function stubBrowser(): void {
   // Node's navigator has no sendBeacon, so post() falls through to fetch.
   (globalThis as any).location = {
     href: "https://example.com/pricing?utm_source=hn",
+    origin: "https://example.com",
     pathname: "/pricing",
     search: "?utm_source=hn",
   };
@@ -96,7 +97,9 @@ test("pageview still populates the fields the server reads", async () => {
   const e = await sentEvent();
 
   assert.equal(e.event_type, "pageview");
-  assert.equal(e.url, "https://example.com/pricing?utm_source=hn");
+  // F41: url is origin+path; the utm param rides as an explicit field.
+  assert.equal(e.url, "https://example.com/pricing");
+  assert.equal(e.utm_source, "hn");
   assert.equal(e.referrer, "https://news.ycombinator.com/");
   assert.equal(e.title, "Pricing");
   assert.equal(e.properties, undefined, "an unannotated pageview carries no properties");
@@ -106,7 +109,7 @@ test("pageview carries an explicit pathname as a property", async () => {
   pageview("/checkout/step-2");
   const e = await sentEvent();
 
-  assert.equal(e.url, "https://example.com/pricing?utm_source=hn");
+  assert.equal(e.url, "https://example.com/pricing");
   assert.deepEqual(e.properties, { pathname: "/checkout/step-2" });
 });
 
@@ -432,4 +435,39 @@ test("sustained failure bounds retention and drop-oldest is reported", async () 
   await new Promise((r) => setTimeout(r, 10)); // past the backoff gate
   await flush();
   assert.ok(errors.some((m) => m.includes("retention cap reached")), `expected the retention-cap report, got ${JSON.stringify(errors.slice(0, 3))}`);
+});
+
+// F41 URL contract: the raw query string never leaves the browser — only
+// the allowlisted campaign params, as explicit fields.
+test("pageview strips the query and sends only allowlisted utm fields", async () => {
+  (globalThis as any).location = {
+    href: "https://example.com/lp?utm_source=news&utm_medium=email&utm_campaign=launch&utm_term=t&utm_content=c&email=me@x.io&token=hunter2#frag",
+    origin: "https://example.com",
+    pathname: "/lp",
+    search: "?utm_source=news&utm_medium=email&utm_campaign=launch&utm_term=t&utm_content=c&email=me@x.io&token=hunter2",
+  };
+  // Earlier tests leave in-flight sends that land on later microtasks;
+  // this test asserts on the request its own flush produces.
+  sent = [];
+  pageview();
+  await flush();
+  assert.ok(sent.length >= 1, "a flush was issued");
+  const e = sent[sent.length - 1].body.events[sent[sent.length - 1].body.events.length - 1];
+
+  assert.equal(e.url, "https://example.com/lp");
+  assert.equal(e.utm_source, "news");
+  assert.equal(e.utm_medium, "email");
+  assert.equal(e.utm_campaign, "launch");
+  assert.equal(e.utm_term, "t");
+  assert.equal(e.utm_content, "c");
+  const raw = JSON.stringify(e);
+  assert.equal(raw.includes("hunter2"), false, "non-allowlisted params never leave the browser");
+  assert.equal(raw.includes("me@x.io"), false);
+});
+
+test("track callers can pass explicit utm fields as reserved top-level fields", async () => {
+  track("purchase", { utm_campaign: "launch", amount: 42 });
+  const e = await sentEvent();
+  assert.equal(e.utm_campaign, "launch");
+  assert.equal(e.properties.amount, 42);
 });

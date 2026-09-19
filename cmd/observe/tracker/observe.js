@@ -14,6 +14,10 @@
   var autoTrack = script.getAttribute('data-auto-track') !== 'false';
   var autoCapture = script.getAttribute('data-autocapture') !== 'false';
   var respectDNT = script.getAttribute('data-respect-dnt') !== 'false';
+  // F41: element text is sensitive by default. Autocaptured clicks used to
+  // carry up to 32 chars of the clicked element's visible text; it is now
+  // sent ONLY when the page opts in explicitly.
+  var captureText = script.getAttribute('data-capture-text') === 'true';
 
   if (respectDNT && navigator.doNotTrack === '1') return;
 
@@ -62,17 +66,66 @@
     return hex;
   }
 
+  // F41 URL contract: what leaves the page is origin+path only. Query
+  // string, fragment, and any credentials the URL might carry never reach
+  // the wire from this tracker; campaign attribution rides the explicit
+  // utm_* fields extracted from the allowlisted query params below.
+  function pageURL() {
+    try { return location.origin + location.pathname; } catch (e) { return ''; }
+  }
+
+  var UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content'];
+
+  // Extract the allowlisted campaign params from the CURRENT query string.
+  // Manual parse (no URLSearchParams dependency — the classic tracker
+  // supports old browsers); values are decoded defensively and capped.
+  function campaignFields() {
+    var out = {};
+    var search = '';
+    try { search = location.search; } catch (e) { return out; }
+    if (!search || search.charAt(0) !== '?') return out;
+    var parts = search.substring(1).split('&');
+    for (var i = 0; i < parts.length; i++) {
+      var kv = parts[i].split('=');
+      var key = decodeURIComponent(kv[0].replace(/\+/g, ' '));
+      if (UTM_KEYS.indexOf(key) === -1) continue;
+      var val = kv.length > 1 ? decodeURIComponent(kv.slice(1).join('=').replace(/\+/g, ' ')) : '';
+      if (val) out[key] = val.substring(0, 256);
+    }
+    return out;
+  }
+
+  // Reduce any href to origin+path for storage-safe wire values.
+  function sanitizeURL(href) {
+    try {
+      var u = new URL(href);
+      return u.origin + u.pathname;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  // Element text only when the page opted in (F41).
+  function elText(target) {
+    if (!captureText) return '';
+    return (target.textContent || '').trim().substring(0, 32);
+  }
+
   function send(eventType, props) {
     var payload = {
       event_type: eventType || 'pageview',
       event_id: makeId(),
       site_id: siteId,
-      url: location.href,
+      url: pageURL(),
       referrer: document.referrer || '',
       title: document.title || '',
       language: navigator.language || '',
       screen: screen.width + 'x' + screen.height
     };
+    var utm = campaignFields();
+    for (var k in utm) {
+      if (Object.prototype.hasOwnProperty.call(utm, k)) payload[k] = utm[k];
+    }
     if (props) payload.properties = props;
     if (distinctId) payload.distinct_id = distinctId;
 
@@ -208,7 +261,9 @@
         if (target.id) selector += '#' + target.id;
         else if (target.className && typeof target.className === 'string') selector += '.' + target.className.split(' ')[0];
 
-        var text = (target.textContent || '').trim().substring(0, 32);
+        // F41: text is sent only under data-capture-text opt-in; hrefs are
+        // reduced to origin+path (a query string can carry tokens).
+        var text = elText(target);
         var href = target.getAttribute('href') || '';
 
         // Rage click detection: 3+ clicks on same element within 1 second
@@ -226,7 +281,7 @@
 
         // Track meaningful clicks (links, buttons, inputs)
         if (tag === 'a' || tag === 'button' || tag === 'input' || target.getAttribute('role') === 'button') {
-          send('click', { selector: selector, text: text, href: href });
+          send('click', { selector: selector, text: text, href: sanitizeURL(href) });
         }
 
         // Dead click detection: click yielded no DOM mutation, no navigation,
@@ -251,7 +306,7 @@
             send('dead_click', {
               x: deadClickX, y: deadClickY,
               target_selector: selector,
-              page_url: startUrl,
+              page_url: sanitizeURL(startUrl),
             });
           }, 1500);
         }
@@ -274,7 +329,9 @@
         try {
           var url = new URL(link.href);
           if (url.hostname !== location.hostname) {
-            send('outbound_click', { href: link.href, text: (link.textContent || '').trim().substring(0, 32) });
+            // F41: origin+path only — the full href (query, fragment) never
+            // leaves the page; text under the same opt-in as clicks.
+            send('outbound_click', { href: sanitizeURL(link.href), text: elText(link) });
           }
         } catch(err) {}
       }, true);

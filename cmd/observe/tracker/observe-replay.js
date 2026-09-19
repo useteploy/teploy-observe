@@ -27,6 +27,15 @@
   // Rage click: N clicks on the same target within W ms.
   var rageThreshold = boundedInteger(script.getAttribute('data-rage-threshold'), 4, 1, 100);
   var rageWindowMs = boundedInteger(script.getAttribute('data-rage-window'), 1000, 100, 60000);
+  // F39 (the smaller step): mid-session re-snapshots. The player replays
+  // interactions over the initial snapshot, so a long session on a changing
+  // page drifts indefinitely. A fresh snapshot is recorded periodically
+  // and early when a mutation burst hits the threshold — both throttled by
+  // the minimum gap so a churning page cannot snapshot itself to death.
+  // This is NOT a DOM-delta protocol; the full design stays deferred.
+  var resnapshotIntervalMs = boundedInteger(script.getAttribute('data-resnapshot-interval'), 30000, 5000, 600000);
+  var resnapshotMinGapMs = boundedInteger(script.getAttribute('data-resnapshot-min-gap'), 10000, 1000, 600000);
+  var resnapshotBurst = boundedInteger(script.getAttribute('data-resnapshot-burst'), 150, 10, 5000);
 
   var events = [];
   var flushTimer = null;
@@ -190,12 +199,39 @@
     }
   }
 
+  // --- F39: throttled mid-session re-snapshot ---
+  //
+  // A fresh snapshot is recorded when the interval elapsed OR a mutation
+  // burst hit the threshold, whichever comes first — but never more often
+  // than the minimum gap. Snapshots are the heaviest event in a batch
+  // (bounded by the serializer's node/depth/text budgets), so the throttle
+  // bounds the overhead; the player already selects the most recent
+  // keyframe at or before the playhead, so these snapshots are what keeps
+  // a long replay from drifting off a single initial DOM.
+  var lastSnapshotAt = 0;
+  var mutationsSinceSnapshot = 0;
+  var resnapshotTimer = null;
+
+  function maybeResnapshot() {
+    if (!active) return;
+    var now = Date.now();
+    var intervalElapsed = now - lastSnapshotAt >= resnapshotIntervalMs;
+    var burstHit = mutationsSinceSnapshot >= resnapshotBurst;
+    if (!intervalElapsed && !burstHit) return;
+    if (now - lastSnapshotAt < resnapshotMinGapMs) return;
+    record('snapshot', takeSnapshot());
+    lastSnapshotAt = now;
+    mutationsSinceSnapshot = 0;
+  }
+
   // Full snapshot on start
   function init() {
     if (active) return; // AUD-027: idempotent start
     active = true;
 
     record('snapshot', takeSnapshot());
+    lastSnapshotAt = Date.now();
+    mutationsSinceSnapshot = 0;
 
     // Mouse moves (throttled)
     var lastMove = 0;
@@ -287,6 +323,11 @@
     // DOM mutations (simplified)
     if (typeof MutationObserver !== 'undefined') {
       observer = new MutationObserver(function(mutations) {
+        // F39: count mutations toward the re-snapshot burst threshold.
+        mutationsSinceSnapshot += mutations.length;
+        if (mutationsSinceSnapshot >= resnapshotBurst) {
+          maybeResnapshot();
+        }
         for (var i = 0; i < Math.min(mutations.length, 10); i++) {
           var m = mutations[i];
           if (m.type === 'childList' && m.addedNodes.length > 0) {
@@ -306,6 +347,11 @@
         attributeFilter: ['class', 'style', 'hidden', 'disabled']
       });
     }
+
+    // F39: periodic re-snapshot check rides the flush timer's cadence —
+    // the clock condition is evaluated against wall time, not the tick
+    // count, so a custom flush interval never changes the snapshot policy.
+    resnapshotTimer = setInterval(maybeResnapshot, 1000);
 
     // Error detection
     addListener(window, 'error', function() { hasError = true; });
@@ -572,6 +618,8 @@
       }
       if (flushTimer !== null) clearInterval(flushTimer);
       flushTimer = null;
+      if (resnapshotTimer !== null) clearInterval(resnapshotTimer);
+      resnapshotTimer = null;
       if (history.pushState === wrappedPush) history.pushState = origPush;
       if (history.replaceState === wrappedReplace) history.replaceState = origReplace;
       if (options && options.discard) {

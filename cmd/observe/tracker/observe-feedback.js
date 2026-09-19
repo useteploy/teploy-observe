@@ -48,7 +48,7 @@
 
       var payload = {
         site_id: siteId,
-        url: location.href,
+        url: (function(){ try { return location.origin + location.pathname; } catch (e) { return ''; } })(),
         message: msg,
         email: email,
         category: 'feedback'
