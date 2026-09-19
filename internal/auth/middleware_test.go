@@ -41,6 +41,9 @@ func TestJWTAuthMiddleware_RevokedTokenRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetch seeded principal: %v", err)
 	}
+	if user == nil {
+		t.Fatalf("seeded principal %q is not visible after login (engine visibility flake?)", username)
+	}
 
 	mw := JWTAuthMiddleware(svc)
 	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -113,6 +116,9 @@ func TestJWTAuthMiddleware_StreamTicketContract(t *testing.T) {
 	user, err := svc.Principals().LocalByUsername(ctx, username)
 	if err != nil {
 		t.Fatalf("fetch seeded principal: %v", err)
+	}
+	if user == nil {
+		t.Fatalf("seeded principal %q is not visible after login (engine visibility flake?)", username)
 	}
 	ticket, err := svc.GenerateStreamTicket(neutronauth.Claims{
 		"sub": user.ID, "username": username, "role": RoleAdmin,

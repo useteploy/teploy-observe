@@ -202,13 +202,16 @@ func TestF05OIDCSessionsRevocableAndIssuerScoped(t *testing.T) {
 	}
 
 	// A later sign-in on A refreshes the profile but must not reset the
-	// version — the revoked session stays dead.
+	// version — the revoked session stays dead. TO-003 refined the bump
+	// rule: an UNCHANGED role preserves the version exactly; a role CHANGE
+	// bumps it again (this re-sign-in carries editor where the principal
+	// was viewer).
 	tvA2, err := store.UpsertOIDC(ctx, idA, "alice", "alice@a.example", RoleEditor)
 	if err != nil {
 		t.Fatalf("re-sign-in A: %v", err)
 	}
-	if tvA2 != tvA+1 {
-		t.Fatalf("re-sign-in token_version: got %d, want %d (IdP refresh must preserve the revocation bump)", tvA2, tvA+1)
+	if tvA2 != tvA+2 {
+		t.Fatalf("re-sign-in token_version: got %d, want %d (revocation bump + the role-change bump; an unchanged role would preserve it)", tvA2, tvA+2)
 	}
 	stale, err := svc.GenerateToken(idA, "alice", RoleEditor, tvA)
 	if err != nil {

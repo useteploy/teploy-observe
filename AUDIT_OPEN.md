@@ -579,8 +579,16 @@ TS workspace (`pnpm install --frozen-lockfile`), runs scripts/ui-sync.sh,
 and fails on `git diff --exit-code -- cmd/observe/ui/dist`. A source edit
 without a ui-sync run can no longer ship a stale dashboard silently.
 First push may need provisioning fixes on the runner — the flow is
-verified locally (ui-sync is byte-idempotent against the working tree),
-but the job itself has not executed on GitHub's runners yet.
+verified locally (ui-sync is byte-idempotent against the working tree for
+every hashed asset) — but the job itself has not executed on GitHub's
+runners yet. RESIDUAL (found 2026-09-19, round-3 close-out): the
+canonical build stamps `generatedAt` (and byte-saved counters that
+reference it) into `.neutron-static-policy.json` /
+`.neutron-adapter-static.json`, so a rebuild of UNCHANGED source still
+differs in that metadata and the gate's `git diff --exit-code` would trip
+on it. Needs an upstream build normalization (stable timestamp or none)
+or the gate scoping those two metadata files out; framework-owned, filed
+for the upstream handover rather than worked around here.
 
 ## Resolution log (2026-09-12 — prior register, closed)
 

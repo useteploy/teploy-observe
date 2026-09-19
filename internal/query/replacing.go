@@ -69,7 +69,7 @@ var replacingKeys = map[string][]string{
 	"principals": {"id"},
 	// 041_replay_batch_ledger — insert-once per (site, replay, batch);
 	// replacing so a cross-process double-submit collapses to one row.
-	"replay_batches": {"tenant_id", "site_id", "replay_id", "batch_id"},
+	"replay_batches": {"tenant_id", "site_id", "replay_id", "producer_id", "batch_id"},
 }
 
 // Keys returns the registered ORDER BY key of a replacing table, or nil.
