@@ -136,54 +136,43 @@ func NewBuffer(db *nucleus.Client, maxSize, flushSize int, flushInterval time.Du
 }
 
 // AttachQueue enables WAL-backed durability. Must be called before Start;
-// any surviving events from the previous process are replayed immediately.
+// any surviving events from the previous process are recovered immediately.
 //
-// Audit F15: the queue is installed ONLY after replay succeeds. Installing it
-// first meant a failed replay could leave a live queue attached whose
-// checkpoint later advanced past the still-unread backlog — turning a
-// recoverable replay problem into skipped data.
+// Audit F15: the queue is installed ONLY after recovery succeeds.
 //
-// F16: replay STREAMS the backlog frame by frame with the dedup running in
-// 500-event chunks, instead of materializing the entire WAL as one []Event
-// slice next to the buffer's own copy. Peak replay memory is the final
-// backlog plus one chunk, not twice the backlog.
+// TO-014: recovery is WRITE-THROUGH and bounded — each streamed frame
+// chunk is committed to the database through insertBatch (whose per-chunk
+// transaction already runs the committed-event-id dedup) before the next
+// chunk is read, and the WAL is checkpointed once at the end. Peak replay
+// memory is one chunk, not the backlog; a corrupt late frame fails the
+// attach with NOTHING partially staged in the buffer (the events already
+// committed durably stay committed — the checkpoint simply doesn't
+// advance, and the remaining tail replays after the file is repaired).
+// The in-memory events buffer is never touched here, so a failed attach
+// cannot leave a half-attached prefix behind a memory-only fallback.
 func (b *Buffer) AttachQueue(q *DiskQueue) error {
-	// Exactly-once replay of committed events: a crash between a flush's DB
-	// commit and its WAL checkpoint leaves committed events still in the WAL,
-	// so replay would re-insert (and double-count) them. Drop any pending
-	// event whose event_id is already in the DB before replaying it. On a
-	// lookup error this FAILS OPEN (keeps all events) — durability over
-	// dedup — so it is a recovery optimization, not an unconditional
-	// exactly-once guarantee.
-	const dedupChunk = 500
+	const recoverChunk = 500
 	var chunk []Event
-	replayed := 0
-	dropped := 0
+	recovered, dropped := 0, 0
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
 	flushChunk := func() error {
 		if len(chunk) == 0 {
 			return nil
 		}
-		before := len(chunk)
-		chunk = b.dropAlreadyCommitted(chunk)
-		dropped += before - len(chunk)
-		if len(chunk) > 0 {
-			b.events = append(b.events, chunk...)
-			// AUD-015: replayed events count against the byte budget too —
-			// a large backlog must not restart with an unaccounted memory
-			// spike.
-			for _, e := range chunk {
-				n := approxEventBytes(e)
-				b.eventBytes = append(b.eventBytes, n)
-				b.bufferedBytes += int64(n)
-			}
-			replayed += len(chunk)
+		committed, err := b.insertBatch(ctx, chunk)
+		if err != nil {
+			return fmt.Errorf("WAL recovery commit failed (recovered-and-committed prefix: %d events, failing chunk starts at %d): %w", recovered, committed, err)
 		}
+		recovered += committed
+		dropped += len(chunk) - committed
 		chunk = chunk[:0]
 		return nil
 	}
 	if err := q.StreamPending(func(events []Event) error {
 		chunk = append(chunk, events...)
-		if len(chunk) >= dedupChunk {
+		if len(chunk) >= recoverChunk {
 			return flushChunk()
 		}
 		return nil
@@ -194,7 +183,7 @@ func (b *Buffer) AttachQueue(q *DiskQueue) error {
 		return fmt.Errorf("WAL replay failed: %w", err)
 	}
 	if dropped > 0 {
-		b.logger.Info("ingest queue: skipped already-committed events on replay", "dropped", dropped)
+		b.logger.Info("ingest queue: skipped already-committed events on recovery", "dropped", dropped)
 	}
 
 	b.mu.Lock()
@@ -202,12 +191,15 @@ func (b *Buffer) AttachQueue(q *DiskQueue) error {
 	if b.queue != nil {
 		return fmt.Errorf("WAL already attached")
 	}
-	// Seed the high-water mark to the WAL end so the first flush after replay
-	// checkpoints past the replayed region; otherwise those events (already on
-	// disk below the new writes) would replay again on the next crash.
+	// Everything recovered is now durable in the database: advance the
+	// checkpoint to the WAL end so the recovered region never replays
+	// again, and seed the high-water mark for the next flush.
+	if err := q.Checkpoint(q.Offset()); err != nil {
+		return fmt.Errorf("WAL recovery checkpoint failed (events are committed; the backlog will replay again after a restart): %w", err)
+	}
 	b.lastOffset = q.Offset()
-	if replayed > 0 {
-		b.logger.Info("ingest queue: replayed", "count", replayed)
+	if recovered > 0 {
+		b.logger.Info("ingest queue: recovered events from WAL", "count", recovered)
 	}
 	b.queue = q
 	return nil
@@ -226,8 +218,8 @@ func approxEventBytes(e Event) int {
 
 // existingEventIDs returns the subset of ids already stored in events, with
 // a timestamp floor so the lookup stays bounded (see flushDedupeHorizon).
-// Shared by the WAL-replay dedup (dropAlreadyCommitted) and the flush-time
-// dedup (filterUncommitted).
+// Used by the flush-time dedup (filterUncommitted), which also covers WAL
+// recovery now that recovery commits through insertBatch (TO-014).
 func existingEventIDs(ctx context.Context, sqlc *nucleus.SQLModel, ids []string, minTS int64, logger *slog.Logger) map[string]struct{} {
 	existing := make(map[string]struct{}, len(ids))
 	type idRow struct {
@@ -263,41 +255,6 @@ func existingEventIDs(ctx context.Context, sqlc *nucleus.SQLModel, ids []string,
 		}
 	}
 	return existing
-}
-
-// dropAlreadyCommitted returns the subset of events whose event_id is NOT
-// already present in the events table — so a WAL replay of committed-but-not-
-// checkpointed events doesn't double-count them. Bounded by a timestamp floor
-// so the lookup uses the (…, timestamp, …) sort-key prefix instead of a full
-// scan. On any error it FAILS OPEN (keeps all events) — preserving durability
-// at the cost of a possible duplicate, which is the pre-existing behavior.
-func (b *Buffer) dropAlreadyCommitted(pending []Event) []Event {
-	if len(pending) == 0 {
-		return pending
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	ids := make([]string, 0, len(pending))
-	minTS := pending[0].Timestamp
-	for _, e := range pending {
-		ids = append(ids, e.EventID)
-		if e.Timestamp < minTS {
-			minTS = e.Timestamp
-		}
-	}
-
-	existing := existingEventIDs(ctx, b.db.SQL(), ids, minTS, b.logger)
-	if existing == nil || len(existing) == 0 {
-		return pending
-	}
-	out := pending[:0]
-	for _, e := range pending {
-		if _, dup := existing[e.EventID]; !dup {
-			out = append(out, e)
-		}
-	}
-	return out
 }
 
 // Start begins the periodic flush loop. Idempotent-safe: a second Start is
@@ -644,10 +601,13 @@ const flushDedupeHorizon = 24 * time.Hour
 
 // filterUncommitted drops chunk events whose event_id already exists in the
 // events table (F12: the durable dedupe boundary for producer-stable event
-// ids). Runs inside the chunk's own transaction; Flush is serialized by
-// flushMu, so within one process the existence check and the INSERT it
-// guards cannot interleave with another flush of the same ids. Fails OPEN
-// on a lookup error (a possible duplicate beats certain data loss).
+// ids — and, since TO-014, the WAL-recovery dedup too: recovery commits
+// through insertBatch, so already-committed survivors of a crash between DB
+// commit and WAL checkpoint are dropped instead of double-counted). Runs
+// inside the chunk's own transaction; Flush is serialized by flushMu, so
+// within one process the existence check and the INSERT it guards cannot
+// interleave with another flush of the same ids. Fails OPEN on a lookup
+// error (a possible duplicate beats certain data loss).
 func (b *Buffer) filterUncommitted(ctx context.Context, sqlc *nucleus.SQLModel, chunk []Event) []Event {
 	ids := make([]string, 0, len(chunk))
 	minTS := chunk[0].Timestamp

@@ -322,3 +322,159 @@ func (m *memorySink) String() string { return string(m.data) }
 func (m *memorySink) has(substr string) bool {
 	return strings.Contains(m.String(), substr)
 }
+
+// TO-012: segment bases are immutable for the queue's lifetime. Repro: an
+// acknowledged-segment GC (from an earlier Checkpoint) used to rebase the
+// survivors' bases while q.offset and outstanding checkpoint targets stayed
+// in the original coordinates — a later Checkpoint of a target captured
+// after the rebase mapped it FORWARD by the removed size, marking
+// uncommitted records as durable (they never replayed after a crash).
+func TestDiskQueue_GCDoesNotRebaseOutstandingCheckpointTargets(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	const segBytes = 400
+	q, err := NewDiskQueue(dir, "events", time.Hour, segBytes, logger)
+	if err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+	defer q.Close()
+
+	// Append until the first roll, remembering the event that landed in
+	// segment 1 — checkpointing ITS end puts cpSeg=1 and GCs segment 0.
+	var rolledAt, t1 int64
+	for i := 0; ; i++ {
+		off, err := q.Append(ev(fmt.Sprintf("gc%03d", i)))
+		if err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		q.mu.Lock()
+		rolled := q.activeIdx >= 1
+		q.mu.Unlock()
+		if rolled {
+			rolledAt, t1 = int64(i), off
+			break
+		}
+	}
+	if err := q.Checkpoint(t1); err != nil {
+		t.Fatalf("checkpoint t1: %v", err)
+	}
+	q.mu.Lock()
+	segsAfterGC := len(q.segments)
+	q.mu.Unlock()
+	if segsAfterGC < 1 {
+		t.Fatal("expected surviving segments after acknowledged GC")
+	}
+
+	// More uncommitted appends; capture their end as the flush target.
+	var target int64
+	for i := int(rolledAt) + 1; i < int(rolledAt)+30; i++ {
+		target, err = q.Append(ev(fmt.Sprintf("gc%03d", i)))
+		if err != nil {
+			t.Fatalf("append tail: %v", err)
+		}
+	}
+	// Events appended AFTER the target was captured: they are not part of
+	// the batch being flushed, must NOT be covered by its checkpoint, and
+	// must replay after a crash.
+	var postTarget string
+	for i := int(rolledAt) + 30; i < int(rolledAt)+36; i++ {
+		if _, err = q.Append(ev(fmt.Sprintf("gc%03d", i))); err != nil {
+			t.Fatalf("append post-target: %v", err)
+		}
+		postTarget = fmt.Sprintf("gc%03d", i)
+	}
+	if err := q.Checkpoint(target); err != nil {
+		t.Fatalf("checkpoint target: %v", err)
+	}
+	// Crash: only the events AFTER `target` are uncommitted — they must
+	// ALL replay. Under the old base rebasing, the checkpoint mapped
+	// forward by the removed segment's size and skipped the first of them.
+	if err := q.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	q2, err := NewDiskQueue(dir, "events", time.Hour, segBytes, logger)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer q2.Close()
+	pending, err := q2.Pending()
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	got := ids(pending)
+	if len(got) == 0 {
+		t.Fatal("uncommitted tail must replay")
+	}
+	wantFirst := fmt.Sprintf("gc%03d", rolledAt+30)
+	if got[0] != wantFirst || got[len(got)-1] != postTarget {
+		t.Fatalf("post-GC replay = %v…%v, want %v…%v (a rebased checkpoint skipped the uncommitted records right after the target)",
+			got[0], got[len(got)-1], wantFirst, postTarget)
+	}
+}
+
+// TO-013: construction never deletes UNACKNOWLEDGED recovery data. A
+// backlog above the configured total cap must still be present (and
+// replayable) after NewDiskQueueWithLimits — the high-water is a roll-time
+// policy, not a startup purge.
+func TestDiskQueue_ConstructionPreservesOverCapBacklog(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	const segBytes = 400
+	// Write a multi-segment backlog whose total exceeds the cap we will
+	// pass on reopen.
+	q, err := NewDiskQueueWithLimits(dir, "events", time.Hour, segBytes, 1<<20, logger)
+	if err != nil {
+		t.Fatalf("seed queue: %v", err)
+	}
+	for i := 0; i < 30; i++ {
+		if _, err := q.Append(ev(fmt.Sprintf("cap%02d", i))); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	total := q.Stats().Bytes
+	if q.Stats().Segments < 2 {
+		t.Fatalf("expected a multi-segment backlog, got %d segment(s)", q.Stats().Segments)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Reopen with a total cap BELOW the backlog: every segment (all
+	// unacknowledged — nothing was checkpointed) must survive.
+	q2, err := NewDiskQueueWithLimits(dir, "events", time.Hour, segBytes, total-1, logger)
+	if err != nil {
+		t.Fatalf("reopen under cap: %v", err)
+	}
+	defer q2.Close()
+	pending, err := q2.Pending()
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	got := ids(pending)
+	if len(got) != 30 {
+		t.Fatalf("construction must preserve the unacknowledged backlog: got %d of 30 events", len(got))
+	}
+}
+
+// TO-015: a negative JSON checkpoint offset is corruption, not a position.
+func TestDiskQueue_NegativeJSONCheckpointOffsetRefused(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	q, err := NewDiskQueue(dir, "events", time.Hour, 1<<20, logger)
+	if err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+	if _, err := q.Append(ev("neg-1")); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "events", "checkpoint"),
+		[]byte(`{"segment":0,"offset":-1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewDiskQueue(dir, "events", time.Hour, 1<<20, logger); err == nil {
+		t.Fatal("a negative JSON checkpoint offset must be refused at open")
+	}
+}

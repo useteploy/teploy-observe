@@ -119,14 +119,18 @@ func (q *DiskQueue) Stats() QueueStats {
 	}
 }
 
-// WithMaxTotalBytes sets the disk high-water (F16). Values below maxBytes are
-// clamped to maxBytes — a cap that forbids even one segment would turn every
-// roll into a breach loop.
+// WithMaxTotalBytes sets the disk high-water (F16). Values below maxBytes
+// are clamped to maxBytes with a warning (TO-013: a cap that forbids even
+// one segment would turn every roll into a breach loop — and the clamp is
+// operator-visible, not silent).
 func (q *DiskQueue) WithMaxTotalBytes(n int64) *DiskQueue {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if n >= q.maxBytes && n > 0 {
 		q.maxTotalBytes = n
+	} else if n > 0 {
+		q.logger.Warn("ingest queue: OBSERVE_WAL_MAX_TOTAL_BYTES below the segment cap — clamped to the segment cap",
+			"queue", q.name, "configured", n, "effective", q.maxBytes)
 	}
 	return q
 }
@@ -168,12 +172,36 @@ func parseSegmentFileName(name string) (int64, bool) {
 	return n, true
 }
 
-// NewDiskQueue opens (or creates) a disk queue under dir/name/. Missing
-// directories are created. fsyncInterval is how often we flush OS buffers
-// to disk during steady-state writes. maxBytes is the per-segment cap
-// (F16): an append that would push the active segment past it rolls to a
-// fresh segment first.
+// NewDiskQueue opens (or creates) a disk queue under dir/name/ with the
+// default total-bytes high-water (raised to the segment cap when a caller
+// passes a larger segment — one full segment always fits, the same clamp
+// WithMaxTotalBytes applies). See NewDiskQueueWithLimits for the full
+// contract (TO-013: the configured cap must be in effect before any
+// discovery/GC decision is made — use the limits variant when the cap is
+// operator-configured).
 func NewDiskQueue(dir, name string, fsyncInterval time.Duration, maxBytes int64, logger *slog.Logger) (*DiskQueue, error) {
+	total := int64(DefaultWALMaxTotalBytes)
+	if maxBytes > total {
+		total = maxBytes
+	}
+	return NewDiskQueueWithLimits(dir, name, fsyncInterval, maxBytes, total, logger)
+}
+
+// NewDiskQueueWithLimits opens (or creates) a disk queue with BOTH byte
+// limits supplied up front (TO-013). The constructor never sheds
+// UNACKNOWLEDGED recovery data: it reclaims only acknowledged sealed
+// segments (below the checkpoint — already committed, safe), and leaves the
+// high-water enforcement to roll time, after the backlog has been replayed
+// and the operator's configured cap is in effect. A queue that starts over
+// the cap therefore comes up intact, replays on Attach, and reclaims once
+// flushes advance the checkpoint.
+func NewDiskQueueWithLimits(dir, name string, fsyncInterval time.Duration, maxBytes, maxTotalBytes int64, logger *slog.Logger) (*DiskQueue, error) {
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("ingest queue: segment bytes cap must be positive (got %d)", maxBytes)
+	}
+	if maxTotalBytes < maxBytes {
+		return nil, fmt.Errorf("ingest queue: total bytes cap (%d) must be >= the segment cap (%d)", maxTotalBytes, maxBytes)
+	}
 	full := filepath.Join(dir, name)
 	if err := os.MkdirAll(full, 0o700); err != nil {
 		return nil, fmt.Errorf("ingest queue: mkdir: %w", err)
@@ -191,7 +219,7 @@ func NewDiskQueue(dir, name string, fsyncInterval time.Duration, maxBytes int64,
 		name:           name,
 		fsyncInterval:  fsyncInterval,
 		maxBytes:       maxBytes,
-		maxTotalBytes:  DefaultWALMaxTotalBytes,
+		maxTotalBytes:  maxTotalBytes,
 		stopCh:         make(chan struct{}),
 		logger:         logger,
 		activeIdx:      0,
@@ -330,10 +358,14 @@ func NewDiskQueue(dir, name string, fsyncInterval time.Duration, maxBytes int64,
 	q.offset = q.segmentEnd(q.activeIdx)
 	q.cpSeg, q.cpOff = cpSeg, cpOff
 
-	// F16: reclaim acknowledged sealed segments left behind by a crash
-	// between checkpoint and GC, and enforce the disk high-water.
+	// F16 + TO-013: reclaim acknowledged sealed segments left behind by a
+	// crash between checkpoint and GC — safe, they are below the
+	// checkpoint. The disk high-water is deliberately NOT enforced here:
+	// construction runs before the operator's configured cap could be
+	// applied through the old setter flow and before replay drains the
+	// backlog; dropping unacknowledged segments at startup deleted
+	// recoverable data. enforceCapLocked runs at roll time instead.
 	q.gcSegmentsLocked()
-	q.enforceCapLocked()
 
 	go q.fsyncLoop()
 	return q, nil
@@ -572,6 +604,16 @@ func (q *DiskQueue) rollLocked() error {
 // segment that still holds unacknowledged records is a POLICY BREACH —
 // those events lose their crash-recovery copy (they remain in the flush
 // buffer) — and is counted and logged. Callers hold q.mu.
+//
+// TO-012: surviving segment bases are IMMUTABLE — nothing is rebased here.
+// q.offset and every checkpoint target Buffer holds live in one logical
+// coordinate system for the lifetime of the queue instance; shifting bases
+// under them mapped a still-valid target past uncommitted records.
+// Bases are re-derived from the on-disk segment set only at construction.
+//
+// TO-013: this runs at ROLL time (and after checkpoint GC), never as a
+// side effect of construction before the configured cap was applied and
+// the backlog replayed.
 func (q *DiskQueue) enforceCapLocked() {
 	var total int64
 	for i := range q.segments {
@@ -594,12 +636,9 @@ func (q *DiskQueue) enforceCapLocked() {
 			q.logger.Error("ingest queue: high-water GC dir sync failed", "queue", q.name, "err", err)
 		}
 		q.segments = q.segments[1:]
-		// Bases of the survivors shift down by the removed size; the
-		// checkpoint is stored as (segment, offset) so its own mapping is
-		// unaffected — only recompute the survivors' bases.
-		for i := range q.segments {
-			q.segments[i].base -= oldest.size
-		}
+		// The checkpoint is stored as (segment, offset), so its mapping
+		// is unaffected by removal; logical offsets stay in the original
+		// coordinate system (see the TO-012 note above).
 		total -= oldest.size
 		if !acked {
 			q.droppedUnackedSegments++
@@ -614,7 +653,7 @@ func (q *DiskQueue) enforceCapLocked() {
 
 // gcSegmentsLocked deletes sealed segments fully below the checkpoint
 // (acknowledged-segment GC, F16). Never touches the active segment.
-// Callers hold q.mu.
+// Callers hold q.mu. Segment bases are never rebased (TO-012).
 func (q *DiskQueue) gcSegmentsLocked() {
 	removed := true
 	for removed {
@@ -634,9 +673,6 @@ func (q *DiskQueue) gcSegmentsLocked() {
 				q.logger.Warn("ingest queue: acknowledged-segment GC dir sync failed", "queue", q.name, "err", err)
 			}
 			q.segments = q.segments[1:]
-			for i := range q.segments {
-				q.segments[i].base -= oldest.size
-			}
 			removed = true
 		}
 	}
@@ -967,6 +1003,12 @@ func (q *DiskQueue) fsyncLoop() {
 					q.setErrLocked(fmt.Errorf("WAL flush: %w", err))
 				} else if err := q.file.Sync(); err != nil {
 					q.setErrLocked(fmt.Errorf("WAL sync: %w", err))
+				} else {
+					// TO-016: a successful periodic sync clears the dirty
+					// flag — leaving it set made an otherwise idle queue
+					// re-fsync every interval until some other path
+					// happened to reset it.
+					q.dirtySinceFlush = false
 				}
 			}
 			q.mu.Unlock()
@@ -1033,7 +1075,12 @@ func repairTornTail(f *os.File, size int64, logger *slog.Logger, name string) (i
 // (AUD-014, round 2). F16: the check runs against the checkpoint's own
 // segment file.
 func (q *DiskQueue) validateCheckpointBoundary(seg, off int64) error {
-	if off <= 0 {
+	// TO-015: only a zero offset is boundary-trivially-valid; a negative
+	// offset is corruption, not a position.
+	if off < 0 {
+		return fmt.Errorf("checkpoint offset is negative (%d)", off)
+	}
+	if off == 0 {
 		return nil
 	}
 	var name string
@@ -1077,8 +1124,11 @@ func readCheckpoint(path string) (seg, off int64, err error) {
 		if err := json.Unmarshal([]byte(trimmed), &cf); err != nil {
 			return 0, 0, fmt.Errorf("ingest queue: parse checkpoint: %w", err)
 		}
-		if cf.Segment < 0 {
-			return 0, 0, fmt.Errorf("ingest queue: checkpoint segment is negative (%d)", cf.Segment)
+		// TO-015: both components are validated — a negative JSON offset
+		// used to pass parsing (only the segment was checked) and reach a
+		// negative seek during replay.
+		if cf.Segment < 0 || cf.Offset < 0 {
+			return 0, 0, fmt.Errorf("ingest queue: checkpoint position is negative (segment=%d offset=%d)", cf.Segment, cf.Offset)
 		}
 		return cf.Segment, cf.Offset, nil
 	}

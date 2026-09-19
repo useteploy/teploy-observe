@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"testing"
 	"time"
+
+	"github.com/neutron-dev/neutron-go/nucleus"
 )
 
 // TestReplayDedup_DropsAlreadyCommitted is the regression for exactly-once event
@@ -60,14 +62,54 @@ func TestReplayDedup_DropsAlreadyCommitted(t *testing.T) {
 		t.Fatalf("attach: %v", err)
 	}
 
-	// Only the fresh event should be queued for replay; the committed one is dropped.
-	buf.mu.Lock()
-	got := append([]Event(nil), buf.events...)
-	buf.mu.Unlock()
-	if len(got) != 1 {
-		t.Fatalf("want 1 replayed event (fresh only), got %d: %+v", len(got), got)
+	// TO-014: recovery is write-through — the fresh event is committed to
+	// the events table during attach (not staged in the in-memory buffer),
+	// the committed one is deduped, and nothing stays buffered.
+	if got := buf.Len(); got != 0 {
+		t.Fatalf("write-through recovery must leave the in-memory buffer empty, got %d events", got)
 	}
-	if got[0].EventID != freshID {
-		t.Fatalf("replayed wrong event: got %q, want %q", got[0].EventID, freshID)
+	countRows := func(q string, args ...any) int {
+		rows, err := nucleus.Query[struct {
+			N string `db:"n"`
+		}](ctx, db.SQL(), q, args...)
+		if err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("count: expected 1 row, got %d", len(rows))
+		}
+		var n int
+		if _, err := fmt.Sscanf(rows[0].N, "%d", &n); err != nil {
+			t.Fatalf("count parse %q: %v", rows[0].N, err)
+		}
+		return n
+	}
+	for _, tc := range []struct {
+		id   string
+		want int
+	}{
+		{committedID, 1},
+		{freshID, 1},
+	} {
+		got := countRows("SELECT CAST(COUNT(*) AS TEXT) AS n FROM events WHERE event_id = $1", tc.id)
+		if got != tc.want {
+			t.Fatalf("event %s: want %d row(s) after recovery, got %d", tc.id, tc.want, got)
+		}
+	}
+
+	// The recovery checkpoint advanced: reopening the queue again must
+	// replay nothing.
+	_ = q2.Close()
+	q3, err := NewDiskQueue(dir, "ingest", time.Second, 1<<20, logger)
+	if err != nil {
+		t.Fatalf("reopen after recovery: %v", err)
+	}
+	defer q3.Close()
+	buf3 := NewBuffer(db, 1000, 100, time.Hour, logger)
+	if err := buf3.AttachQueue(q3); err != nil {
+		t.Fatalf("second attach: %v", err)
+	}
+	if got := buf3.Len(); got != 0 {
+		t.Fatalf("a checkpointed recovery must not replay again, got %d events", got)
 	}
 }

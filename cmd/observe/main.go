@@ -257,6 +257,9 @@ func main() {
 	// all segments; a roll that would exceed it drops the OLDEST segment
 	// (breach-counted and logged loudly when it held unacknowledged events
 	// — those lose their crash-recovery copy, availability is kept).
+	// TO-013: the cap is passed INTO construction (a setter-after-the-fact
+	// let the constructor's default cap delete recovery data before the
+	// operator's larger configured cap ever took effect).
 	walMaxTotalBytes := int64(0) // 0 -> DiskQueue default (512 MiB)
 	if raw := strings.TrimSpace(os.Getenv("OBSERVE_WAL_MAX_TOTAL_BYTES")); raw != "" {
 		if n, perr := strconv.ParseInt(raw, 10, 64); perr == nil && n > 0 {
@@ -275,11 +278,19 @@ func main() {
 	// looking healthy.
 	requireWAL := strings.EqualFold(os.Getenv("OBSERVE_REQUIRE_WAL"), "true") || os.Getenv("OBSERVE_REQUIRE_WAL") == "1"
 	walDegraded := false
-	eventsQ, err := ingest.NewDiskQueue(queueDir, "events", 500*time.Millisecond, maxQueueBytes, logger)
+	effectiveWalCap := walMaxTotalBytes
+	if effectiveWalCap == 0 {
+		effectiveWalCap = ingest.DefaultWALMaxTotalBytes
+	}
+	if effectiveWalCap < maxQueueBytes {
+		// Same clamp the setter applied (a cap below one segment is a
+		// breach loop), but operator-visible.
+		logger.Warn("OBSERVE_WAL_MAX_TOTAL_BYTES below the segment cap — clamped to the segment cap",
+			"configured", effectiveWalCap, "effective", maxQueueBytes)
+		effectiveWalCap = maxQueueBytes
+	}
+	eventsQ, err := ingest.NewDiskQueueWithLimits(queueDir, "events", 500*time.Millisecond, maxQueueBytes, effectiveWalCap, logger)
 	if err == nil {
-		if walMaxTotalBytes > 0 {
-			eventsQ.WithMaxTotalBytes(walMaxTotalBytes)
-		}
 		if err := buf.AttachQueue(eventsQ); err != nil {
 			walDegraded = true
 			// AUD-012 (round 2): close the created-but-unattached queue —
