@@ -247,3 +247,211 @@ test("mutation bursts and time trigger throttled re-snapshots", async () => {
   const snapshots = bodies.flatMap((b) => (b.events || []).filter((e) => e.type === "snapshot"));
   assert.ok(snapshots.length >= 2, `expected the initial snapshot plus a burst re-snapshot, got ${snapshots.length}`);
 });
+
+// --- Round-3 fixtures: capture-aware listeners, pre-set DOM, gated
+// delivery — the flag-matching, serializer, and discard-invalidation
+// contracts exercised against the real served script.
+function makeR3Sandbox({ fetchImpl, attrs, documentElement } = {}) {
+  const listeners = []; // {target,type,fn,capture}
+  const add = (target) => (t, fn, opts) => {
+    const capture = typeof opts === "boolean" ? opts : !!(opts && opts.capture);
+    listeners.push({ target, type: t, fn, capture });
+  };
+  const remove = (target) => (t, fn, capture) => {
+    // Real EventTarget semantics: removal requires the SAME capture flag
+    // the listener was added with.
+    const i = listeners.findIndex((l) =>
+      l.target === target && l.type === t && l.fn === fn && l.capture === !!capture);
+    if (i >= 0) listeners.splice(i, 1);
+  };
+  const document = {
+    currentScript: {
+      src: "https://observe.test/t/observe-replay.js",
+      getAttribute: (n) => (attrs && n in attrs ? attrs[n] : null),
+    },
+    addEventListener: add("document"),
+    removeEventListener: remove("document"),
+    visibilityState: "visible",
+    doctype: { name: "html" },
+    documentElement: documentElement || {
+      nodeType: 1, tagName: "HTML", attributes: [], childNodes: [
+        { nodeType: 1, tagName: "BODY", attributes: [], childNodes: [] },
+      ],
+    },
+    body: { nodeType: 1, tagName: "BODY", attributes: [], childNodes: [] },
+  };
+  const bodies = [];
+  const sandbox = {
+    console,
+    document,
+    history: { pushState() {}, replaceState() {} },
+    location: { origin: "https://app.test", pathname: "/page", href: "https://app.test/page" },
+    navigator: { userAgent: "node-test" },
+    setInterval: () => 1,
+    clearInterval: () => {},
+    setTimeout,
+    localStorage: { getItem: () => null },
+    addEventListener: add("window"),
+    removeEventListener: remove("window"),
+    fetch:
+      fetchImpl ||
+      ((url, opts) => {
+        bodies.push({ url: String(url), body: JSON.parse(opts.body) });
+        return Promise.resolve({ ok: true });
+      }),
+    XMLHttpRequest: function () { throw new Error("XHR not expected"); },
+    Blob: class { constructor(p) { this.size = String(p[0]).length; } },
+    TextEncoder,
+    URL,
+  };
+  sandbox.window = sandbox;
+  vm.runInNewContext(src, sandbox, { filename: "observe-replay.js" });
+  return { sandbox, listeners, bodies, document };
+}
+
+function r3click(listeners, target) {
+  listeners.filter((l) => l.type === "click").at(-1).fn({ target, clientX: 1, clientY: 2 });
+}
+
+function r3hideAndFlush(sandbox, listeners) {
+  sandbox.document.visibilityState = "hidden";
+  listeners.filter((l) => l.type === "visibilitychange").at(-1).fn({});
+}
+
+// TO-029: capture-phase listeners are removed WITH the capture flag, so
+// nothing the recorder installed survives stop().
+test("stop removes capture-phase listeners via the matching flag (TO-029)", () => {
+  const { sandbox, listeners } = makeR3Sandbox();
+  const before = listeners.length;
+  assert.ok(before > 0);
+  sandbox.window.observeReplay.stop();
+  assert.equal(listeners.length, 0, "every installed listener must be gone after stop");
+});
+
+// TO-029: a handler reference that escapes removal (e.g. held by the app)
+// is inert after stop — no events, no rage-click requests.
+test("held handler is inert after stop (TO-029)", () => {
+  const { sandbox, listeners, bodies } = makeR3Sandbox();
+  const handler = listeners.filter((l) => l.type === "click").at(-1);
+  sandbox.window.observeReplay.stop();
+  const target = { nodeType: 1, tagName: "BUTTON", id: "b", className: "", attributes: [] };
+  const before = bodies.length;
+  for (let i = 0; i < 6; i++) handler.fn({ target, clientX: 1, clientY: 2 });
+  assert.equal(bodies.length, before, "a held handler must produce zero requests after stop");
+});
+
+// TO-029: discard aborts/invalidates in-flight delivery — a first chunk
+// completing after stop({discard:true}) must not send later chunks or
+// requeue anything.
+test("discard during in-flight delivery sends no later chunks (TO-029)", async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let sent = 0;
+  const s = makeR3Sandbox({
+    fetchImpl: () => {
+      sent++;
+      return gate.then(() => Promise.resolve({ ok: true }));
+    },
+  });
+  const target = { nodeType: 1, tagName: "BUTTON", id: "x", className: "", attributes: [] };
+  for (let i = 0; i < 3; i++) r3click(s.listeners, target);
+  r3hideAndFlush(s.sandbox, s.listeners);
+  assert.ok(sent >= 1, "a chunk must be in flight");
+  s.sandbox.window.observeReplay.stop({ discard: true });
+  release();
+  await new Promise((r) => setTimeout(r, 20));
+  const after = sent;
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(sent, after, "no further chunks may send or retry after discard");
+});
+
+// TO-031: a second independent burst on the SAME selector reports again.
+// (The rage window attribute clamps to a 100 ms minimum; the gap must
+// exceed it.)
+test("rage clicks: second burst on the same element is reported (TO-031)", async () => {
+  const { sandbox, listeners, bodies } = makeR3Sandbox({
+    attrs: { "data-rage-window": "150", "data-rage-threshold": "3" },
+  });
+  const target = { nodeType: 1, tagName: "BUTTON", id: "rage", className: "", attributes: [] };
+  for (let i = 0; i < 3; i++) r3click(listeners, target);
+  const firstReports = bodies.filter((b) => b.body.error_type === "RageClick").length;
+  assert.ok(firstReports >= 1, "first burst must report");
+  await new Promise((r) => setTimeout(r, 250));
+  const before = bodies.length;
+  for (let i = 0; i < 3; i++) r3click(listeners, target);
+  const secondReports = bodies.slice(before).filter((b) => b.body.error_type === "RageClick").length;
+  assert.ok(secondReports >= 1, "a second independent burst on the same element must report again");
+});
+
+// TO-028: forbidden attribute channels never serialize — CSRF meta
+// content, signed img src queries, style, href. The DOM is in place
+// BEFORE the script loads so the initial snapshot sees it.
+test("snapshot serializer drops non-allowlisted attributes and head content (TO-028)", () => {
+  const { sandbox, listeners, bodies } = makeR3Sandbox({
+    documentElement: {
+      nodeType: 1, tagName: "HTML", attributes: [], childNodes: [
+        { nodeType: 1, tagName: "HEAD", attributes: [], childNodes: [
+          { nodeType: 1, tagName: "META", attributes: [
+            { name: "name", value: "csrf" }, { name: "content", value: "TO028_CSRF_SECRET" },
+          ], childNodes: [] },
+        ] },
+        { nodeType: 1, tagName: "BODY", attributes: [], childNodes: [
+          { nodeType: 1, tagName: "IMG", attributes: [
+            { name: "src", value: "https://cdn.test/pic.png?sig=TO028_SIGNED" },
+            { name: "onerror", value: "alert(1)" },
+          ], childNodes: [] },
+          { nodeType: 1, tagName: "A", attributes: [
+            { name: "href", value: "https://track.test/click?token=TO028_HREF" },
+          ], childNodes: [{ nodeType: 3, textContent: "link" }] },
+          { nodeType: 1, tagName: "DIV", attributes: [
+            { name: "style", value: "background:url(https://leak.test/x)" },
+            { name: "class", value: "keep-me" },
+          ], childNodes: [{ nodeType: 3, textContent: "text" }] },
+        ] },
+      ],
+    },
+  });
+  r3click(listeners, { nodeType: 1, tagName: "BUTTON", id: "snap", className: "", attributes: [] });
+  r3hideAndFlush(sandbox, listeners);
+  const snap = bodies.map((b) => JSON.stringify(b.body)).find((s) => s.includes("snapshot"));
+  assert.ok(snap, "a snapshot must have been recorded");
+  assert.ok(!snap.includes("TO028_CSRF_SECRET"), "meta content must not serialize");
+  assert.ok(!snap.includes("TO028_SIGNED"), "img src query must be stripped");
+  assert.ok(!snap.includes("sig="), "no query material at all");
+  assert.ok(!snap.includes("TO028_HREF"), "href must not serialize");
+  assert.ok(!snap.includes("leak.test"), "style must not serialize");
+  assert.ok(!snap.includes("onerror"), "event handlers must not serialize");
+  assert.ok(snap.includes("keep-me"), "allowlisted class attribute survives");
+  assert.ok(snap.includes("https://cdn.test/pic.png"), "sanitized img src survives");
+});
+
+// TO-030: an event too large for any legal request is dropped at flush
+// time with an error report — it must not block the valid events behind
+// it as a permanently failing retry head. (Single fields are capped by the
+// serializer; the aggregate of many capped text nodes is what can exceed
+// the request budget.)
+test("oversized event is dropped, later events still deliver (TO-030)", async () => {
+  // 16 branches x 200 capped text nodes x 1000 chars ≈ 3.2 MB serialized —
+  // over the 1.5 MiB request cap, while every individual limit is legal.
+  const childNodes = [];
+  for (let b = 0; b < 16; b++) {
+    const branch = { nodeType: 1, tagName: "DIV", attributes: [], childNodes: [] };
+    for (let i = 0; i < 200; i++) {
+      branch.childNodes.push({ nodeType: 3, textContent: "y".repeat(1000) });
+    }
+    childNodes.push(branch);
+  }
+  const { sandbox, listeners, bodies } = makeR3Sandbox({
+    documentElement: {
+      nodeType: 1, tagName: "HTML", attributes: [], childNodes: [
+        { nodeType: 1, tagName: "BODY", attributes: [], childNodes },
+      ],
+    },
+  });
+  r3click(listeners, { nodeType: 1, tagName: "BUTTON", id: "big", className: "", attributes: [] });
+  r3hideAndFlush(sandbox, listeners);
+  await new Promise((r) => setTimeout(r, 50));
+  const types = bodies.flatMap((b) => (b.body.events || []).map((e) => e.type));
+  assert.ok(!types.includes("snapshot"), "the oversized snapshot must be dropped");
+  assert.ok(types.includes("click"), "the valid click behind it must still deliver");
+});

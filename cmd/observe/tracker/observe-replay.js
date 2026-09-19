@@ -57,14 +57,22 @@
   // continuing to record, and repeated start() cannot stack duplicate
   // listeners, observers, wrappers, and timers.
   var active = false;
-  var listeners = [];       // [target, type, fn] triples to remove on stop
+  // TO-029: listeners store their CAPTURE FLAG — removeEventListener only
+  // detaches a listener added with the same flag, so the capture-phase
+  // click/input listeners (registered with `true`) survived stop() while
+  // being removed without it, and the retained click handler kept firing
+  // reportRageClick network requests after consent withdrawal. Every
+  // stored wrapper is additionally gated on `active` at entry.
+  var listeners = [];       // [target, type, fn, capture] to remove on stop
   var observer = null;      // MutationObserver to disconnect on stop
   var origPush = null, wrappedPush = null;
   var origReplace = null, wrappedReplace = null;
 
   function addListener(target, type, fn, opts) {
-    target.addEventListener(type, fn, opts);
-    listeners.push([target, type, fn]);
+    var capture = typeof opts === 'boolean' ? opts : !!(opts && opts.capture);
+    function guarded(event) { if (active) fn(event); }
+    target.addEventListener(type, guarded, opts);
+    listeners.push([target, type, guarded, capture]);
   }
 
   // Local replay id — generated client-side so observe-errors.js can attach
@@ -102,15 +110,51 @@
   // fix. A subtree can opt into masking with data-observe-block; there is
   // deliberately no opt-OUT from blocking.
   //
+  // TO-028 (round 3): attributes are captured through an ALLOWLIST (see
+  // CAPTURE_ATTRS) and the document head subtree is an opaque placeholder,
+  // so meta content (CSRF tokens), signed href queries, and style URLs
+  // never leave the browser; the only URL ever captured is a sanitized
+  // img src (origin+path) the player re-loads through the asset proxy.
+  //
   // AUD-031 (round 2): the serializer is bounded — total nodes, depth, and
   // text length — so a huge or pathologically deep page cannot stall the
-  // recorder. Bounds are enforced per snapshot, not per element.
+  // recorder. Bounds are enforced per snapshot, not per element. TO-030
+  // (round 3): the node budget matches the player's render budget
+  // (5000), so every accepted snapshot is one the player can actually
+  // render.
 
-  var PRIVATE_TAG = /^(input|textarea|select|option|script|noscript|iframe|object|embed|style)$/;
+  var PRIVATE_TAG = /^(input|textarea|select|option|script|noscript|iframe|object|embed|style|head|meta|link|base|title)$/;
 
-  var MAX_SNAPSHOT_NODES = 15000;
+  var MAX_SNAPSHOT_NODES = 5000;
   var MAX_SNAPSHOT_DEPTH = 32;
   var MAX_TEXT_LENGTH = 2048;
+
+  // TO-028: a capture-time attribute ALLOWLIST — the serializer used to
+  // copy every attribute except on*/data-*/value, which shipped meta
+  // content (CSRF tokens), signed src/href queries, and style URLs to
+  // replay storage. Only structural/styling-safe attributes survive;
+  // img src is sanitized to origin+path (the player proxies the load).
+  // The player's own renderer allowlist is the second, independent layer.
+  var CAPTURE_ATTRS = {
+    'class': true, 'id': true, 'colspan': true, 'rowspan': true,
+    'dir': true, 'lang': true, 'alt': true, 'width': true, 'height': true,
+    'type': true, 'role': true, 'href': false, 'src': false
+  };
+
+  function captureAttribute(tag, name, value) {
+    name = String(name || '').toLowerCase();
+    if (name === 'src' && tag === 'img') {
+      try {
+        var u = new URL(value, location.href);
+        if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+        u.username = ''; u.password = ''; u.search = ''; u.hash = '';
+        return u.href.length <= 2048 ? u.href : null;
+      } catch (e) { return null; }
+    }
+    if (!CAPTURE_ATTRS[name] || CAPTURE_ATTRS[name] === false) return null;
+    if (typeof value !== 'string' || value.length > 256) return null;
+    return value;
+  }
 
   function isPrivateElement(el) {
     var tag = el.tagName.toLowerCase();
@@ -144,12 +188,11 @@
     for (var i = 0; i < node.attributes.length; i++) {
       var attr = node.attributes[i];
       var name = attr.name;
-      // Skip event handlers, data-* attributes (token-bearing), and the
-      // value attribute anywhere it can hold user input.
+      // Event handlers and data-* attributes never serialize (token-bearing).
       if (name.lastIndexOf('on', 0) === 0) continue;
       if (name.lastIndexOf('data-', 0) === 0) continue;
-      if (name === 'value') continue;
-      attrs[name] = attr.value;
+      var captured = captureAttribute(tag, name, attr.value);
+      if (captured !== null) attrs[name] = captured;
     }
 
     var children = [];
@@ -253,24 +296,25 @@
       var ctx = pageContext();
       record('click', { x: e.clientX, y: e.clientY, target: sel, page_url: ctx.page_url, viewport_width: ctx.viewport_width });
 
-      // AUD-034 (round 2): an emptied time window starts a NEW burst — the
-      // `reported` flag used to reset only on a selector change, so a
-      // second independent rage burst on the same element was never
-      // reported, and threshold=1 never fired on its first click.
+      // AUD-034 (round 2) + TO-031 (round 3): an emptied time window
+      // starts a NEW burst. The prune-and-reset must run BEFORE the
+      // current click is pushed — appending first guaranteed the window
+      // was never empty, so the `reported` flag never reset and a second
+      // independent burst on the same element was never reported.
       var now = Date.now();
       if (rageState.selector !== sel) {
         rageState.selector = sel;
         rageState.clicks = [];
         rageState.reported = false;
       }
-      rageState.clicks.push(now);
       var cutoff = now - rageWindowMs;
       while (rageState.clicks.length && rageState.clicks[0] < cutoff) {
         rageState.clicks.shift();
       }
-      if (!rageState.clicks.length) {
+      if (rageState.clicks.length === 0) {
         rageState.reported = false;
       }
+      rageState.clicks.push(now);
       if (rageState.clicks.length >= rageThreshold && !rageState.reported) {
         rageState.reported = true;
         record('rage_click', { target: sel, count: rageState.clicks.length });
@@ -410,21 +454,38 @@
     var small = byteLength(body) <= 48 * 1024;
     var headers = { 'Content-Type': 'application/json' };
     if (apiKey) headers['X-API-Key'] = apiKey;
+    // The callback fires at most once; TO-029's discard aborts the
+    // transport, which resolves it with an error (ignored via the
+    // generation check in sendChunks).
+    var settled = false;
+    var done = function(err) {
+      if (settled) return;
+      settled = true;
+      cb(err || null);
+    };
 
     if (typeof fetch === 'function') {
       try {
+        var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        var abortFetch = controller
+          ? function() { try { controller.abort(); } catch (e) { /* already settled */ } }
+          : null;
+        if (abortFetch) inFlightRequests.add(abortFetch);
         fetch(url, {
           method: 'POST',
           credentials: 'omit',
           redirect: 'error',
           headers: headers,
           body: body,
-          keepalive: small
+          keepalive: small,
+          signal: controller ? controller.signal : undefined
         }).then(function(res) {
-          if (!res.ok) cb(new Error('observe-replay: ingest returned ' + res.status));
-          else cb(null);
+          if (abortFetch) inFlightRequests.delete(abortFetch);
+          if (!res.ok) done(new Error('observe-replay: ingest returned ' + res.status));
+          else done(null);
         }, function(err) {
-          cb(err instanceof Error ? err : new Error(String(err)));
+          if (abortFetch) inFlightRequests.delete(abortFetch);
+          done(err instanceof Error ? err : new Error(String(err)));
         });
         return;
       } catch (e) {
@@ -442,21 +503,43 @@
       } catch (e) { /* fall through to XHR */ }
     }
     var xhr = new XMLHttpRequest();
+    var xhrAbort = function() { try { xhr.abort(); } catch (e) { /* noop */ } };
+    inFlightRequests.add(xhrAbort);
     xhr.open('POST', url, true);
     for (var h in headers) {
       if (Object.prototype.hasOwnProperty.call(headers, h)) {
         try { xhr.setRequestHeader(h, headers[h]); } catch (e) { /* forbidden header name */ }
       }
     }
+    var xhrDone = function(err) { inFlightRequests.delete(xhrAbort); done(err); };
     xhr.onload = function() {
-      if (xhr.status >= 200 && xhr.status < 300) cb(null);
-      else cb(new Error('observe-replay: ingest returned ' + xhr.status));
+      if (xhr.status >= 200 && xhr.status < 300) xhrDone(null);
+      else xhrDone(new Error('observe-replay: ingest returned ' + xhr.status));
     };
-    xhr.onerror = function() { cb(new Error('observe-replay: network error')); };
-    try { xhr.send(body); } catch (e) { cb(e); }
+    xhr.onerror = function() { xhrDone(new Error('observe-replay: network error')); };
+    xhr.onabort = function() { xhrDone(new Error('observe-replay: aborted')); };
+    try { xhr.send(body); } catch (e) { xhrDone(e); }
   }
 
   var flushInFlight = false;
+
+  // TO-029: delivery generation. Incremented on discard; every delivery
+  // callback captures the generation at start and goes silent (no send,
+  // no requeue, no next chunk) once it is obsolete — an in-flight request
+  // completing after stop({discard:true}) must not resurrect discarded
+  // content or keep sending later chunks. In-flight requests themselves
+  // are aborted where the transport supports it.
+  var deliveryGeneration = 0;
+  var inFlightRequests = new Set();
+
+  function discardDelivery() {
+    deliveryGeneration++;
+    inFlightRequests.forEach(function(abort) {
+      try { abort(); } catch (e) { /* already settled */ }
+    });
+    inFlightRequests.clear();
+    flushInFlight = false;
+  }
 
   function makePayload(chunk) {
     var ctx = pageContext();
@@ -508,9 +591,14 @@
     return n;
   }
 
-  function sendChunks(chunks, idx, done) {
+  function sendChunks(chunks, idx, gen, done) {
+    // TO-029: a delivery from a discarded generation goes completely
+    // silent — no requeue, no later chunk, no error report about content
+    // the user withdrew consent for.
+    if (gen !== deliveryGeneration) { done(null); return; }
     if (idx >= chunks.length) { done(null); return; }
     deliver(endpoint, makePayload(chunks[idx]), function(err) {
+      if (gen !== deliveryGeneration) { done(null); return; }
       if (err) {
         // Requeue this chunk (identity intact) and every chunk not yet
         // attempted; already accepted chunks stay sent. Bounded by
@@ -526,7 +614,7 @@
         done(err);
         return;
       }
-      sendChunks(chunks, idx + 1, done);
+      sendChunks(chunks, idx + 1, gen, done);
     });
   }
 
@@ -539,12 +627,40 @@
     var chunks = pendingChunks;
     pendingChunks = [];
     var batch = events.splice(0, MAX_FLUSH_EVENTS);
-    if (batch.length) chunks = chunks.concat(chunkBatch(batch));
+    if (batch.length) {
+      // TO-030: an event too large to ever fit a legal request is
+      // rejected HERE, before it can become a permanently failing retry
+      // head that blocks every chunk behind it.
+      var legal = [];
+      for (var i = 0; i < batch.length; i++) {
+        if (soloEventFits(batch[i])) {
+          legal.push(batch[i]);
+        } else {
+          onErrorHook(new Error('observe-replay: dropped an event exceeding the request byte budget at flush time'));
+        }
+      }
+      batch = legal;
+      if (batch.length) chunks = chunks.concat(chunkBatch(batch));
+    }
+    if (!chunks.length) return;
     flushInFlight = true;
-    sendChunks(chunks, 0, function() {
-      flushInFlight = false;
+    var gen = deliveryGeneration;
+    sendChunks(chunks, 0, gen, function() {
+      if (gen === deliveryGeneration) flushInFlight = false;
     });
     // Any remainder rides the interval tick set up in init().
+  }
+
+  // TO-030: measure the COMPLETE envelope around one event — the 512-byte
+  // overhead estimate in chunkBatch could not catch a snapshot that is
+  // oversized on its own, which then looped as a failing retry head.
+  function soloEventFits(event) {
+    var probe = { id: replayId + '-probe', events: [event] };
+    try {
+      return byteLength(JSON.stringify(makePayload(probe))) <= MAX_REQUEST_BYTES;
+    } catch (e) {
+      return false;
+    }
   }
 
   // Read the distinct_id set by observe.js's identify(). Lives in
@@ -593,7 +709,9 @@
     };
     var distinctId = readDistinctID();
     if (distinctId) payload.distinct_id = distinctId;
-    deliver(errorsEndpoint, payload, onErrorHook);
+    // deliver() invokes its callback with null on SUCCESS; route it so a
+    // successful report is not logged as a delivery failure.
+    deliver(errorsEndpoint, payload, function(err) { if (err) onErrorHook(err); });
   }
 
   // --- Public API ---
@@ -608,7 +726,7 @@
       if (!active) return;
       active = false; // first: wrappers/observers still in the stack go inert
       for (var i = 0; i < listeners.length; i++) {
-        try { listeners[i][0].removeEventListener(listeners[i][1], listeners[i][2]); }
+        try { listeners[i][0].removeEventListener(listeners[i][1], listeners[i][2], listeners[i][3]); }
         catch (e) { /* already gone */ }
       }
       listeners = [];
@@ -623,6 +741,11 @@
       if (history.pushState === wrappedPush) history.pushState = origPush;
       if (history.replaceState === wrappedReplace) history.replaceState = origReplace;
       if (options && options.discard) {
+        // TO-029: consent withdrawal invalidates in-flight delivery, not
+        // just the queued arrays — abort what is in the air, and obsolete
+        // every delivery callback so nothing requeues or sends a later
+        // chunk after the discard.
+        discardDelivery();
         events.length = 0;
         pendingChunks = [];
       } else {
