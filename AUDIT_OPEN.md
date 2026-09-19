@@ -901,3 +901,16 @@ session against a freshly built repo-based engine:
 Closure notes appended to `Teploy/_internal/UPSTREAM_BUGS.md`. No
 Neutron/Nucleus edits were made from this session; the canary
 reconciliation is observe-side test code only.
+
+## 2026-09-19 reported default-site selection — fixed
+
+The filter provider wrote its bootstrap selection into URL/storage before
+checking for a prior selection, so initial site discovery never ran. Capture
+initial intent before effects, defer persistence until discovery completes,
+and prefer a configured site over the bootstrap default. Explicit URL and
+remembered choices (including default) still win. Default Site remains a
+valid fallback; no stored telemetry or site records are removed.
+
+Validation: Go suite (DB-dependent cases require Nucleus), UI unit suite,
+production UI rebuild, four Chromium regressions covering fresh selection,
+URL precedence, remembered selection, and bootstrap-only installs.

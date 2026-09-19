@@ -1,5 +1,5 @@
 import { createContext } from "preact";
-import { useContext, useEffect, useReducer } from "preact/hooks";
+import { useContext, useEffect, useReducer, useRef, useState } from "preact/hooks";
 import type { ComponentChildren } from "preact";
 import { h } from "preact";
 import { defaultRange, loadRange, saveRange } from "../utils/ranges.js";
@@ -78,15 +78,15 @@ function rangeState(r: PersistedRange) {
  * Asynchronous fetch of the user's first site happens via `RouteFilterProvider`
  * once the component mounts; this is the synchronous best-effort guess.
  */
-function initialSiteId(): string {
-  if (typeof window === "undefined") return "default";
+function initialSiteId(): string | null {
+  if (typeof window === "undefined") return null;
   const urlSite = new URLSearchParams(window.location.search).get("site_id");
   if (urlSite) return urlSite;
   try {
     const stored = window.localStorage.getItem(SITE_STORAGE_KEY);
     if (stored) return stored;
   } catch { /* localStorage may be disabled */ }
-  return "default";
+  return null;
 }
 
 /**
@@ -125,8 +125,11 @@ export function FilterProvider({ siteId, children }: { siteId: string; children:
  * dispatches, so deep-links and reloads round-trip the selection.
  */
 export function RouteFilterProvider({ children }: { children: ComponentChildren }) {
+  // Capture intent before effects canonicalize the URL or write storage.
+  const initialSelection = useRef(initialSiteId());
+  const [siteReady, setSiteReady] = useState(Boolean(initialSelection.current));
   const [state, dispatch] = useReducer(reducer, {
-    siteId: initialSiteId(),
+    siteId: initialSelection.current || "default",
     ...rangeState(loadRange()),
     compare: null,
     filters: initialFilters(),
@@ -147,7 +150,7 @@ export function RouteFilterProvider({ children }: { children: ComponentChildren 
 
   // Persist + canonicalize whenever siteId changes.
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    if (typeof window === "undefined" || !siteReady) return;
     try { window.localStorage.setItem(SITE_STORAGE_KEY, state.siteId); } catch { /* ignore */ }
 
     const url = new URL(window.location.href);
@@ -155,17 +158,16 @@ export function RouteFilterProvider({ children }: { children: ComponentChildren 
       url.searchParams.set("site_id", state.siteId);
       window.history.replaceState(null, "", url.toString());
     }
-  }, [state.siteId]);
+  }, [state.siteId, siteReady]);
 
   // Async: if neither URL nor localStorage had a value, fetch the user's first
   // site and adopt it. Avoids leaving a stale "default" selection when the
   // tenant has only renamed sites.
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const urlHadIt = new URLSearchParams(window.location.search).get("site_id");
-    let stored: string | null = null;
-    try { stored = window.localStorage.getItem(SITE_STORAGE_KEY); } catch { /* ignore */ }
-    if (urlHadIt || stored) return;
+    if (initialSelection.current || siteReady) return;
+    // A selection made while discovery is pending wins over the fallback.
+    if (state.siteId !== "default") { setSiteReady(true); return; }
 
     let cancelled = false;
     const token = (() => { try { return window.localStorage.getItem("obs_token"); } catch { return null; } })();
@@ -175,13 +177,15 @@ export function RouteFilterProvider({ children }: { children: ComponentChildren 
       .then(r => r.ok ? r.json() : null)
       .then((sites: Array<{ site_id: string }> | null) => {
         if (cancelled || !sites?.length) return;
-        const first = sites[0].site_id;
+        // Prefer a configured site over the bootstrap fallback.
+        const first = (sites.find(site => site.site_id !== "default") || sites[0]).site_id;
         if (first && first !== state.siteId) dispatch({ type: "SET_SITE", siteId: first });
       })
-      .catch(() => { /* keep default */ });
+      .catch(() => { /* keep default */ })
+      .finally(() => { if (!cancelled) setSiteReady(true); });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [state.siteId, siteReady]);
 
   return h(FilterContext.Provider, { value: { state, dispatch } }, children);
 }
