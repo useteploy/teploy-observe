@@ -1,6 +1,7 @@
 package replays
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log/slog"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,5 +180,79 @@ func TestAssetProxy_BadTargets(t *testing.T) {
 	}
 	if rec := proxyGet(p, "http://anything.example.com/x.png?utm_source=ok"); rec.Code == http.StatusBadRequest {
 		t.Fatal("a plain query string is a legal target (the proxy relays it; logs redact it)")
+	}
+}
+
+// TO-025: the validator is bound to the BODY, not the URL — a changed
+// asset at the same URL must be re-served (200, new tag), not revalidated
+// into staleness forever by a URL-keyed 304.
+func TestAssetProxy_ChangedBodyAtSameURLIsNotStale(t *testing.T) {
+	body := append([]byte(nil), pngHeader...)
+	up := startUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	})
+	p := testProxy(t, []string{upstreamHost(up.URL)}, 0)
+
+	first := proxyGet(p, up.URL+"/logo.png")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first fetch: %d", first.Code)
+	}
+	oldTag := first.Header().Get("ETag")
+
+	// The origin changes the asset.
+	body = append(body, 0x00, 0x01, 0x02)
+
+	// A revalidation presenting the OLD tag must get the NEW body.
+	req := httptest.NewRequest("GET", "/api/v1/replay-assets?u="+url.QueryEscape(up.URL+"/logo.png"), nil)
+	req.Header.Set("If-None-Match", oldTag)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a changed body must not 304 against the old tag, got %d", rec.Code)
+	}
+	if rec.Header().Get("ETag") == oldTag {
+		t.Fatal("the validator must change with the body")
+	}
+	if rec.Body.Len() != len(body) {
+		t.Fatalf("the new body must be served in full: %d of %d bytes", rec.Body.Len(), len(body))
+	}
+}
+
+// TO-027: a read that fails after a valid image prefix must be a 502, not
+// a truncated 200 "success".
+func TestAssetProxy_TruncatedReadIsAnError(t *testing.T) {
+	up := startUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(pngHeader)
+		panic(http.ErrAbortHandler) // drop the connection mid-body
+	})
+	p := testProxy(t, []string{upstreamHost(up.URL)}, 0)
+	rec := proxyGet(p, up.URL+"/logo.png")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("a truncated body must be a 502, got %d", rec.Code)
+	}
+}
+
+// TO-026: the fetch-failure log carries host + failure class only — never
+// the raw transport error (whose *url.Error embeds the full signed URL).
+func TestAssetProxy_FetchFailureLogLeaksNothing(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	allow, err := netsafe.ParseAllow("127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewAssetProxyWithAllow([]string{"upstream.invalid"}, 0, 500*time.Millisecond, allow, logger)
+
+	// A URL with a secret-bearing query against an unresolvable host.
+	rec := proxyGet(p, "https://upstream.invalid/x.png?sig=TO026_SECRET_TOKEN")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d", rec.Code)
+	}
+	if strings.Contains(buf.String(), "TO026_SECRET_TOKEN") {
+		t.Fatalf("log must not contain the query secret: %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "transport_failure") {
+		t.Fatalf("log should carry the failure class: %q", buf.String())
 	}
 }

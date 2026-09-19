@@ -1,11 +1,13 @@
 package replays
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -153,13 +155,6 @@ func (p *AssetProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Content-hash ETag first: one replay seek must not re-fetch.
-	etag := `"` + contentETag(u.String()) + `"`
-	if r.Header.Get("If-None-Match") == etag {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, u.String(), nil)
 	if err != nil {
 		http.Error(w, "bad upstream request", http.StatusBadGateway)
@@ -168,7 +163,11 @@ func (p *AssetProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	req.Header.Set("Accept", "image/*")
 	resp, err := p.client.Do(req)
 	if err != nil {
-		p.logger.Warn("replay asset proxy: fetch failed", "url", redactAssetURL(u), "err", err)
+		// TO-026: never log the raw error — *url.Error embeds the full
+		// request URL, signed query included; the redacted URL field next
+		// to it did not redact the error. Host + failure class only.
+		p.logger.Warn("replay asset proxy: fetch failed",
+			"host", host, "class", assetFailureClass(err))
 		http.Error(w, "asset fetch failed", http.StatusBadGateway)
 		return
 	}
@@ -180,49 +179,71 @@ func (p *AssetProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bound the read BEFORE sniffing: the sniff buffer is part of the cap.
-	limited := io.LimitReader(resp.Body, p.maxBytes+1)
-	head := make([]byte, 512)
-	n, _ := io.ReadFull(limited, head)
-	head = head[:n]
-	ct := http.DetectContentType(head)
+	// TO-027: one bounded read of the whole body, PRESERVING the read
+	// error. The old head-then-rest reads discarded the first error; a
+	// transport failure after a valid image prefix could surface a
+	// truncated image as a 200 success.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, p.maxBytes+1))
+	if err != nil {
+		p.logger.Warn("replay asset proxy: body read failed",
+			"host", host, "class", assetFailureClass(err))
+		http.Error(w, "asset read failed", http.StatusBadGateway)
+		return
+	}
+	if int64(len(body)) > p.maxBytes {
+		http.Error(w, "asset exceeds size cap", http.StatusRequestEntityTooLarge)
+		return
+	}
+	ct := http.DetectContentType(body)
 	if !allowedAssetMIME(ct) {
 		p.logger.Warn("replay asset proxy: content type not allowlisted", "url", redactAssetURL(u), "type", ct)
 		http.Error(w, "asset type not allowed", http.StatusUnsupportedMediaType)
 		return
 	}
-	rest, err := io.ReadAll(limited)
-	if err != nil {
-		http.Error(w, "asset read failed", http.StatusBadGateway)
-		return
-	}
-	if int64(len(head)+len(rest)) > p.maxBytes {
-		http.Error(w, "asset exceeds size cap", http.StatusRequestEntityTooLarge)
-		return
-	}
 
-	// Same-site caching: private (browser-only), content-addressed, and a
-	// hard cap so a churning origin cannot pin cache entries forever. The
-	// upstream's own cache/control headers are never forwarded.
+	// TO-025: the ETag is a digest of the FETCHED BODY, computed after the
+	// bounded read — a URL-keyed validator returned 304s without ever
+	// consulting the origin, so a changed asset at the same URL stayed
+	// stale forever (revalidation after max-age just got another 304).
+	// Revalidation costs the upstream fetch; that is the price of a
+	// validator that can actually notice changes.
+	etag := contentETag(body)
 	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Content-Length", strconv.Itoa(len(head)+len(rest)))
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.Header().Set("Cache-Control", "private, max-age=86400")
 	w.Header().Set("ETag", etag)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(head)
-	_, _ = w.Write(rest)
+	_, _ = w.Write(body)
 }
 
-// contentETag derives the deterministic (URL-keyed) weak validator. Keyed on
-// the URL, not the body: the body would require fetching before a 304 can be
-// answered, which defeats the point. A changed asset at the same URL is
-// served stale for at most the max-age window — same tradeoff as any
-// content-addressed CDN edge.
-func contentETag(u string) string {
-	sum := sha256.Sum256([]byte("observe-replay-asset|" + u))
-	return hex.EncodeToString(sum[:16])
+// contentETag derives the strong validator from the served body (TO-025).
+func contentETag(body []byte) string {
+	sum := sha256.Sum256(body)
+	return `"` + hex.EncodeToString(sum[:]) + `"`
+}
+
+// assetFailureClass reduces a transport error to a coarse, URL-free
+// category for logs (TO-026). A custom transport's own error text can
+// still embed anything — which is exactly why the raw error is never
+// logged on this path.
+func assetFailureClass(err error) string {
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return "timeout"
+	}
+	return "transport_failure"
 }
 
 // redactAssetURL keeps the query out of logs — the allowlisted host is the
