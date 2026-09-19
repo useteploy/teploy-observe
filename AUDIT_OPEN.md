@@ -42,7 +42,20 @@ Three NEW upstream reports filed from verifying F45 against the live
 repo-built engine (lease scope gaps — see the Upstream section); the
 observe side carries documented, tested workarounds for each.
 
-Open items: 10 (1 P1 product/schema decision, 7 P2 designs/halves, 2 hardening/producer notes)
+Close-out session (2026-09-18, later still): F16 FIXED (numbered WAL
+segments + bounded streaming replay + disk high-water), F38 FIXED (asset
+proxy), F41 FIXED (URL/sensitive-data contract, wire+storage+trackers),
+F46 FIXED (persistent audit key + key_id + rotation keyring, migration
+042), F39's smaller step LANDED (throttled mid-session re-snapshots; the
+full DOM-delta protocol stays deferred), and the e2e CI coverage extended
+to the core product paths (login, dashboard, replay transport controls,
+audit view). The three 2026-09-18 lease-scope upstream reports are
+RESOLVED upstream (Neutron `4c7c4367`, verified live against a repo-built
+engine); the observe-side engine canaries were reconciled to the fixed
+shapes (see the Upstream section).
+
+Open items: 7 (1 P1 product decision, 3 P2 deferred designs, 2 hardening
+notes, 1 future-work remainder)
 
 ## F02 - P1 - Open (design decision): first-run grace authorizes administration
 
@@ -134,15 +147,31 @@ internal/ingest dedupe unit tests + live-Nucleus integration tests
 (duplicate batch -> single count; mixed duplicate+fresh -> only fresh).
 Wire-protocol version bumped to v2 with the SDKs, as the audit allowed.
 
-## F16 - P2 - Open (design, previously deferred): WAL disk high-water and bounded streaming replay
+## F16 - P2 - Fixed 2026-09-18 (later still): WAL disk high-water and bounded streaming replay
 
-Prior register item (teploy-observe-03 deferred half), unchanged: maxBytes
-is a compaction threshold, not a cap; Pending() materializes the backlog.
-Needs the numbered-segment design (seal at size, checkpoint per segment,
-delete acknowledged sealed segments, bounded replay iterator) plus an
-explicit operator policy for limits and breach behavior. F14's sticky
-degradation + admission refusal (landed) means an ailing WAL now fails loud
-instead of growing quietly, which lowers the urgency but does not close it.
+Numbered segments with a real cap: an append that would push the active
+segment past maxBytes rolls to a fresh `wal-NNNNNN.log` first — the cap is
+enforced by rolling, not only by compaction. `current.log` stays segment 0,
+so a never-rolled install keeps the exact legacy on-disk layout (decimal
+checkpoint included); the checkpoint gains a segment-scoped JSON form once
+writes live in numbered segments, and the legacy decimal form still reads.
+Acknowledged sealed segments are deleted once the checkpoint moves strictly
+past them (never the segment a checkpoint boundary sits in — deleting it
+would clamp the next open to a full-log replay through the best-effort
+dedup); a fully-checkpointed over-sized active segment is rolled away
+instead of truncated. Replay streams frame by frame (StreamPending) with
+the buffer's dedup in 500-event chunks, so the backlog is no longer
+materialized twice; Pending() remains as the collecting wrapper. Disk
+high-water: OBSERVE_WAL_MAX_TOTAL_BYTES (default 512 MiB; per-segment cap
+now OBSERVE_WAL_MAX_SEGMENT_BYTES, default 64 MiB) drops the oldest
+segment on breach — counted, logged loudly, surfaced in /healthz via
+Stats() — keeping admission alive at the documented cost of the dropped
+events' crash-recovery copy (F14's sticky degradation still governs WAL
+write FAILURES). Proofs: internal/ingest queue tests (roll + cross-segment
+replay, segment-scoped checkpoints, acknowledged-segment GC with the
+boundary rule, breach drop + counters + admission survival, streaming
+frames + consumer abort, legacy layout both directions), all green under
+-race and against the live repo-built engine.
 
 ## F19 - P1 - Fixed 2026-09-18 (batch idempotency; sessions half landed 2026-09-17)
 
@@ -210,31 +239,81 @@ product decision: masking ALL visible text by default with an explicit
 current visible-text-by-default posture. Changing it silently blanks every
 existing replay's readable content; needs an operator-visible toggle.
 
-## F38 - P2 - Fixed structural path; asset proxy open
+## F38 - P2 - Fixed 2026-09-18 (later still): asset proxy landed
 
-Structured snapshots render through a strict tag/attribute allowlist with a
-deny-all CSP posture. Open: any legitimate replay image/style (none exist
-today — the tracker strips styles/scripts and now blocks img-bearing
-elements) would need a separately designed asset proxy/allowlist; legacy
-raw-HTML snapshots get a best-effort injected CSP only.
+`GET /api/v1/replay-assets?u=<absolute http(s) url>` behind JWT auth, the
+route added to the stream-ticket set (img elements cannot carry headers;
+the player mints a per-snapshot ticket). Designed allowlist:
+OBSERVE_REPLAY_ASSET_HOSTS names the destination hosts (empty = proxy
+disabled; a miss is 403, distinguishable from the disabled 404). Bounded
+size (5 MiB default; over-cap rejects, never truncates), MIME sniffed from
+leading bytes against a raster-image allowlist (SVG deliberately excluded
+— script-bearing), `Cache-Control: private` + content-hash ETag with 304
+revalidation and upstream cache headers never forwarded (same-site
+caching), redirects rejected instead of followed (following would defeat
+the allowlist in one hop), egress confined at dial time via netsafe
+(loopback/private/link-local/metadata refused even for allowlisted host
+names — DNS-rebinding safe). The player renders img through the tag
+allowlist with src rewritten to the proxy (relative srcs resolve against
+the session URL; unproxyable srcs drop — the pre-F38 behavior) and
+img-src 'self' in the replay CSP. Legacy raw-HTML snapshots keep the
+injected-CSP best-effort, unchanged. Residual, deliberate: share-token
+replay views get no assets (stream tickets need a session token; images
+fail closed there), and non-image asset classes (fonts, stylesheets) stay
+out until a real consumer exists. Proofs: internal/replays assets tests
+(sniffed-type win over a lying header, private caching + 304, allowlist
+403/disabled 404, redirect refusal, html/svg 415, 413-not-truncate,
+dial-time private refusal for an allowlisted host, malformed-target 400s).
 
-## F39 - P2 - Open (protocol): recorded mutations cannot reconstruct a changing page
+## F39 - P2 - Smaller step landed 2026-09-18; full protocol deferred
 
-Mutation records are summaries; the player replays mouse/click/scroll over
-the initial snapshot. Full fix needs a versioned DOM-delta protocol with
-stable node IDs and deterministic seeking (audit's throttled re-snapshot
-fallback is the smaller implementable step). Deferred as feature work with
-real protocol design, not a bug patch.
+LANDED (the audit's throttled re-snapshot fallback): observe-replay.js
+records fresh mid-session snapshots periodically
+(data-resnapshot-interval, default 30 s) and early on mutation bursts
+(data-resnapshot-burst, default 150), throttled by a minimum gap
+(data-resnapshot-min-gap, default 10 s) so a churning page cannot snapshot
+itself to death. The player already selects the most recent keyframe at
+or before the playhead (AUD-032), so long replays no longer drift
+indefinitely off a single initial DOM. Contract-tested in
+tests/tracker/observe-replay.test.mjs (burst over threshold past the gap
+records a second snapshot).
 
-## F41 - P2 - Open (policy): shared sensitive-data policy for URLs and autocaptured text
+DEFERRED (unchanged): the full versioned DOM-delta protocol — stable node
+IDs, deterministic seeking over deltas, keyset-paginated event windows
+(AUD-020's UI half rides with it). Real protocol design, not a bug patch;
+revisit when a product need asks for sub-snapshot fidelity or replay
+payloads need to shrink.
 
-Trackers send full location.href (query/fragment), href attributes, and
-element text. Not fixed client-side because the server's UTM analytics
-READ the query string — a naive client-side strip breaks attribution. Needs
-the audit's designed contract: strip credentials/query/fragment by default,
-extract allowlisted campaign params into explicit fields (server-side
-extraction from an already-stripped URL is impossible), text capture
-opt-in. Wire + storage + migration change; deferred.
+## F41 - P2 - Fixed 2026-09-18 (later still): URL/sensitive-data contract
+
+Wire side: trackers send location.href as origin+path — credentials,
+fragment, and query never leave the page (observe.js, observe-errors.js,
+observe-feedback.js, sdk/browser; observe-replay.js already did). Campaign
+attribution rides explicit utm_* fields extracted client-side from the
+allowlisted params (utm_source/medium/campaign/term/content — exactly the
+stored columns); element-text autocapture is opt-in
+(data-capture-text on observe.js), click/outbound hrefs and dead_click
+page_url are sanitized to origin+path, and navigation breadcrumbs carry
+origin+path. Server side: the explicit fields are the primary attribution
+path; for legacy producers still sending a query string, the same
+allowlisted params are extracted from it per-field before the stored URL is
+sanitized to scheme+host+path (fail-closed on non-http) — so attribution
+survives the upgrade and nothing outside the allowlist is ever read or
+stored. Storage: the utm columns already existed; no migration. History:
+rows written before this change keep their full URLs until retention ages
+them out (same forward-only posture as AUD-030's referrer tightening; a
+retroactive rewrite of unbounded event history at boot was judged worse
+than the window). Error-breadcrumb element text (64 chars, diagnostic
+surface) deliberately keeps its pre-F41 behavior — the opt-in gates
+ANALYTICS text capture. Deliberate boundary recorded here rather than
+slipped in. SDKs ship with the server (F12/F19 bump-together pattern);
+Go SDK has no analytics-event producer, Python passes caller URLs through
+the now-sanitizing server. Proofs: internal/ingest F41 handler tests
+(explicit-fields precedence, per-field legacy fallback, userinfo/fragment/
+non-http fail-closed), tests/tracker/observe.test.mjs (pageview
+origin+path + utm fields + non-allowlisted params never leave, text
+opt-in off/on, outbound href sanitized), sdk/browser unit tests (query
+strip + all five utm fields + reserved-field passthrough).
 
 ## F45 - P2 - Fixed 2026-09-18 (later session): snapshot-lease dumps + KV srcmap archive section; upstream lease-scope caveats registered
 
@@ -279,13 +358,32 @@ rolls back. Engine canaries pin all three shapes
 TestLease_HolderSeesInFlightUncommittedWrites) and fail when upstream
 closes them, at which point the workarounds should be simplified.
 
-## F46 - P2 - Partially fixed: empty audit key warns at startup
+## F46 - P2 - Fixed 2026-09-18 (later still): dedicated persistent audit key with rotation keyring
 
-Startup now states the chain is unkeyed instead of silently HMAC-ing with
-an empty key. Open: the dedicated persistent audit key (base64 ≥32 bytes),
-key_id + historical verification keyring for rotation, and the encoding
-migration that preserves verification of existing rows — a contract change
-recorded here rather than slipped in.
+Migration 042 rebuilds audit_events with a key_id column (rename-aside +
+create + copy, rows preserved verbatim with key_id='' — the legacy
+encoding verified against the configured legacy candidates). Key
+resolution (internal/audit keys.go): OBSERVE_AUDIT_KEY (base64 >=32
+decoded bytes or raw >=32 bytes; a value that IS valid base64 is held to
+the decoded floor) when set; else a persistent generated 32-byte key file
+at data/audit.key (0600, temp+fsync+rename — every install's chain is
+keyed without operator action, and the key lives on the observe host
+rather than in the database it protects); else the JWT-secret fallback;
+unkeyed is the loud last resort (the earlier empty-key warning, now only
+reachable when the key file is unusable and no fallback exists). Rows
+stamp the signer's id (first 8 hex of sha256(key)); verification selects
+the key per row — '' tries the legacy candidates (signer, the RAW env
+interpretation, JWT fallback, empty — covering every key a pre-042 process
+could have signed with), any other id must resolve in the keyring or the
+chain reports it broken with a rotation-specific detail. Rotation:
+OBSERVE_AUDIT_KEYRING holds historical "id:base64" verification keys
+(ids must match the derived id or startup refuses — a mistyped entry
+would silently drop verification of the history it covers); startup logs
+the ready-to-paste entry for rotating off the file key. The compliance
+control distinguishes dedicated/persistent (pass) from jwt-fallback and
+unkeyed (warn). Live-verified against the repo-built engine: the ladder
+applies through 042, rows carry key ids, and a chain written under one
+signer verifies after rotation with the old key in the keyring.
 
 ## F47 - P2 - Open (architecture): verification accepts a valid-prefix tail
 
@@ -506,12 +604,16 @@ New deferrals from this round:
   the `nucleus-integration` CI job runs the full suite against a pinned
   published engine image (see the engine-selection rationale in ci.yml and
   the upstream notes below), fresh per run, serially (`-p 1`, the known
-  Migrate TOCTOU), after a migration boot; the `e2e-smoke` job boots the
-  real binary + engine + demo seed and runs a Playwright smoke
-  (login -> dashboard renders -> one replay plays), skipping cleanly when
-  no instance is at baseURL. Remaining future work (not audit blockers):
-  the fuller 27-spec e2e suite is still local-only, and the fixture image
-  carries the two engine defects recorded below.
+  Migrate TOCTOU), after a migration boot; the e2e job boots the real
+  binary + engine + demo seed and runs the Playwright suites. Extended
+  2026-09-18 (later still): core.spec.ts joins smoke.spec.ts in CI —
+  dashboard stat cards render against the live API, replay transport
+  controls work (play/pause toggle, scrub seeks), and the audit view
+  renders the trail; one API login per worker (the server's per-IP login
+  rate limit trips when five specs each drive the form). Remaining future
+  work (not audit blockers): the fuller 27-spec e2e suite is still
+  local-only, and the fixture image carries the two engine defects
+  recorded below (both resolved in the tree; see the upstream section).
 
 Upstream (2026-09-18, from the trust-close session; both logged in
 Tyler's `Teploy/_internal/UPSTREAM_BUGS.md` with standalone reproducers;
@@ -581,3 +683,37 @@ Neutron/Nucleus edits made from this session):
 Earlier standing upstream item: F45's snapshot-boundary primitive
 (2026-09-17 entry) — CLOSED 2026-09-18: the primitive landed in the
 tree (see the F45 entry above).
+
+Upstream update (2026-09-18, close-out session): the three lease-scope
+reports above are RESOLVED UPSTREAM — Neutron `4c7c4367` (lease-scope
+fixes) plus `6d7c3ffa` (MVCC GC tail compaction), verified live from this
+session against a freshly built repo-based engine:
+
+- KV-write bypass / unpinned holder reads: the holder's KV reads are now
+  snapshot-pinned, so a dump taken under active KV churn converges by
+  construction. The KV-scalar writes themselves still commit through a
+  held lease (the write-side half of the gap is unchanged;
+  TestLease_KVScalarWritesBypassTheGate still pins it), which is now
+  harmless to the dump boundary. The convergence proof in kvsrcmap.go is
+  REDUNDANT with the pin but harmless — it runs as a cheap invariant;
+  simplifying it out is follow-up work, recorded here rather than slipped
+  into this session. The churn test was reconciled to the fixed shape
+  (TestDump_KVSrcmapChurnConvergesUnderPinnedReads: churning dump
+  SUCCEEDS and declares its kv section).
+- Dirty reads under the lease: ACQUIRE now refuses while another
+  session's writer transaction is in flight ("timed out waiting for N
+  in-flight writer transaction(s)"), delivering the promised isolation by
+  exclusion. The canary became the contract test
+  TestLease_AcquireExcludesInFlightWriters (acquire under a parked writer
+  fails naming the in-flight writer; after the writer resolves, acquire
+  succeeds and sees exactly the committed state). The straddler exemption
+  in TestDump_LeaseConsistentMomentUnderConcurrentWrites is likewise now
+  redundant (a straddling unit can no longer be archived) and its removal
+  rides the same kvsrcmap simplification follow-up.
+- KV_KEYS collection enumeration: NOT part of the fixed set — the
+  reconstruct-from-blob-keys workaround and its orphaned-index residual
+  hole stand unchanged (see kvsrcmap.go).
+
+Closure notes appended to `Teploy/_internal/UPSTREAM_BUGS.md`. No
+Neutron/Nucleus edits were made from this session; the canary
+reconciliation is observe-side test code only.
