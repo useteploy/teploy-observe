@@ -237,6 +237,11 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 | `OBSERVE_FLUSH_INTERVAL_MS` | `2000` | Flush threshold (time). |
 | `OBSERVE_DATA_DIR` | `./data` | Root dir for WAL, queue, local state. |
 | `OBSERVE_QUEUE_DIR` | `$OBSERVE_DATA_DIR/queue` | Ingest WAL directory. |
+| `OBSERVE_WAL_MAX_SEGMENT_BYTES` | `67108864` | Per-segment cap: appends past it roll to a fresh numbered WAL segment. |
+| `OBSERVE_WAL_MAX_TOTAL_BYTES` | `536870912` | Disk high-water across all WAL segments. On breach the oldest segment is dropped (loudly, counted in `/healthz`) — those events lose their crash-recovery copy but ingestion keeps accepting work. |
+| `OBSERVE_AUDIT_KEY` | | Audit-chain HMAC key: base64 (>=32 decoded bytes) or raw (>=32 bytes). Unset uses the persistent generated key at `$OBSERVE_DATA_DIR/audit.key`. |
+| `OBSERVE_AUDIT_KEYRING` | | Comma-separated `id:base64key` historical audit keys kept for verification through rotation (startup logs the ready-to-paste entry for the file key). |
+| `OBSERVE_REPLAY_ASSET_HOSTS` | | Comma-separated hostnames the replay asset proxy may fetch images from (empty disables proxied replay images). |
 | `OBSERVE_REQUIRE_WAL` | (unset) | Set to `true` (or `1`) to refuse to start when WAL-backed ingestion durability is unavailable, instead of degrading to memory-only. |
 | `OBSERVE_RAW_RETENTION_DAYS` | `30` | Raw event retention. Also the window over which visitor counts are exact from raw events; past it they are counted from the `sessions` table (90 days), and past both the dashboard says which window the figure covers. |
 | `OBSERVE_HOURLY_RETENTION_DAYS` | `365` | Hourly rollup retention. |

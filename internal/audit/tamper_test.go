@@ -113,6 +113,13 @@ func TestChain_Integration(t *testing.T) {
 	) WITH (engine = 'mergetree') ORDER BY (tenant_id, site_id, timestamp)`); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
+	// F46: rows from other writers (an observe process booted against this
+	// DSN signs with its own key) name key ids this test's keyring does not
+	// know. Verify walks every row, so the test starts from a swept table
+	// and owns the whole chain it walks.
+	if _, err := db.SQL().Exec(ctx, `DELETE FROM audit_events`); err != nil {
+		t.Fatalf("sweep audit_events: %v", err)
+	}
 
 	// Must be the key the other integration tests use. They share this table,
 	// and Verify walks every row: a chain signed with one key does not verify

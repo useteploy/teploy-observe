@@ -1,6 +1,7 @@
 package tracking
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -79,8 +80,18 @@ func stackUp(t *testing.T, base string) bool {
 
 func login(t *testing.T, base string) string {
 	t.Helper()
-	resp, err := http.Post(base+"/api/v1/auth/login", "application/json",
-		strings.NewReader(`{"username":"admin","password":"observe"}`))
+	user := os.Getenv("OBSERVE_ADMIN_USER")
+	if user == "" {
+		user = "admin"
+	}
+	pass := os.Getenv("OBSERVE_ADMIN_PASSWORD")
+	if pass == "" {
+		// Same default as e2e/tests/helpers.ts ("observe" alone is under
+		// the server's 8-char password floor and can never be booted).
+		pass = "observe-e2e-pass"
+	}
+	body, _ := json.Marshal(map[string]string{"username": user, "password": pass})
+	resp, err := http.Post(base+"/api/v1/auth/login", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("login post: %v", err)
 	}

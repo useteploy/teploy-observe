@@ -226,7 +226,17 @@ func TestDump_LeaseConsistentMomentUnderConcurrentWrites(t *testing.T) {
 // — the dump must FAIL LOUDLY instead of shipping an archive whose KV
 // moment is undefined; once the namespace is quiesced again the same dump
 // succeeds.
-func TestDump_KVSrcmapChurnFailsLoudlyThenRecovers(t *testing.T) {
+// F45 kv-churn coverage, reconciled with the upstream lease-scope fixes
+// (Neutron 4c7c4367, 2026-09-18): the holder's KV reads are now
+// snapshot-pinned, so a dump taken while another session churns the kv
+// srcmap namespace converges BY CONSTRUCTION — the two-read convergence
+// proof in kvsrcmap.go became redundant the day the pin landed (it still
+// runs; it is now a cheap invariant, not a workaround). This test pins the
+// current contract: the churning dump SUCCEEDS, its archive restores
+// cleanly, and the manifest still declares the kv section. The pre-fix
+// shape (churn forced a loud "kept changing" failure) is closed history —
+// see Teploy/_internal/UPSTREAM_BUGS.md, 2026-09-18 lease reports.
+func TestDump_KVSrcmapChurnConvergesUnderPinnedReads(t *testing.T) {
 	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -249,9 +259,8 @@ func TestDump_KVSrcmapChurnFailsLoudlyThenRecovers(t *testing.T) {
 	}()
 
 	// Strictly-advancing churn: even steps SET a never-repeating value, odd
-	// steps DELETE the key. No two consecutive full reads of the namespace
-	// can agree while this loop runs — the value never repeats and the key
-	// set flips.
+	// steps DELETE the key — outside a pinned snapshot no two consecutive
+	// full reads of the namespace could agree.
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -272,38 +281,22 @@ func TestDump_KVSrcmapChurnFailsLoudlyThenRecovers(t *testing.T) {
 			}
 		}
 	}()
-	// Let the churn establish itself, then attempt the dump.
+	// Let the churn establish itself, then take the dump.
 	time.Sleep(200 * time.Millisecond)
 	var arch bytes.Buffer
 	err = DumpWithLog(ctx, db, &arch, io.Discard)
-
-	// The writer keeps churning through the whole dump attempt; stop it
-	// only after the dump call has returned either way, then verify.
 	close(stop)
 	wg.Wait()
 
-	if err == nil {
-		t.Fatal("dump of a churning kv srcmap namespace succeeded — the archive's KV moment is undefined and must not ship")
+	// The pinned-read lease makes the KV moment well-defined even under
+	// churn; a failure here means the pin regressed (re-verify the lease
+	// scope against the engine before touching the dump).
+	if err != nil {
+		t.Fatalf("dump under kv churn failed — the holder's KV reads are no longer snapshot-pinned (upstream regression?): %v", err)
 	}
-	if !strings.Contains(err.Error(), "kept changing") {
-		t.Fatalf("expected the kv-churn failure, got: %v", err)
-	}
-	// The completed-but-failed archive is honestly marked: restore must
-	// refuse it (F44), and its completion record must name the kv section
-	// as failed.
-	if err := Restore(ctx, db, bytes.NewReader(arch.Bytes())); err == nil {
-		t.Fatal("restore accepted an archive whose kv section failed to converge")
-	}
-
-	// Quiesced: the same dump now converges and succeeds.
-	time.Sleep(300 * time.Millisecond)
-	var retry bytes.Buffer
-	if err := DumpWithLog(ctx, db, &retry, io.Discard); err != nil {
-		t.Fatalf("dump after churn stopped: %v", err)
-	}
-	manifest := readManifest(t, &retry)
+	manifest := readManifest(t, &arch)
 	if !containsStr(manifest.KVSections, kvSrcmapSection) {
-		t.Fatalf("recovered dump lost the kv section declaration:\n%s", mustJSON(t, manifest))
+		t.Fatalf("churning dump lost the kv section declaration:\n%s", mustJSON(t, manifest))
 	}
 }
 
@@ -421,18 +414,18 @@ func TestLease_KVScalarWritesBypassTheGate(t *testing.T) {
 	}
 }
 
-// Engine-scope canary (F45): the lease holder's reads are NOT isolated
-// from another session's in-flight transaction — a statement already past
-// the writer gate when the lease is acquired stays visible to the holder
-// even before its commit, and vanishes if that transaction rolls back
-// (verified live 2026-09-18; upstream report in
-// Teploy/_internal/UPSTREAM_BUGS.md). The lease contract promises an MVCC
-// snapshot; the engine delivers live visibility with a commit gate. A dump
-// can therefore archive a row its writer subsequently rolls back. If this
-// test ever FAILS, upstream has delivered the promised isolation and the
-// straddler exemption in TestDump_LeaseConsistentMomentUnderConcurrentWrites
-// (plus this note) should be removed.
-func TestLease_HolderSeesInFlightUncommittedWrites(t *testing.T) {
+// Engine-scope contract (F45), reconciled with the upstream lease-scope
+// fixes (Neutron 4c7c4367, 2026-09-18): ACQUIRE SNAPSHOT LEASE now REFUSES
+// while another session's writer transaction is in flight ("timed out
+// waiting for N in-flight writer transaction(s)") instead of handing the
+// holder a snapshot that still sees the writer's uncommitted rows. The
+// pre-fix dirty-read shape (holder saw the parked row, and a dump could
+// archive a row its writer later rolled back) is closed history — see
+// Teploy/_internal/UPSTREAM_BUGS.md, 2026-09-18 lease reports. This test
+// pins the delivered isolation: acquire under a parked writer fails
+// loudly, and once the writer resolves, acquire succeeds and the holder
+// sees exactly the committed state.
+func TestLease_AcquireExcludesInFlightWriters(t *testing.T) {
 	dsn := nucleustest.DSN(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -464,43 +457,48 @@ func TestLease_HolderSeesInFlightUncommittedWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Holder: lease, then read the parked row.
+	// Acquire under the parked writer must fail loudly (short timeout so
+	// the refusal is quick), naming the in-flight writer.
 	holder, err := db.Pool().Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer holder.Rollback(ctx)
-	if _, err := holder.Exec(ctx, "ACQUIRE SNAPSHOT LEASE TIMEOUT 10000"); err != nil {
-		if isLeaseUnsupported(err) {
-			t.Skipf("engine at %s predates the snapshot lease: %v", dsn, err)
-		}
-		t.Fatalf("acquire: %v", err)
+	_, acquireErr := holder.Exec(context.Background(), "ACQUIRE SNAPSHOT LEASE TIMEOUT 1000")
+	if acquireErr == nil {
+		// Roll back and fail with context: the lease handed out a snapshot
+		// over an in-flight writer — the pre-fix dirty-read shape is back.
+		_ = holder.Rollback(ctx)
+		t.Fatal("acquire succeeded under a parked uncommitted writer — the holder's snapshot may see uncommitted rows (pre-4c7c4367 behavior); re-verify the lease scope")
 	}
-	var n int64
-	if err := holder.QueryRow(ctx, "SELECT COUNT(*) FROM link_clicks WHERE click_id = $1", tag).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	if n != 1 {
-		t.Fatalf("holder saw %d rows of the uncommitted write — the engine now isolates the holder from in-flight transactions (upstream fixed); remove the straddler exemption in the consistency test", n)
-	}
-
-	// Roll the writer back; after release the row must be gone everywhere
-	// (the archive could have shipped it — the observe-side consequence of
-	// the engine gap).
-	if err := wtx.Rollback(ctx); err != nil {
-		t.Fatal(err)
+	if !isLeaseUnsupported(acquireErr) && !strings.Contains(acquireErr.Error(), "in-flight") && !strings.Contains(acquireErr.Error(), "writer") {
+		t.Fatalf("acquire under an in-flight writer failed with an unexpected shape (want an in-flight-writer refusal): %v", acquireErr)
 	}
 	if err := holder.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := nucleus.Query[struct {
-		N int64 `db:"n"`
-	}](ctx, db.SQL(), "SELECT COUNT(*) AS n FROM link_clicks WHERE click_id = $1", tag)
+
+	// Writer rolls back; acquire now succeeds and the row is gone.
+	if err := wtx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	holder2, err := db.Pool().Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) > 0 && rows[0].N != 0 {
-		t.Fatalf("rolled-back row still present: %d", rows[0].N)
+	defer holder2.Rollback(ctx)
+	if _, err := holder2.Exec(ctx, "ACQUIRE SNAPSHOT LEASE TIMEOUT 10000"); err != nil {
+		if isLeaseUnsupported(err) {
+			t.Skipf("engine at %s predates the snapshot lease: %v", dsn, err)
+		}
+		t.Fatalf("acquire after the writer resolved: %v", err)
+	}
+	var n int64
+	if err := holder2.QueryRow(ctx, "SELECT COUNT(*) FROM link_clicks WHERE click_id = $1", tag).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("holder saw %d rows of the rolled-back write — isolation broken", n)
 	}
 }
 

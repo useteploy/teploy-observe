@@ -217,6 +217,10 @@ func TestKeyring_RotationVerifiesLive_Integration(t *testing.T) {
 	) WITH (engine = 'mergetree') ORDER BY (tenant_id, site_id, timestamp)`); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
+	// Own the whole walked chain (see TestChain_Integration's sweep note).
+	if _, err := db.SQL().Exec(ctx, `DELETE FROM audit_events`); err != nil {
+		t.Fatalf("sweep audit_events: %v", err)
+	}
 
 	oldSvc := NewService(db, []byte(integrationAuditKey))
 	oldID := keyID([]byte(integrationAuditKey))
