@@ -2,9 +2,13 @@ package replays
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
 // F12/F19 retry-safety proofs. All three batch retry scenarios the audit
@@ -178,8 +182,9 @@ func TestIngest_V2InterruptedBatchRetryProducesIdenticalChildren(t *testing.T) {
 		if firstIDs[i] != secondIDs[i] {
 			t.Fatalf("child %d identity changed on retry: %q -> %q", i, firstIDs[i], secondIDs[i])
 		}
-		// And the identity is the documented deterministic derivation.
-		want := DeterministicChildID(siteID, replayID, input.BatchID, i)
+		// And the identity is the documented deterministic derivation
+		// (producer-scoped since TO-019).
+		want := DeterministicChildID(siteID, replayID, input.ProducerID, input.BatchID, i)
 		var found bool
 		for _, id := range secondIDs {
 			if id == want {
@@ -254,5 +259,91 @@ func mustExec(t *testing.T, db *nucleus.Client, ctx context.Context, q string, a
 	t.Helper()
 	if _, err := db.Pool().Exec(ctx, q, args...); err != nil {
 		t.Fatalf("exec %q: %v", q, err)
+	}
+}
+
+// TO-019: the ledger identity is the (producer, batch) PAIR. Two producers
+// submitting the same batch id for one replay with different content are
+// two distinct batches — both admitted — where the pre-043 key collapsed
+// them into a 409 or a wrong dedupe.
+func TestIngest_TwoProducersSharingBatchIDAreDistinct(t *testing.T) {
+	db := testDB(t)
+	svc := NewReplayService(db)
+	ctx := context.Background()
+	siteID := uniqueID("to019-site")
+	replayID := uniqueID("to019-replay")
+
+	a := v2Input(siteID, "sess-1", replayID, "producer-000001", "batch-00000001", 11)
+	b := v2Input(siteID, "sess-1", replayID, "producer-000002", "batch-00000001", 12)
+	if a.BatchID != b.BatchID {
+		t.Fatal("test shape: both inputs must share the batch id")
+	}
+	if _, err := svc.Ingest(ctx, a); err != nil {
+		t.Fatalf("producer A ingest: %v", err)
+	}
+	if _, err := svc.Ingest(ctx, b); err != nil {
+		t.Fatalf("producer B ingest with the same batch id must be its own batch, not a reuse error: %v", err)
+	}
+	children := countRows(t, db, ctx,
+		"SELECT COUNT(*) FROM replay_events WHERE site_id = $1 AND replay_id = $2", siteID, replayID)
+	if children != int64(len(a.Events)+len(b.Events)) {
+		t.Fatalf("both producers' children must be stored, got %d of %d", children, len(a.Events)+len(b.Events))
+	}
+	// A retry of producer A's exact batch still dedupes against A's row.
+	res, err := svc.Ingest(ctx, a)
+	if err != nil || !res.Deduped {
+		t.Fatalf("producer A retry must dedupe against its own ledger row: (%+v, %v)", res, err)
+	}
+}
+
+// TO-019: legacy pre-043 ledger rows (producer_id='') still dedupe an
+// in-flight retry of a pre-upgrade batch.
+func TestIngest_LegacyProducerlessLedgerRowStillDedupes(t *testing.T) {
+	db := testDB(t)
+	svc := NewReplayService(db)
+	ctx := context.Background()
+	siteID := uniqueID("to019lg-site")
+	replayID := uniqueID("to019lg-replay")
+	input := v2Input(siteID, "sess-1", replayID, "producer-000001", "batch-00000001", 11)
+
+	// Seed the ledger the way a pre-043 process wrote it: no producer.
+	digest := input.batchDigest()
+	if _, err := db.SQL().Exec(ctx,
+		`INSERT INTO replay_batches (tenant_id, site_id, replay_id, producer_id, batch_id, event_count, payload_sha, first_seen, version)
+		 VALUES ('default', $1, $2, '', $3, $4, $5, $6, $6)`,
+		siteID, replayID, input.BatchID,
+		strconv.FormatInt(int64(len(input.Events)), 10), digest, dbutil.IntParam(time.Now().UnixMilli())); err != nil {
+		t.Fatalf("seed legacy ledger row: %v", err)
+	}
+	res, err := svc.Ingest(ctx, input)
+	if err != nil {
+		t.Fatalf("legacy-row retry ingest: %v", err)
+	}
+	if !res.Deduped {
+		t.Fatal("a legacy producer_id='' ledger row must still dedupe the batch it recorded")
+	}
+	children := countRows(t, db, ctx,
+		"SELECT COUNT(*) FROM replay_events WHERE site_id = $1 AND replay_id = $2", siteID, replayID)
+	if children != 0 {
+		t.Fatalf("deduped retry must write no children, got %d", children)
+	}
+}
+
+// TO-019: partial v2 identities and unknown versions are rejected, not
+// silently degraded to non-idempotent v1 semantics.
+func TestIngest_PartialV2IdentityRejected(t *testing.T) {
+	db := testDB(t)
+	svc := NewReplayService(db)
+	ctx := context.Background()
+
+	partial := v2Input("to019p-site", "sess-1", uniqueID("to019p-replay"), "producer-000001", "batch-00000001", 11)
+	partial.ProducerID = ""
+	if _, err := svc.Ingest(ctx, partial); err == nil {
+		t.Fatal("a batch_id without producer_id must be rejected")
+	}
+	badVersion := v2Input("to019v-site", "sess-1", uniqueID("to019v-replay"), "producer-000001", "batch-00000001", 11)
+	badVersion.V = 3
+	if _, err := svc.Ingest(ctx, badVersion); err == nil {
+		t.Fatal("an unsupported protocol version must be rejected")
 	}
 }

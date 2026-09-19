@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-dev/neutron-go/neutron"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 	"github.com/useteploy/teploy-observe/internal/heatmaps"
@@ -193,6 +194,22 @@ func (in *IngestInput) idempotent() bool {
 	return in.ProducerID != "" && in.BatchID != ""
 }
 
+// validateReplayProtocol enforces the v2 contract (TO-019): a request
+// declaring v2 — or carrying any identity field — must carry ALL of
+// producer_id, batch_id, and replay_id, and the declared version must be
+// one this server speaks. A partial identity used to fall back silently to
+// non-idempotent v1 writes, which could double-count on retry.
+func validateReplayProtocol(in *IngestInput) error {
+	if in.V != 0 && in.V != 1 && in.V != 2 {
+		return fmt.Errorf("unsupported replay protocol version %d (this server speaks v1 and v2)", in.V)
+	}
+	carriesIdentity := in.ProducerID != "" || in.BatchID != ""
+	if (in.V == 2 || carriesIdentity) && !in.idempotent() {
+		return neutron.ErrBadRequest("a v2 replay batch requires both producer_id and batch_id")
+	}
+	return nil
+}
+
 // batchDigest is the sha256 over the canonical JSON encoding of the batch's
 // event list. Go marshals struct fields in declaration order and map keys
 // sorted, so the same events always digest identically on producer and
@@ -210,11 +227,12 @@ func (in *IngestInput) batchDigest() string {
 }
 
 // DeterministicChildID derives one replay child event id from
-// (site, replay, batch, index) - the F12/F19 stable child identity. A
-// retried batch re-derives the same ids, so children are natural
-// deduplicates of themselves under any future unique-key or CAS scheme.
-func DeterministicChildID(siteID, replayID, batchID string, index int) string {
-	sum := sha256.Sum256([]byte("observe-replay-v2|" + siteID + "|" + replayID + "|" + batchID + "|" + strconv.Itoa(index)))
+// (site, replay, producer, batch, index) - the F12/F19 stable child
+// identity, producer-scoped since TO-019. A retried batch re-derives the
+// same ids, so children are natural deduplicates of themselves under any
+// future unique-key or CAS scheme.
+func DeterministicChildID(siteID, replayID, producerID, batchID string, index int) string {
+	sum := sha256.Sum256([]byte("observe-replay-v2|" + siteID + "|" + replayID + "|" + producerID + "|" + batchID + "|" + strconv.Itoa(index)))
 	return hex.EncodeToString(sum[:16])
 }
 
@@ -236,19 +254,33 @@ type ledgerRow struct {
 var replayBatchCols = []string{"event_count", "payload_sha"}
 
 // replayBatchLatest renders the collapsed replay_batches derived table for
-// one (site, replay, batch) key.
+// one (site, replay, producer, batch) key.
 func replayBatchLatest(where string) string {
 	return query.LatestRows("replay_batches", replayBatchCols, where) + " AS replay_batches"
 }
 
 // ledgerLookup returns the committed ledger row for a batch key, or nil.
-func (s *ReplayService) ledgerLookup(ctx context.Context, sqlc *nucleus.SQLModel, siteID, replayID, batchID string) (*ledgerRow, error) {
-	rows, err := nucleus.Query[ledgerRow](ctx, sqlc,
-		`SELECT event_count, payload_sha FROM `+
-			replayBatchLatest("site_id = $1 AND replay_id = $2 AND batch_id = $3"),
-		siteID, replayID, batchID)
+// TO-019: the key is producer-scoped; when the producer-scoped lookup
+// misses, a LEGACY row (producer_id='', written pre-043) for the same
+// batch is honored — an in-flight retry of a pre-upgrade batch keeps
+// deduplicating across the migration. Legacy rows are never written.
+func (s *ReplayService) ledgerLookup(ctx context.Context, sqlc *nucleus.SQLModel, siteID, replayID, producerID, batchID string) (*ledgerRow, error) {
+	read := func(producer string) ([]ledgerRow, error) {
+		return nucleus.Query[ledgerRow](ctx, sqlc,
+			`SELECT event_count, payload_sha FROM `+
+				replayBatchLatest("site_id = $1 AND replay_id = $2 AND producer_id = $3 AND batch_id = $4"),
+			siteID, replayID, producer, batchID)
+	}
+	rows, err := read(producerID)
 	if err != nil {
 		return nil, fmt.Errorf("replays: batch ledger lookup: %w", err)
+	}
+	if len(rows) == 0 && producerID != "" {
+		// Legacy pre-043 row (no producer recorded).
+		rows, err = read("")
+		if err != nil {
+			return nil, fmt.Errorf("replays: batch ledger legacy lookup: %w", err)
+		}
 	}
 	if len(rows) == 0 {
 		return nil, nil
@@ -435,6 +467,11 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (Result, 
 	if len(input.Events) == 0 {
 		return Result{}, nil
 	}
+	// TO-019: partial v2 identities and unknown versions are rejected
+	// instead of silently degrading to non-idempotent v1 writes.
+	if err := validateReplayProtocol(&input); err != nil {
+		return Result{}, err
+	}
 
 	replayID := input.ReplayID
 	if replayID == "" {
@@ -506,7 +543,7 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (Result, 
 	// writes it guards are one serialized unit. A duplicate whose digest
 	// matches returns without writing anything.
 	if input.idempotent() {
-		prior, err := s.ledgerLookup(ctx, sqlc, input.SiteID, replayID, input.BatchID)
+		prior, err := s.ledgerLookup(ctx, sqlc, input.SiteID, replayID, input.ProducerID, input.BatchID)
 		if err != nil {
 			return Result{}, err
 		}
@@ -538,9 +575,9 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (Result, 
 		eventID := genID()
 		if idempotent {
 			// F12/F19: children of an idempotent batch are named by
-			// (site, replay, batch, index) so any re-insert path lands on
-			// the same rows.
-			eventID = DeterministicChildID(input.SiteID, replayID, input.BatchID, i)
+			// (site, replay, producer, batch, index) so any re-insert
+			// path lands on the same rows.
+			eventID = DeterministicChildID(input.SiteID, replayID, input.ProducerID, input.BatchID, i)
 		}
 		dataJSON := "null"
 		if ev.Data != nil {
@@ -600,9 +637,9 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (Result, 
 	if idempotent {
 		now := time.Now().UTC().UnixMilli()
 		if _, err := sqlc.Exec(ctx,
-			`INSERT INTO replay_batches (tenant_id, site_id, replay_id, batch_id, event_count, payload_sha, first_seen, version)
-			 VALUES ('default', $1, $2, $3, $4, $5, $6, $6)`,
-			input.SiteID, replayID, input.BatchID,
+			`INSERT INTO replay_batches (tenant_id, site_id, replay_id, producer_id, batch_id, event_count, payload_sha, first_seen, version)
+			 VALUES ('default', $1, $2, $3, $4, $5, $6, $7, $7)`,
+			input.SiteID, replayID, input.ProducerID, input.BatchID,
 			strconv.FormatInt(int64(len(input.Events)), 10),
 			input.batchDigest(), dbutil.IntParam(now),
 		); err != nil {
