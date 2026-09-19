@@ -16,24 +16,24 @@ func TestBatchDeduper_Window(t *testing.T) {
 	d := NewBatchDeduper(10*time.Minute, 4)
 	d.now = func() time.Time { return now }
 
-	if d.duplicate("p1\x00b1") {
+	if d.duplicate("p1\x00b1", "digest-1") {
 		t.Fatal("fresh key must not be a duplicate")
 	}
-	d.record("p1\x00b1")
+	d.record("p1\x00b1", "digest-1")
 
 	now = now.Add(time.Minute)
-	if !d.duplicate("p1\x00b1") {
+	if !d.duplicate("p1\x00b1", "digest-1") {
 		t.Fatal("recorded key inside TTL must be a duplicate")
 	}
 	// The duplicate check refreshes the window: hammering the same key keeps
 	// it recognized.
 	now = now.Add(9 * time.Minute)
-	if !d.duplicate("p1\x00b1") {
+	if !d.duplicate("p1\x00b1", "digest-1") {
 		t.Fatal("refreshed key must still be recognized inside its window")
 	}
 	// Past the refreshed TTL the key is forgotten.
 	now = now.Add(11 * time.Minute)
-	if d.duplicate("p1\x00b1") {
+	if d.duplicate("p1\x00b1", "digest-1") {
 		t.Fatal("key past TTL must be forgotten")
 	}
 }
@@ -46,19 +46,19 @@ func TestBatchDeduper_Bounded(t *testing.T) {
 	d.now = func() time.Time { return now }
 	for i := 0; i < 10; i++ {
 		k := string(rune('a'+i)) + "-producer-key-batch"
-		if d.duplicate(k) {
+		if d.duplicate(k, "digest-"+k) {
 			t.Fatalf("key %d must be fresh", i)
 		}
-		d.record(k)
+		d.record(k, "digest-"+k)
 	}
 	if len(d.seen) > 3 || len(d.order) > 3 {
 		t.Fatalf("cache must stay bounded (seen=%d ring=%d)", len(d.seen), len(d.order))
 	}
 	// The oldest keys were evicted; the newest one is still recognized.
-	if !d.duplicate("j-producer-key-batch") {
+	if !d.duplicate("j-producer-key-batch", "digest-j-producer-key-batch") {
 		t.Fatal("the newest recorded key must still be recognized as a duplicate")
 	}
-	if d.duplicate("a-producer-key-batch") {
+	if d.duplicate("a-producer-key-batch", "digest-a-producer-key-batch") {
 		t.Fatal("the oldest key must have been evicted at capacity")
 	}
 }
@@ -177,5 +177,48 @@ func TestPrepareEvent_ProducerEventID(t *testing.T) {
 	}
 	if bad.EventID == "short" || len(bad.EventID) != 32 {
 		t.Fatalf("invalid producer id must be replaced by a server id, got %q", bad.EventID)
+	}
+}
+
+// TO-017: the admission cache is content-bound. The same (producer, batch)
+// identity resubmitted with DIFFERENT events — a producer that repacked a
+// failed/acknowledged batch with newly queued events under the head
+// event's batch id — must be PROCESSED, not answered with a stale
+// duplicate acknowledgment that silently discards the new tail.
+func TestBatchHandler_SameKeyDifferentContentIsNotDeduped(t *testing.T) {
+	buf := batchTestBuffer(t)
+	d := NewBatchDeduper(DefaultBatchDedupeTTL, DefaultBatchDeduperCapacity)
+	h := BatchHandler(buf, "salt", (*sites.SiteService)(nil), d)
+	ctx := withTestUA(context.Background())
+
+	head := IngestInput{SiteID: "s1", EventType: "pageview", EventID: "evt-head-0001"}
+	tail := IngestInput{SiteID: "s1", EventType: "click", EventID: "evt-tail-0002"}
+	first := BatchInput{V: 2, ProducerID: "producer-0001", BatchID: "evt-head-0001",
+		Events: []IngestInput{head}}
+	res, err := h(ctx, first)
+	if err != nil || res.Deduped || res.Accepted != 1 {
+		t.Fatalf("first submit must be accepted: (%+v, %v)", res, err)
+	}
+	// Retry carrying a NEW event under the same batch id (the head event's
+	// id — exactly how the browser SDK used to repack).
+	retry := BatchInput{V: 2, ProducerID: "producer-0001", BatchID: "evt-head-0001",
+		Events: []IngestInput{head, tail}}
+	res2, err := h(ctx, retry)
+	if err != nil {
+		t.Fatalf("repacked submit: %v", err)
+	}
+	if res2.Deduped {
+		t.Fatal("a same-key batch with different content must NOT be acknowledged as a duplicate")
+	}
+	if res2.Accepted != 2 {
+		t.Fatalf("the repacked batch must be admitted in full, got accepted=%d", res2.Accepted)
+	}
+	if buf.Len() != 3 {
+		t.Fatalf("buffer must hold all admitted events, has %d", buf.Len())
+	}
+	// A byte-identical retry of the FIRST batch still dedupes.
+	res3, err := h(ctx, first)
+	if err != nil || !res3.Deduped {
+		t.Fatalf("identical retry must still dedupe: (%+v, %v)", res3, err)
 	}
 }

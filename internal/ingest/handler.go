@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -462,11 +463,20 @@ type BatchInput struct {
 // BatchDeduper is the in-process admission cache for v2 event batches
 // (F12). It exists to stop a client retrying an ambiguous (response-lost)
 // batch from re-buffering events the server already admitted - the fast
-// path. The durable boundary is the flush-time event-id existence filter
-// (see Buffer.insertBatch), which covers restarts, WAL replay, and any
-// cache miss; this cache is an optimization, and its loss (restart, TTL,
-// bound eviction) never produces duplicates, only a redundant admission
-// that the flush filter then drops.
+// path. The durable boundary is the flush-time site-scoped event-id
+// existence filter (see Buffer.insertBatch), which covers restarts, WAL
+// replay, and any cache miss; this cache is an optimization, and its loss
+// (restart, TTL, bound eviction) never produces duplicates, only a
+// redundant admission that the flush filter then drops.
+//
+// TO-017: cache entries are SITE-SCOPED and CONTENT-BOUND. The key is
+// (authenticated site, producer, batch); the value carries a digest of the
+// prepared events' (site, event-id) identities. A retry with the same key
+// AND the same identity digest is acknowledged as a duplicate; the same
+// key with a DIFFERENT digest is NOT deduplicated — the batch is processed
+// normally and the flush-time event-id filter arbitrates (a producer that
+// repacks a failed batch with newly queued events under the head event's
+// batch id must not have the new tail silently discarded).
 //
 // Deliberately in-memory and per-process: observe runs one instance per
 // database (the same documented single-process boundary as the replay
@@ -474,7 +484,7 @@ type BatchInput struct {
 // stable-key/CAS design this defers to.
 type BatchDeduper struct {
 	mu    sync.Mutex
-	seen  map[string]time.Time
+	seen  map[string]batchDedupEntry
 	order []string
 	head  int
 	ttl   time.Duration
@@ -482,36 +492,80 @@ type BatchDeduper struct {
 	now   func() time.Time
 }
 
+// batchDedupEntry is one admitted batch key's identity digests and their
+// admission time (TO-017). A key may legitimately carry more than one
+// digest over its life (a repacked batch reusing the head event's batch id
+// is admitted, not rejected); the small bounded list keeps every recently
+// admitted identity deduplicable while bounding a misbehaving producer
+// that sprays new digests under one key.
+type batchDedupEntry struct {
+	digests  []string // newest first, at most maxDigestsPerKey
+	admitted time.Time
+}
+
+// maxDigestsPerKey bounds how many distinct content digests one batch key
+// remembers. Real producers need one (a stable retry); the headroom covers
+// a repack and a duplicate retry of either body.
+const maxDigestsPerKey = 4
+
 func NewBatchDeduper(ttl time.Duration, max int) *BatchDeduper {
 	return &BatchDeduper{
-		seen: make(map[string]time.Time),
+		seen: make(map[string]batchDedupEntry),
 		ttl:  ttl,
 		max:  max,
 		now:  time.Now,
 	}
 }
 
-// duplicate reports whether key was recorded within the TTL, refreshing its
-// timestamp so a busy retrying producer cannot slide its own batch back
-// under the TTL by hammering it.
-func (d *BatchDeduper) duplicate(key string) bool {
+// duplicate reports whether key was recorded within the TTL with the SAME
+// content digest, refreshing its timestamp so a busy retrying producer
+// cannot slide its own batch back under the TTL by hammering it. A key
+// recorded only with DIFFERENT digests is reported as not-duplicate (the
+// cache never answers a changed body with a stale acknowledgment).
+func (d *BatchDeduper) duplicate(key, digest string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if t, ok := d.seen[key]; ok && d.now().Sub(t) < d.ttl {
-		d.seen[key] = d.now()
-		return true
+	entry, ok := d.seen[key]
+	if !ok || d.now().Sub(entry.admitted) >= d.ttl {
+		return false
+	}
+	for _, dg := range entry.digests {
+		if dg == digest {
+			entry.admitted = d.now()
+			d.seen[key] = entry
+			return true
+		}
 	}
 	return false
 }
 
-// record remembers key as admitted. Called only AFTER the batch was
-// successfully buffered, so a refused (429) first attempt stays retryable.
-// order is a fixed-capacity ring: at capacity the oldest recorded key is
-// overwritten, bounding both the map and the ring to max entries.
-func (d *BatchDeduper) record(key string) {
+// record remembers key as admitted with its content digest. Called only
+// AFTER the batch was successfully buffered, so a refused (429) first
+// attempt stays retryable. order is a fixed-capacity ring over KEYS: at
+// capacity the oldest recorded key is overwritten, bounding both the map
+// and the ring to max entries.
+func (d *BatchDeduper) record(key, digest string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.seen[key] = d.now()
+	entry, ok := d.seen[key]
+	if ok {
+		for _, dg := range entry.digests {
+			if dg == digest {
+				entry.admitted = d.now()
+				d.seen[key] = entry
+				return
+			}
+		}
+	}
+	entry.digests = append([]string{digest}, entry.digests...)
+	if len(entry.digests) > maxDigestsPerKey {
+		entry.digests = entry.digests[:maxDigestsPerKey]
+	}
+	entry.admitted = d.now()
+	d.seen[key] = entry
+	if ok {
+		return
+	}
 	if len(d.order) < d.max {
 		d.order = append(d.order, key)
 		return
@@ -541,19 +595,12 @@ func BatchHandler(buf *Buffer, salt string, siteSvc *sites.SiteService, deduper 
 		if len(input.Events) == 0 {
 			return IngestResponse{OK: true}, nil
 		}
-		// F12: a v2 batch whose identity this process already admitted is a
-		// retry of an ambiguous submit - acknowledge as a duplicate WITHOUT
-		// re-buffering. The key is recorded only after successful admission
-		// below, so a 429'd first attempt stays retryable; a concurrent
-		// double-submit both miss here and the flush-time event-id filter
-		// drops the loser.
-		var batchKey string
-		if deduper != nil && validProducerID(input.ProducerID) && validProducerID(input.BatchID) {
-			batchKey = input.ProducerID + "\x00" + input.BatchID
-			if deduper.duplicate(batchKey) {
-				return IngestResponse{OK: true, Deduped: true}, nil
-			}
-		}
+		// F12/TO-017: the admission-cache key is checked AFTER preparation
+		// (below) so it is scoped to the AUTHENTICATED site and bound to
+		// the batch's content digest — a reused (producer, batch) pair for
+		// different content or a different site is never answered with a
+		// stale duplicate acknowledgment.
+		useCache := deduper != nil && validProducerID(input.ProducerID) && validProducerID(input.BatchID)
 		// AUD-010 (round 2): prepare EVERY event side-effect-free first,
 		// then admit the survivors in one atomic Buffer.PushBatch under the
 		// buffer lock. The old Avail-snapshot + per-event Push loop let two
@@ -585,16 +632,52 @@ func BatchHandler(buf *Buffer, salt string, siteSvc *sites.SiteService, deduper 
 			}
 			prepared = append(prepared, *e)
 		}
+		var batchKey, batchDigest string
+		if useCache {
+			batchKey = SiteIDFromContext(ctx) + "\x00" + input.ProducerID + "\x00" + input.BatchID
+			batchDigest = preparedIdentityDigest(prepared)
+			if deduper.duplicate(batchKey, batchDigest) {
+				return IngestResponse{OK: true, Deduped: true}, nil
+			}
+		}
 		if !buf.PushBatch(prepared) {
 			return IngestResponse{}, neutron.ErrRateLimited(
 				fmt.Sprintf("buffer capacity below batch size %d, retry the whole batch later", len(prepared)))
 		}
 		if batchKey != "" {
-			deduper.record(batchKey)
+			deduper.record(batchKey, batchDigest)
 		}
 		accepted += len(prepared)
 		return IngestResponse{OK: true, Accepted: accepted, Rejected: rejected}, nil
 	}
+}
+
+// preparedIdentityDigest binds an admission-cache entry to the content it
+// admitted (TO-017): the sha256 over the prepared events' (site, event-id)
+// identities and count — the fields that are stable across a legitimate
+// producer retry (server-assigned timestamps are deliberately excluded).
+// A repacked batch carrying new event ids digests differently and is
+// processed rather than falsely acknowledged.
+func preparedIdentityDigest(prepared []Event) string {
+	type idPair struct {
+		Site    string `json:"s"`
+		EventID string `json:"e"`
+	}
+	pairs := make([]idPair, 0, len(prepared))
+	for _, e := range prepared {
+		pairs = append(pairs, idPair{Site: e.SiteID, EventID: e.EventID})
+	}
+	raw, err := json.Marshal(struct {
+		Count int      `json:"n"`
+		IDs   []idPair `json:"ids"`
+	}{Count: len(pairs), IDs: pairs})
+	if err != nil {
+		// Marshal of string pairs cannot fail; degrade to a per-attempt
+		// unique digest (no dedupe) rather than blocking ingest.
+		return fmt.Sprintf("undigestable:%d:%v", len(prepared), err)
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 func generateID() string {

@@ -3,8 +3,9 @@ package ingest
 import (
 	"context"
 	"fmt"
-	"testing"
+	"io"
 	"log/slog"
+	"testing"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -144,5 +145,67 @@ func TestFlushMixedDuplicateAndFresh(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("mixed retry must yield exactly the 2 distinct events, got %d", n)
+	}
+}
+
+// TO-018: the durable event-id dedupe is SITE-SCOPED. A producer-chosen
+// event id is only an identity within its owner site: the same id under a
+// second site must store BOTH records, while a same-site retry still
+// deduplicates.
+func TestFlush_CrossSiteEventIDsAreDistinct(t *testing.T) {
+	db := testBufferDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	buf := NewBuffer(db, 1000, 100, time.Hour, logger)
+
+	siteA := fmt.Sprintf("to018a-%d", time.Now().UnixNano())
+	siteB := fmt.Sprintf("to018b-%d", time.Now().UnixNano())
+	sharedID := "evt-shared-" + siteA
+	ts := time.Now().UTC().UnixMilli()
+
+	first := Event{EventID: sharedID, TenantID: "default", SiteID: siteA, SessionID: "s", VisitID: "s", EventType: "pageview", Timestamp: ts}
+	if !buf.PushBatch([]Event{first}) {
+		t.Fatal("site A admission failed")
+	}
+	buf.Flush()
+
+	// Same id, different site: must store a SECOND record.
+	second := first
+	second.SiteID = siteB
+	if !buf.PushBatch([]Event{second}) {
+		t.Fatal("site B admission failed")
+	}
+	buf.Flush()
+
+	// Same id, same site A again: the durable dedupe drops it.
+	if !buf.PushBatch([]Event{first}) {
+		t.Fatal("site A retry admission failed")
+	}
+	buf.Flush()
+
+	count := func(site string) int {
+		rows, err := nucleus.Query[struct {
+			N string `db:"n"`
+		}](ctx, db.SQL(),
+			"SELECT CAST(COUNT(*) AS TEXT) AS n FROM events WHERE event_id = $1 AND site_id = $2",
+			sharedID, site)
+		if err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("count: expected 1 row, got %d", len(rows))
+		}
+		var n int
+		if _, err := fmt.Sscanf(rows[0].N, "%d", &n); err != nil {
+			t.Fatalf("count parse %q: %v", rows[0].N, err)
+		}
+		return n
+	}
+	if got := count(siteA); got != 1 {
+		t.Fatalf("site A: want exactly 1 record, got %d", got)
+	}
+	if got := count(siteB); got != 1 {
+		t.Fatalf("site B: the same event id under another site must store its own record, got %d", got)
 	}
 }

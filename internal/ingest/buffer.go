@@ -216,33 +216,43 @@ func approxEventBytes(e Event) int {
 	return len(raw)
 }
 
-// existingEventIDs returns the subset of ids already stored in events, with
-// a timestamp floor so the lookup stays bounded (see flushDedupeHorizon).
-// Used by the flush-time dedup (filterUncommitted), which also covers WAL
-// recovery now that recovery commits through insertBatch (TO-014).
-func existingEventIDs(ctx context.Context, sqlc *nucleus.SQLModel, ids []string, minTS int64, logger *slog.Logger) map[string]struct{} {
-	existing := make(map[string]struct{}, len(ids))
-	type idRow struct {
+// eventKey is the durable-dedupe identity of one event (TO-018): the
+// producer-assigned event id is only unique within its OWNER SITE — two
+// sites choosing the same id are two events, and a cross-site collision
+// must not make one of them vanish.
+type eventKey struct {
+	SiteID  string
+	EventID string
+}
+
+// existingEventKeys returns which of the given (site, event_id) pairs are
+// already stored in events, with a timestamp floor so the lookup stays
+// bounded (see flushDedupeHorizon). Used by the flush-time dedup
+// (filterUncommitted), which also covers WAL recovery (TO-014).
+func existingEventKeys(ctx context.Context, sqlc *nucleus.SQLModel, events []Event, minTS int64, logger *slog.Logger) map[eventKey]struct{} {
+	existing := make(map[eventKey]struct{}, len(events))
+	type keyRow struct {
+		SiteID  string `db:"site_id"`
 		EventID string `db:"event_id"`
 	}
 	const chunk = 500
-	for i := 0; i < len(ids); i += chunk {
+	for i := 0; i < len(events); i += chunk {
 		end := i + chunk
-		if end > len(ids) {
-			end = len(ids)
+		if end > len(events) {
+			end = len(events)
 		}
-		batch := ids[i:end]
+		batch := events[i:end]
 		ph := make([]string, len(batch))
 		args := make([]any, 0, len(batch)+1)
 		args = append(args, dbutil.IntParam(minTS))
-		for j, id := range batch {
+		for j, e := range batch {
 			ph[j] = fmt.Sprintf("$%d", j+2)
-			args = append(args, id)
+			args = append(args, e.EventID)
 		}
 		q := fmt.Sprintf(
-			"SELECT event_id FROM events WHERE timestamp >= $1 AND event_id IN (%s)",
+			"SELECT site_id, event_id FROM events WHERE timestamp >= $1 AND event_id IN (%s)",
 			strings.Join(ph, ","))
-		rows, err := nucleus.Query[idRow](ctx, sqlc, q, args...)
+		rows, err := nucleus.Query[keyRow](ctx, sqlc, q, args...)
 		if err != nil {
 			// Fail open: keep all pending (durability over dedup).
 			if logger != nil {
@@ -251,7 +261,7 @@ func existingEventIDs(ctx context.Context, sqlc *nucleus.SQLModel, ids []string,
 			return nil
 		}
 		for _, r := range rows {
-			existing[r.EventID] = struct{}{}
+			existing[eventKey{SiteID: r.SiteID, EventID: r.EventID}] = struct{}{}
 		}
 	}
 	return existing
@@ -609,21 +619,19 @@ const flushDedupeHorizon = 24 * time.Hour
 // interleave with another flush of the same ids. Fails OPEN on a lookup
 // error (a possible duplicate beats certain data loss).
 func (b *Buffer) filterUncommitted(ctx context.Context, sqlc *nucleus.SQLModel, chunk []Event) []Event {
-	ids := make([]string, 0, len(chunk))
 	minTS := chunk[0].Timestamp
 	for _, e := range chunk {
-		ids = append(ids, e.EventID)
 		if e.Timestamp < minTS {
 			minTS = e.Timestamp
 		}
 	}
-	existing := existingEventIDs(ctx, sqlc, ids, minTS-flushDedupeHorizon.Milliseconds(), b.logger)
-	if existing == nil || len(existing) == 0 {
+	existing := existingEventKeys(ctx, sqlc, chunk, minTS-flushDedupeHorizon.Milliseconds(), b.logger)
+	if len(existing) == 0 {
 		return chunk
 	}
 	out := chunk[:0]
 	for _, e := range chunk {
-		if _, dup := existing[e.EventID]; !dup {
+		if _, dup := existing[eventKey{SiteID: e.SiteID, EventID: e.EventID}]; !dup {
 			out = append(out, e)
 		}
 	}
