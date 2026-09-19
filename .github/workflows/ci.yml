@@ -224,7 +224,7 @@ jobs:
             -e NUCLEUS_ALLOW_NO_AUTH=1 \
             -e NUCLEUS_ALLOW_INSECURE_CLUSTER=1 \
             -e NUCLEUS_ALLOW_INSECURE_REPLICATION=1 \
-            ghcr.io/neutron-build/nucleus:v0.1.8 \
+            ghcr.io/neutron-build/nucleus:v1.1.0 \
             start --host 0.0.0.0 --port 5432 --cluster-port 5433 --data /data --max-memory 512
           for i in $(seq 1 60); do
             if (exec 3<>/dev/tcp/127.0.0.1/55432) 2>/dev/null; then exec 3>&-; exit 0; fi
