@@ -6,7 +6,11 @@
  *
  * init({
  *   endpoint: "https://observe.example.com",
- *   siteId: "default",
+ *   siteId: "my-site",
+ *   // Ingestion requires a site-scoped API key (create one under
+ *   // Settings > API keys; browser keys are public by design and can only
+ *   // append telemetry to their own site).
+ *   apiKey: "pk_site_scoped_ingest_key",
  * });
  * ```
  *
@@ -20,7 +24,9 @@ export interface InitOptions {
   endpoint: string;
   /** The site identifier. Defaults to `"default"`. */
   siteId?: string;
-  /** API key for server-side or authenticated ingest. Most browsers don't need one. */
+  /** API key for authenticated ingest. Required: the server's ingest
+   * routes reject keyless requests (a browser-visible key is public by
+   * design — scope it to one site and append-only telemetry). */
   apiKey?: string;
   /** Disable automatic pageview on init (useful for SPAs doing manual routing). */
   disableAutoPageview?: boolean;
@@ -121,14 +127,22 @@ export interface LogPayload {
 }
 
 interface Client {
-  opts: Required<Omit<InitOptions, "apiKey" | "release" | "environment" | "onError" | "onRetry">> & {
+  opts: Required<Pick<InitOptions, "endpoint" | "siteId" | "disableAutoPageview" | "batchSize" | "flushIntervalMs" | "maxRetryAttempts" | "retryBackoffMs">> & {
     apiKey?: string;
     release?: string;
     environment?: string;
     onError?: (err: Error) => void;
     onRetry?: (info: { attempt: number; delayMs: number; batchSize: number; error: Error }) => void;
   };
-  buffer: EventPayload[];
+  /** Newly recorded events not yet packed into a request (TO-032). Each
+   * entry is an owned JSON snapshot taken at admission (TO-033). */
+  buffer: string[];
+  /** Serialized bytes reserved by buffer + pending (TO-034). */
+  queuedBytes: number;
+  /** Frozen, identity-stamped request envelopes awaiting first send or
+   * retry (TO-032). A request retries its exact bytes; its events are
+   * never merged back into the live buffer. */
+  pending: PendingEventRequest[];
   timer: number | null;
   userId: string | null;
   sessionId: string | null;
@@ -139,14 +153,28 @@ interface Client {
    * duplicate prefixes and then slice differing lengths off a mutated
    * queue, deleting events neither request had sent. */
   flushing: Promise<void> | null;
-  /** F32: retry attempts per detached batch, keyed by the batch head's
-   * stable event_id (the same identity the server dedupes on). */
+  /** F32: retry attempts per pending request, keyed by batch id. */
   retryCounts: Map<string, number>;
   /** F32: earliest wall-clock time (ms) at which a flush may send again —
    * the retry backoff gate. Set after each failed attempt. */
   retryAfter: number;
   /** Removes this client's interval and DOM listeners (audit F31). */
   dispose: () => void;
+}
+
+/**
+ * TO-032: one immutable request envelope. Identity (producer, batch) is
+ * allocated once, the body serialized once, and a retry resends the exact
+ * same bytes — a failed batch can never be repacked with newly recorded
+ * events under its already-acknowledged batch id (the old repack lost the
+ * new tail whenever the server's admission cache recognized the id).
+ */
+interface PendingEventRequest {
+  readonly producerId: string;
+  readonly batchId: string;
+  readonly body: string;
+  readonly bytes: number;
+  readonly eventCount: number;
 }
 
 let client: Client | null = null;
@@ -170,14 +198,31 @@ const MAX_KEEPALIVE_BYTES = 48 * 1024;
 // leaves room for envelope overhead under the route cap.
 const MAX_REQUEST_BYTES = 1024 * 1024;
 
-// Retained events on a failed send (audit F32): keep the batch for the next
+// TO-033/TO-034: admission-time budgets. Every queued record carries its
+// serialized bytes, and the queued+pending total is capped in BOTH count
+// and bytes — during retry backoff or a hanging request the buffer can no
+// longer grow without limit (the old MAX_BUFFERED_ON_ERROR only ran after
+// a send had already failed).
+const MAX_QUEUED_EVENTS = 200;
+const MAX_QUEUED_BYTES = 8 * 1024 * 1024;
+
+// TO-035: a conservative per-event admission cap under the server's 64 KiB
+// stored-event limit, so a record that can never be accepted is reported
+// at admission instead of poisoning every request that packs it.
+const MAX_EVENT_BYTES = 60 * 1024;
+
+// Retained requests on a failed send (audit F32): keep the batch for the next
 // flush instead of silently erasing it, but bound the retention so a long
-// outage cannot grow memory without limit. Beyond the cap, oldest events
-// are dropped and reported.
-const MAX_BUFFERED_ON_ERROR = 200;
+// outage cannot grow memory without limit. Beyond the cap, the OLDEST
+// pending requests are dropped and reported (they carry the oldest data).
+const MAX_PENDING_REQUESTS = 200;
 
 // F32 retry policy: the backoff doubles per attempt up to this ceiling.
 const MAX_RETRY_DELAY_MS = 60_000;
+
+// TO-034: every flush-network request carries a deadline; a hanging fetch
+// must not pin the single flush owner forever while the buffer grows.
+const FETCH_DEADLINE_MS = 10_000;
 
 const textEncoder = new TextEncoder();
 
@@ -206,73 +251,98 @@ function campaignFields(): Partial<Record<(typeof UTM_KEYS)[number], string>> {
   return out;
 }
 
-/** Measure the encoded byte length of the v2 batch envelope around events.
- * The batch_id is derived from the first event's stable event_id, so the
- * measurement matches the body actually sent (F12). */
-function eventsBodyBytes(events: EventPayload[]): number {
-  return textEncoder.encode(JSON.stringify(batchEnvelope(events))).byteLength;
+/** Serialize the v2 batch envelope around already-serialized events.
+ * The producer id is ALWAYS the owning client's (TO-036): the old global
+ * fallback let an old client's in-flight flush adopt a replacement
+ * client's producer identity after re-init. */
+function batchEnvelopeJSON(producerId: string, batchId: string, events: string[]): string {
+  return `{"v":${PROTOCOL_VERSION},"producer_id":${JSON.stringify(producerId)},"batch_id":${JSON.stringify(batchId)},"events":[${events.join(",")}]}`;
 }
 
-/** The v2 batch wire shape (F12): v + producer identity + events. batch_id
- * is the first event's event_id, which makes it stable across retries of
- * the same detached batch by construction - a requeued batch re-flushes
- * with the identical id, so the server admission cache recognizes it. */
-function batchEnvelope(events: EventPayload[], producerId?: string): Record<string, unknown> {
-  const pid = producerId ?? client?.producerId ?? "";
-  return {
-    v: PROTOCOL_VERSION,
-    producer_id: pid,
-    batch_id: events[0]?.event_id ?? "",
-    events,
+/** Freeze buffer entries into request-legal envelopes by count and encoded
+ * bytes (AUD-026/TO-032). Every emitted request is complete and immutable;
+ * entries that cannot fit any envelope are reported and dropped (they were
+ * already rejected at admission, so this is a belt-and-braces re-check). */
+function packEventRequests(
+  producerId: string,
+  entries: string[],
+  onDrop: (why: string) => void,
+): PendingEventRequest[] {
+  const out: PendingEventRequest[] = [];
+  let batch: string[] = [];
+  let bytes = 0;
+  const flushBatch = () => {
+    if (!batch.length) return;
+    const batchId = makeId();
+    const body = batchEnvelopeJSON(producerId, batchId, batch);
+    out.push({
+      producerId,
+      batchId,
+      body,
+      bytes: textEncoder.encode(body).byteLength,
+      eventCount: batch.length,
+    });
+    batch = [];
+    bytes = 0;
   };
-}
-
-/**
- * Pack events into server-legal chunks by BOTH count and encoded body size
- * (AUD-026): no emitted body may exceed MAX_REQUEST_BYTES. A single event
- * that cannot fit alone is rejected loudly rather than silently poisoning
- * every batch that contains it.
- */
-function packEventChunks(events: EventPayload[]): { chunks: EventPayload[][]; oversized: EventPayload[] } {
-  const chunks: EventPayload[][] = [];
-  const oversized: EventPayload[] = [];
-  let batch: EventPayload[] = [];
-  let size = eventsBodyBytes([]);
-  for (const ev of events) {
-    const candidate = eventsBodyBytes([...batch, ev]);
-    if (candidate > MAX_REQUEST_BYTES || batch.length >= MAX_EVENTS_PER_REQUEST) {
-      if (batch.length === 0) {
-        oversized.push(ev);
-        continue;
-      }
-      chunks.push(batch);
-      batch = [];
-      size = eventsBodyBytes([]);
-    }
-    // Re-measure with the event alone in the fresh batch: it may still be
-    // oversized on its own.
-    const solo = eventsBodyBytes([ev]);
+  for (const raw of entries) {
+    const rawBytes = textEncoder.encode(raw).byteLength;
+    const solo = textEncoder.encode(batchEnvelopeJSON(producerId, "probe", [raw])).byteLength;
     if (solo > MAX_REQUEST_BYTES) {
-      oversized.push(ev);
+      onDrop("dropped an event exceeding the request byte budget");
       continue;
     }
-    batch.push(ev);
-    size = solo;
+    const envelopeOverhead = solo - rawBytes;
+    if (
+      batch.length >= MAX_EVENTS_PER_REQUEST ||
+      (batch.length > 0 && bytes + rawBytes + envelopeOverhead > MAX_REQUEST_BYTES)
+    ) {
+      flushBatch();
+    }
+    bytes += rawBytes;
+    batch.push(raw);
   }
-  if (batch.length) chunks.push(batch);
-  return { chunks, oversized };
+  flushBatch();
+  return out;
+}
+
+/** fetch with a hard deadline (TO-034) and redirect refusal (TO-037: a
+ * redirect would forward the X-API-Key credential to another origin). */
+async function fetchWithDeadline(url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_DEADLINE_MS);
+  try {
+    return await fetch(url, { ...init, redirect: "error", signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
- * Send one JSON payload. STRICT (AUD-021, round 2): this rejects on any
- * transport failure (non-2xx, network error) and on unserializable
- * payloads — the previous version swallowed every rejection between the
- * transport and its retry owner, so flushClient saw fulfilled promises and
- * deleted the batch it believed had been delivered. Fire-and-forget PUBLIC
- * boundaries (captureException, log, unload sends) catch and report; the
- * flush owner consumes the rejection to drive retention. `keepalive` is
- * only used for small final sends while the page is unloading.
+ * Send one pre-serialized JSON body. STRICT (AUD-021/TO-037): rejects on
+ * any transport failure (non-2xx, network error, redirect) and carries a
+ * request deadline so a hanging fetch cannot pin the flush owner (TO-034).
+ * The flush owner consumes rejections to drive retention; the
+ * fire-and-forget public boundaries (captureException, log, unload sends)
+ * report them instead. `keepalive` is only used for small final sends
+ * while the page is unloading.
  */
+function sendRawJSON(target: Client, path: string, raw: string, unloading = false): Promise<void> {
+  const url = target.opts.endpoint.replace(/\/+$/, "") + path;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (target.opts.apiKey) headers["X-API-Key"] = target.opts.apiKey;
+  const bytes = textEncoder.encode(raw).byteLength;
+  return fetchWithDeadline(url, {
+    method: "POST",
+    headers,
+    body: raw,
+    credentials: "omit",
+    keepalive: unloading && bytes <= MAX_KEEPALIVE_BYTES,
+  }).then((res) => {
+    if (!res.ok) throw new Error(`observe: ingest returned ${res.status}`);
+  });
+}
+
 function sendJSON(target: Client, path: string, payload: unknown, unloading = false): Promise<void> {
   let raw: string;
   try {
@@ -280,36 +350,24 @@ function sendJSON(target: Client, path: string, payload: unknown, unloading = fa
   } catch (err) {
     return Promise.reject(err instanceof Error ? err : new Error("observe: payload not serializable"));
   }
-  const url = target.opts.endpoint.replace(/\/+$/, "") + path;
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (target.opts.apiKey) headers["X-API-Key"] = target.opts.apiKey;
-  const bytes = textEncoder.encode(raw).byteLength;
+  return sendRawJSON(target, path, raw, unloading).catch((err) => {
+    reportError(target, err instanceof Error ? err : new Error(String(err)));
+  });
+}
 
-  const viaFetch = (keepalive: boolean): Promise<void> =>
-    fetch(url, { method: "POST", headers, body: raw, credentials: "omit", keepalive })
-      .then((res) => {
-        if (!res.ok) throw new Error(`observe: ingest returned ${res.status}`);
-      });
-
-  if (unloading && bytes <= MAX_KEEPALIVE_BYTES) {
-    // Beacons cannot carry headers, so they only apply to keyless installs;
-    // a false return means the browser refused to queue it — fall through
-    // to keepalive fetch instead of treating the batch as delivered.
-    if (!target.opts.apiKey && typeof navigator !== "undefined" && "sendBeacon" in navigator) {
-      try {
-        if (navigator.sendBeacon(url, new Blob([raw], { type: "application/json" }))) {
-          return Promise.resolve();
-        }
-      } catch {
-        /* fall through to fetch */
-      }
-    }
-    return viaFetch(true).catch((err) => {
-      reportError(target, err instanceof Error ? err : new Error(String(err)));
-    }); // best effort on unload — no retry is possible
+/**
+ * TO-035: read and validate the events-batch acknowledgment. HTTP success
+ * alone is not acceptance — the server reports per-event rejections in
+ * `rejected`; those surface through onError (the rejected events are gone
+ * server-side; retrying would only duplicate the accepted neighbors).
+ */
+async function readEventBatchAck(res: Response): Promise<{ ok: boolean; accepted?: number; rejected?: number; deduped?: boolean }> {
+  if (!res.ok) throw new Error(`observe: ingest returned ${res.status}`);
+  const value: unknown = await res.json().catch(() => null);
+  if (!value || typeof value !== "object" || (value as { ok?: unknown }).ok !== true) {
+    throw new Error("observe: invalid batch acknowledgment");
   }
-  // Oversized or normal sends: strict rejection for the flush owner.
-  return viaFetch(false);
+  return value as { ok: boolean; accepted?: number; rejected?: number; deduped?: boolean };
 }
 
 /** Route a transport failure to the configured hook without throwing into
@@ -332,32 +390,26 @@ function reportRetry(target: Client, info: { attempt: number; delayMs: number; b
 }
 
 /** Initialize the SDK. Re-init disposes the previous client's timer and
- * listeners and flushes its buffer under the OLD configuration (audit F31);
- * previously each init() leaked one interval plus three listeners and
- * silently dropped everything the replaced client had buffered. */
+ * listeners and drains its queued work under the OLD configuration (audit
+ * F31); previously each init() leaked one interval plus three listeners
+ * and silently dropped everything the replaced client had buffered.
+ * Numeric options are clamped to finite sane ranges (TO-034). */
 export function init(options: InitOptions): void {
   if (!options.endpoint) throw new Error("@teploy/observe-browser: endpoint is required");
+
+  const clamp = (v: number | undefined, dflt: number, min: number, max: number): number => {
+    const n = typeof v === "number" && Number.isFinite(v) ? v : dflt;
+    return Math.min(max, Math.max(min, n));
+  };
 
   const previous = client;
   if (previous) {
     previous.dispose();
-    // Best-effort final flush of the old client's events to the old
-    // endpoint under the old key — never redirected to the new config.
-    // AUD-023 (round 2): each chunk is sent as its own FLAT events array;
-    // the old nested `{events: EventPayload[][]}` shape was rejected by
-    // the server and silently discarded the replaced client's buffer.
-    if (previous.buffer.length > 0) {
-      const batch = previous.buffer.splice(0);
-      const { chunks, oversized } = packEventChunks(batch);
-      for (const ev of oversized) {
-        reportError(previous, new Error("observe: dropped an event exceeding the request byte budget on re-init"));
-      }
-      for (const chunk of chunks) {
-        sendJSON(previous, "/api/v1/events/batch", batchEnvelope(chunk, previous.producerId)).catch((err) => {
-          reportError(previous, err instanceof Error ? err : new Error(String(err)));
-        });
-      }
-    }
+    // Best-effort final drain of the old client's work to the old endpoint
+    // under the old key — never redirected to the new config (TO-036: the
+    // old client's requests keep ITS producer identity). Frozen pending
+    // requests resend their exact bytes (TO-032).
+    drainClient(previous);
   }
 
   const instance: Client = {
@@ -366,16 +418,18 @@ export function init(options: InitOptions): void {
       siteId: options.siteId ?? "default",
       apiKey: options.apiKey,
       disableAutoPageview: options.disableAutoPageview ?? false,
-      batchSize: options.batchSize ?? 50,
-      flushIntervalMs: options.flushIntervalMs ?? 2000,
+      batchSize: clamp(options.batchSize, 50, 1, MAX_EVENTS_PER_REQUEST),
+      flushIntervalMs: clamp(options.flushIntervalMs, 2000, 250, 3_600_000),
       release: options.release,
       environment: options.environment,
       onError: options.onError,
       onRetry: options.onRetry,
-      maxRetryAttempts: options.maxRetryAttempts ?? 5,
-      retryBackoffMs: options.retryBackoffMs ?? 1000,
+      maxRetryAttempts: clamp(options.maxRetryAttempts, 5, 0, 50),
+      retryBackoffMs: clamp(options.retryBackoffMs, 1000, 1, 60_000),
     },
     buffer: [],
+    queuedBytes: 0,
+    pending: [],
     timer: null,
     userId: null,
     sessionId: makeId(),
@@ -494,14 +548,14 @@ const MAX_PROPERTIES = 50;
  * are dropped rather than letting the whole event be rejected.
  */
 export function track(eventType: string, props: Record<string, unknown> = {}): void {
-  if (!client) return;
-  const payload: EventPayload = {
-    site_id: client.opts.siteId,
-    event_type: eventType,
-    event_id: makeId(),
-  };
+  const target = client;
+  if (!target) return;
+  const payload: Record<string, unknown> = {};
   const properties: Record<string, unknown> = {};
   for (const key of Object.keys(props)) {
+    // SDK-owned identity fields are assigned LAST (below) so a caller
+    // cannot override site/event/id routing through props (TO-033).
+    if (key === "site_id" || key === "event_type" || key === "event_id") continue;
     if (RESERVED_FIELDS.has(key)) {
       payload[key] = props[key];
     } else if (Object.keys(properties).length < MAX_PROPERTIES) {
@@ -509,10 +563,39 @@ export function track(eventType: string, props: Record<string, unknown> = {}): v
     }
   }
   if (Object.keys(properties).length > 0) payload.properties = properties;
-  if (client.userId) payload.distinct_id = client.userId;
-  if (client.opts.release) payload.release = client.opts.release;
-  client.buffer.push(payload);
-  if (client.buffer.length >= client.opts.batchSize) flush();
+  if (target.userId) payload.distinct_id = target.userId;
+  if (target.opts.release) payload.release = target.opts.release;
+  payload.site_id = target.opts.siteId;
+  payload.event_type = eventType;
+  payload.event_id = makeId();
+
+  // TO-033: snapshot the record at admission. The queue owns immutable
+  // bytes — caller mutations after track() (nested objects, arrays) can no
+  // longer change the eventual body, and an unserializable record (BigInt,
+  // circular) is isolated and reported here instead of poisoning the flush.
+  let raw: string;
+  try {
+    raw = JSON.stringify(payload);
+  } catch (err) {
+    reportError(target, new Error(`observe: event is not JSON-serializable (${err instanceof Error ? err.message : String(err)})`));
+    return;
+  }
+  const bytes = textEncoder.encode(raw).byteLength;
+  if (bytes > MAX_EVENT_BYTES) {
+    reportError(target, new Error(`observe: event exceeds ${MAX_EVENT_BYTES} bytes and was dropped`));
+    return;
+  }
+  // TO-034: admission-time count+byte budget across queued and pending —
+  // during retry backoff or a hanging request the buffer can no longer
+  // grow without limit. Overflow drops the NEWEST record (the oldest data
+  // is closest to delivery) and says so.
+  if (target.buffer.length >= MAX_QUEUED_EVENTS || target.queuedBytes + bytes > MAX_QUEUED_BYTES) {
+    reportError(target, new Error("observe: queue budget reached — newest event dropped"));
+    return;
+  }
+  target.buffer.push(raw);
+  target.queuedBytes += bytes;
+  if (target.buffer.length >= target.opts.batchSize) flush();
 }
 
 /** Trait keys that duplicate the raw identity (audit F33). The ID travels
@@ -639,23 +722,96 @@ export function log(entry: Omit<LogPayload, "site_id">): Promise<void> {
 
 /** Split events into server-legal chunks by count and encoded bytes
  * (AUD-026). */
-function chunkEvents(events: EventPayload[]): EventPayload[][] {
-  return packEventChunks(events).chunks;
+/** Release the queue reservation of a delivered/abandoned request (TO-034). */
+function releaseRequest(target: Client, req: PendingEventRequest): void {
+  target.queuedBytes -= req.bytes;
+  if (target.queuedBytes < 0) target.queuedBytes = 0;
+  target.retryCounts.delete(req.batchId);
 }
 
-/** Flush a specific client's buffer.
+/** Drop the OLDEST pending requests over the retention bounds, reporting
+ * each. Called under the flush owner only. */
+function trimPending(target: Client): void {
+  let droppedRequests = 0;
+  let droppedEvents = 0;
+  while (target.pending.length > MAX_PENDING_REQUESTS || target.queuedBytes > MAX_QUEUED_BYTES) {
+    const oldest = target.pending.shift();
+    if (!oldest) break;
+    releaseRequest(target, oldest);
+    droppedRequests++;
+    droppedEvents += oldest.eventCount;
+  }
+  if (droppedRequests > 0) {
+    reportError(target, new Error(
+      `observe: dropped ${droppedRequests} oldest pending request(s) (${droppedEvents} event(s)) — retention cap reached`));
+  }
+}
+
+/** Send one frozen request and consume its acknowledgment. Returns the
+ * ack on acceptance (including partial rejections, which are reported but
+ * NOT retried — the rejected events are gone server-side and the accepted
+ * neighbors must not be resent). */
+async function deliverRequest(target: Client, req: PendingEventRequest, unloading: boolean): Promise<{ ok: boolean; accepted?: number; rejected?: number; deduped?: boolean }> {
+  const res = await fetchWithDeadline(
+    target.opts.endpoint.replace(/\/+$/, "") + "/api/v1/events/batch",
+    requestInitFor(target, req.body, unloading),
+  );
+  const ack = await readEventBatchAck(res);
+  if ((ack.rejected ?? 0) > 0) {
+    reportError(target, new Error(
+      `observe: server rejected ${ack.rejected} of ${req.eventCount} event(s) (accepted ${ack.accepted ?? 0}) — rejected events were dropped`));
+  }
+  return ack;
+}
+
+/** Build the fetch init for a frozen body. */
+function requestInitFor(target: Client, body: string, unloading: boolean): RequestInit {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (target.opts.apiKey) headers["X-API-Key"] = target.opts.apiKey;
+  return {
+    method: "POST",
+    headers,
+    body,
+    credentials: "omit",
+    keepalive: unloading && textEncoder.encode(body).byteLength <= MAX_KEEPALIVE_BYTES,
+  };
+}
+
+/** Best-effort final drain of a replaced client's work (TO-036): pending
+ * requests resend their exact bytes under their own producer identity;
+ * buffered records are frozen into fresh requests. Failures are reported,
+ * never retried (the replacement owns the timer from here on). */
+function drainClient(target: Client): void {
+  const requests = [...target.pending];
+  target.pending = [];
+  if (target.buffer.length > 0) {
+    const entries = target.buffer.splice(0);
+    requests.push(...packEventRequests(target.producerId, entries, (why) => {
+      reportError(target, new Error(`observe: ${why} on re-init`));
+    }));
+  }
+  for (const req of requests) {
+    deliverRequest(target, req, true).catch((err) => {
+      reportError(target, err instanceof Error ? err : new Error(String(err)));
+    });
+    releaseRequest(target, req);
+  }
+}
+
+/** Flush a specific client's queue.
  *
- * AUD-022 (round 2): ONE flush owner per client. The flush detaches its
- * OWNED batch (splice) before awaiting the transport and prepends exactly
- * that batch on failure — the old slice-then-await-then-slice-by-length
- * flow let two overlapping flushes send duplicate prefixes and delete
- * newly queued events neither had sent. Bounded work per wakeup so one
- * signal cannot spin forever.
+ * AUD-022 (round 2): ONE flush owner per client.
  *
- * F32 retry policy: a failed batch is re-sent automatically with a
+ * TO-032: delivery units are FROZEN request envelopes. A request keeps its
+ * identity and exact bytes across every retry — a failed batch is never
+ * merged back into the live buffer, so a retry can never reuse an
+ * already-acknowledged batch id for different content (the old repack
+ * lost the newly queued tail whenever the server recognized the id).
+ *
+ * F32 retry policy: a failed request is re-sent automatically with a
  * doubling backoff (retryAfter gate below) until maxRetryAttempts, then
- * dropped with an onError report. Retried batches keep their stable
- * event/batch ids (F12), so the server dedupes any redelivery. */
+ * dropped with an onError report. Retries keep their producer/batch ids
+ * (F12), so the server dedupes any redelivery. */
 function flushClient(target: Client, unloading = false): Promise<void> {
   if (target.flushing) return target.flushing;
   // Backoff gate: during the retry sleep, wakeups (timer, visibility,
@@ -663,51 +819,48 @@ function flushClient(target: Client, unloading = false): Promise<void> {
   // last-gasp best effort with nothing left to wait for.
   if (!unloading && Date.now() < target.retryAfter) return Promise.resolve();
   const work = Promise.resolve().then(async () => {
-    for (let units = 0; target.buffer.length && units < 8; units++) {
-      const { chunks, oversized } = packEventChunks(target.buffer);
-      if (oversized.length) {
-        // Permanently undeliverable records: drop only these, never the
-        // valid neighbors sharing their batch (AUD-021).
-        const bad = new Set(oversized);
-        target.buffer = target.buffer.filter((e) => !bad.has(e));
-        reportError(target, new Error(`observe: dropped ${oversized.length} event(s) exceeding the request byte budget`));
-        if (!target.buffer.length) return;
+    for (let units = 0; units < 8; units++) {
+      // Freeze newly recorded records into requests first: retries of
+      // older requests keep FIFO order ahead of them.
+      if (target.buffer.length > 0) {
+        const entries = target.buffer.splice(0);
+        target.queuedBytes -= entries.reduce((n, raw) => n + textEncoder.encode(raw).byteLength, 0);
+        if (target.queuedBytes < 0) target.queuedBytes = 0;
+        const fresh = packEventRequests(target.producerId, entries, (why) => {
+          reportError(target, new Error(`observe: ${why}`));
+        });
+        target.pending.push(...fresh);
+        trimPending(target);
       }
-      const batch = target.buffer.splice(0, chunks[0]?.length ?? target.buffer.length);
-      const headId: string | undefined = batch[0]?.event_id;
+      const req = target.pending.shift();
+      if (!req) return;
       try {
-        await sendJSON(target, "/api/v1/events/batch", batchEnvelope(batch), unloading);
-        target.retryCounts.delete(headId ?? "");
+        await deliverRequest(target, req, unloading);
+        releaseRequest(target, req);
       } catch (err) {
         const sendErr = err instanceof Error ? err : new Error(String(err));
-        const attempts = (headId ? target.retryCounts.get(headId) ?? 0 : 0) + 1;
-        if (headId && attempts > target.opts.maxRetryAttempts) {
-          // Retry budget exhausted: give up on THIS batch only. The
-          // identity-stable events behind it stay queued for their own
-          // flush.
-          target.retryCounts.delete(headId);
-          reportError(target, new Error(`observe: gave up on a batch after ${target.opts.maxRetryAttempts} attempts — dropped ${batch.length} event(s)`));
+        const attempts = (target.retryCounts.get(req.batchId) ?? 0) + 1;
+        if (attempts > target.opts.maxRetryAttempts) {
+          // Retry budget exhausted: give up on THIS request only. Its
+          // reservation is released; later requests keep their turn.
+          releaseRequest(target, req);
+          reportError(target, new Error(
+            `observe: gave up on a batch after ${target.opts.maxRetryAttempts} attempts — dropped ${req.eventCount} event(s)`));
         } else {
-          if (headId) target.retryCounts.set(headId, attempts);
+          target.retryCounts.set(req.batchId, attempts);
           const delayMs = Math.min(target.opts.retryBackoffMs * 2 ** (attempts - 1), MAX_RETRY_DELAY_MS);
           target.retryAfter = Date.now() + delayMs;
-          // Delivery failed: prepend exactly THIS batch (bounded) and stop —
-          // the backoff gate above holds the next attempt until the retry
-          // moment; the interval/visibility flushes then re-send it.
-          target.buffer = [...batch, ...target.buffer];
-          const dropped = Math.max(0, target.buffer.length - MAX_BUFFERED_ON_ERROR);
-          if (dropped > 0) {
-            const removed = target.buffer.slice(MAX_BUFFERED_ON_ERROR);
-            target.buffer = target.buffer.slice(0, MAX_BUFFERED_ON_ERROR);
-            for (const ev of removed) target.retryCounts.delete(ev.event_id ?? "");
-            reportError(target, new Error(`observe: dropped ${dropped} oldest queued events (send failing and retention cap reached)`));
-          }
-          reportRetry(target, { attempt: attempts, delayMs, batchSize: batch.length, error: sendErr });
+          // Delivery failed: the frozen request keeps its bytes and its
+          // place at the head of the queue; the backoff gate above holds
+          // the next attempt until the retry moment.
+          target.pending.unshift(req);
+          trimPending(target);
+          reportRetry(target, { attempt: attempts, delayMs, batchSize: req.eventCount, error: sendErr });
         }
         reportError(target, sendErr);
         return;
       }
-      if (unloading) return; // one best-effort batch per unload
+      if (unloading) return; // one best-effort request per unload
     }
   });
   const owned = work.finally(() => {
@@ -719,9 +872,10 @@ function flushClient(target: Client, unloading = false): Promise<void> {
 
 /** Force an immediate flush of buffered events. */
 export function flush(): Promise<void> {
-  if (!client || client.buffer.length === 0) return Promise.resolve();
+  if (!client || (client.buffer.length === 0 && client.pending.length === 0)) return Promise.resolve();
   return flushClient(client);
 }
+
 
 /** Parse one stack frame line in V8 or SpiderMonkey syntax.
  *

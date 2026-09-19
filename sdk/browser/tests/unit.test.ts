@@ -20,7 +20,8 @@ function stubBrowser(): void {
   sent = [];
   (globalThis as any).fetch = (url: string, opts: any) => {
     sent.push({ url, body: JSON.parse(opts.body) });
-    return Promise.resolve({ ok: true });
+    // TO-035: the flush owner reads the batch acknowledgment.
+    return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
   };
   // Node's navigator has no sendBeacon, so post() falls through to fetch.
   (globalThis as any).location = {
@@ -143,7 +144,7 @@ test("flush sends the configured API key on the events batch", async () => {
   (globalThis as any).fetch = (url: string, opts: any) => {
     sawHeader = opts.headers["X-API-Key"];
     sent.push({ url, body: JSON.parse(opts.body) });
-    return Promise.resolve({ ok: true });
+    return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
   };
   track("evt");
   await flush();
@@ -197,11 +198,14 @@ test("failed batch is retained and reported, not deleted", async () => {
 
   track("kept-event");
   await flush();
-  // Re-deliver with a working transport: the retained event must arrive.
+  // Re-deliver with a working transport: the retained request must arrive
+  // (byte-identical). The retry gate opens after the (1 ms clamped)
+  // backoff.
   (globalThis as any).fetch = (url: string, opts: any) => {
     sent.push({ url, body: JSON.parse(opts.body) });
-    return Promise.resolve({ ok: true });
+    return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
   };
+  await new Promise((r) => setTimeout(r, 10));
   await flush();
   assert.equal(sent.length, 1);
   assert.equal(sent[0].body.events[0].event_type, "kept-event");
@@ -218,9 +222,9 @@ test("overlapping flushes send each event exactly once", async () => {
     sent.push({ url, body: JSON.parse(opts.body) });
     if (first) {
       first = false;
-      return new Promise((resolve) => pending.push(() => resolve({ ok: true })));
+      return new Promise((resolve) => pending.push(() => resolve({ ok: true, json: async () => ({ ok: true }) })));
     }
-    return Promise.resolve({ ok: true });
+    return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
   };
 
   track("e1");
@@ -280,7 +284,8 @@ test("oversized events are dropped individually, valid neighbors delivered", asy
   const delivered = sent.flatMap((s) => s.body.events.map((e: any) => e.event_type));
   assert.ok(delivered.includes("small-neighbor") && delivered.includes("after"), "valid events must survive");
   assert.ok(!delivered.includes("monster"), "the oversized event must be dropped");
-  assert.ok(errs.some((m) => m.includes("byte budget")), "the drop must be reported");
+  // TO-033: the monster is now rejected at admission (per-event byte cap).
+  assert.ok(errs.some((m) => m.includes("bytes and was dropped")), "the drop must be reported");
 });
 
 // F12 (protocol v2): every event carries a producer-assigned stable
@@ -292,7 +297,10 @@ test("events carry stable producer ids and a v2 batch envelope", async () => {
   await flush();
   assert.equal(sent[0].body.v, 2);
   assert.ok(sent[0].body.producer_id, "producer_id must be set");
-  assert.equal(sent[0].body.batch_id, sent[0].body.events[0].event_id);
+  // TO-032: batch identity is allocated per frozen request, not derived
+  // from the first event (a repacked request must never travel under a
+  // batch id that already acknowledged different content).
+  assert.match(sent[0].body.batch_id, /^[0-9a-f]{32}$/, "batch_id is a fresh 32-hex id");
   for (const e of sent[0].body.events) {
     assert.match(e.event_id, /^[0-9a-f]{32}$/, "event_id is a 32-hex producer id");
   }
@@ -314,8 +322,9 @@ test("retried batch reuses its batch id and event ids", async () => {
   assert.ok(failedBody, "first attempt must have been issued");
   (globalThis as any).fetch = (url: string, opts: any) => {
     sent.push({ url, body: JSON.parse(opts.body) });
-    return Promise.resolve({ ok: true });
+    return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
   };
+  await new Promise((r) => setTimeout(r, 10)); // past the 1 ms clamped gate
   await flush();
   assert.equal(sent.length, 1);
   // The retried batch is bit-identical in identity: same batch_id and the
@@ -357,7 +366,7 @@ test("failed batch retries after backoff with intact identity", async () => {
   (globalThis as any).fetch = (url: string, opts: any) => {
     attempts++;
     sent.push({ url, body: JSON.parse(opts.body) });
-    return Promise.resolve({ ok: true });
+    return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
   };
   await flush();
   assert.equal(sent.length, 1, "the retry after the window delivers the batch");
@@ -408,7 +417,7 @@ test("retry budget exhausts, drops the batch, and recovers", async () => {
   // The dropped batch must not poison the client: a new event goes through.
   (globalThis as any).fetch = (url: string, opts: any) => {
     sent.push({ url, body: JSON.parse(opts.body) });
-    return Promise.resolve({ ok: true });
+    return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
   };
   track("after-recovery");
   await new Promise((r) => setTimeout(r, 10)); // past any residual gate
@@ -418,9 +427,10 @@ test("retry budget exhausts, drops the batch, and recovers", async () => {
   assert.ok(!delivered.includes("doomed"), "the given-up batch must not resurrect");
 });
 
-// F32: under sustained failure the retention cap still bounds memory and
-// reports the drop-oldest, and the queue drains in order once healthy.
-test("sustained failure bounds retention and drop-oldest is reported", async () => {
+// TO-034: under sustained failure (or a hanging request) the queue is
+// bounded at ADMISSION time — recording past the count budget drops the
+// newest event with a report instead of growing memory without limit.
+test("sustained failure bounds the queue at admission", async () => {
   const errors: string[] = [];
   init({
     endpoint: "https://observe.example.com",
@@ -430,11 +440,11 @@ test("sustained failure bounds retention and drop-oldest is reported", async () 
     onError: (e) => errors.push(e.message),
   });
   (globalThis as any).fetch = () => Promise.resolve({ ok: false, status: 503 });
-  // Queue far beyond the 200-event retention cap.
+  // Queue far beyond the 200-event admission budget while nothing drains.
   for (let i = 0; i < 230; i++) track(`flood-${i}`);
   await new Promise((r) => setTimeout(r, 10)); // past the backoff gate
   await flush();
-  assert.ok(errors.some((m) => m.includes("retention cap reached")), `expected the retention-cap report, got ${JSON.stringify(errors.slice(0, 3))}`);
+  assert.ok(errors.some((m) => m.includes("queue budget reached")), `expected the queue-budget report, got ${JSON.stringify(errors.slice(0, 3))}`);
 });
 
 // F41 URL contract: the raw query string never leaves the browser — only
@@ -470,4 +480,137 @@ test("track callers can pass explicit utm fields as reserved top-level fields", 
   const e = await sentEvent();
   assert.equal(e.utm_campaign, "launch");
   assert.equal(e.properties.amount, 42);
+});
+
+// --- Round 3 ---
+
+// TO-032: the response-lost repack. Server accepts [A] but the response is
+// lost; event B is recorded; the retry must resend A's EXACT bytes under
+// A's original batch id (so the server dedupes it), and B must be delivered
+// in its own request — the old repack sent [A,B] under A's batch id and the
+// admission cache swallowed B whole.
+test("repacked batch after response loss delivers the new tail (TO-032)", async () => {
+  init({ endpoint: "https://observe.example.com", siteId: "s1", retryBackoffMs: 1 });
+  const errors: string[] = [];
+  init({ endpoint: "https://observe.example.com", siteId: "s1", retryBackoffMs: 1, onError: (e) => errors.push(e.message) });
+  let attempt = 0;
+  let firstBody: any = null;
+  (globalThis as any).fetch = (_url: string, opts: any) => {
+    attempt++;
+    if (attempt === 1) {
+      firstBody = JSON.parse(opts.body);
+      // Simulate a lost response: the server accepted it, the client saw a
+      // network error.
+      return Promise.reject(new TypeError("network error"));
+    }
+    sent.push({ url: _url, body: JSON.parse(opts.body) });
+    return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
+  };
+  track("A");
+  await flush();
+  // Event B arrives while A's retry is pending.
+  track("B");
+  await new Promise((r) => setTimeout(r, 10));
+  await flush();
+  await new Promise((r) => setTimeout(r, 10));
+  await flush();
+
+  const delivered = sent.map((s) => s.body);
+  // A's retry is byte-identical to the lost request.
+  const retryA = delivered.find((b) => b.events.some((e: any) => e.event_type === "A"));
+  assert.ok(retryA, "the lost batch must be retried");
+  assert.equal(retryA.batch_id, firstBody.batch_id, "the retry keeps the frozen batch id");
+  assert.deepEqual(retryA.events.map((e: any) => e.event_id), firstBody.events.map((e: any) => e.event_id));
+  // B is delivered in its own request, never merged into A's.
+  const reqB = delivered.find((b) => b.events.some((e: any) => e.event_type === "B"));
+  assert.ok(reqB, "the new tail must be delivered");
+  assert.equal(reqB.batch_id === firstBody.batch_id, false, "B rides its own request identity");
+  assert.equal(reqB.events.length, 1);
+});
+
+// TO-033: an unserializable record is isolated at admission — the good
+// neighbors still deliver, and identity fields cannot be overridden through
+// props.
+test("unserializable and identity-overriding records are isolated (TO-033)", async () => {
+  const errors: string[] = [];
+  init({ endpoint: "https://observe.example.com", siteId: "s1", onError: (e) => errors.push(e.message) });
+  const circular: any = { self: null };
+  circular.self = circular;
+  track("good-before");
+  track("poison", { payload: circular });
+  track("sneaky", { site_id: "evil-site", event_id: "forged", event_type: "forged-type" });
+  track("good-after");
+  await flush();
+  const delivered = sent.flatMap((s) => s.body.events.map((e: any) => e.event_type));
+  assert.ok(delivered.includes("good-before") && delivered.includes("good-after"), "valid neighbors deliver");
+  assert.ok(!delivered.includes("poison"), "the unserializable record is dropped, not the flush");
+  assert.ok(errors.some((m) => m.includes("not JSON-serializable")), "the poison is reported");
+  const sneaky = sent.flatMap((s) => s.body.events).find((e: any) => e.event_type === "sneaky");
+  assert.ok(sneaky, "the sneaky record itself delivers");
+  assert.equal(sneaky.site_id, "s1", "site_id cannot be overridden");
+  assert.notEqual(sneaky.event_id, "forged", "event_id cannot be overridden");
+});
+
+// TO-035: a 200 acknowledgment reporting per-event rejections surfaces
+// through onError and is NOT retried.
+test("partial rejection is reported and not retried (TO-035)", async () => {
+  const errors: string[] = [];
+  init({ endpoint: "https://observe.example.com", siteId: "s1", retryBackoffMs: 1, onError: (e) => errors.push(e.message) });
+  let calls = 0;
+  (globalThis as any).fetch = (_url: string, opts: any) => {
+    calls++;
+    sent.push({ url: _url, body: JSON.parse(opts.body) });
+    return Promise.resolve({ ok: true, json: async () => ({ ok: true, accepted: 1, rejected: 1 }) });
+  };
+  track("ok-one");
+  track("rejected-one");
+  await flush();
+  await new Promise((r) => setTimeout(r, 10));
+  await flush();
+  assert.equal(calls, 1, "a partially rejected batch must not be resent");
+  assert.ok(errors.some((m) => m.includes("rejected 1 of 2")), `expected the partial-rejection report, got ${JSON.stringify(errors)}`);
+});
+
+// TO-036: an old client's in-flight drain keeps ITS producer identity and
+// endpoint — a re-init must not relabel or redirect it.
+test("old client drain keeps its own producer identity (TO-036)", async () => {
+  init({ endpoint: "https://observe.example.com", siteId: "s1" });
+  track("old-event");
+  const seen: any[] = [];
+  (globalThis as any).fetch = (_url: string, opts: any) => {
+    seen.push({ url: _url, body: JSON.parse(opts.body) });
+    return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
+  };
+  // Re-init while the old buffer is undelivered.
+  init({ endpoint: "https://observe.example.net", siteId: "s2" });
+  await new Promise((r) => setTimeout(r, 20));
+  const old = seen.find((s) => s.body.events.some((e: any) => e.event_type === "old-event"));
+  assert.ok(old, "the old client's event must drain");
+  assert.match(old.url, /observe\.example\.com/, "drain goes to the OLD endpoint");
+  // The replacement client's own traffic carries a different producer id
+  // and a different endpoint — the drain was never relabeled or redirected.
+  track("new-event");
+  await flush();
+  const fresh = seen.find((s) => s.url.includes("example.net") && s.body.events.some((e: any) => e.event_type === "new-event"));
+  assert.ok(fresh, "the new client sends to the new endpoint");
+  assert.notEqual(fresh.body.producer_id, old.body.producer_id, "the drain keeps the OLD producer identity");
+});
+
+// TO-037: fetch is invoked with redirect:"error" — a redirecting ingest
+// endpoint fails the request instead of forwarding the API key.
+test("transport refuses redirects (TO-037)", async () => {
+  init({ endpoint: "https://observe.example.com", siteId: "s1", apiKey: "k" });
+  let sawRedirect: unknown;
+  (globalThis as any).fetch = (_url: string, opts: any) => {
+    sawRedirect = opts.redirect;
+    sent.push({ url: _url, body: JSON.parse(opts.body) });
+    return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
+  };
+  track("redirect-probe");
+  await flush();
+  assert.equal(sawRedirect, "error");
+  sawRedirect = undefined;
+  const { captureException } = await import("../src/index.js");
+  await captureException(new Error("x"));
+  assert.equal(sawRedirect, "error", "error reports refuse redirects too");
 });
