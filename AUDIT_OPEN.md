@@ -5,9 +5,11 @@ Register: teploy-observe audit 2026-09-17 (51 findings, pinned at
 `6d49fcc380781e64e85b30b2d227ee45cd343f0c`; report lives outside the repo).
 Round 2: audit 2026-09-17 (56 findings AUD-001..AUD-056, pinned at
 `bbd2fe9038863db0447ac1335554451feb89735a`; report lives outside the repo)
-— remediation record below. Earlier sweeps (2026-09-09 through 2026-09-11,
-passes 1-5) are closed history; their one surviving item is folded into F16
-below.
+— remediation record below. Round 3: audit 2026-09-18 (54 findings
+TO-001..TO-054, pinned at `fd7acf68803abd4e43f23f8438802b3b65f5ba23`;
+report lives outside the repo) — remediation record below. Earlier sweeps
+(2026-09-09 through 2026-09-11, passes 1-5) are closed history; their one
+surviving item is folded into F16 below.
 
 Pass record (2026-09-17 audit, remediation session same day):
 
@@ -54,8 +56,182 @@ RESOLVED upstream (Neutron `4c7c4367`, verified live against a repo-built
 engine); the observe-side engine canaries were reconciled to the fixed
 shapes (see the Upstream section).
 
-Open items: 7 (1 P1 product decision, 3 P2 deferred designs, 2 hardening
-notes, 1 future-work remainder)
+Open items: 9 (F02 product decision, 3 P2 deferred designs, 2 hardening
+notes, 1 future-work remainder, 2 round-3 deferred designs)
+
+## Round-3 register (2026-09-18 audit, 54 findings TO-001..TO-054)
+
+Audited revision `fd7acf6` (the round-2 close-out state). Every finding
+was verified against local source before disposition; none was a false
+positive. Fixed this round (commits 913ad74, 824cf23, 8b75884, b02bf97,
+cdfe08f, 54faec7, 151f2b9, 8172bb4, a0131ae, 81e61db, 20f4c17):
+
+- TO-001: empty-key audit downgrade. key_id='' rows verify against SECRET
+  legacy candidates only; an empty-key match classifies as UNKEYED and
+  Verify reports Authenticated=false + UnkeyedCount instead of presenting
+  the history as tamper-evident (compliance control warns). Residual: a
+  fully-downgraded chain is still reported Intact (internally
+  consistent) with the unauthenticated classification carried alongside —
+  detecting a truncated/downgraded tail outright needs the F47 external
+  anchor.
+- TO-002: startup no longer logs RotationSpec() (the signing secret in
+  transportable form); rotation instructions point at the protected key
+  file. Keys already emitted to old logs should be treated as exposed
+  (rotate; keep the old key in OBSERVE_AUDIT_KEYRING for verification).
+- TO-003: UpsertOIDC bumps token_version when the IdP-supplied role
+  changes; a pre-downgrade admin JWT dies at its next use (live gate
+  test).
+- TO-004: principal lookups distinguish absence ((nil,nil)) from store
+  errors; CreateLocal/UpsertOIDC/replace fail closed instead of treating
+  a SELECT failure as free username/absent principal.
+- TO-005 (deployment half): compose binds the dashboard port to loopback
+  by default (the tls profile included); header documents the
+  tailnet/public-ingest topologies. The middleware grace half is F02
+  below (unchanged deferral — product decision).
+- TO-007: persistent-key publication is no-replace (link/O_EXCL) with a
+  canonical re-read (concurrent starts converge); an existing-but-
+  unusable key file refuses startup instead of silently downgrading the
+  signer.
+- TO-008: OBSERVE_AUDIT_KEYRING secrets join the legacy candidates —
+  rotated-out keys still verify the pre-042 rows they signed.
+- TO-009: colliding keyring ids naming different bytes are refused.
+- TO-011: Verify pages at pageSize+1 and rejects a duplicate sequence at
+  a page boundary instead of skipping it.
+- TO-012: WAL segment bases are immutable for the queue's lifetime (the
+  GC rebase mapped outstanding checkpoint targets past uncommitted
+  records; regression test fails against the old code).
+- TO-013: NewDiskQueueWithLimits takes both caps up front; construction
+  reclaims only acknowledged segments and never enforces the high-water
+  before replay/config; main.go passes the configured cap into
+  construction; the sub-segment clamp is warned.
+- TO-014: AttachQueue recovers write-through (per-chunk commit through
+  insertBatch, checkpoint once at the end, nothing partially staged);
+  peak replay memory is one chunk.
+- TO-015: negative JSON checkpoint offsets refused at open.
+- TO-016: a successful periodic fsync clears the dirty flag.
+- TO-017: the v2 admission cache key is (site, producer, batch) with a
+  per-entry digest of the prepared events' identities; same key +
+  different content is PROCESSED, not falsely acknowledged.
+- TO-018: the durable event-id dedupe is site-scoped (site_id, event_id);
+  cross-site id collisions store both records (live gate test).
+- TO-019: replay ledger/child ids/ErrBatchIDReuse are producer-scoped
+  (migration 043, legacy rows honored via fallback lookup); partial v2
+  identities and unknown versions rejected.
+- TO-023: img/src is handled before the SAFE_ATTRS gate — the F38 asset
+  proxy rewrite was unreachable dead code; img renders as a void element.
+- TO-024: the snapshot loader is generation-guarded (no stale-async
+  overwrite of a newer seek), the asset ticket is a per-load local, the
+  keyboard listener is its own effect.
+- TO-025: the asset ETag is a digest of the fetched body (a changed
+  asset at the same URL is re-served, not 304'd stale forever).
+- TO-026: asset fetch/read failures log host + failure class only (the
+  raw *url.Error leaked the signed URL).
+- TO-027: one bounded error-preserving body read (a truncated image is a
+  502, not a 200).
+- TO-028: capture-time attribute allowlist + sanitized img src + opaque
+  head subtree — meta content, signed href/src, and style URLs never
+  leave the browser; node budget matches the player's.
+- TO-029: listeners store their capture flag and are gated at entry
+  (capture-phase removal actually lands; held handlers are inert after
+  stop); discard aborts in-flight delivery and obsoletes every delivery
+  callback; reportRageClick no longer logs success as failure.
+- TO-030: an event that cannot fit any legal request is dropped at flush
+  with a report instead of becoming a permanently failing retry head.
+- TO-031: the rage window prunes and resets BEFORE pushing the current
+  click — second bursts report again.
+- TO-032: browser delivery units are frozen immutable requests (identity
+  once, exact-bytes retries, never merged into the live buffer) — the
+  response-lost repack can no longer lose the new tail (regression test
+  replays the scenario; pairs with the TO-017 server fix).
+- TO-033: track() snapshots records at admission (unserializable isolated
+  + reported; identity fields assigned last).
+- TO-034: admission-time count+byte budget across queued+pending, fetch
+  deadline, clamped options.
+- TO-035: batch acknowledgments are read and validated; partial
+  rejections surface through onError and are not retried.
+- TO-036: serialization/retry state binds to the owning client (no
+  module-global producer; old drains keep their endpoint and identity).
+- TO-037 (Go+Python+browser): redirects refused everywhere and only 2xx
+  is success — a cross-origin 307 can no longer forward X-API-Key.
+- TO-038: span admission joins the owned worker (post-close refused,
+  budgeted, failures requeue and surface at Close).
+- TO-039: metric exports freeze a retained envelope re-sent until the
+  POST succeeds; serialized; idle buffers export nothing.
+- TO-040: histograms export DELTA temporality with interval timestamps;
+  counters stay cumulative with a series start time.
+- TO-041: unambiguous JSON series keys (no delimiter collision, no
+  __name__ pseudo-label); duplicate/empty label keys rejected.
+- TO-042: non-finite values, bad bounds, incompatible redefinitions, and
+  counter overflow rejected at the boundary with reports.
+- TO-043: metric series/gauge-point budgets; recording after Close
+  refused.
+- TO-044 (Python): serialized default replacement that validates first,
+  propagates a failed close, and registers ONE module-level exit handler.
+- TO-045: the backup manifest records the audit key's non-secret
+  fingerprint (status + key id), making the external data/audit.key
+  recovery dependency explicit per archive. Residual: the full encrypted
+  secret-bundle export/import workflow is future work (the fingerprint
+  identifies the dependency; it cannot reconstruct the key).
+- TO-046: the client-side lease window starts before the acquisition
+  round trip; the configured timeout is bounded.
+- TO-047: lease live tests fail (not skip) under
+  OBSERVE_REQUIRE_SNAPSHOT_LEASE=1; a new nucleus-lease CI job builds
+  the engine from the pinned Neutron revision (repo-built engines pass
+  the ladder since upstream 6286531a — the stale ci.yml rationale is
+  corrected) and runs the lease-required suite. First run on GitHub's
+  runners pending push (the flow is verified locally against the
+  repo-built engine).
+- TO-048: the UI freshness gate consumes .ci/pnpm-version (the Neutron
+  workspace's packageManager pin) with validation instead of pnpm@latest.
+- TO-049: compose defaults OBSERVE_SEED_DEMO to false (demo seeding is
+  explicit; matches the application default and the README).
+- TO-050: the compose healthcheck override is removed (the image's
+  measured cold-connection budget applies).
+- TO-051: the browser SDK's keyless sendBeacon fallback is gone (keyless
+  ingest no longer exists), and the quick-start shows the site-scoped
+  API key.
+- TO-052: a configured OIDC redirect is startup-validated (absolute,
+  exact callback path, HTTPS except localhost under the dev flag, no
+  userinfo/query/fragment) and pins the state cookie's Secure attribute
+  off request headers. Residual: the unconfigured local-dev Host
+  derivation remains, documented (PKCE + state cookie + IdP-registered
+  redirect URIs bound the flow; a spoofed Host breaks SSO, does not
+  redirect it).
+- TO-053: any non-empty OBSERVE_OIDC_* variable (except the documented
+  ALLOW_HTTP_ISSUER dev modifier) counts as configuration and requires
+  the core fields.
+- TO-054: span attributes are normalized and snapshotted at
+  SetAttribute; unsupported types (and uint overflow, non-finite floats)
+  are reported and dropped, never silently encoded as empty strings.
+
+Round-3 deferrals (new):
+
+- TO-006 = the standing AUD-003/F03 deferred half (atomic bootstrap
+  claim-as-record). Unchanged: the KV claim cannot join the SQL principal
+  insert in one engine transaction (KV writes commit through, documented
+  upstream scope note); needs a SQL-authoritative claim row plus an
+  engine-uniqueness story. The contained detach/cleanup landed in round 2.
+- TO-010 = F47 below (external witness). Unchanged.
+- TO-020 - P2 - Open (design): durable heatmap outbox. The replay
+  transaction's post-commit heatmap aggregation is best-effort; a crash
+  or aggregation failure after commit permanently skips that batch's
+  derived work (a producer retry is ledger-deduped away). The code
+  documents the gap; the fix is a derived-work table + idempotent worker
+  (migration + exactly-once contribution design), not a contained patch.
+- TO-021/TO-022 - P2 - Open (design): replay pagination + causal
+  ordering. GetReplayEvents is unbounded and equal-timestamp events order
+  by deterministic-but-not-causal (timestamp, event_id); the fix is the
+  keyset-paginated windowed player protocol with a producer-scoped
+  capture sequence — the same versioned-cutover work F39's full
+  DOM-delta protocol tracks. TO-022's per-recorder monotonic sequence is
+  the schema half of that protocol.
+
+Round-3 items that restated standing deferrals, kept under their F/AUD
+numbers: TO-005 middleware half = F02; TO-037's classic-tracker retry
+port = F32's documented remainder. AUD-017 (WAL symlink/flock hardening)
+and AUD-054's site-attribution half are unchanged open hardening notes.
+
+
 
 ## F02 - P1 - Open (design decision): first-run grace authorizes administration
 
