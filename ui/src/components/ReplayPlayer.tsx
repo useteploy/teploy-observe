@@ -70,20 +70,14 @@ const MAX_RENDER_CHARS = 128 * 1024;
 const MAX_RENDER_ATTRS = 32;
 
 /**
- * F38: the credential fragment the player appends to proxied asset URLs.
- * Re-minted per snapshot write (tickets live 2 minutes and bind to the
- * asset route); empty when no session token exists (share view) or minting
- * failed — then srcs are simply not rewritten and images do not load.
+ * F38: rewrite a snapshot image src to the same-origin asset proxy.
+ * Returns "" for anything that cannot be proxied (the attr is then
+ * dropped, exactly the pre-F38 behavior). Relative srcs resolve against
+ * the session's recorded base URL when one is known. The ticket is the
+ * CALLER'S minted credential (TO-024: no module-global coupling between
+ * independent player instances).
  */
-let assetTicket = "";
-
-/**
- * Rewrite a snapshot image src to the same-origin asset proxy. Returns ""
- * for anything that cannot be proxied (the attr is then dropped, exactly
- * the pre-F38 behavior). Relative srcs resolve against the session's
- * recorded base URL when one is known.
- */
-function rewriteAssetSrc(src: string, baseURL: string): string {
+function rewriteAssetSrc(src: string, baseURL: string, ticket: string): string {
   if (!src || src.startsWith("data:") || src.startsWith("blob:")) return "";
   let abs = src;
   if (baseURL && !/^https?:\/\//i.test(src)) {
@@ -94,10 +88,10 @@ function rewriteAssetSrc(src: string, baseURL: string): string {
     }
   }
   if (!/^https?:\/\//i.test(abs)) return "";
-  return `/api/v1/replay-assets?u=${encodeURIComponent(abs)}${assetTicket}`;
+  return `/api/v1/replay-assets?u=${encodeURIComponent(abs)}${ticket}`;
 }
 
-function renderSnapshotBody(root: unknown, baseURL: string): string {
+function renderSnapshotBody(root: unknown, baseURL: string, ticket: string): string {
   let remainingNodes = MAX_RENDER_NODES;
   let remainingChars = MAX_RENDER_CHARS;
   const walk = (value: unknown, depth: number): string => {
@@ -124,21 +118,28 @@ function renderSnapshotBody(root: unknown, baseURL: string): string {
       const entries = Object.entries(n.attrs as Record<string, unknown>);
       if (entries.length > MAX_RENDER_ATTRS) throw new Error("snapshot attribute count limit");
       for (const [k, v] of entries) {
-        if (!SAFE_ATTRS.has(k) || typeof v !== "string" || v.length > 256) continue;
-        // F38: img src never passes through — either the asset proxy URL
-        // or nothing. Every other URL-bearing attr was already outside
-        // SAFE_ATTRS.
-        let value = v;
+        // TO-023: img/src is handled BEFORE the inert-attribute gate —
+        // the old ordering ran the SAFE_ATTRS filter first, and src is
+        // not (and must not be) in it, so the F38 rewrite branch below
+        // was unreachable and recorded images never loaded through the
+        // proxy.
         if (k === "src") {
-          if (tag !== "img") continue;
-          value = rewriteAssetSrc(v, baseURL);
+          if (tag !== "img" || typeof v !== "string" || v.length > 2048) continue;
+          const value = rewriteAssetSrc(v, baseURL, ticket);
           if (!value) continue;
+          remainingChars -= value.length;
+          if (remainingChars < 0) throw new Error("snapshot attribute limit");
+          attrs += ` src="${escapeAttr(value)}"`;
+          continue;
         }
+        if (!SAFE_ATTRS.has(k) || typeof v !== "string" || v.length > 256) continue;
         remainingChars -= v.length;
         if (remainingChars < 0) throw new Error("snapshot attribute limit");
-        attrs += ` ${k}="${escapeAttr(value)}"`;
+        attrs += ` ${k}="${escapeAttr(v)}"`;
       }
     }
+    // img is a void element — never a paired tag with serialized children.
+    if (tag === "img") return `<img${attrs}>`;
     return tag === "br" ? "<br>" : `<${tag}${attrs}>${inner}</${tag}>`;
   };
   try {
@@ -148,8 +149,8 @@ function renderSnapshotBody(root: unknown, baseURL: string): string {
   }
 }
 
-function nodeToHTML(node: SerializedNode, baseURL: string): string {
-  return renderSnapshotBody(node, baseURL);
+function nodeToHTML(node: SerializedNode, baseURL: string, ticket: string): string {
+  return renderSnapshotBody(node, baseURL, ticket);
 }
 
 function escapeText(s: string): string {
@@ -167,14 +168,14 @@ function escapeAttr(s: string): string {
 // legacy raw-HTML path prepends the CSP at byte zero so no resource-bearing
 // markup can precede it (best-effort — the hardened path is the structured
 // one, tracked with F38's legacy work).
-function snapshotToHTML(snap: Snapshot, baseURL: string): string {
+function snapshotToHTML(snap: Snapshot, baseURL: string, ticket: string): string {
   const csp = `<meta http-equiv="Content-Security-Policy" content="${REPLAY_CSP}">`;
   const head = `<!DOCTYPE html><html><head>${csp}</head><body>`;
   if (typeof snap.html === "string") {
     return `${head}${snap.html}</body></html>`;
   }
   if (snap.html && typeof snap.html === "object") {
-    return `${head}${renderSnapshotBody(snap.html, baseURL)}</body></html>`;
+    return `${head}${renderSnapshotBody(snap.html, baseURL, ticket)}</body></html>`;
   }
   return `${head}<div style="padding:32px;color:#888;font-family:system-ui;">No DOM snapshot available.</div></body></html>`;
 }
@@ -226,29 +227,53 @@ export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerPro
     return selected;
   }, [keyframes, startTs, elapsed]);
 
+  // TO-024: generation counter invalidates obsolete snapshot loads. The
+  // ticket mint is async; two quick seeks can otherwise complete out of
+  // order and paint the WRONG (older) keyframe over the newer one, and an
+  // unmounted player could still write into a dead iframe.
+  const loadGeneration = useRef(0);
+
   const loadSnapshot = useCallback(async () => {
     const iframe = iframeRef.current;
     if (!iframe || !iframe.contentDocument) return;
+    const generation = ++loadGeneration.current;
+    setSnapshotReady(false);
     // F38: (re)mint the asset-route ticket for this snapshot's <img> load —
-    // tickets live 2 minutes and every seek rewrites the DOM anyway.
-    assetTicket = await streamTicketQuery("/api/v1/replay-assets");
-    const html = snapshotEvent ? snapshotToHTML(snapshotEvent.data as Snapshot, url || "")
+    // tickets live 2 minutes and every seek rewrites the DOM anyway. The
+    // ticket is a LOCAL value (no module-global credential).
+    const ticket = await streamTicketQuery("/api/v1/replay-assets");
+    if (generation !== loadGeneration.current) return; // a newer seek won
+    const doc = iframe.contentDocument;
+    if (!doc) return;
+    const html = snapshotEvent ? snapshotToHTML(snapshotEvent.data as Snapshot, url || "", ticket)
       : '<!DOCTYPE html><html><body style="padding:32px;color:#888;font-family:system-ui;">No snapshot recorded for this session.</body></html>';
-    iframe.contentDocument.open();
-    iframe.contentDocument.write(html);
-    iframe.contentDocument.close();
+    doc.open();
+    doc.write(html);
+    doc.close();
     setSnapshotReady(true);
   }, [snapshotEvent, url]);
 
+  // TO-024: the snapshot load is its own effect (the keyboard listener no
+  // longer re-registers on every keyframe change); cleanup invalidates any
+  // in-flight load for this player.
   useEffect(() => {
-    void loadSnapshot();
+    void loadSnapshot().catch(() => {
+      // A failed ticket mint leaves srcs unproxied (the documented F38
+      // behavior); an unexpected failure must not become an unhandled
+      // rejection.
+      setSnapshotReady(false);
+    });
+    return () => { ++loadGeneration.current; };
+  }, [loadSnapshot]);
+
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
       if (e.key === " ") { e.preventDefault(); setPlaying((p) => !p); }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [loadSnapshot, onClose]);
+  }, [onClose]);
 
   // Apply events up to the current elapsed offset.
   useEffect(() => {
