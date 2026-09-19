@@ -121,7 +121,7 @@ func TestRecordAndList_Integration(t *testing.T) {
 		action TEXT NOT NULL, target TEXT NOT NULL DEFAULT '',
 		result TEXT NOT NULL DEFAULT 'success', source_ip TEXT NOT NULL DEFAULT '',
 		user_agent TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}',
-		seq BIGINT NOT NULL DEFAULT 0, prev_hash TEXT NOT NULL DEFAULT '', hash TEXT NOT NULL DEFAULT ''
+		key_id TEXT NOT NULL DEFAULT '', seq BIGINT NOT NULL DEFAULT 0, prev_hash TEXT NOT NULL DEFAULT '', hash TEXT NOT NULL DEFAULT ''
 	) WITH (engine = 'mergetree') ORDER BY (tenant_id, site_id, timestamp)`); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestTimeFilter_Integration(t *testing.T) {
 		action TEXT NOT NULL, target TEXT NOT NULL DEFAULT '',
 		result TEXT NOT NULL DEFAULT 'success', source_ip TEXT NOT NULL DEFAULT '',
 		user_agent TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}',
-		seq BIGINT NOT NULL DEFAULT 0, prev_hash TEXT NOT NULL DEFAULT '', hash TEXT NOT NULL DEFAULT ''
+		key_id TEXT NOT NULL DEFAULT '', seq BIGINT NOT NULL DEFAULT 0, prev_hash TEXT NOT NULL DEFAULT '', hash TEXT NOT NULL DEFAULT ''
 	) WITH (engine = 'mergetree') ORDER BY (tenant_id, site_id, timestamp)`); err != nil {
 		t.Fatalf("create table: %v", err)
 	}

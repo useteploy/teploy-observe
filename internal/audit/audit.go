@@ -46,6 +46,12 @@ type AuditEvent struct {
 	Seq      int64  `json:"seq" db:"seq"`
 	PrevHash string `json:"prev_hash" db:"prev_hash"`
 	Hash     string `json:"hash" db:"hash"`
+	// KeyID names the signing key (F46): '' is the pre-042 legacy encoding
+	// (verified against the configured legacy candidates), any other value
+	// is looked up in the verification keyring. Not part of the MAC input —
+	// it selects the key, like an algorithm identifier; swapping it between
+	// rows still breaks their hashes.
+	KeyID string `json:"key_id,omitempty" db:"key_id"`
 }
 
 // Result constants.
@@ -76,8 +82,11 @@ const (
 // single writer (one observe instance owns the chain). A multi-writer setup
 // would need a shared sequence — documented, not supported here.
 type Service struct {
-	db  *nucleus.Client
-	key []byte
+	db *nucleus.Client
+	// keys is the resolved chain-key state (F46). A nil keyring behaves as
+	// the unkeyed legacy service (empty signer, empty-key legacy
+	// verification) — NewService without keys keeps old call sites working.
+	keys *Keyring
 
 	mu       sync.Mutex
 	lastHash string
@@ -88,15 +97,31 @@ type Service struct {
 // NewService wires the audit store to the shared Nucleus client. key is the
 // HMAC key for the tamper-evidence chain — without it (nil), the chain still
 // links but a DB-level attacker could recompute it; with a key held outside the
-// DB, they can't forge the chain.
+// DB, they can't forge the chain. The key becomes both the signer and a legacy
+// verification candidate, so rows this process's predecessor signed with it
+// keep verifying.
 func NewService(db *nucleus.Client, key []byte) *Service {
-	return &Service{db: db, key: key}
+	kr := &Keyring{verify: map[string][]byte{}, Status: KeyStatusUnkeyed}
+	if len(key) > 0 {
+		kr.Status = KeyStatusDedicated
+		kr.Signer = KeyMaterial{ID: keyID(key), Key: key}
+		kr.verify[kr.Signer.ID] = key
+	}
+	kr.legacy = dedupKeys([][]byte{key, {}})
+	return &Service{db: db, keys: kr}
 }
 
-// computeHash is the keyed chain hash over prev_hash + the event's fields,
-// length-prefixed so no field value can be smuggled across a delimiter.
-func (s *Service) computeHash(ev AuditEvent) string {
-	mac := hmac.New(sha256.New, s.key)
+// NewServiceWithKeys wires the audit store with a fully resolved keyring
+// (F46): dedicated/generated/fallback signer plus rotation keyring.
+func NewServiceWithKeys(db *nucleus.Client, kr *Keyring) *Service {
+	return &Service{db: db, keys: kr}
+}
+
+// computeHashWith is the keyed chain hash over prev_hash + the event's
+// fields, length-prefixed so no field value can be smuggled across a
+// delimiter.
+func computeHashWith(key []byte, ev AuditEvent) string {
+	mac := hmac.New(sha256.New, key)
 	write := func(v string) {
 		var n [8]byte
 		binary.BigEndian.PutUint64(n[:], uint64(len(v)))
@@ -118,6 +143,48 @@ func (s *Service) computeHash(ev AuditEvent) string {
 	write(ev.UserAgent)
 	write(ev.Metadata)
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// computeHash signs with the active signer (empty key when unkeyed — the
+// documented accidental-edit-only posture).
+func (s *Service) computeHash(ev AuditEvent) string {
+	var key []byte
+	if s.keys != nil {
+		key = s.keys.Signer.Key
+	}
+	return computeHashWith(key, ev)
+}
+
+// rowHashMatches verifies one row's hash against the key its KeyID selects:
+// '' tries every legacy candidate (the pre-042 rows record no signer), any
+// other id must resolve in the keyring — an unknown id is a verification
+// failure, not a fallback.
+func (s *Service) rowHashMatches(ev AuditEvent) bool {
+	if s.keys == nil {
+		return computeHashWith(nil, ev) == ev.Hash
+	}
+	if ev.KeyID == "" {
+		for _, k := range s.keys.LegacyCandidates() {
+			if computeHashWith(k, ev) == ev.Hash {
+				return true
+			}
+		}
+		return false
+	}
+	k, ok := s.keys.KeyFor(ev.KeyID)
+	if !ok {
+		return false
+	}
+	return computeHashWith(k, ev) == ev.Hash
+}
+
+// keyKnown reports whether a row's key id resolves (legacy '' always does).
+func (s *Service) keyKnown(keyID string) bool {
+	if s.keys == nil || keyID == "" {
+		return true
+	}
+	_, ok := s.keys.KeyFor(keyID)
+	return ok
 }
 
 // loadStateLocked reads the chain head (highest seq + its hash) so a restarted
@@ -189,12 +256,14 @@ func (s *Service) Verify(ctx context.Context) (VerifyResult, error) {
 				Detail: fmt.Sprintf("missing records before verification watermark %d", through)}, nil
 		}
 		for _, ev := range rows {
-			if ev.Seq != expectSeq || ev.PrevHash != prev || s.computeHash(ev) != ev.Hash {
+			if ev.Seq != expectSeq || ev.PrevHash != prev || !s.keyKnown(ev.KeyID) || !s.rowHashMatches(ev) {
 				detail := "sequence gap: expected %d, got %d (record deleted or reordered)"
 				switch {
 				case ev.Seq != expectSeq:
 				case ev.PrevHash != prev:
 					detail = "prev_hash mismatch (record inserted or chain relinked)"
+				case !s.keyKnown(ev.KeyID):
+					detail = fmt.Sprintf("record signed by unknown key id %q (rotation key removed from the keyring?)", ev.KeyID)
 				default:
 					detail = "hash mismatch (record contents modified)"
 				}
@@ -245,7 +314,7 @@ type Filter struct {
 	Limit  int
 }
 
-var auditColumns = "audit_id, tenant_id, site_id, timestamp, actor, actor_type, action, target, result, source_ip, user_agent, metadata, seq, prev_hash, hash"
+var auditColumns = "audit_id, tenant_id, site_id, timestamp, actor, actor_type, action, target, result, source_ip, user_agent, metadata, key_id, seq, prev_hash, hash"
 
 // Record writes one audit event synchronously (never via the lossy ingest
 // buffer — an audit trail must be durable and immediate). Defaults are filled
@@ -286,14 +355,19 @@ func (s *Service) Record(ctx context.Context, ev AuditEvent) error {
 	}
 	ev.Seq = s.lastSeq + 1
 	ev.PrevHash = s.lastHash
+	// F46: stamp the signing key's id so verification selects it (and so a
+	// later rotation can keep verifying this row via the keyring).
+	if s.keys != nil && s.keys.Keyed() {
+		ev.KeyID = s.keys.Signer.ID
+	}
 	ev.Hash = s.computeHash(ev)
 
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO audit_events (`+auditColumns+`)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
 		ev.AuditID, ev.TenantID, ev.SiteID, dbutil.IntParam(ev.Timestamp),
 		ev.Actor, ev.ActorType, ev.Action, ev.Target, ev.Result,
-		ev.SourceIP, ev.UserAgent, ev.Metadata,
+		ev.SourceIP, ev.UserAgent, ev.Metadata, ev.KeyID,
 		dbutil.IntParam(ev.Seq), ev.PrevHash, ev.Hash)
 	if err != nil {
 		// AUD-052 (round 2): the commit outcome is ambiguous — a transport

@@ -21,7 +21,7 @@ func TestEvaluateControls_Healthy(t *testing.T) {
 		Verify:         audit.VerifyResult{Intact: true, Count: 10},
 		AuthRequired:   true,
 		DemoMode:       false,
-		TamperKeyed:    true,
+		TamperKeyState: "dedicated",
 	})
 	for _, id := range []string{"audit_logging", "audit_tamper_evidence", "authentication", "write_protection"} {
 		if got := controlByID(cs, id).Status; got != "pass" {
@@ -39,7 +39,7 @@ func TestEvaluateControls_Problems(t *testing.T) {
 		Verify:         audit.VerifyResult{Intact: false, BrokenAtSeq: 3, Detail: "hash mismatch"},
 		AuthRequired:   false, // --no-auth
 		DemoMode:       true,
-		TamperKeyed:    true,
+		TamperKeyState: "dedicated",
 	})
 	if controlByID(cs, "audit_tamper_evidence").Status != "fail" {
 		t.Error("broken chain must fail")
@@ -60,9 +60,33 @@ func TestEvaluateControls_UnkeyedChainWarns(t *testing.T) {
 		HasRecentAudit: true,
 		Verify:         audit.VerifyResult{Intact: true},
 		AuthRequired:   true,
-		TamperKeyed:    false, // intact but no key
+		TamperKeyState: "unkeyed",
 	})
 	if got := controlByID(cs, "audit_tamper_evidence").Status; got != "warn" {
 		t.Errorf("unkeyed intact chain should warn, got %q", got)
+	}
+}
+
+// F46: the JWT-fallback key state warns (chain keyed, but by a secret shared
+// with the session domain); the persistent generated key passes.
+func TestEvaluateControls_KeyStates(t *testing.T) {
+	for _, tc := range []struct {
+		state string
+		want  string
+	}{
+		{"dedicated", "pass"},
+		{"persistent", "pass"},
+		{"jwt-fallback", "warn"},
+		{"unkeyed", "warn"},
+	} {
+		cs := evaluateControls(complianceInputs{
+			HasRecentAudit: true,
+			Verify:         audit.VerifyResult{Intact: true},
+			AuthRequired:   true,
+			TamperKeyState: tc.state,
+		})
+		if got := controlByID(cs, "audit_tamper_evidence").Status; got != tc.want {
+			t.Errorf("key state %q should be %q, got %q", tc.state, tc.want, got)
+		}
 	}
 }

@@ -30,7 +30,8 @@ type complianceInputs struct {
 	VerifyErr      bool
 	AuthRequired   bool
 	DemoMode       bool
-	TamperKeyed    bool
+	// KeyState is the audit chain key status (F46): audit.KeyStatus*.
+	TamperKeyState string
 }
 
 // evaluateControls maps the live facts to a control-status list (pure).
@@ -48,10 +49,14 @@ func evaluateControls(in complianceInputs) []controlStatus {
 		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "info", "chain could not be verified"})
 	case !in.Verify.Intact:
 		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "fail", in.Verify.Detail})
-	case !in.TamperKeyed:
-		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "warn", "chain intact but unkeyed — set OBSERVE_AUDIT_KEY so a DB-level actor can't forge it"})
+	case in.TamperKeyState == "dedicated":
+		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "pass", "hash chain intact, keyed by a dedicated key"})
+	case in.TamperKeyState == "persistent":
+		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "pass", "hash chain intact, keyed by the persistent generated key (rotate via OBSERVE_AUDIT_KEY + OBSERVE_AUDIT_KEYRING)"})
+	case in.TamperKeyState == "jwt-fallback":
+		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "warn", "chain intact but keyed by the JWT secret — set OBSERVE_AUDIT_KEY so the chain key is not shared with the session domain"})
 	default:
-		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "pass", "hash chain intact and keyed"})
+		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "warn", "chain intact but unkeyed — set OBSERVE_AUDIT_KEY so a DB-level actor can't forge it"})
 	}
 
 	if in.AuthRequired {
@@ -85,7 +90,7 @@ func summarize(controls []controlStatus) map[string]int {
 // demo-able "here are your controls" surface (evidence layer for SOC2/ISO). It
 // reports only what observe can actually verify — self-hosted, so the operator
 // owns the compliance; this is the control plane, not a certification.
-func complianceHandler(store auditStore, authRequired, demoMode, tamperKeyed bool) http.HandlerFunc {
+func complianceHandler(store auditStore, authRequired, demoMode bool, keyState string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		recent, _ := store.List(r.Context(), audit.Filter{
 			From:  time.Now().Add(-24 * time.Hour).UnixMilli(),
@@ -99,7 +104,7 @@ func complianceHandler(store auditStore, authRequired, demoMode, tamperKeyed boo
 			VerifyErr:      verr != nil,
 			AuthRequired:   authRequired,
 			DemoMode:       demoMode,
-			TamperKeyed:    tamperKeyed,
+			TamperKeyState: keyState,
 		})
 
 		w.Header().Set("Content-Type", "application/json")

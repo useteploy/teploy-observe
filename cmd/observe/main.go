@@ -368,22 +368,44 @@ func main() {
 	aiSchema := aiquery.NewSchemaCard(db)
 	scheduledExportSvc := jobs.NewExportService(db, explorerSvc, logger)
 	incidentSvc := incidents.NewService(db)
-	// Audit chain HMAC key: prefer a dedicated OBSERVE_AUDIT_KEY, else fall back
-	// to the JWT secret so the tamper-evidence chain is keyed by default. For
-	// strongest guarantees set a separate audit key held outside the DB host.
-	auditKey := cfg.AuditKey
-	if auditKey == "" {
-		auditKey = cfg.JWTSecret
+	// Audit chain keys (F46). One signer, resolved in order:
+	// OBSERVE_AUDIT_KEY (dedicated, base64 >=32 bytes), the persistent
+	// generated key file (data/audit.key — every install's chain is keyed
+	// without operator action; the file lives on this host, not in the DB),
+	// then the JWT-secret fallback. Rows stamp the signing key's id;
+	// OBSERVE_AUDIT_KEYRING holds historical keys for verification through
+	// rotation (move the old key there when switching).
+	auditKeyring, auditKeyErr := audit.LoadKeyring(audit.KeyEnv{
+		Dedicated:   cfg.AuditKey,
+		KeyringSpec: os.Getenv("OBSERVE_AUDIT_KEYRING"),
+		Fallback:    cfg.JWTSecret,
+		File:        filepath.Join(effectiveDataDir(), "audit.key"),
+	})
+	if auditKeyErr != nil {
+		logger.Error("audit chain key configuration is invalid — refusing to start with a mis-keyed chain", "err", auditKeyErr)
+		os.Exit(1)
 	}
-	if auditKey == "" {
-		// Audit F46: with neither key configured, NewAuthService generated a
-		// random JWT secret internally while this local value stayed empty —
-		// the chain was silently HMAC'd with a KNOWN empty key, detectable
-		// only against accidental edits. Say so at startup; a dedicated
-		// persistent key with rotation keyring is a deferred design item.
+	switch auditKeyring.Status {
+	case audit.KeyStatusDedicated:
+		logger.Info("audit chain keyed by OBSERVE_AUDIT_KEY", "key_id", auditKeyring.Signer.ID)
+	case audit.KeyStatusPersistent:
+		logger.Info("audit chain keyed by the persistent generated key",
+			"key_id", auditKeyring.Signer.ID, "file", filepath.Join(effectiveDataDir(), "audit.key"))
+		if spec := auditKeyring.RotationSpec(); spec != "" {
+			logger.Info("to rotate to a dedicated key: set OBSERVE_AUDIT_KEY, and put this entry in OBSERVE_AUDIT_KEYRING so existing rows keep verifying",
+				"rotation_entry", spec)
+		}
+	case audit.KeyStatusFallback:
+		logger.Warn("audit chain keyed by the JWT secret fallback — set OBSERVE_AUDIT_KEY so the chain key is not shared with the session domain",
+			"key_id", auditKeyring.Signer.ID)
+		if ferr := auditKeyring.FileErr(); ferr != nil {
+			logger.Warn("persistent audit key file unusable, fell back", "err", ferr)
+		}
+	default:
+		// F46 empty-key warning, now the last resort rather than the default.
 		logger.Warn("audit chain is UNKEYED (empty HMAC key): tamper-evidence detects accidental edits only — set OBSERVE_AUDIT_KEY for a chain a database-level attacker cannot recompute")
 	}
-	auditSvc := audit.NewService(db, []byte(auditKey))
+	auditSvc := audit.NewServiceWithKeys(db, auditKeyring)
 
 	// SSO sign-ins land in the same audit trail as password logins. Wired here
 	// rather than at construction because the audit service is built after
@@ -1146,7 +1168,7 @@ func main() {
 	// Tamper-evidence: walk the hash chain and report whether it's intact.
 	r.Handle("GET /api/v1/audit/verify", jwtMW(requireAdmin(auditVerifyHandler(auditSvc))))
 	// Compliance control-status report (the evidence-layer surface).
-	r.Handle("GET /api/v1/compliance", jwtMW(requireAdmin(complianceHandler(auditSvc, true, cfg.DemoMode, auditKey != ""))))
+	r.Handle("GET /api/v1/compliance", jwtMW(requireAdmin(complianceHandler(auditSvc, true, cfg.DemoMode, string(auditKeyring.Status)))))
 
 	// --- Feature flags (JWT auth + public evaluate; editor+ writes) ---
 	flagGroup := r.Group("/api/v1/flags", jwtMW)
