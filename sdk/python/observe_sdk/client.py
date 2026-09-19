@@ -21,6 +21,19 @@ import uuid
 PROTOCOL_VERSION = 2
 
 
+class _NoTelemetryRedirect(urlrequest.HTTPRedirectHandler):
+    """TO-037: never follow a redirect on a credential-bearing request.
+
+    urllib's default redirect follower would forward the X-API-Key header
+    to whatever origin the endpoint names; refusing keeps the key on the
+    configured endpoint (a deliberate redirect is an operator decision —
+    configure the final URL instead).
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
 @dataclass
 class Options:
     endpoint: str
@@ -111,6 +124,9 @@ class Client:
         self._thread = threading.Thread(
             target=self._loop, name="observe-flush", daemon=True
         )
+        # TO-037: the opener refuses redirects; a 3xx surfaces as an error
+        # (strict 2xx below) instead of silently forwarding the API key.
+        self._opener = urlrequest.build_opener(_NoTelemetryRedirect)
         self._thread.start()
 
     # ── public API ────────────────────────────────────────────────────────
@@ -333,9 +349,15 @@ class Client:
             headers["X-API-Key"] = self.opts.api_key
         req = urlrequest.Request(url, data=data, headers=headers, method="POST")
         try:
-            with urlrequest.urlopen(req, timeout=self.opts.timeout) as resp:
-                if resp.status >= 400 and not silent:
+            with self._opener.open(req, timeout=self.opts.timeout) as resp:
+                # TO-037: only 2xx is success (a refused 3xx reaches here
+                # as an HTTPError, which is a URLError subclass).
+                if not 200 <= resp.status < 300 and not silent:
                     raise RuntimeError(f"observe: {path} returned {resp.status}")
+        except urlrequest.HTTPError as exc:
+            if silent:
+                return
+            raise RuntimeError(f"observe: {path} returned {exc.code}") from exc
         except (URLError, TimeoutError) as exc:
             if not silent:
                 raise RuntimeError(f"observe: post {path} failed: {exc}") from exc
@@ -362,19 +384,44 @@ def encode_entry(entry: Dict[str, Any]) -> bytes:
 # ── module-level default client ────────────────────────────────────────────
 
 _default: Optional[Client] = None
+# TO-044: default replacement is serialized and a failed shutdown of the
+# outgoing client is PROPAGATED (Client.close deliberately exposes drain
+# failures — swallowing them here hid them); one module-level exit handler
+# closes whatever client is current at exit instead of retaining every
+# client init() ever created.
+_default_lock = threading.RLock()
 
 
 def init(**kwargs: Any) -> Client:
-    """Initialize the default client. Repeat calls replace the previous one."""
+    """Initialize the default client. Repeat calls replace the previous one.
+
+    The replacement's options are validated BEFORE the outgoing client is
+    closed, and a failed close of the outgoing client raises (the caller
+    can catch it and still complete the swap manually via a second init).
+    """
+    candidate = Client.__new__(Client)  # validate without starting a worker
+    candidate.opts = Options(**kwargs)
+    _validate_options(candidate.opts)
     global _default
-    if _default is not None:
+    with _default_lock:
+        previous = _default
+        if previous is not None:
+            previous.close()  # may raise — the old client stays recoverable
+        _default = Client(**kwargs)
+        return _default
+
+
+def _close_default_at_exit() -> None:
+    with _default_lock:
+        current = _default
+    if current is not None:
         try:
-            _default.close()
-        except Exception:
+            current.close()
+        except Exception:  # noqa: BLE001 - interpreter teardown
             pass
-    _default = Client(**kwargs)
-    atexit.register(_default.close)
-    return _default
+
+
+atexit.register(_close_default_at_exit)
 
 
 def _require() -> Client:

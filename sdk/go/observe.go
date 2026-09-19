@@ -68,9 +68,9 @@ type Options struct {
 
 // Client submits events, errors, logs, traces, and metrics to Observe.
 type Client struct {
-	opts    Options
-	http    *http.Client
-	mu      sync.Mutex
+	opts Options
+	http *http.Client
+	mu   sync.Mutex
 	// logs holds entries serialized AT ADMISSION (AUD-036, round 2): the
 	// old code stored the caller's LogEntry with its live map attributes,
 	// so mutation after log() changed the eventual body and one
@@ -89,6 +89,14 @@ type Client struct {
 	// pendingLogBytes bounds total queued log bytes (AUD-038, round 2) —
 	// the count cap alone let a slow endpoint grow memory without limit.
 	pendingLogBytes int64
+	// spansN/pendingSpanBytes bound the queued span batches (TO-038).
+	spansN           int
+	pendingSpanBytes int64
+	// pendingMetrics holds frozen metric envelopes whose POST failed
+	// (TO-039) — retried before any new snapshot is taken.
+	pendingMetrics []*frozenMetrics
+	// metricFlushMu serializes metric exports (TO-039).
+	metricFlushMu sync.Mutex
 	// logFlushMu serializes public Flush and worker flushes so one owner
 	// sends at a time and a failed chunk leaves its queue prefix intact
 	// (AUD-038).
@@ -175,8 +183,18 @@ func New(opts Options) (*Client, error) {
 	if opts.SiteID == "" {
 		opts.SiteID = "default"
 	}
-	if opts.HTTPClient == nil {
-		opts.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+	base := opts.HTTPClient
+	if base == nil {
+		base = &http.Client{Timeout: 10 * time.Second}
+	}
+	// TO-037: telemetry carries the X-API-Key credential, and Go's default
+	// redirect follower forwards custom headers across origins — a
+	// redirecting (or compromised) endpoint would receive the key. The
+	// client is COPIED (never mutate a caller-owned client) and refuses
+	// redirects; postRaw accepts only 2xx.
+	owned := *base
+	owned.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
 	if opts.LogBatchSize <= 0 {
 		opts.LogBatchSize = 50
@@ -186,7 +204,7 @@ func New(opts Options) (*Client, error) {
 	}
 	c := &Client{
 		opts:      opts,
-		http:      opts.HTTPClient,
+		http:      &owned,
 		closed:    make(chan struct{}),
 		done:      make(chan struct{}),
 		flushWake: make(chan struct{}, 1),
@@ -231,18 +249,27 @@ func (c *Client) loop() {
 			// by the ticker rather than a tight loop. AUD-038 (round 2):
 			// failures are REPORTED through the hook, not ignored — a
 			// silently dropped chunk used to look identical to success at
-			// Close time.
+			// Close time. TO-038: span/metric export failures are
+			// reported the same way.
 			if err := c.flushLogs(context.Background()); err != nil {
 				c.reportError(err)
 			}
-			_ = c.flushSpans(context.Background())
-			_ = c.FlushMetrics(context.Background())
+			if err := c.flushSpans(context.Background()); err != nil {
+				c.reportError(err)
+			}
+			if err := c.FlushMetrics(context.Background()); err != nil {
+				c.reportError(err)
+			}
 		case <-t.C:
 			if err := c.flushLogs(context.Background()); err != nil {
 				c.reportError(err)
 			}
-			_ = c.flushSpans(context.Background())
-			_ = c.FlushMetrics(context.Background())
+			if err := c.flushSpans(context.Background()); err != nil {
+				c.reportError(err)
+			}
+			if err := c.FlushMetrics(context.Background()); err != nil {
+				c.reportError(err)
+			}
 		}
 	}
 }
@@ -467,7 +494,10 @@ func (c *Client) postRaw(ctx context.Context, url string, body any, extraHeaders
 		return fmt.Errorf("observe: post: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	// TO-037: only 2xx is success. Redirects are already refused by the
+	// owned client (they would forward the credential); a 3xx reaching
+	// this check means the caller's transport forced one through.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("observe: %s returned %d", url, resp.StatusCode)
 	}
 	return nil

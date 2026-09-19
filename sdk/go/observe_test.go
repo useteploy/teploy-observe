@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -240,5 +241,136 @@ func TestLogQueueByteLimitDropsNewEntries(t *testing.T) {
 	}
 	if errs.Load() == 0 {
 		t.Fatal("byte-bounded admission must report drops")
+	}
+}
+
+// TO-037: telemetry refuses redirects — a cross-origin 307 must never
+// carry the API key to the redirect target, and a 3xx status is a failure,
+// not a silent success.
+func TestRedirectNeverForwardsAPIKey(t *testing.T) {
+	keySeen := make(chan string, 4)
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		keySeen <- r.Header.Get("X-API-Key")
+		w.WriteHeader(204)
+	}))
+	defer sink.Close()
+	target := strings.Replace(sink.URL, "127.0.0.1", "localhost", 1)
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	c, err := New(Options{Endpoint: source.URL, APIKey: "REPRO_KEY", LogFlushInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.CaptureException(errors.New("x")); err == nil {
+		t.Fatal("a redirected request must fail, not report success")
+	}
+	select {
+	case k := <-keySeen:
+		t.Fatalf("the key must never reach the redirect target, got %q", k)
+	default:
+	}
+}
+
+// TO-038: a failed span export retains its batch and Close surfaces the
+// failure; spans admitted after Close are refused with a report.
+func TestSpanExportRetainedAndPostCloseRefused(t *testing.T) {
+	var errs []error
+	var fail atomic.Bool
+	fail.Store(true)
+	var spanPosts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/traces" {
+			spanPosts.Add(1)
+			if fail.Load() {
+				w.WriteHeader(503)
+				return
+			}
+			w.WriteHeader(200)
+			return
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	c, _ := New(Options{
+		Endpoint:         srv.URL,
+		ServiceName:      "t038",
+		LogFlushInterval: time.Hour,
+		OnError:          func(e error) { errs = append(errs, e) },
+	})
+	_, span := c.StartSpan(context.Background(), "work")
+	span.SetAttribute("k", "v")
+	span.End()
+	if err := c.flushSpans(context.Background()); err == nil {
+		t.Fatal("the first export must fail against 503")
+	}
+	if spanPosts.Load() != 1 {
+		t.Fatalf("expected exactly one attempt, got %d", spanPosts.Load())
+	}
+	// The batch survived: retry succeeds and ships it.
+	fail.Store(false)
+	if err := c.flushSpans(context.Background()); err != nil {
+		t.Fatalf("retry must succeed: %v", err)
+	}
+	if spanPosts.Load() != 2 {
+		t.Fatalf("the retained batch must have been re-sent, got %d posts", spanPosts.Load())
+	}
+
+	// Post-close admission is refused and reported.
+	c.Close()
+	_, late := c.StartSpan(context.Background(), "late")
+	late.End()
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Error(), "after close") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the post-close span must be reported, got %v", errs)
+	}
+}
+
+// TO-054: unsupported span attribute types are rejected with a diagnostic
+// instead of silently encoding as an empty string; the supported scalar
+// widening (float32, small/unsigned ints) round-trips.
+func TestSpanAttributeNormalization(t *testing.T) {
+	var errs []error
+	c, _ := New(Options{Endpoint: "http://unused.example", OnError: func(e error) { errs = append(errs, e) }})
+	defer c.Close()
+
+	_, span := c.StartSpan(context.Background(), "attrs")
+	span.SetAttribute("str", "s")
+	span.SetAttribute("i", 7)
+	span.SetAttribute("i8", int8(3))
+	span.SetAttribute("u16", uint16(9))
+	span.SetAttribute("f32", float32(1.5))
+	span.SetAttribute("slice", []int{1})         // unsupported
+	span.SetAttribute("overflow", uint64(1)<<63) // exceeds int64
+	span.SetAttribute("nan", math.NaN())
+	span.mu.Lock()
+	defer span.mu.Unlock()
+	vals := map[string]any{}
+	for _, a := range span.attributes {
+		vals[a.key] = a.value
+	}
+	if _, ok := vals["slice"]; ok {
+		t.Fatal("an unsupported slice attribute must be rejected")
+	}
+	if _, ok := vals["overflow"]; ok {
+		t.Fatal("an overflowing uint64 must be rejected")
+	}
+	if _, ok := vals["nan"]; ok {
+		t.Fatal("NaN must be rejected")
+	}
+	if vals["f32"] != 1.5 || vals["i8"] != int64(3) || vals["u16"] != int64(9) {
+		t.Fatalf("widened scalars must normalize: %#v", vals)
+	}
+	if len(errs) != 3 {
+		t.Fatalf("each rejection must be reported, got %d: %v", len(errs), errs)
 	}
 }
