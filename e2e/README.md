@@ -19,10 +19,18 @@ credentials. Override with env vars:
 
 ## What's covered
 
+- `smoke.spec.ts` — boot-level smoke (CI): login -> dashboard renders -> one
+  seeded replay opens in the player.
+- `core.spec.ts` — core product paths (CI): dashboard stat cards render,
+  replay transport controls work (play/pause toggle, scrub seeks), the audit
+  view renders the trail. Logs in once per worker via the API and injects
+  the token (the server rate-limits logins per IP).
 - `auth.spec.ts` — login flow; unauthenticated redirect.
 - `routes.spec.ts` — every sidebar route returns 200 with no console errors.
 - `cmdk.spec.ts` — Cmd-K palette opens, search, Enter navigates.
 - `docs-and-api.spec.ts` — Swagger UI + OpenAPI paths count >80.
+
+CI runs smoke + core only; the remaining specs are the fuller local suite.
 
 ## Add a test
 

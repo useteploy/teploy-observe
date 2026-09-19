@@ -194,9 +194,10 @@ jobs:
         # upstream Migrate ledger TOCTOU (documented in AUDIT_OPEN.md).
         run: go test -p 1 ./...
 
-  # e2e smoke (AUD-056 remainder): login -> dashboard renders -> one replay
-  # plays, against the real binary + real Nucleus. The fuller e2e suite is
-  # still local-only; this is the minimal honest browser-level check.
+  # e2e (AUD-056 remainder): smoke + core — login -> dashboard renders ->
+  # one replay plays/pauses/seeks -> audit view renders — against the real
+  # binary + real Nucleus. The fuller e2e suite is still local-only; this is
+  # the honest browser-level check of the product's core surface.
   e2e-smoke:
     runs-on: ubuntu-latest
     steps:
@@ -237,11 +238,11 @@ jobs:
           done
           echo "observe did not become healthy" >&2
           exit 1
-      - name: Playwright smoke
+      - name: Playwright smoke + core
         working-directory: e2e
         run: |
           npm ci
           npx playwright install --with-deps chromium
-          npx playwright test tests/smoke.spec.ts
+          npx playwright test tests/smoke.spec.ts tests/core.spec.ts
         env:
           OBSERVE_URL: http://127.0.0.1:3000
