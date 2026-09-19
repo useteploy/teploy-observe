@@ -247,3 +247,67 @@ func TestF05Pre040OIDCTokenShapeRejected(t *testing.T) {
 		t.Fatalf("pre-040 oidc:<sub> token: expected 401, got %d", code)
 	}
 }
+
+// TestTO003_OIDCRoleDowngradeRetiresOldJWT is the TO-003 gate: an admin JWT
+// minted before the IdP downgraded the identity to viewer must die at its
+// next use, while an unchanged-role re-sign-in preserves the version.
+func TestTO003_OIDCRoleDowngradeRetiresOldJWT(t *testing.T) {
+	ctx, db, done := connect(t)
+	defer done()
+	svc := testService(db)
+	admin := seedLocalPrincipal(t, svc, uniqueSite("to003"), "admin-password-1", RoleAdmin, "admin")
+	store := svc.Principals()
+	t.Cleanup(func() {
+		db.SQL().Exec(context.Background(), "DELETE FROM principals WHERE id = $1", admin)
+	})
+
+	id := OIDCSubjectID("https://sso.example.com", "to003-sub")
+	t.Cleanup(func() {
+		db.SQL().Exec(context.Background(), "DELETE FROM principals WHERE id = $1", id)
+	})
+
+	tv1, err := store.UpsertOIDC(ctx, id, "carol", "carol@example.com", RoleAdmin)
+	if err != nil {
+		t.Fatalf("first sign-in: %v", err)
+	}
+	oldToken, err := svc.GenerateToken(id, "carol", RoleAdmin, tv1)
+	if err != nil {
+		t.Fatalf("mint admin token: %v", err)
+	}
+	h := authedHandler(svc)
+	if code := bearer(t, h, oldToken); code != http.StatusOK {
+		t.Fatalf("pre-downgrade admin token must work, got %d", code)
+	}
+
+	// Unchanged role: version preserved (a profile refresh must not log
+	// everybody out).
+	tv2, err := store.UpsertOIDC(ctx, id, "carol", "carol@example.com", RoleAdmin)
+	if err != nil {
+		t.Fatalf("refresh sign-in: %v", err)
+	}
+	if tv2 != tv1 {
+		t.Fatalf("unchanged role must preserve token_version: %d -> %d", tv1, tv2)
+	}
+	if code := bearer(t, h, oldToken); code != http.StatusOK {
+		t.Fatalf("unchanged-role re-sign-in must not retire the session, got %d", code)
+	}
+
+	// IdP downgrades to viewer: version bumps, the old admin JWT dies.
+	tv3, err := store.UpsertOIDC(ctx, id, "carol", "carol@example.com", RoleViewer)
+	if err != nil {
+		t.Fatalf("downgrade sign-in: %v", err)
+	}
+	if tv3 != tv2+1 {
+		t.Fatalf("role change must bump token_version: %d -> %d", tv2, tv3)
+	}
+	if code := bearer(t, h, oldToken); code != http.StatusUnauthorized {
+		t.Fatalf("pre-downgrade admin token must be rejected after the role change, got %d", code)
+	}
+	newToken, err := svc.GenerateToken(id, "carol", RoleViewer, tv3)
+	if err != nil {
+		t.Fatalf("mint viewer token: %v", err)
+	}
+	if code := bearer(t, h, newToken); code != http.StatusOK {
+		t.Fatalf("post-downgrade token must work, got %d", code)
+	}
+}

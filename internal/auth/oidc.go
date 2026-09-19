@@ -112,13 +112,24 @@ type oidcFlow struct {
 // issuer and client ID, and the issuer must be an absolute URL without
 // credentials/query/fragment. HTTPS is required unless
 // OBSERVE_OIDC_ALLOW_HTTP_ISSUER=true (narrow local-development override).
+//
+// TO-053: "any set variable" now means ANY OBSERVE_OIDC_* variable (the
+// four core fields plus every policy field — scopes, role claim, groups,
+// allowlists). A security-policy-only configuration fails closed instead
+// of reading as "OIDC off". OBSERVE_OIDC_ALLOW_HTTP_ISSUER is the one
+// documented exception: it modifies issuer validation and is meaningless
+// without an issuer.
+//
+// TO-052: a configured redirect is validated at startup (absolute HTTPS
+// callback URL on the exact callback path; HTTP only for localhost under
+// the explicit dev flag) and becomes the trusted source for the Secure
+// cookie decision — never a request-supplied Host or forwarded header.
 func NewOIDCAuth(authSvc *AuthService, logger *slog.Logger) (*OIDCAuth, error) {
 	issuer := strings.TrimSpace(os.Getenv("OBSERVE_OIDC_ISSUER"))
 	clientID := strings.TrimSpace(os.Getenv("OBSERVE_OIDC_CLIENT_ID"))
 	clientSecret := strings.TrimSpace(os.Getenv("OBSERVE_OIDC_CLIENT_SECRET"))
 	redirectURL := strings.TrimSpace(os.Getenv("OBSERVE_OIDC_REDIRECT_URL"))
-	configured := issuer != "" || clientID != "" || clientSecret != "" || redirectURL != ""
-	if !configured {
+	if !anyOIDCEnvironmentConfigured() {
 		return nil, nil
 	}
 	if issuer == "" || clientID == "" {
@@ -126,6 +137,11 @@ func NewOIDCAuth(authSvc *AuthService, logger *slog.Logger) (*OIDCAuth, error) {
 	}
 	if err := validateOIDCIssuer(issuer); err != nil {
 		return nil, err
+	}
+	if redirectURL != "" {
+		if err := validateOIDCRedirect(redirectURL, os.Getenv("OBSERVE_OIDC_ALLOW_HTTP_ISSUER") == "true"); err != nil {
+			return nil, fmt.Errorf("OBSERVE_OIDC_REDIRECT_URL: %w", err)
+		}
 	}
 	o := &OIDCAuth{
 		authSvc:        authSvc,
@@ -443,8 +459,12 @@ func claimStrings(v any) []string {
 	return nil
 }
 
-// effectiveRedirect returns the OAuth redirect URL, preferring the configured
-// value and otherwise deriving it from the request.
+// effectiveRedirect returns the OAuth redirect URL. With a configured
+// (startup-validated) redirect it is returned verbatim — request Host
+// never influences it (TO-052). Without one (local development), it is
+// derived from the request as before; that posture is documented: the
+// state cookie + PKCE verifier + the IdP's registered redirect URIs bound
+// the flow, so a spoofed Host can only break SSO, not redirect it.
 func (o *OIDCAuth) effectiveRedirect(r *http.Request) string {
 	if o.redirectURL != "" {
 		return o.redirectURL
@@ -454,6 +474,62 @@ func (o *OIDCAuth) effectiveRedirect(r *http.Request) string {
 		scheme = "https"
 	}
 	return scheme + "://" + r.Host + "/api/v1/auth/oidc/callback"
+}
+
+// stateCookieSecure decides the state cookie's Secure attribute from
+// TRUSTED configuration (TO-052): a validated https redirect pins Secure
+// on regardless of how the login request arrived (a proxy that strips
+// X-Forwarded-Proto must not downgrade the cookie). With no configured
+// redirect (local-dev derivation) the request's own transport is the only
+// signal available.
+func (o *OIDCAuth) stateCookieSecure(r *http.Request) bool {
+	if o.redirectURL != "" {
+		return strings.HasPrefix(o.redirectURL, "https://")
+	}
+	return requestIsHTTPS(r)
+}
+
+// anyOIDCEnvironmentConfigured reports whether any OBSERVE_OIDC_* variable
+// is set to a non-empty value (TO-053). ALLOW_HTTP_ISSUER is excluded: it
+// is a modifier of issuer validation, not an SSO configuration field.
+func anyOIDCEnvironmentConfigured() bool {
+	for _, item := range os.Environ() {
+		name, value, ok := strings.Cut(item, "=")
+		if ok && strings.HasPrefix(name, "OBSERVE_OIDC_") &&
+			name != "OBSERVE_OIDC_ALLOW_HTTP_ISSUER" &&
+			strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// oidcCallbackPath is the single registered callback path a configured
+// redirect must point at.
+const oidcCallbackPath = "/api/v1/auth/oidc/callback"
+
+// validateOIDCRedirect checks a configured redirect URL (TO-052): absolute,
+// no userinfo/query/fragment, on the exact callback path, HTTPS outside the
+// explicit localhost-development exception.
+func validateOIDCRedirect(raw string, allowLocalHTTP bool) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("must be an absolute URL (got %q)", raw)
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.RawFragment != "" {
+		return fmt.Errorf("must carry no userinfo, query, or fragment (got %q)", raw)
+	}
+	if u.Path != oidcCallbackPath {
+		return fmt.Errorf("must be the registered callback URL ending in %s (got path %q)", oidcCallbackPath, u.Path)
+	}
+	if u.Scheme != "https" {
+		host := u.Hostname()
+		local := host == "localhost" || host == "127.0.0.1" || host == "::1"
+		if !(allowLocalHTTP && u.Scheme == "http" && local) {
+			return fmt.Errorf("must be HTTPS outside explicit local development (got scheme %q)", u.Scheme)
+		}
+	}
+	return nil
 }
 
 // requestIsHTTPS reports whether the request arrived over TLS, directly or via a
@@ -484,7 +560,7 @@ func (o *OIDCAuth) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	o.storeFlow(state, &oidcFlow{nonce: nonce, verifier: verifier, exp: time.Now().Add(oidcFlowTTL)})
 	http.SetCookie(w, &http.Cookie{
 		Name: oidcStateCookie, Value: state, Path: "/", MaxAge: int(oidcFlowTTL.Seconds()),
-		HttpOnly: true, Secure: requestIsHTTPS(r), SameSite: http.SameSiteLaxMode,
+		HttpOnly: true, Secure: o.stateCookieSecure(r), SameSite: http.SameSiteLaxMode,
 	})
 	cfg := o.oauthConfig(o.effectiveRedirect(r))
 	authURL := cfg.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier))
@@ -510,7 +586,7 @@ func (o *OIDCAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	cookie, cookieErr := r.Cookie(oidcStateCookie)
 	http.SetCookie(w, &http.Cookie{
 		Name: oidcStateCookie, Value: "", Path: "/", MaxAge: -1,
-		HttpOnly: true, Secure: requestIsHTTPS(r), SameSite: http.SameSiteLaxMode,
+		HttpOnly: true, Secure: o.stateCookieSecure(r), SameSite: http.SameSiteLaxMode,
 	})
 	if cookieErr != nil || state == "" || subtle.ConstantTimeCompare([]byte(state), []byte(cookie.Value)) != 1 {
 		o.failAudit(w, r, "", auditResultFailure, "state_mismatch", "SSO state mismatch — please sign in again")

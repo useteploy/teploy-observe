@@ -105,18 +105,23 @@ func NewStore(db *nucleus.Client) *Store {
 	return &Store{db: db}
 }
 
-// ByID returns the latest version of one principal.
+// ByID returns the latest version of one principal, or (nil, nil) when no
+// such principal exists (TO-004: absence and store failure are different
+// answers — callers used to read both as "missing").
 func (s *Store) ByID(ctx context.Context, id string) (*Principal, error) {
 	return byID(ctx, s.db, id)
 }
 
 func byID(ctx context.Context, db *nucleus.Client, id string) (*Principal, error) {
-	row, err := nucleus.QueryOne[Principal](ctx, db.SQL(),
-		principalSelect+principalsLatest("id = $1"), id)
+	rows, err := nucleus.Query[Principal](ctx, db.SQL(),
+		principalSelect+principalsLatest("id = $1")+" LIMIT 1", id)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("principals: by-id lookup: %w", err)
 	}
-	return &row, nil
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return &rows[0], nil
 }
 
 // TokenVersionByID returns the live token_version for any principal. This is
@@ -138,15 +143,10 @@ func (s *Store) TokenVersionByID(ctx context.Context, id string) (int64, error) 
 // login may authenticate. Deterministic where the 040 backfill merged the
 // same username from both legacy tables: the 'admin'-origin row wins (it held
 // a working password pre-merge), then oldest created_at, then lowest id.
+// (nil, nil) means the username is genuinely free; an error is a store
+// failure the caller must not treat as absence (TO-004).
 func (s *Store) LocalByUsername(ctx context.Context, username string) (*Principal, error) {
-	row, err := nucleus.QueryOne[Principal](ctx, s.db.SQL(), principalSelect+principalsLatest("")+
-		` WHERE username = $1 AND kind = 'local'
-		  ORDER BY CASE origin WHEN 'admin' THEN 0 ELSE 1 END ASC, created_at ASC, id ASC
-		  LIMIT 1`, username)
-	if err != nil {
-		return nil, err
-	}
-	return &row, nil
+	return s.localByUsernameLocked(ctx, username)
 }
 
 // CountLocal returns how many local principals exist. "Is this install
@@ -172,14 +172,18 @@ func (s *Store) List(ctx context.Context) ([]Principal, error) {
 }
 
 // FirstLocalAdmin returns the first local admin by created_at, id - the
-// account OBSERVE_RESET_ADMIN_PASSWORD resets.
+// account OBSERVE_RESET_ADMIN_PASSWORD resets. (nil, nil) when no local
+// admin exists.
 func (s *Store) FirstLocalAdmin(ctx context.Context) (*Principal, error) {
-	row, err := nucleus.QueryOne[Principal](ctx, s.db.SQL(), principalSelect+principalsLatest("")+
+	rows, err := nucleus.Query[Principal](ctx, s.db.SQL(), principalSelect+principalsLatest("")+
 		" WHERE kind = 'local' AND role = 'admin' ORDER BY created_at ASC, id ASC LIMIT 1")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("principals: first-admin lookup: %w", err)
 	}
-	return &row, nil
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return &rows[0], nil
 }
 
 // ErrUsernameTaken is returned by CreateLocal when a local principal already
@@ -194,7 +198,14 @@ func (s *Store) CreateLocal(ctx context.Context, username, email, passwordHash, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if existing, err := s.localByUsernameLocked(ctx, username); err == nil && existing != nil {
+	// TO-004: a failed lookup is NOT a free username — proceeding would
+	// let a transient SELECT error green-light a duplicate of an existing
+	// account (one of the two passwords silently dead since 040).
+	existing, err := s.localByUsernameLocked(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("principals: username lookup: %w", err)
+	}
+	if existing != nil {
 		return nil, ErrUsernameTaken
 	}
 	nowMs := time.Now().UnixMilli()
@@ -260,25 +271,39 @@ func (s *Store) RevokeSessions(ctx context.Context, id string) error {
 
 // UpsertOIDC records an SSO sign-in: creates the issuer-namespaced principal
 // on first login, refreshes username/email/role from the IdP on later ones
-// (the IdP stays authoritative for role), and PRESERVES token_version so a
-// later sign-in does not retire other still-valid sessions for the same
-// identity. Returns the token_version a JWT minted now must embed.
+// (the IdP stays authoritative for role), and PRESERVES token_version on an
+// unchanged role so a later sign-in does not retire other still-valid
+// sessions for the same identity. A role CHANGE bumps token_version
+// (TO-003): an admin JWT minted before the IdP downgraded the identity to
+// viewer must die at its next use, exactly like SetRole. Returns the
+// token_version a JWT minted now must embed.
 func (s *Store) UpsertOIDC(ctx context.Context, id, username, email, role string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	nowMs := time.Now().UnixMilli()
 	existing, err := byID(ctx, s.db, id)
-	if err == nil && existing != nil {
+	if err != nil {
+		// TO-004: a lookup failure must not fall through to the
+		// create-with-token-version-zero branch — that silently reset
+		// revocation state (a suspended/downgraded identity re-logged-in
+		// by a transient SELECT error).
+		return 0, fmt.Errorf("principals: OIDC lookup: %w", err)
+	}
+	if existing != nil {
+		nextTokenVersion := existing.TokenVersion
+		if existing.Role != role {
+			nextTokenVersion++
+		}
 		next := nextVersion(nowMs, existing.LatestVersion)
 		if _, err := s.db.SQL().Exec(ctx, `INSERT INTO principals
 			(id, kind, username, email, password_hash, role, origin, created_at, invited_by, token_version, version)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 			id, KindOIDC, username, email, existing.PasswordHash, role, OriginOIDC,
-			existing.CreatedAt, existing.InvitedBy, existing.TokenVersion, next); err != nil {
+			existing.CreatedAt, existing.InvitedBy, nextTokenVersion, next); err != nil {
 			return 0, fmt.Errorf("principals: upsert oidc: %w", err)
 		}
-		return existing.TokenVersion, nil
+		return nextTokenVersion, nil
 	}
 	if _, err := s.db.SQL().Exec(ctx, `INSERT INTO principals
 		(id, kind, username, email, password_hash, role, origin, created_at, invited_by, token_version, version)
@@ -298,7 +323,10 @@ func (s *Store) replace(ctx context.Context, id string, mutate func(*Principal) 
 	defer s.mu.Unlock()
 
 	p, err := byID(ctx, s.db, id)
-	if err != nil || p == nil {
+	if err != nil {
+		return nil, fmt.Errorf("principals: load %s: %w", id, err)
+	}
+	if p == nil {
 		return nil, fmt.Errorf("principals: %s not found", id)
 	}
 	if err := mutate(p); err != nil {
@@ -329,12 +357,17 @@ func (s *Store) replace(ctx context.Context, id string, mutate func(*Principal) 
 }
 
 func (s *Store) localByUsernameLocked(ctx context.Context, username string) (*Principal, error) {
-	row, err := nucleus.QueryOne[Principal](ctx, s.db.SQL(), principalSelect+principalsLatest("")+
-		" WHERE username = $1 AND kind = 'local' LIMIT 1", username)
+	rows, err := nucleus.Query[Principal](ctx, s.db.SQL(), principalSelect+principalsLatest("")+
+		` WHERE username = $1 AND kind = 'local'
+		  ORDER BY CASE origin WHEN 'admin' THEN 0 ELSE 1 END ASC, created_at ASC, id ASC
+		  LIMIT 1`, username)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("principals: username lookup: %w", err)
 	}
-	return &row, nil
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return &rows[0], nil
 }
 
 // nextVersion is the 039 stamp: strictly increasing even when the wall clock

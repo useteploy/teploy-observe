@@ -247,7 +247,7 @@ func (s *AuthService) EnsureAdmin(ctx context.Context, username, password string
 // table no login path read).
 func (s *AuthService) Login(ctx context.Context, username, password string) (string, error) {
 	p, err := s.store.LocalByUsername(ctx, username)
-	if err != nil {
+	if err != nil || p == nil {
 		// Run a bcrypt comparison against a fixed dummy hash even when the
 		// user doesn't exist, so the response time doesn't leak username
 		// existence.
@@ -285,7 +285,7 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID, currentPasswor
 	defer s.credentialMu.Unlock()
 
 	p, err := s.store.ByID(ctx, userID)
-	if err != nil || p.Kind != principals.KindLocal {
+	if err != nil || p == nil || p.Kind != principals.KindLocal {
 		return fmt.Errorf("user not found")
 	}
 	if !checkPassword(currentPassword, p.PasswordHash) {
@@ -329,7 +329,10 @@ func (s *AuthService) ForceResetAdminPassword(ctx context.Context, password stri
 
 	p, err := s.store.FirstLocalAdmin(ctx)
 	if err != nil {
-		return fmt.Errorf("auth: no admin user found to reset: %w", err)
+		return fmt.Errorf("auth: first-admin lookup failed: %w", err)
+	}
+	if p == nil {
+		return fmt.Errorf("auth: no admin user found to reset")
 	}
 
 	_, err = s.store.ReplacePassword(ctx, p.ID, "", hash)

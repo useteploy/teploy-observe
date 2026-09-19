@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/neutron-dev/neutron-go/neutron"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/useteploy/teploy-observe/internal/principals"
@@ -105,6 +106,9 @@ func (s *UserService) Get(ctx context.Context, userID string) (*User, error) {
 	p, err := s.store.ByID(ctx, userID)
 	if err != nil {
 		return nil, err
+	}
+	if p == nil {
+		return nil, neutron.ErrNotFound("user not found")
 	}
 	u := toUser(p)
 	return &u, nil
