@@ -142,24 +142,59 @@ func NewBuffer(db *nucleus.Client, maxSize, flushSize int, flushInterval time.Du
 // first meant a failed replay could leave a live queue attached whose
 // checkpoint later advanced past the still-unread backlog — turning a
 // recoverable replay problem into skipped data.
+//
+// F16: replay STREAMS the backlog frame by frame with the dedup running in
+// 500-event chunks, instead of materializing the entire WAL as one []Event
+// slice next to the buffer's own copy. Peak replay memory is the final
+// backlog plus one chunk, not twice the backlog.
 func (b *Buffer) AttachQueue(q *DiskQueue) error {
-	pending, err := q.Pending()
-	if err != nil {
-		return fmt.Errorf("WAL replay failed: %w", err)
-	}
 	// Exactly-once replay of committed events: a crash between a flush's DB
 	// commit and its WAL checkpoint leaves committed events still in the WAL,
 	// so replay would re-insert (and double-count) them. Drop any pending
-	// event whose event_id is already in the DB before replaying. On a lookup
-	// error this FAILS OPEN (keeps all events) — durability over dedup — so
-	// it is a recovery optimization, not an unconditional exactly-once
-	// guarantee.
-	if len(pending) > 0 {
-		before := len(pending)
-		pending = b.dropAlreadyCommitted(pending)
-		if dropped := before - len(pending); dropped > 0 {
-			b.logger.Info("ingest queue: skipped already-committed events on replay", "dropped", dropped)
+	// event whose event_id is already in the DB before replaying it. On a
+	// lookup error this FAILS OPEN (keeps all events) — durability over
+	// dedup — so it is a recovery optimization, not an unconditional
+	// exactly-once guarantee.
+	const dedupChunk = 500
+	var chunk []Event
+	replayed := 0
+	dropped := 0
+	flushChunk := func() error {
+		if len(chunk) == 0 {
+			return nil
 		}
+		before := len(chunk)
+		chunk = b.dropAlreadyCommitted(chunk)
+		dropped += before - len(chunk)
+		if len(chunk) > 0 {
+			b.events = append(b.events, chunk...)
+			// AUD-015: replayed events count against the byte budget too —
+			// a large backlog must not restart with an unaccounted memory
+			// spike.
+			for _, e := range chunk {
+				n := approxEventBytes(e)
+				b.eventBytes = append(b.eventBytes, n)
+				b.bufferedBytes += int64(n)
+			}
+			replayed += len(chunk)
+		}
+		chunk = chunk[:0]
+		return nil
+	}
+	if err := q.StreamPending(func(events []Event) error {
+		chunk = append(chunk, events...)
+		if len(chunk) >= dedupChunk {
+			return flushChunk()
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("WAL replay failed: %w", err)
+	}
+	if err := flushChunk(); err != nil {
+		return fmt.Errorf("WAL replay failed: %w", err)
+	}
+	if dropped > 0 {
+		b.logger.Info("ingest queue: skipped already-committed events on replay", "dropped", dropped)
 	}
 
 	b.mu.Lock()
@@ -171,18 +206,8 @@ func (b *Buffer) AttachQueue(q *DiskQueue) error {
 	// checkpoints past the replayed region; otherwise those events (already on
 	// disk below the new writes) would replay again on the next crash.
 	b.lastOffset = q.Offset()
-	if len(pending) > 0 {
-		b.events = append(b.events, pending...)
-		// AUD-015: replayed events count against the byte budget too — a
-		// large backlog must not restart with an unaccounted memory spike.
-		for _, e := range pending {
-			n := approxEventBytes(e)
-			b.eventBytes = append(b.eventBytes, n)
-			b.bufferedBytes += int64(n)
-		}
-	}
-	if len(pending) > 0 {
-		b.logger.Info("ingest queue: replayed", "count", len(pending))
+	if replayed > 0 {
+		b.logger.Info("ingest queue: replayed", "count", replayed)
 	}
 	b.queue = q
 	return nil

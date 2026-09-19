@@ -245,7 +245,26 @@ func main() {
 			logger.Warn("OBSERVE_MAX_BUFFERED_BYTES is not an integer — using the default byte budget", "err", perr)
 		}
 	}
-	maxQueueBytes := int64(64 * 1024 * 1024) // 64 MiB per WAL file before compaction
+	maxQueueBytes := int64(64 * 1024 * 1024) // 64 MiB per WAL segment cap (F16: roll, not just compact)
+	if raw := strings.TrimSpace(os.Getenv("OBSERVE_WAL_MAX_SEGMENT_BYTES")); raw != "" {
+		if n, perr := strconv.ParseInt(raw, 10, 64); perr == nil && n > 0 {
+			maxQueueBytes = n
+		} else {
+			logger.Warn("OBSERVE_WAL_MAX_SEGMENT_BYTES is not a positive integer — using the default segment cap", "err", perr)
+		}
+	}
+	// F16 disk high-water: the WAL refuses to grow past this total across
+	// all segments; a roll that would exceed it drops the OLDEST segment
+	// (breach-counted and logged loudly when it held unacknowledged events
+	// — those lose their crash-recovery copy, availability is kept).
+	walMaxTotalBytes := int64(0) // 0 -> DiskQueue default (512 MiB)
+	if raw := strings.TrimSpace(os.Getenv("OBSERVE_WAL_MAX_TOTAL_BYTES")); raw != "" {
+		if n, perr := strconv.ParseInt(raw, 10, 64); perr == nil && n > 0 {
+			walMaxTotalBytes = n
+		} else {
+			logger.Warn("OBSERVE_WAL_MAX_TOTAL_BYTES is not a positive integer — using the default high-water", "err", perr)
+		}
+	}
 	// OBS-009: a WAL init/attach failure used to silently downgrade to
 	// memory-only ingestion — the project documents durable ingestion via the
 	// WAL, so this changed a stated guarantee without telling anyone.
@@ -258,6 +277,9 @@ func main() {
 	walDegraded := false
 	eventsQ, err := ingest.NewDiskQueue(queueDir, "events", 500*time.Millisecond, maxQueueBytes, logger)
 	if err == nil {
+		if walMaxTotalBytes > 0 {
+			eventsQ.WithMaxTotalBytes(walMaxTotalBytes)
+		}
 		if err := buf.AttachQueue(eventsQ); err != nil {
 			walDegraded = true
 			// AUD-012 (round 2): close the created-but-unattached queue —
@@ -1384,14 +1406,21 @@ func main() {
 			// instead of reporting "wal" on a queue that stopped writing.
 			durability = "wal-degraded"
 		}
-		_ = json.NewEncoder(w).Encode(map[string]string{
+		health := map[string]any{
 			"status":     "ok",
 			"version":    version,
 			"commit":     commit,
 			"durability": durability,
-		})
+		}
+		if eventsQ != nil {
+			// F16: the WAL's disk state is operator-visible at the health
+			// endpoint — segment count, total bytes against the high-water,
+			// and the breach counters for segments dropped past the cap
+			// before they were checkpointed.
+			health["wal"] = eventsQ.Stats()
+		}
+		_ = json.NewEncoder(w).Encode(health)
 	})
-
 	r.Handle("GET /assets/", http.FileServer(http.FS(uiSub)))
 
 	// The tab icon sits at the build root, not under /assets/, so it needs its

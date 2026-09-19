@@ -143,8 +143,8 @@ func TestBuffer_FlushFailureSurvivesRetryAndRestart(t *testing.T) {
 	if got := buf.Len(); got != 4 {
 		t.Fatalf("failed flush must retain every accepted event, got %d of 4", got)
 	}
-	if cp, err := readCheckpoint(filepath.Join(dir, "ingest", "checkpoint")); err != nil || cp != 0 {
-		t.Fatalf("failed flush must not advance the checkpoint, got %d (err %v)", cp, err)
+	if cpSeg, cpOff, err := readCheckpoint(filepath.Join(dir, "ingest", "checkpoint")); err != nil || cpSeg != 0 || cpOff != 0 {
+		t.Fatalf("failed flush must not advance the checkpoint, got (%d,%d) (err %v)", cpSeg, cpOff, err)
 	}
 
 	// Retry against a live connection: every accepted event is inserted.

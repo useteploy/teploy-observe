@@ -2,7 +2,6 @@ package ingest
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -235,19 +234,21 @@ func TestDiskQueue_ConcurrentAppendCheckpointNoStrandedBytes(t *testing.T) {
 
 	q.mu.Lock()
 	dirty := q.dirtySinceFlush
-	cp, off := q.checkpoint, q.offset
+	cp, off := q.cpLogical(), q.offset
 	q.mu.Unlock()
 	if cp < off && !dirty {
 		t.Fatalf("bytes past the checkpoint (offset %d, checkpoint %d) are not flagged dirty — the fsync loop would skip them", off, cp)
 	}
 }
 
-// TestDiskQueue_CompactRotationKeepsNewRecordsReplayable is the observe-02
-// rotation regression: compaction used to truncate the log and only then
-// remove the checkpoint file, so a crash in between left a durable checkpoint
-// pointing past an empty/replacement log. Rotation must clear the checkpoint
-// first; a crash at either boundary still leaves new valid records replayable.
-func TestDiskQueue_CompactRotationKeepsNewRecordsReplayable(t *testing.T) {
+// TestDiskQueue_FullCheckpointReclaimsOversizedSegments is the F16 successor
+// of the observe-02 rotation regression. The pre-F16 design truncated a
+// fully-checkpointed over-grown log in place, with the checkpoint removed
+// first so a crash in between left new records replayable. The segment design
+// replaces truncation with a roll: the checkpointed active segment is sealed,
+// a fresh active segment takes over (same monotonic logical offset), and the
+// sealed one is reclaimed. Post-roll records must survive a restart.
+func TestDiskQueue_FullCheckpointReclaimsOversizedSegments(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	const maxBytes = 512
@@ -255,10 +256,10 @@ func TestDiskQueue_CompactRotationKeepsNewRecordsReplayable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDiskQueue: %v", err)
 	}
-	// Append past maxBytes, then checkpoint everything: this is the
-	// checkpoint that triggers compaction.
+	// Append past maxBytes (forcing rolls), then checkpoint everything:
+	// this is the checkpoint that triggers reclamation.
 	var off int64
-	for i := 0; q.Offset() <= maxBytes; i++ {
+	for i := 0; q.Stats().Bytes <= 3*maxBytes; i++ {
 		off, err = q.Append(ev(fmt.Sprintf("old%d", i)))
 		if err != nil {
 			t.Fatalf("append: %v", err)
@@ -267,13 +268,11 @@ func TestDiskQueue_CompactRotationKeepsNewRecordsReplayable(t *testing.T) {
 	if err := q.Checkpoint(off); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
-	if got := q.Offset(); got != 0 {
-		t.Fatalf("compaction must reset the log, offset=%d", got)
+	if got := q.Stats().Bytes; got > maxBytes {
+		t.Fatalf("checkpointed data was not reclaimed: %d bytes remain (cap %d)", got, maxBytes)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "events", "checkpoint")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("compaction must remove the checkpoint file, stat err=%v", err)
-	}
-	// New records land in the fresh log and must survive a restart.
+	// New records land in the fresh active segment and must survive a
+	// restart.
 	if _, err := q.Append(ev("post1")); err != nil {
 		t.Fatalf("append: %v", err)
 	}
@@ -290,7 +289,7 @@ func TestDiskQueue_CompactRotationKeepsNewRecordsReplayable(t *testing.T) {
 		t.Fatalf("pending: %v", err)
 	}
 	if got, want := ids(pending), []string{"post1", "post2"}; !equal(got, want) {
-		t.Fatalf("pending after rotation = %v, want %v", got, want)
+		t.Fatalf("pending after reclamation = %v, want %v", got, want)
 	}
 }
 
@@ -315,7 +314,7 @@ func TestDiskQueue_OpenClampsCheckpointPastLog(t *testing.T) {
 		t.Fatalf("open with poisoned checkpoint: %v", err)
 	}
 	q.mu.Lock()
-	cp := q.checkpoint
+	cp := q.cpLogical()
 	q.mu.Unlock()
 	if cp != 0 {
 		t.Fatalf("checkpoint past log length must clamp to 0 on load, got %d", cp)
