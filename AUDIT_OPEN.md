@@ -7,9 +7,206 @@ Round 2: audit 2026-09-17 (56 findings AUD-001..AUD-056, pinned at
 `bbd2fe9038863db0447ac1335554451feb89735a`; report lives outside the repo)
 — remediation record below. Round 3: audit 2026-09-18 (54 findings
 TO-001..TO-054, pinned at `fd7acf68803abd4e43f23f8438802b3b65f5ba23`;
-report lives outside the repo) — remediation record below. Earlier sweeps
-(2026-09-09 through 2026-09-11, passes 1-5) are closed history; their one
-surviving item is folded into F16 below.
+report lives outside the repo) — remediation record below. Round 4: audit
+2026-09-19 (45 findings R01..R45, pinned at
+`5e2108db4d7b36ac7af1b1309e9064de484bcd58`; report lives outside the repo)
+— remediation record below. Earlier sweeps (2026-09-09 through 2026-09-11,
+passes 1-5) are closed history; their one surviving item is folded into F16
+below.
+
+## Round-4 register (2026-09-19 audit, 45 findings R01..R45)
+
+Audited revision `5e2108d`. Every finding was verified against local source
+before disposition; none was a false positive. Fixed this round (commits in
+the round-4 series):
+
+- R02: setup decodes through a shared bounded reader (8 KiB, single JSON
+  document, unknown fields rejected), checks setup-completeness BEFORE any
+  parsing/hashing (the authoritative atomic check stays in EnsureAdmin), and
+  enforces the shared credential length policy (username <=128, password
+  <=72) at the boundary.
+- R04: error ingestion requires the authenticated context site and applies
+  the BoundSite invariant — a key for site A can no longer write errors
+  under site B by naming it in the body. Missing authenticated context is
+  refused outright (keyless ingest has been gone since AUD-002).
+- R05: the legacy (site_id, slug) check-in routes are RETIRED (410 with a
+  pointing message); the service layer additionally refuses slug check-ins
+  for any monitor carrying a ping token. Token check-ins are the only
+  public heartbeat path.
+- R06: cron listings strip ping_token for anyone below editor; webhook
+  listings reduce the URL to its host for viewers (a Slack incoming-webhook
+  URL is a posting credential). Creation remains the editor-only one-time
+  reveal; the HMAC secret was already excluded.
+- R07: API key capabilities (migration 044, rename-aside + create + copy).
+  Existing keys backfill to telemetry-ONLY — publish is never silently
+  granted; operators mint a dedicated CI key via POST
+  /api/v1/sites/{id}/keys {"scopes":["publish"]}. The sourcemap upload's
+  key path requires the publish scope (editor JWT unchanged); the ingest
+  middleware requires telemetry, so a publish-only key is not an ingest
+  credential. docs/migrations/from-sentry.md updated.
+- R08: SetRole refuses to demote the LAST local administrator inside the
+  serialized principal mutation (count query failure fails closed). OIDC
+  role refresh (UpsertOIDC) is deliberately unguarded — the IdP is
+  authoritative; SSO-only installs document break-glass via
+  OBSERVE_ADMIN_USER provisioning.
+- R09: stream tickets inherit the PARENT token's version, never the current
+  one — a concurrent demotion/revocation can no longer be upgraded into a
+  fresh-version ticket with stale role claims. Equality recheck preserved.
+- R10: the logs SSE handler revalidates the principal's token_version on a
+  30s ticker and closes the stream on revocation/role change/password reset
+  (fails closed on a recheck error). The 2-minute ticket remains a
+  connection-opening credential only.
+- R11: ipRateLimitMW keys on the trusted-proxy-resolved context IP (RemoteAddr
+  fallback) — clients behind a proxy no longer share one login bucket.
+- R12: ErrAuthUnavailable distinguishes an auth-store outage (503 +
+  Retry-After, both middleware paths) from an invalid key (401). Absence
+  detection switched to a rows-empty check so not-found is not conflated
+  with an error.
+- R13: the error buffer bounds count AND retained bytes (64 MiB default,
+  256 KiB per record) across queued plus in-flight; buffered records are
+  frozen serialized snapshots (caller mutation after Push changes nothing);
+  reservations retire only on final disposition; queued/bytes surfaced via
+  /healthz.
+- R14 (contained half): each flushed record gets its own bounded context —
+  one slow storage call can no longer exhaust a shared deadline and take
+  the whole batch tail with it. The durable idempotent-inbox half stays
+  DEFERRED (same class as TO-020: needs stable producer event identity +
+  payload digest + applied-events ledger committed atomically before the
+  HTTP ack; IngestErrorEvent mints fresh ids per call, so blind requeueing
+  would double-count issue counters — recorded in the buffer's package
+  comment since round 2).
+- R15: /healthz returns 503 with status "degraded" for flush-worker-failed,
+  error-worker-failed, wal-degraded, and memory-only (WAL attach failure —
+  never a deliberate mode in this app), plus the DB probe. The error
+  worker's panic recovery latches a fatal workerErr and closes admission.
+  Error-buffer backlog (queued count + bytes) is reported.
+- R16: every SSE frame (logs stream AND live stats) is written under a
+  renewed finite write deadline via http.NewResponseController — the 10s
+  total WriteTimeout no longer kills 25s/15s keepalive streams. Wrappers in
+  the neutron router implement Unwrap, so the controller reaches the real
+  connection.
+- R17: uptime probe and persistence contexts are separate — a target
+  timeout records its down row under a detached bounded context; scheduler
+  cancellation records nothing; recordResult returns its error.
+- R18: RunChecks admits only the checks that can actually start (worker
+  capacity, oldest-last-check first, id as tie-break); unadmitted monitors
+  stay due for the next tick. lastCheck is no longer premarked for monitors
+  that inherit an expired context in a queue.
+- R19: replacement versions are strictly-monotonic for monitor/cron delete,
+  dashboard delete, panel add/update/delete (read latest version, write
+  max(now, prior+1)) — same-millisecond mutations and clock rollback can no
+  longer collapse away a delete. The principal store already had this.
+- R20: monitor creation validates interval (10..86400) and expected status
+  (100..599) with defaults only for zero values; Enabled is tri-state in
+  the DTOs (omitted = true, explicit false preserved). Cron creation
+  validates name/slug/schedule bounds and grace (0..86400); an empty
+  schedule stays legal (the documented grace-only mode). Handler maps
+  validation to 400, backend errors stay 5xx.
+- R21: feedback List caps limit at 200 (default 20); monitor ListResults
+  caps at 500 (default 50); both with stable total-order tie-breaks.
+- R22 (contained): webhook delivery runs on lifecycle-owned bounded
+  workers (4) with a bounded queue (1000, overflow drops OLDEST loudly),
+  ONE stable delivery id per firing reused across bounded in-process
+  retries (3 attempts), and Shutdown drains. Durable across-restart
+  delivery stays DEFERRED (outbox design, same class as R14/R26).
+- R23: process diagnostics go to stderr — `observe backup` owns stdout
+  exclusively (the unencrypted-backup warning used to prefix the tar
+  stream). Per-table errors were already stderr-side.
+- R27: v2 replay identity fields (producer_id, batch_id, replay_id) are
+  validated against the canonical bounded alphabet [A-Za-z0-9_-]{8,64}
+  AFTER the ledger check — committed retries still dedupe; only batches
+  about to be written must be collision-free, making the pipe-delimiter
+  child-id collision unconstructible for new writes (v2 child ids unchanged
+  — retries of committed work keep their identity).
+- R28: error events and replay sessions sanitize their captured URL through
+  the SAME shared policy as analytics (ingest.CapturedURL: userinfo, query,
+  fragment stripped; non-http(s)/garbage dropped), applied before
+  grouphash/persistence and to click page attribution. Stack text, source
+  map filenames, and free-form contexts remain under their documented
+  policies.
+- R29: the classic tracker sanitizes document.referrer at send, form
+  actions at capture (relative resolves against the document; empty action
+  falls back to the page URL), and sanitizeURL now takes a base so relative
+  hrefs are no longer lost; non-http(s) schemes drop.
+- R30: share pages carry Cache-Control private,no-store, Referrer-Policy
+  no-referrer, X-Content-Type-Options nosniff.
+- R31: the classic tracker's flush path is a single-flight self-draining
+  transport: frozen immutable batches, count+byte budgets across
+  queued+in-flight, UTF-8 byte-measured body cap, automatic tail drain
+  after success, bounded backoff retry of the SAME frozen batch (stable
+  batch/event ids — server admission dedupes), XHR branch got real
+  onload/onerror handling, and the keyless sendBeacon path is gone
+  (keyless ingest no longer exists; parity with TO-051).
+- R32: events are serialized to immutable JSON at capture — caller
+  mutation after track() cannot change what is sent, cyclic/BigInt values
+  are a capture-time diagnostic rejection (droppedEvents() counter) instead
+  of a flush-time throw that detached the batch; revenue() no longer writes
+  into the caller's object.
+- R33: campaignFields decodes each query pair under its own try/catch —
+  one malformed percent escape can no longer abort the initial pageview and
+  tracker initialization; valid allowlisted attribution still ships.
+- R34: every raw-handler error response goes through encoding/json (shared
+  writeJSONError) — Go %q escapes are not JSON and produced unparseable
+  responses for control characters.
+- R35: parseTimeRange rejects malformed explicit timestamps and
+  empty/reversed ranges (400); omitted values keep the documented defaults.
+  All 21 call sites updated.
+- R36: one validatePanel gate for add AND update (empty/unknown panel or
+  query type rejected — the invisible-tombstone create; query_config must
+  be valid JSON; position/size fields integer + range-checked), and
+  ExecutePanel reports a config parse error instead of ignoring it.
+- R37: logs UI guards every state update with a request generation (stale
+  requests can't overwrite newer results; unmount-safe), and a failed load
+  renders an explicit error state with Retry instead of "No logs yet".
+- R38: pagination resets on site/query/level/service change; live entries
+  live in their own capped list that historical fetches cannot overwrite;
+  pagination renders only for historical results; text search disables
+  live tail (the live stream cannot evaluate it) instead of pretending.
+- R39: a blank API key edit FAILS when the existing key cannot be loaded
+  (read/decrypt error) instead of silently erasing the credential.
+- R40: AI query generation gets a principal-keyed rate limit (10/min), a
+  process-wide concurrency gate (4), a bounded question (8 KiB body, 4000
+  chars), and upstream error logs drop the response body (it can echo the
+  user's prompt) — status only.
+- R41: public feedback submission is site-existence-checked (fail-closed
+  503 on lookup error, 404 for invented sites) and rate-limited per client
+  IP AND per site (10/min each). Survey respond keeps its existing bounds;
+  its route-level limiter ride-along is future work if abuse shows up.
+- R42: login audit events carry the resolved client IP and user agent from
+  the request-info context (UA capped at 1024 + UTF-8 sanitized); audit
+  write failures are logged.
+- R43: the compose TLS topology puts Caddy (fixed 172.30.10.2) and observe
+  (fixed .3) on an isolated frontend network and the database on an
+  internal backend network Caddy cannot reach; observe trusts ONLY the
+  Caddy address by default and publishes OBSERVE_PUBLIC_URL. Verified
+  parseable with the nucleus service definition intact.
+- R44: e2e-smoke and nucleus-lease generate per-run JWT secrets (openssl
+  rand -hex 24, prefixed to satisfy nothing but policy — length is what
+  matters); readiness loops capture child logs and fail fast when the
+  process dies instead of waiting out the timeout.
+- R45 (partial, hardening): CI declares contents:read permissions,
+  cancels superseded same-branch runs, and every job carries a
+  timeout-minutes. Digest-pinning the production compose images is NOT
+  done — substituting fabricated digests is worse than mutable tags; it
+  needs a reviewed dependency process that records real digests (residual
+  below).
+
+Round-4 deferrals (new):
+
+- R01 = F02 (unchanged standing deferral — first-run grace is a product
+  decision; mitigations unchanged).
+- R03 = AUD-003/TO-006 (unchanged — atomic bootstrap claim-as-record).
+- R24/R25 = TO-021/TO-022 + F39-full (unchanged — replay pagination +
+  causal ordering ride the versioned player protocol).
+- R26 = TO-020 (unchanged — durable derived-work outbox design).
+- R14 durable half, R22 durable half: new deferrals of the same
+  derived-work class as TO-020 (see their entries above).
+- R45 digest-pinning residual: needs real reviewed digests; the permissions
+  /concurrency/timeout hardening landed.
+
+Round-4 restatements of standing items: none beyond the mappings above.
+AUD-017 and AUD-054's site-attribution half remain unchanged open hardening
+notes.
 
 Pass record (2026-09-17 audit, remediation session same day):
 
