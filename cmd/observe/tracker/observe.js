@@ -28,15 +28,6 @@
     }, { once: true });
   }
 
-  var queue = [];
-  var flushTimer = null;
-  var FLUSH_INTERVAL = 500;
-  // Audit F32: the server rejects >100 events per batch request with a 400
-  // the tracker treated as delivered. Send in legal chunks, keep a failed
-  // chunk for the next flush (bounded, so an outage cannot grow memory
-  // forever), and never send keepalive bodies the browser will refuse.
-  var MAX_BATCH_EVENTS = 100;
-  var MAX_KEPT_ON_FAILURE = 500;
   var currentUrl = null;
   // Set by window.observe.identify(userId). Persisted across page loads
   // via localStorage so SPA navigations and reloads don't lose it.
@@ -46,7 +37,7 @@
   } catch (e) { /* localStorage may be disabled */ }
 
   // F12 (protocol v2): producer identity + per-event stable ids, so a
-  // retried chunk re-presents the same event identities and the server can
+  // retried batch re-presents the same event identities and the server can
   // dedupe at admission and at flush.
   var PROTOCOL_VERSION = 2;
   var producerId = makeId();
@@ -79,6 +70,12 @@
   // Extract the allowlisted campaign params from the CURRENT query string.
   // Manual parse (no URLSearchParams dependency — the classic tracker
   // supports old browsers); values are decoded defensively and capped.
+  // R33 (round 4): each pair decodes under its own try/catch. One malformed
+  // percent escape anywhere in the query string used to throw out of
+  // campaignFields, which ran inside send() — a single bad pair could kill
+  // the initial pageview and abort tracker initialization before all
+  // listeners were installed. Malformed pairs are skipped; valid allowlisted
+  // attribution still ships.
   function campaignFields() {
     var out = {};
     var search = '';
@@ -87,18 +84,26 @@
     var parts = search.substring(1).split('&');
     for (var i = 0; i < parts.length; i++) {
       var kv = parts[i].split('=');
-      var key = decodeURIComponent(kv[0].replace(/\+/g, ' '));
-      if (UTM_KEYS.indexOf(key) === -1) continue;
-      var val = kv.length > 1 ? decodeURIComponent(kv.slice(1).join('=').replace(/\+/g, ' ')) : '';
+      var key, val;
+      try {
+        key = decodeURIComponent(kv[0].replace(/\+/g, ' '));
+        if (UTM_KEYS.indexOf(key) === -1) continue;
+        val = kv.length > 1 ? decodeURIComponent(kv.slice(1).join('=').replace(/\+/g, ' ')) : '';
+      } catch (e) { continue; }
       if (val) out[key] = val.substring(0, 256);
     }
     return out;
   }
 
-  // Reduce any href to origin+path for storage-safe wire values.
-  function sanitizeURL(href) {
+  // Reduce any captured href to origin+path for storage-safe wire values.
+  // R29 (round 4): relative URLs resolve against the document (the old
+  // `new URL(href)` without a base threw away every relative link and form
+  // action), and non-http(s) schemes are dropped.
+  function sanitizeURL(href, base) {
+    if (!href) return '';
     try {
-      var u = new URL(href);
+      var u = new URL(href, base || location.href);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
       return u.origin + u.pathname;
     } catch (e) {
       return '';
@@ -111,13 +116,256 @@
     return (target.textContent || '').trim().substring(0, 32);
   }
 
+  // ---------------------------------------------------------------------
+  // Delivery (R31/R32, round 4): single-flight, self-draining transport.
+  //
+  // The old flush() took at most the first 100 events and never scheduled
+  // the tail (a 101-event burst stranded one event forever), requeued
+  // failed batches without scheduling a retry (delivery depended on the
+  // next unrelated event), measured keepalive fitness in UTF-16 code units
+  // instead of bytes, and had no XHR failure handling at all. Events are
+  // now serialized to immutable JSON at CAPTURE (mutation of the caller's
+  // properties after track() cannot change what is sent, and a cyclic
+  // value is a capture-time rejection instead of a mid-flush throw that
+  // detached and lost the batch), budgeted by count AND bytes across
+  // queued+in-flight, and delivered by one in-flight request that keeps
+  // its frozen batch across bounded retries and reschedules itself until
+  // the queue is empty.
+  // ---------------------------------------------------------------------
+  var MAX_QUEUED_EVENTS = 500;         // retained-event cap (drop-oldest-free: reject-new)
+  var MAX_TOTAL_BYTES = 2 * 1024 * 1024;
+  var MAX_EVENT_BYTES = 32 * 1024;
+  var MAX_BODY_BYTES = 48 * 1024;      // byte budget, not UTF-16 length (R31)
+  var MAX_BATCH_EVENTS = 100;          // server per-request cap
+  var MAX_RETRY_ATTEMPTS = 5;
+  var RETRY_BASE_MS = 1000;
+  var RETRY_MAX_MS = 30000;
+  var FLUSH_DELAY_MS = 500;
+
+  var queue = [];          // frozen packets: {id, json, cost}
+  var pending = null;      // frozen batch: {body, count, cost}
+  var inFlight = false;
+  var drainScheduled = false;
+  var drainHandle = null;
+  var retryScheduled = false;
+  var retryHandle = null;
+  var retryAttempts = 0;
+  var usedCount = 0;
+  var usedBytes = 0;
+  var dropped = 0;
+
+  // Byte length of a string: Blob size when available (all fetch-capable
+  // browsers), else a conservative percent-escape estimate that overcounts
+  // non-ASCII — overcounting only tightens the budget (R31).
+  function byteLen(s) {
+    try {
+      if (typeof Blob === 'function') return new Blob([s]).size;
+    } catch (e) { /* fall through */ }
+    return encodeURIComponent(s).replace(/%[0-9A-Fa-f]{2}/g, 'x').length;
+  }
+
+  function reportDrop(reason, count) {
+    dropped += count;
+    try {
+      if (typeof window.observeOnDrop === 'function') window.observeOnDrop(reason, count);
+    } catch (e) { /* diagnostics must not throw into the page */ }
+  }
+
+  // Serialize the event ONCE at capture (R32). Returns null when the value
+  // is not JSON-serializable or exceeds the per-event cap.
+  function snapshotEvent(event) {
+    var json;
+    try { json = JSON.stringify(event); } catch (e) { return null; }
+    if (typeof json !== 'string') return null;
+    if (byteLen(json) > MAX_EVENT_BYTES) return null;
+    return json;
+  }
+
+  function enqueue(json, id) {
+    var cost = byteLen(json) + 128; // payload + envelope allowance
+    if (usedCount >= MAX_QUEUED_EVENTS || cost > MAX_TOTAL_BYTES - usedBytes) {
+      reportDrop('buffer_full', 1);
+      return false;
+    }
+    queue.push({ id: id, json: json, cost: cost });
+    usedCount++;
+    usedBytes += cost;
+    return true;
+  }
+
+  function releasePending() {
+    if (pending) {
+      usedCount -= pending.count;
+      usedBytes -= pending.cost;
+      pending = null;
+    }
+    retryAttempts = 0;
+  }
+
+  function dropPending(reason) {
+    reportDrop(reason, pending ? pending.count : 0);
+    releasePending();
+  }
+
+  function encodeBatch(packets) {
+    // v2 envelope; batch_id is the first event's stable id, so a retried
+    // batch presents the SAME identity (server admission dedupe, F12).
+    var parts = [];
+    for (var i = 0; i < packets.length; i++) parts.push(packets[i].json);
+    return '{"v":' + PROTOCOL_VERSION +
+      ',"producer_id":' + JSON.stringify(producerId) +
+      ',"batch_id":' + JSON.stringify(packets[0].id) +
+      ',"events":[' + parts.join(',') + ']}';
+  }
+
+  function makePendingBatch() {
+    var packets = [];
+    var cost = 0;
+    var body = '';
+    while (queue.length && packets.length < MAX_BATCH_EVENTS) {
+      var candidatePackets = packets.concat([queue[0]]);
+      var candidateBody = encodeBatch(candidatePackets);
+      var candidateBytes = byteLen(candidateBody);
+      if (candidateBytes > MAX_BODY_BYTES) break;
+      packets = candidatePackets;
+      body = candidateBody;
+      cost += queue[0].cost;
+      queue.shift();
+    }
+    if (!packets.length) {
+      // A single event that cannot fit any legal request: drop it at the
+      // flush boundary instead of a permanently failing retry head (the
+      // per-event cap makes this unreachable; kept as a guard).
+      var oversize = queue.shift();
+      usedCount--;
+      usedBytes -= oversize.cost;
+      reportDrop('event_exceeds_batch_budget', 1);
+      return null;
+    }
+    return { body: body, count: packets.length, cost: cost };
+  }
+
+  function retryDelay() {
+    var exp = RETRY_BASE_MS;
+    for (var i = 1; i < retryAttempts && exp < RETRY_MAX_MS; i++) exp *= 2;
+    if (exp > RETRY_MAX_MS) exp = RETRY_MAX_MS;
+    return exp;
+  }
+
+  // Scheduling uses booleans as the source of truth, not timer handles: a
+  // host whose setTimeout runs the callback synchronously (test sandboxes,
+  // some embedded webviews) would otherwise leave a stale handle parked in
+  // the timer variable and block every future drain.
+  function scheduleDrain(delay) {
+    if (inFlight || (!pending && !queue.length)) return;
+    if (drainScheduled || retryScheduled) return;
+    drainScheduled = true;
+    drainHandle = setTimeout(function() {
+      drainScheduled = false;
+      pump();
+    }, delay);
+  }
+
+  function scheduleRetry(delay) {
+    if (drainScheduled || retryScheduled) return;
+    retryScheduled = true;
+    retryHandle = setTimeout(function() {
+      retryScheduled = false;
+      pump();
+    }, delay);
+  }
+
+  function pump() {
+    if (inFlight) return;
+    if (!pending && queue.length) pending = makePendingBatch();
+    if (!pending) { scheduleDrain(FLUSH_DELAY_MS); return; }
+    inFlight = true;
+    deliver(pending.body, function(outcome) {
+      inFlight = false;
+      if (outcome === 'ok') {
+        releasePending();
+        scheduleDrain(0); // drain the tail without waiting for a new event
+      } else if (outcome === 'retry') {
+        retryAttempts++;
+        if (retryAttempts >= MAX_RETRY_ATTEMPTS) {
+          dropPending('retry_budget_exhausted');
+          scheduleDrain(0);
+        } else {
+          scheduleRetry(retryDelay());
+        }
+      } else {
+        dropPermanent();
+      }
+    });
+  }
+
+  function dropPermanent() {
+    dropPending('permanent_rejection');
+    scheduleDrain(0);
+  }
+
+  // One delivery attempt. cb('ok' | 'retry' | 'drop'). Transient outcomes:
+  // network error, 408/425/429, 5xx. Permanent: other 4xx (the server
+  // rejected the request itself; retrying identical bytes cannot succeed).
+  function deliver(body, cb) {
+    // Keyless delivery is gone (AUD-002 removed keyless ingest server-side;
+    // TO-051 removed the SDK's beacon fallback — this closes the classic
+    // tracker's copy). Without a key the batch cannot be accepted; drop it
+    // loudly instead of beaconing to a 401.
+    if (!apiKey) {
+      reportDrop('missing_api_key', pending ? pending.count : 1);
+      releasePending();
+      cb('drop');
+      return;
+    }
+
+    if (typeof fetch === 'function') {
+      var headers = { 'Content-Type': 'application/json', 'X-API-Key': apiKey };
+      fetch(endpoint, {
+        method: 'POST',
+        headers: headers,
+        body: body,
+        keepalive: byteLen(body) <= MAX_BODY_BYTES,
+        mode: 'cors',
+        credentials: 'omit'
+      }).then(function(res) {
+        if (res.ok) return cb('ok');
+        if (res.status === 408 || res.status === 425 || res.status === 429 || res.status >= 500) return cb('retry');
+        cb('drop');
+      }).catch(function() { cb('retry'); });
+      return;
+    }
+
+    // XHR fallback WITH failure handling (R31: this branch used to fire and
+    // forget — no onload/onerror at all).
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', endpoint, true);
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.setRequestHeader('X-API-Key', apiKey);
+      xhr.onload = function() {
+        if (xhr.status >= 200 && xhr.status < 300) return cb('ok');
+        if (xhr.status === 408 || xhr.status === 425 || xhr.status === 429 || xhr.status >= 500) return cb('retry');
+        cb('drop');
+      };
+      xhr.onerror = function() { cb('retry'); };
+      xhr.ontimeout = function() { cb('retry'); };
+      xhr.send(body);
+    } catch (e) {
+      cb('retry');
+    }
+  }
+
   function send(eventType, props) {
     var payload = {
       event_type: eventType || 'pageview',
       event_id: makeId(),
       site_id: siteId,
       url: pageURL(),
-      referrer: document.referrer || '',
+      // R29 (round 4): the referrer is reduced client-side — the raw value
+      // (which can carry its own query tokens) never crosses the wire. The
+      // server-side cleanReferrer stays as the backstop.
+      referrer: sanitizeURL(document.referrer || ''),
       title: document.title || '',
       language: navigator.language || '',
       screen: screen.width + 'x' + screen.height
@@ -129,79 +377,27 @@
     if (props) payload.properties = props;
     if (distinctId) payload.distinct_id = distinctId;
 
-    queue.push(payload);
-
-    if (!flushTimer) {
-      flushTimer = setTimeout(flush, FLUSH_INTERVAL);
+    // R32 (round 4): snapshot at admission. The queue holds serialized
+    // bytes, never the caller's mutable object; a cyclic or BigInt value
+    // rejects HERE (diagnostic, contained) instead of throwing out of a
+    // later flush after the batch was already detached.
+    var json = snapshotEvent(payload);
+    if (json === null) {
+      reportDrop('not_json_serializable_or_too_large', 1);
+      return;
     }
+    enqueue(json, payload.event_id);
+    scheduleDrain(FLUSH_DELAY_MS);
   }
 
+  // Public flush: called on visibility-hidden. Best effort — a fetch with
+  // keepalive survives unload; XHR may not.
   function flush() {
-    flushTimer = null;
-    if (!queue.length) return;
-
-    var batch = queue.splice(0, MAX_BATCH_EVENTS);
-
-    var sendChunk = function(events) {
-      // F12 v2 envelope. batch_id is the first event's stable event_id, so
-      // a requeued chunk that is retried on a later flush presents the SAME
-      // batch id (and the same event ids) to the server.
-      var body = JSON.stringify({
-        v: PROTOCOL_VERSION,
-        producer_id: producerId,
-        batch_id: events.length ? events[0].event_id : '',
-        events: events
-      });
-
-      // sendBeacon cannot set request headers, so a keyed install sends the
-      // key via fetch with keepalive — same survives-unload guarantee — and
-      // falls back to XHR where fetch is unavailable. An unchecked beacon
-      // return used to count a refused queuing as delivered (audit F32);
-      // a false return now falls through to fetch.
-      if (!apiKey && navigator.sendBeacon) {
-        try {
-          if (navigator.sendBeacon(endpoint, new Blob([body], { type: 'application/json' }))) {
-            return;
-          }
-        } catch (e) { /* fall through to fetch */ }
-      }
-
-      if (typeof fetch === 'function') {
-        var headers = { 'Content-Type': 'application/json' };
-        if (apiKey) headers['X-API-Key'] = apiKey;
-        fetch(endpoint, {
-          method: 'POST',
-          headers: headers,
-          body: body,
-          keepalive: body.length <= 48 * 1024,
-          mode: 'cors',
-          credentials: 'omit'
-        }).then(function(res) {
-          if (!res.ok && queue.length < MAX_KEPT_ON_FAILURE) {
-            // Server rejected the chunk — retain for the next flush tick
-            // rather than silently erasing it. (Without producer-side
-            // idempotency a retried chunk may double-count; the server-side
-            // batch admission contract is tracked as audit F12 follow-up.)
-            queue = events.concat(queue);
-          }
-        }).catch(function() {
-          if (queue.length < MAX_KEPT_ON_FAILURE) queue = events.concat(queue);
-        });
-        return;
-      }
-
-      var xhr = new XMLHttpRequest();
-      xhr.open('POST', endpoint, true);
-      xhr.setRequestHeader('Content-Type', 'application/json');
-      if (apiKey) xhr.setRequestHeader('X-API-Key', apiKey);
-      xhr.send(body);
-    };
-
-    // Chunk to the server's per-request event cap; one flush may need
-    // several requests when the queue grew past it.
-    for (var i = 0; i < batch.length; i += MAX_BATCH_EVENTS) {
-      sendChunk(batch.slice(i, i + MAX_BATCH_EVENTS));
-    }
+    if (drainScheduled && drainHandle !== null) { clearTimeout(drainHandle); drainHandle = null; }
+    if (retryScheduled && retryHandle !== null) { clearTimeout(retryHandle); retryHandle = null; }
+    drainScheduled = false;
+    retryScheduled = false;
+    pump();
   }
 
   function trackPageview() {
@@ -317,7 +513,11 @@
         var form = e.target;
         if (!form || !form.tagName) return;
         var id = form.id ? '#' + form.id : '';
-        var action = form.getAttribute('action') || '';
+        // R29 (round 4): the form action is a captured URL — sanitize it
+        // like every other (a relative action resolves against the page; a
+        // token-bearing query never leaves). An empty action means the form
+        // posts back to the current page.
+        var action = sanitizeURL(form.getAttribute('action')) || pageURL();
         send('form_submit', { selector: 'form' + id, action: action });
       }, true);
 
@@ -406,12 +606,27 @@
       send(name || 'custom', props);
     },
     pageview: trackPageview,
+    flush: flush,
     revenue: function(amount, currency, props) {
-      var p = props || {};
+      // R32 (round 4): build a fresh object — do not write amount/currency
+      // into the caller's properties.
+      var p = {};
+      if (props) {
+        for (var k in props) {
+          if (Object.prototype.hasOwnProperty.call(props, k)) p[k] = props[k];
+        }
+      }
       p.amount = amount;
       p.currency = currency || 'USD';
       send('revenue', p);
     },
+    /**
+     * Delivery diagnostics (R31): how many events this tracker dropped
+     * locally (buffer full, unserializable, retry budget exhausted, keyless
+     * install) — the honest counter for "events you expected but never
+     * landed".
+     */
+    droppedEvents: function() { return dropped; },
     /**
      * Associate subsequent events with a user identifier. The server
      * hashes the value with the per-site session_salt before storage —
