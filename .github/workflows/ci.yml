@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+# R45 (round 4): least-privilege default (no job here needs write access),
+# and a superseded push to the same branch cancels its own stale run.
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 # This repo embeds the built UI at cmd/observe/ui/dist/ as part of the
 # repo (single-binary story). CI only needs to build + test the Go code
 # — no pnpm, no Rust toolchain, no Nucleus build. Local devs run
@@ -14,6 +22,7 @@ on:
 jobs:
   go:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -39,6 +48,7 @@ jobs:
   # sandbox (lifecycle, delivery retention, beacon policy).
   tracker-contracts:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -48,6 +58,7 @@ jobs:
 
   sdk-go:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -65,6 +76,7 @@ jobs:
   # checks. Node 20 and Python 3.12 match the versions the SDKs declare.
   sdk-browser:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -84,6 +96,7 @@ jobs:
 
   sdk-python:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -104,6 +117,7 @@ jobs:
   # working tree at), runs scripts/ui-sync.sh, and fails on any drift.
   ui-freshness:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -158,6 +172,7 @@ jobs:
   # separately rather than replacing this one.
   nucleus-integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -210,6 +225,7 @@ jobs:
   # the honest browser-level check of the product's core surface.
   e2e-smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -235,14 +251,24 @@ jobs:
           exit 1
       - name: Build observe
         run: go build -o /tmp/observe ./cmd/observe
+      - name: Generate per-run test JWT secret
+        # R44 (round 4): the inline literal violated the app's own >=16-char
+        # policy, so the job could never pass startup validation.
+        run: echo "E2E_JWT_SECRET=ci-e2e-$(openssl rand -hex 24)" >> "$GITHUB_ENV"
       - name: Boot observe (seeded)
         run: |
           OBSERVE_NUCLEUS_URL='postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable' \
           OBSERVE_ADMIN_PASSWORD=observe-e2e-pass \
-          OBSERVE_JWT_SECRET=ci-e2e-secret \
+          OBSERVE_JWT_SECRET="$E2E_JWT_SECRET" \
           OBSERVE_SEED_DEMO=true \
-          /tmp/observe &
+          /tmp/observe >/tmp/observe-ci.log 2>&1 &
+          OBS_PID=$!
           for i in $(seq 1 120); do
+            if ! kill -0 "$OBS_PID" 2>/dev/null; then
+              cat /tmp/observe-ci.log >&2
+              wait "$OBS_PID" || true
+              exit 1
+            fi
             if curl -fsS http://127.0.0.1:3000/healthz >/dev/null 2>&1; then exit 0; fi
             sleep 1
           done
@@ -268,6 +294,7 @@ jobs:
   # executed against the source the product compiles against.
   nucleus-lease:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -303,14 +330,22 @@ jobs:
           exit 1
       - name: Build observe
         run: go build -o /tmp/observe ./cmd/observe
+      - name: Generate per-run test JWT secret
+        # R44 (round 4): same policy fix as e2e-smoke.
+        run: echo "LEASE_JWT_SECRET=ci-lease-$(openssl rand -hex 24)" >> "$GITHUB_ENV"
       - name: Boot once to apply migrations
         run: |
           OBSERVE_NUCLEUS_URL='postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable' \
           OBSERVE_ADMIN_PASSWORD=ci-lease-migration-boot \
-          OBSERVE_JWT_SECRET=ci-lease-secret \
-          /tmp/observe &
+          OBSERVE_JWT_SECRET="$LEASE_JWT_SECRET" \
+          /tmp/observe >/tmp/observe-ci.log 2>&1 &
           OBS_PID=$!
           for i in $(seq 1 90); do
+            if ! kill -0 "$OBS_PID" 2>/dev/null; then
+              cat /tmp/observe-ci.log >&2
+              wait "$OBS_PID" || true
+              exit 1
+            fi
             if curl -fsS http://127.0.0.1:3000/healthz >/dev/null 2>&1; then
               kill "$OBS_PID" 2>/dev/null || true
               exit 0

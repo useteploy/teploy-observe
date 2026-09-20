@@ -41,6 +41,10 @@ services:
   nucleus:
     image: ghcr.io/neutron-build/nucleus:latest
     restart: unless-stopped
+    networks:
+      # R43 (round 4): database on the internal backend network only — the
+      # TLS proxy (and anything else on frontend) cannot reach it directly.
+      backend: {}
     volumes:
       - nucleus_data:/data
     command: ["start", "--port", "5432", "--cluster-port", "5433", "--data", "/data", "--max-memory", "512"]
@@ -66,6 +70,10 @@ services:
       # already be private; see the header notes for tailnet/LAN and
       # public-ingest topologies.
       - "127.0.0.1:3000:3000"
+    networks:
+      frontend:
+        ipv4_address: 172.30.10.3
+      backend: {}
     environment:
       OBSERVE_ADDR: ":3000"
       OBSERVE_NUCLEUS_URL: "postgres://nucleus:5432/observe"
@@ -84,6 +92,14 @@ services:
       # production path. Set OBSERVE_SEED_DEMO=true explicitly for the
       # demo experience (matching the application's own default).
       OBSERVE_SEED_DEMO: "${OBSERVE_SEED_DEMO:-false}"
+      # R43 (round 4): behind the supplied Caddy profile, trust ONLY the
+      # proxy (its fixed address on the isolated frontend network below),
+      # and publish the canonical external URL so generated links (share
+      # links, SSO redirects) stop falling back to request metadata. The
+      # subnet belongs to this compose project alone, so the default
+      # cannot accidentally trust some other deployment's container.
+      OBSERVE_TRUSTED_PROXIES: "${OBSERVE_TRUSTED_PROXIES:-172.30.10.2/32}"
+      OBSERVE_PUBLIC_URL: "${OBSERVE_PUBLIC_URL:-https://${OBSERVE_DOMAIN:-observe.localhost}}"
     volumes:
       - observe_data:/var/lib/observe
     depends_on:
@@ -97,10 +113,17 @@ services:
   # Optional: Caddy reverse proxy with automatic TLS via Let's Encrypt.
   # Enable with:  docker compose --profile tls up -d
   # Requires OBSERVE_DOMAIN to point at this host and ports 80/443 open.
+  # R43 (round 4): Caddy gets a FIXED address on the frontend network —
+  # that address (and nothing else) is what observe trusts for forwarded
+  # client-IP headers. The database sits on the separate internal backend
+  # network, which Caddy cannot reach.
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
     profiles: [tls]
+    networks:
+      frontend:
+        ipv4_address: 172.30.10.2
     ports:
       - "80:80"
       - "443:443"
@@ -117,6 +140,14 @@ services:
     depends_on:
       observe:
         condition: service_healthy
+
+networks:
+  frontend:
+    ipam:
+      config:
+        - subnet: 172.30.10.0/24
+  backend:
+    internal: true
 
 volumes:
   nucleus_data:
