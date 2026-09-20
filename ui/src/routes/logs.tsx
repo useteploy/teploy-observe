@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "preact/hooks";
+import { useState, useEffect, useCallback, useRef } from "preact/hooks";
 import { logsApi } from "../api/logs.js";
 import type { LogEntry, LogStats, LogHistogramBucket } from "../api/logs.js";
 import SearchInput from "../components/shared/SearchInput.js";
@@ -214,15 +214,36 @@ export default function LogsPage() {
   const [stats, setStats] = useState<LogStats[]>([]);
   const [histogram, setHistogram] = useState<LogHistogramBucket[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [activeLevel, setActiveLevel] = useState<string>("ALL");
   const [service, setService] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const [live, setLive] = useState(false);
+  // R38: live entries are their own capped list — a historical refresh can
+  // no longer overwrite the tail the user is watching.
+  const [liveEntries, setLiveEntries] = useState<LogEntry[]>([]);
+
+  // R37: generation guard — a slow response for site/query A must never
+  // overwrite the results of a newer request for B, and an unmounted page
+  // must never setState at all.
+  const requestGeneration = useRef(0);
+  useEffect(() => () => { requestGeneration.current++; }, []);
+
+  // R38: any filter/site change resets pagination — applying a restrictive
+  // filter while on page five used to render "no results" for a query that
+  // HAD results on page one.
+  useEffect(() => { setPage(1); }, [siteId, query, activeLevel, service]);
+
+  // R38: the live stream cannot evaluate text search (the server filters
+  // live by site only); disable it rather than implying a filtered tail.
+  useEffect(() => { if (query.trim()) setLive(false); }, [query]);
 
   const fetchLogs = useCallback(async () => {
+    const generation = ++requestGeneration.current;
     setLoading(true);
+    setError(null);
     const now = new Date();
     const from = new Date(now.getTime() - 86400000);
     const fromStr = from.toISOString();
@@ -242,17 +263,19 @@ export default function LogsPage() {
         logsApi.stats(siteId, fromStr, toStr),
         logsApi.histogram(siteId, fromStr, toStr),
       ]);
+      if (generation !== requestGeneration.current) return;
 
       setLogs(logData || []);
       setStats(statData || []);
       setHistogram(histData || []);
     } catch (err) {
       console.error("Failed to fetch logs:", err);
-      setLogs([]);
-      setStats([]);
-      setHistogram([]);
+      if (generation !== requestGeneration.current) return;
+      // R37: a failed request is an ERROR, not "no data" — an outage used to
+      // render the same "No logs yet" empty state as a healthy empty site.
+      setError(err instanceof Error ? err.message : "Unable to load logs");
     } finally {
-      setLoading(false);
+      if (generation === requestGeneration.current) setLoading(false);
     }
   }, [siteId, query, activeLevel, service, page]);
 
@@ -278,10 +301,11 @@ export default function LogsPage() {
       es.onmessage = (e) => {
         try {
           const entry = JSON.parse(e.data) as LogEntry;
-          // Respect active level / service filters on the client.
+          // Respect active level / service filters on the client (text
+          // search disables live entirely — R38).
           if (activeLevel !== "ALL" && entry.level?.toLowerCase() !== activeLevel.toLowerCase()) return;
           if (service.trim() && entry.service_name !== service.trim()) return;
-          setLogs((prev) => [entry, ...prev].slice(0, 200));
+          setLiveEntries((prev) => [entry, ...prev].slice(0, 200));
         } catch { /* ignore */ }
       };
       es.onerror = () => {
@@ -339,9 +363,10 @@ export default function LogsPage() {
         />
         <button
           class={`logs-live-btn ${live ? "logs-live-btn--active" : ""}`}
-          onClick={() => setLive((v) => !v)}
+          onClick={() => { setLive((v) => !v); setLiveEntries([]); }}
+          disabled={query.trim().length > 0}
           aria-pressed={live}
-          title={live ? "Stop live tail" : "Start live tail"}
+          title={query.trim() ? "Clear text search to use live tail" : live ? "Stop live tail" : "Start live tail"}
         >
           <span class="logs-live-dot" aria-hidden="true" />
           {live ? "Live" : "Go live"}
@@ -400,6 +425,36 @@ export default function LogsPage() {
       {/* Log Entries */}
       {loading ? (
         <LogEntrySkeleton />
+      ) : error !== null ? (
+        /* R37: an explicit error state with retry — never rendered as an
+           indistinguishable "no logs" empty state again. */
+        <EmptyState
+          title="Unable to load logs"
+          description={error}
+          icon="zap"
+          actions={[{ label: "Retry", onClick: () => { void fetchLogs(); }, primary: true }]}
+        />
+      ) : live ? (
+        /* R38: the live tail is its own list — not paginated, not
+           overwriteable by a historical fetch. */
+        liveEntries.length === 0 ? (
+          <EmptyState
+            title="Waiting for logs"
+            description="Live tail is connected. New log entries will appear here as they are ingested."
+            icon="zap"
+          />
+        ) : (
+          <div class="logs-list obs-stagger">
+            {liveEntries.map((entry) => (
+              <LogRow
+                key={entry.log_id}
+                entry={entry}
+                expanded={expandedId === entry.log_id}
+                onToggle={() => toggleExpand(entry.log_id)}
+              />
+            ))}
+          </div>
+        )
       ) : logs.length === 0 ? (
         query || activeLevel !== "ALL" || service ? (
           <EmptyState
@@ -433,6 +488,7 @@ export default function LogsPage() {
               />
             ))}
           </div>
+          {/* R38: pagination describes the historical query only. */}
           <Pagination page={page} pageSize={PAGE_SIZE} resultCount={logs.length} onPageChange={(p) => { setPage(p); window.scrollTo(0, 0); }} />
         </>
       )}
