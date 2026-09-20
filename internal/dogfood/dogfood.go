@@ -220,7 +220,7 @@ func ensureMetaAPIKey(ctx context.Context, db *nucleus.Client, authSvc *auth.Aut
 	if err == nil && len(rows) > 0 && rows[0].Value != "" {
 		return rows[0].Value, nil
 	}
-	plaintext, _, err := authSvc.CreateAPIKey(ctx, MetaSiteID, "dogfood")
+	plaintext, _, err := authSvc.CreateAPIKey(ctx, MetaSiteID, "dogfood", nil)
 	if err != nil {
 		return "", err
 	}

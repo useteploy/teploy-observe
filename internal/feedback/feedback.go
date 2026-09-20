@@ -68,15 +68,20 @@ func (s *FeedbackService) Submit(ctx context.Context, input FeedbackInput) (stri
 }
 
 func (s *FeedbackService) List(ctx context.Context, siteID string, from, to time.Time, limit int) ([]FeedbackEntry, error) {
+	// R21 (round 4): caller-supplied limit is capped (stable total order),
+	// matching the monitoring package's list policy.
 	if limit <= 0 {
 		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
 	}
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 	return nucleus.Query[FeedbackEntry](ctx, s.db.SQL(),
 		fmt.Sprintf(`SELECT feedback_id, tenant_id, site_id, session_id, url, message, email, category, timestamp
 		 FROM feedback WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-		 ORDER BY timestamp DESC LIMIT %d`, limit),
+		 ORDER BY timestamp DESC, feedback_id DESC LIMIT %d`, limit),
 		siteID, fromMs, toMs,
 	)
 }

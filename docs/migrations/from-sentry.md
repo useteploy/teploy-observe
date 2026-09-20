@@ -112,10 +112,12 @@ Same upload model — bundle with sourcemaps, upload for a release, frames get
 symbolicated on read.
 
 ```bash
-# Generate and upload
-npm run build -- --sourcemap
+# Generate and upload. Source-map upload is a PUBLISH capability, not
+# telemetry: use a key created for CI with scopes ["publish"] (R07) — the
+# browser-exposed telemetry key is rejected here.
+#   POST /api/v1/sites/{site_id}/keys  {"label":"ci","scopes":["publish"]}
 curl -X POST https://observe.example.com/api/v1/sourcemaps/upload \
-  -H "X-API-Key: $OBSERVE_API_KEY" \
+  -H "X-API-Key: $OBSERVE_PUBLISH_KEY" \
   -F release=v1.4.2 \
   -F file=@dist/app.js.map \
   -F filename=app.js

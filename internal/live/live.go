@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -37,6 +38,11 @@ type liveEvent struct {
 
 // Handler returns an http.HandlerFunc that streams live events via SSE.
 // Register as: r.HandleFunc("GET /api/v1/stats/live", liveSvc.Handler())
+//
+// R16 (round 4): every frame is written under a renewed bounded write
+// deadline — the server's total WriteTimeout otherwise kills the stream on
+// its first write past the connection deadline (the 15s heartbeat always
+// outlived a 10s timeout).
 func (s *LiveService) Handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		siteID := r.URL.Query().Get("site_id")
@@ -45,18 +51,14 @@ func (s *LiveService) Handler() http.HandlerFunc {
 			return
 		}
 
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "streaming not supported", http.StatusInternalServerError)
-			return
-		}
-
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(http.StatusOK)
-		flusher.Flush()
+		if writeSSEFrame(w, "") != nil {
+			return
+		}
 
 		ctx := r.Context()
 		lastSeen := time.Now().UTC().Add(-30 * time.Second)
@@ -70,10 +72,9 @@ func (s *LiveService) Handler() http.HandlerFunc {
 			case <-ctx.Done():
 				return
 			case <-heartbeat.C:
-				if _, err := fmt.Fprint(w, ":ping\n\n"); err != nil {
+				if writeSSEFrame(w, ":ping\n\n") != nil {
 					return
 				}
-				flusher.Flush()
 			case <-pollTicker.C:
 				events, err := s.pollEvents(ctx, siteID, lastSeen)
 				if err != nil {
@@ -85,7 +86,7 @@ func (s *LiveService) Handler() http.HandlerFunc {
 					if err != nil {
 						continue
 					}
-					if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+					if writeSSEFrame(w, "data: "+string(data)+"\n\n") != nil {
 						return
 					}
 					evTS := time.UnixMilli(ev.Timestamp)
@@ -93,12 +94,24 @@ func (s *LiveService) Handler() http.HandlerFunc {
 						lastSeen = evTS
 					}
 				}
-				if len(events) > 0 {
-					flusher.Flush()
-				}
 			}
 		}
 	}
+}
+
+// writeSSEFrame writes one SSE frame under a fresh finite write deadline and
+// flushes. An empty frame only establishes/flushes headers.
+func writeSSEFrame(w http.ResponseWriter, frame string) error {
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return fmt.Errorf("set stream deadline: %w", err)
+	}
+	if frame != "" {
+		if _, err := io.WriteString(w, frame); err != nil {
+			return err
+		}
+	}
+	return rc.Flush()
 }
 
 func (s *LiveService) pollEvents(ctx context.Context, siteID string, after time.Time) ([]liveEvent, error) {

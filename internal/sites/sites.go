@@ -147,6 +147,20 @@ func (s *SiteService) Get(ctx context.Context, siteID string) (Site, error) {
 	return site, nil
 }
 
+// Exists reports whether a site row exists. Distinguishes absence (false,
+// nil) from a store failure (error) so fail-closed callers — e.g. the public
+// feedback route's abuse control (R41, round 4) — never treat an outage as
+// permission to write.
+func (s *SiteService) Exists(ctx context.Context, siteID string) (bool, error) {
+	rows, err := nucleus.Query[struct {
+		SiteID string `db:"site_id"`
+	}](ctx, s.db.SQL(), "SELECT site_id FROM sites WHERE site_id = $1", siteID)
+	if err != nil {
+		return false, fmt.Errorf("sites: exists: %w", err)
+	}
+	return len(rows) > 0, nil
+}
+
 // EnsureDefault creates a site with site_id="default" if none exists.
 // Used on first boot so UI defaults that reference "default" work out of the box.
 func (s *SiteService) EnsureDefault(ctx context.Context) error {

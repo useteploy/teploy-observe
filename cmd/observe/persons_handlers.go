@@ -57,7 +57,10 @@ func listPersonsHandler(svc *persons.Service) neutron.HandlerFunc[listPersonsInp
 		if in.SiteID == "" {
 			return listPersonsResult{}, neutron.ErrBadRequest("site_id required")
 		}
-		from, to := parseTimeRange(in.From, in.To)
+		from, to, err := parseTimeRange(in.From, in.To)
+		if err != nil {
+			return listPersonsResult{}, neutron.ErrBadRequest(err.Error())
+		}
 		fromMs, toMs := from.UnixMilli(), to.UnixMilli()
 
 		rows, err := svc.ListPersons(ctx, in.SiteID, fromMs, toMs, in.Limit, in.Offset, in.IncludeAnonymous)

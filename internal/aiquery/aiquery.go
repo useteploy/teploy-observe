@@ -4,10 +4,10 @@
 // POST /api/v1/ai/query with a question and receive a SQL draft.
 //
 // Safety is layered:
-//   1. Admin-supplied API key: Observe never sees user credentials.
-//   2. LLM output is post-processed by explorer.classifyReadOnlySQL so
-//      write statements are rejected even if the model drafts one.
-//   3. Rate limit applies per user (enforced at the HTTP layer).
+//  1. Admin-supplied API key: Observe never sees user credentials.
+//  2. LLM output is post-processed by explorer.classifyReadOnlySQL so
+//     write statements are rejected even if the model drafts one.
+//  3. Rate limit applies per user (enforced at the HTTP layer).
 package aiquery
 
 import (
@@ -86,14 +86,19 @@ func (s *Service) GetConfig(ctx context.Context) (Config, error) {
 
 // SetConfig persists the AI config.  Admin-only — the caller must enforce
 // RBAC.  A blank APIKey preserves the existing key (so the admin can
-// re-save the form without retyping it).
+// re-save the form without retyping it). R39 (round 4): if the existing key
+// cannot be LOADED (read failure, decrypt failure), the update fails — the
+// old code ignored the load error and proceeded with an empty key, turning
+// a transient backend problem into silent credential deletion.
 func (s *Service) SetConfig(ctx context.Context, cfg Config) error {
 	if cfg.APIKey == "" {
-		// Preserve existing key on partial update.
+		// Preserve existing key on partial update — but only when the
+		// existing key is actually loadable.
 		existing, err := s.loadFullConfig(ctx)
-		if err == nil && existing.APIKey != "" {
-			cfg.APIKey = existing.APIKey
+		if err != nil {
+			return fmt.Errorf("aiquery: cannot preserve existing API key: %w", err)
 		}
+		cfg.APIKey = existing.APIKey
 	}
 	if cfg.Endpoint == "" {
 		cfg.Endpoint = defaultURL
@@ -140,11 +145,11 @@ func (s *Service) loadFullConfig(ctx context.Context) (Config, error) {
 
 // GenerateResult is the shape returned to the UI.
 type GenerateResult struct {
-	SQL        string `json:"sql"`
-	Model      string `json:"model"`
-	LatencyMs  int64  `json:"latency_ms"`
-	TokensIn   int    `json:"tokens_in,omitempty"`
-	TokensOut  int    `json:"tokens_out,omitempty"`
+	SQL       string `json:"sql"`
+	Model     string `json:"model"`
+	LatencyMs int64  `json:"latency_ms"`
+	TokensIn  int    `json:"tokens_in,omitempty"`
+	TokensOut int    `json:"tokens_out,omitempty"`
 }
 
 // Generate asks the configured LLM to translate question into SQL,
@@ -202,7 +207,10 @@ func (s *Service) Generate(ctx context.Context, question, schemaCard string) (Ge
 	// caller (it can contain the provider's own error detail / echoed input).
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if resp.StatusCode >= 400 {
-		s.logger.Error("aiquery upstream error", "status", resp.StatusCode, "body", string(body))
+		// R40 (round 4): log status only. The bounded body can echo the
+		// user's question or other provider-side sensitive detail; it is not
+		// written to operational logs by default.
+		s.logger.Error("aiquery upstream error", "status", resp.StatusCode)
 		return GenerateResult{}, fmt.Errorf("aiquery: upstream returned %d", resp.StatusCode)
 	}
 

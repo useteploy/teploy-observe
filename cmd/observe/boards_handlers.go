@@ -64,7 +64,10 @@ func boardsSummaryHandler(svc *query.BoardService) neutron.HandlerFunc[boardsSum
 		if len(ids) == 0 {
 			return []query.SiteRow{}, nil
 		}
-		from, to := parseTimeRange(in.From, in.To)
+		from, to, err := parseTimeRange(in.From, in.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		rows, err := svc.BoardSummary(ctx, ids, from.UnixMilli(), to.UnixMilli())
 		if err != nil {
 			return nil, err

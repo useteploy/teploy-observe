@@ -382,6 +382,13 @@ func prepareEvent(ctx context.Context, input IngestInput, salt string, siteSvc *
 	return e, nil
 }
 
+// CapturedURL is the exported captured-page-URL policy (R28, round 4): one
+// reduction shared by analytics, error ingestion, and replay session
+// upserts, so no producer class can park credentials, query tokens, or
+// fragments in a stored URL field. Unparseable or non-http(s) input drops
+// entirely (fail closed).
+func CapturedURL(raw string) string { return sanitizeEventURL(raw) }
+
 // sanitizeEventURL reduces a tracker-captured page URL to scheme + host +
 // path (F41): credentials, query, and fragment never reach storage — the
 // wire contract has trackers strip them client-side, and this is the

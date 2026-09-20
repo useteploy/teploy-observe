@@ -13,6 +13,7 @@ import (
 	"github.com/neutron-dev/neutron-go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/identity"
+	"github.com/useteploy/teploy-observe/internal/ingest"
 	"github.com/useteploy/teploy-observe/internal/sourcemaps"
 )
 
@@ -151,6 +152,12 @@ func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (strin
 	if input.Level == "" {
 		input.Level = "error"
 	}
+	// R28 (round 4): the captured page URL gets the SAME privacy boundary
+	// the analytics path enforces (F41) — userinfo, query, and fragment are
+	// stripped before persistence, and a non-http(s) or unparseable URL is
+	// dropped. Applied before the grouphash so rage-click grouping digests
+	// the sanitized value consistently.
+	input.URL = ingest.CapturedURL(input.URL)
 
 	// Compute grouphash
 	var groupHash string

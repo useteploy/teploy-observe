@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,6 +81,22 @@ type MonitorResult struct {
 	ErrorMessage string `json:"error_message" db:"error_message"`
 }
 
+// nextMutationVersion returns a replacement-table version strictly greater
+// than prior (R19, round 4): same-millisecond mutations and clock rollback
+// must not produce tied or regressed versions — latest-row collapse would
+// keep the stale row and undo the delete/update.
+func nextMutationVersion(prior, nowMS int64) string {
+	next := nextMutationVersionInt(prior, nowMS)
+	return strconv.FormatInt(next, 10)
+}
+
+func nextMutationVersionInt(prior, nowMS int64) int64 {
+	if prior+1 > nowMS {
+		return prior + 1
+	}
+	return nowMS
+}
+
 // CreateMonitor inserts a new uptime monitor.
 func (s *UptimeService) CreateMonitor(ctx context.Context, m Monitor) (*Monitor, error) {
 	m.MonitorID = genID()
@@ -97,14 +115,19 @@ func (s *UptimeService) CreateMonitor(ctx context.Context, m Monitor) (*Monitor,
 	if err := netsafe.ValidateURL(m.URL); err != nil {
 		return nil, fmt.Errorf("monitor url: %w", err)
 	}
-	if !m.Enabled {
-		m.Enabled = true
-	}
+	// R20 (round 4): numeric configuration is validated, not silently
+	// rewritten into something else. Defaults apply only to zero values
+	// (omitted fields); an explicit Enabled=false now stays false — the old
+	// `if !m.Enabled { m.Enabled = true }` made a disabled monitor
+	// impossible to create while reporting that it had been.
 	if m.ExpectedStatus == 0 {
 		m.ExpectedStatus = 200
 	}
 	if m.IntervalSecs == 0 {
 		m.IntervalSecs = 60
+	}
+	if err := validateMonitor(m); err != nil {
+		return nil, err
 	}
 
 	_, err := s.db.SQL().Exec(ctx,
@@ -118,6 +141,27 @@ func (s *UptimeService) CreateMonitor(ctx context.Context, m Monitor) (*Monitor,
 		return nil, fmt.Errorf("monitoring: create monitor: %w", err)
 	}
 	return &m, nil
+}
+
+// ValidateMonitor is the exported boundary check (handlers map it to 400);
+// CreateMonitor applies it again as defense in depth.
+func ValidateMonitor(m Monitor) error { return validateMonitor(m) }
+
+// validateMonitor enforces the numeric bounds R20 (round 4): an accepted
+// configuration must behave the way it reads. Interval floor of 10s keeps the
+// scheduler honest; ceiling of a day; expected status must be a real HTTP
+// status code.
+func validateMonitor(m Monitor) error {
+	if strings.TrimSpace(m.SiteID) == "" || strings.TrimSpace(m.Name) == "" {
+		return fmt.Errorf("monitoring: site_id and name are required")
+	}
+	if m.IntervalSecs < 10 || m.IntervalSecs > 86400 {
+		return fmt.Errorf("monitoring: interval_secs must be between 10 and 86400")
+	}
+	if m.ExpectedStatus < 100 || m.ExpectedStatus > 599 {
+		return fmt.Errorf("monitoring: expected_status must be a valid HTTP status code")
+	}
+	return nil
 }
 
 // ListMonitors returns all enabled monitors for a site.
@@ -139,16 +183,32 @@ func (s *UptimeService) ListMonitors(ctx context.Context, siteID string) ([]Moni
 
 // DeleteMonitor disables a monitor by re-inserting with enabled='false' and a
 // bumped version. Scoped by site_id so a caller cannot disable another site's
-// monitor by guessing its id.
+// monitor by guessing its id. R19 (round 4): the replacement's version is
+// computed from the latest row's version (strictly greater), so a delete in
+// the same millisecond as a prior mutation — or after clock rollback — can no
+// longer produce a tied/regressed version whose collapse resurrects the live
+// row.
 func (s *UptimeService) DeleteMonitor(ctx context.Context, siteID, monitorID string) error {
-	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
-	_, err := s.db.SQL().Exec(ctx,
+	latest, err := nucleus.Query[struct {
+		Version string `db:"version"`
+	}](ctx, s.db.SQL(),
+		"SELECT version FROM "+uptimeMonitorsLatest("monitor_id = $1 AND site_id = $2"),
+		monitorID, siteID)
+	if err != nil {
+		return fmt.Errorf("monitoring: delete monitor lookup: %w", err)
+	}
+	if len(latest) == 0 {
+		return fmt.Errorf("monitoring: monitor not found")
+	}
+	prior, _ := strconv.ParseInt(latest[0].Version, 10, 64)
+	next := nextMutationVersion(prior, time.Now().UTC().UnixMilli())
+	_, err = s.db.SQL().Exec(ctx,
 		`INSERT INTO uptime_monitors (monitor_id, tenant_id, site_id, name, url, method,
 			interval_secs, expected_status, enabled, created_at, version)
 		 SELECT monitor_id, tenant_id, site_id, name, url, method,
 			interval_secs, expected_status, 'false', created_at, $3
 		 FROM `+uptimeMonitorsLatest("monitor_id = $1 AND site_id = $2"),
-		monitorID, siteID, now,
+		monitorID, siteID, next,
 	)
 	if err != nil {
 		return fmt.Errorf("monitoring: delete monitor: %w", err)
@@ -156,31 +216,50 @@ func (s *UptimeService) DeleteMonitor(ctx context.Context, siteID, monitorID str
 	return nil
 }
 
-// CheckMonitor performs an HTTP request against the monitor's URL and records the result.
-func (s *UptimeService) CheckMonitor(ctx context.Context, m Monitor) {
-	start := time.Now()
-
-	req, err := http.NewRequestWithContext(ctx, m.Method, m.URL, nil)
-	if err != nil {
-		s.recordResult(ctx, m, 0, 0, false, err.Error())
-		return
+// CheckMonitor performs an HTTP request against the monitor's URL and records
+// the result.
+//
+// R17 (round 4): the probe budget and the persistence budget are separate.
+// The probe runs under the caller's (possibly expiring) context, but the
+// result row — the whole point of a timeout — is written under a detached,
+// bounded context so a target timeout cannot leave "no result" as its only
+// trace. Cancellation of the SCHEDULER itself (parent canceled before the
+// probe ran or during it) is not a target outage and records nothing.
+func (s *UptimeService) CheckMonitor(parent context.Context, m Monitor) error {
+	timeout := time.Duration(m.IntervalSecs) * time.Second
+	if timeout <= 0 || timeout > 30*time.Second {
+		timeout = 30 * time.Second
 	}
-	req.Header.Set("User-Agent", "Teploy-Observe-Uptime/1.0")
+	probeCtx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
 
-	resp, err := s.client.Do(req)
-	elapsed := time.Since(start).Milliseconds()
-	if err != nil {
-		s.recordResult(ctx, m, 0, elapsed, false, err.Error())
-		return
+	started := time.Now()
+	req, err := http.NewRequestWithContext(probeCtx, m.Method, m.URL, nil)
+	code, message := 0, ""
+	if err == nil {
+		req.Header.Set("User-Agent", "Teploy-Observe-Uptime/1.0")
+		var resp *http.Response
+		resp, err = s.client.Do(req)
+		if resp != nil {
+			code = resp.StatusCode
+			resp.Body.Close()
+		}
 	}
-	resp.Body.Close()
-
-	isUp := resp.StatusCode == m.ExpectedStatus
-
-	s.recordResult(ctx, m, resp.StatusCode, elapsed, isUp, "")
+	if parent.Err() != nil {
+		// Scheduler stop is not target failure — recording a down row for a
+		// monitor the process is no longer responsible for would be noise.
+		return parent.Err()
+	}
+	if err != nil {
+		message = err.Error()
+	}
+	persistCtx, stop := context.WithTimeout(context.WithoutCancel(parent), 5*time.Second)
+	defer stop()
+	return s.recordResult(persistCtx, m, code, time.Since(started).Milliseconds(),
+		err == nil && code == m.ExpectedStatus, message)
 }
 
-func (s *UptimeService) recordResult(ctx context.Context, m Monitor, statusCode int, responseMs int64, isUp bool, errMsg string) {
+func (s *UptimeService) recordResult(ctx context.Context, m Monitor, statusCode int, responseMs int64, isUp bool, errMsg string) error {
 	resultID := genID()
 	now := time.Now().UTC().UnixMilli()
 	nowStr := dbutil.IntParam(now)
@@ -193,8 +272,11 @@ func (s *UptimeService) recordResult(ctx context.Context, m Monitor, statusCode 
 		nowStr, strconv.Itoa(statusCode), dbutil.IntParam(responseMs), strconv.FormatBool(isUp), errMsg,
 	)
 	if err != nil {
-		s.logger.Error("monitoring: record result failed", "monitor", m.MonitorID, "err", err)
+		// R17 (round 4): the persistence failure is returned so RunChecks
+		// can surface it instead of reporting a healthy run.
+		return fmt.Errorf("monitoring: record result: %w", err)
 	}
+	return nil
 }
 
 // RunChecks iterates all enabled monitors across all sites and checks the ones
@@ -202,6 +284,15 @@ func (s *UptimeService) recordResult(ctx context.Context, m Monitor, statusCode 
 // on every tick (so interval_secs was ignored) and checks ran serially (so one
 // slow target stalled the rest). Eligible checks now run concurrently under a
 // bounded worker pool, each with a per-check timeout.
+//
+// R18 (round 4): only the checks that can actually START this tick are
+// marked (lastCheck) — admitted in oldest-last-check order up to the worker
+// capacity. The old loop premarked every due monitor, then queued them
+// behind a 10-slot semaphore under a run-level deadline; with more due
+// monitors than slots the queued tail inherited an expired context YET
+// counted as checked, systematically starving exactly the monitors that were
+// already late. Unadmitted monitors stay due and are first in line next
+// tick.
 func (s *UptimeService) RunChecks(ctx context.Context) error {
 	monitors, err := nucleus.Query[Monitor](ctx, s.db.SQL(),
 		`SELECT monitor_id, tenant_id, site_id, name, url, method,
@@ -212,6 +303,7 @@ func (s *UptimeService) RunChecks(ctx context.Context) error {
 		return fmt.Errorf("monitoring: run checks query: %w", err)
 	}
 
+	const maxConcurrent = 10
 	now := time.Now()
 	var due []Monitor
 	s.mu.Lock()
@@ -223,44 +315,56 @@ func (s *UptimeService) RunChecks(ctx context.Context) error {
 		if last, ok := s.lastCheck[m.MonitorID]; ok && now.Sub(last) < interval {
 			continue
 		}
-		s.lastCheck[m.MonitorID] = now
 		due = append(due, m)
+	}
+	// Oldest last-check first, id as the deterministic tie-break — the
+	// monitors that have waited longest get the slots.
+	sort.Slice(due, func(i, j int) bool {
+		a, b := s.lastCheck[due[i].MonitorID], s.lastCheck[due[j].MonitorID]
+		if a.Equal(b) {
+			return due[i].MonitorID < due[j].MonitorID
+		}
+		return a.Before(b)
+	})
+	if len(due) > maxConcurrent {
+		due = due[:maxConcurrent]
+	}
+	for _, m := range due {
+		// Only these actually start; everything else remains due.
+		s.lastCheck[m.MonitorID] = now
 	}
 	s.mu.Unlock()
 
-	const maxConcurrent = 10
-	sem := make(chan struct{}, maxConcurrent)
 	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
 	for _, m := range due {
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(m Monitor) {
 			defer wg.Done()
-			defer func() { <-sem }()
-			// Cap one hung target so it can't block the worker indefinitely.
-			timeout := time.Duration(m.IntervalSecs) * time.Second
-			if timeout <= 0 || timeout > 30*time.Second {
-				timeout = 30 * time.Second
+			if err := s.CheckMonitor(ctx, m); err != nil && ctx.Err() == nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
 			}
-			cctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			s.CheckMonitor(cctx, m)
 		}(m)
 	}
 	wg.Wait()
-	return nil
+	return firstErr
 }
 
-// ListResults returns recent check results for a given monitor.
+// ListResults returns recent check results for a given monitor. R21 (round
+// 4): the caller-supplied limit is capped (with a stable total order), so an
+// authenticated reader cannot request an unbounded scan.
 func (s *UptimeService) ListResults(ctx context.Context, monitorID string, limit int) ([]MonitorResult, error) {
-	if limit <= 0 {
-		limit = 50
-	}
+	limit = pageLimit(limit, 50, 500)
 	rows, err := nucleus.Query[MonitorResult](ctx, s.db.SQL(),
 		fmt.Sprintf(`SELECT result_id, tenant_id, monitor_id, site_id,
 			timestamp, status_code, response_ms, is_up, error_message
 		 FROM uptime_results WHERE monitor_id = $1
-		 ORDER BY timestamp DESC LIMIT %d`, limit),
+		 ORDER BY timestamp DESC, result_id DESC LIMIT %d`, limit),
 		monitorID,
 	)
 	if err != nil {
@@ -270,6 +374,18 @@ func (s *UptimeService) ListResults(ctx context.Context, monitorID string, limit
 		rows = []MonitorResult{}
 	}
 	return rows, nil
+}
+
+// pageLimit applies the shared list-size policy (R21, round 4): default when
+// omitted, hard ceiling when excessive.
+func pageLimit(requested, fallback, maximum int) int {
+	if requested <= 0 {
+		return fallback
+	}
+	if requested > maximum {
+		return maximum
+	}
+	return requested
 }
 
 // ---------------------------------------------------------------------------
@@ -317,7 +433,10 @@ type CronCheckin struct {
 	DurationMs int64  `json:"duration_ms" db:"duration_ms"`
 }
 
-// CreateCron registers a new cron monitor.
+// CreateCron registers a new cron monitor. R20 (round 4): the configuration
+// is validated before the INSERT (bounded name/slug, bounded nonnegative
+// grace, nonempty schedule) and an explicit Enabled=false stays false — the
+// service no longer silently flips it.
 func (s *CronService) CreateCron(ctx context.Context, c CronMonitor) (*CronMonitor, error) {
 	c.CronID = genID()
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
@@ -326,11 +445,11 @@ func (s *CronService) CreateCron(ctx context.Context, c CronMonitor) (*CronMonit
 	if c.TenantID == "" {
 		c.TenantID = "default"
 	}
-	if !c.Enabled {
-		c.Enabled = true
-	}
 	if c.GracePeriod == 0 {
 		c.GracePeriod = 300
+	}
+	if err := validateCron(c); err != nil {
+		return nil, err
 	}
 	// Opaque high-entropy token: possession of it is what authorizes a heartbeat.
 	c.PingToken = genID() + genID()
@@ -346,6 +465,34 @@ func (s *CronService) CreateCron(ctx context.Context, c CronMonitor) (*CronMonit
 		return nil, fmt.Errorf("monitoring: create cron: %w", err)
 	}
 	return &c, nil
+}
+
+// ValidateCron is the exported boundary check (handlers map it to 400);
+// CreateCron applies it again as defense in depth.
+func ValidateCron(c CronMonitor) error { return validateCron(c) }
+
+// validateCron enforces the R20 (round 4) bounds: site/name required and
+// bounded; slug bounded when supplied (the slug is a label now that the
+// legacy slug check-in routes are retired — R05); schedule bounded (an empty
+// schedule stays legal: it is the documented grace-only mode the missed-cron
+// detector supports); grace nonnegative and bounded.
+func validateCron(c CronMonitor) error {
+	if strings.TrimSpace(c.SiteID) == "" {
+		return fmt.Errorf("monitoring: site_id is required")
+	}
+	if strings.TrimSpace(c.Name) == "" || len(c.Name) > 128 {
+		return fmt.Errorf("monitoring: name is required and at most 128 characters")
+	}
+	if len(c.Slug) > 128 {
+		return fmt.Errorf("monitoring: slug is at most 128 characters")
+	}
+	if len(c.Schedule) > 64 {
+		return fmt.Errorf("monitoring: schedule is at most 64 characters")
+	}
+	if c.GracePeriod < 0 || c.GracePeriod > 86400 {
+		return fmt.Errorf("monitoring: grace_period must be between 0 and 86400 seconds")
+	}
+	return nil
 }
 
 // ListCrons returns all enabled cron monitors for a site.
@@ -369,14 +516,26 @@ func (s *CronService) ListCrons(ctx context.Context, siteID string) ([]CronMonit
 // bumped version. Scoped by site_id so a caller cannot disable another site's
 // cron by guessing its id.
 func (s *CronService) DeleteCron(ctx context.Context, siteID, cronID string) error {
-	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
-	_, err := s.db.SQL().Exec(ctx,
+	latest, err := nucleus.Query[struct {
+		Version string `db:"version"`
+	}](ctx, s.db.SQL(),
+		"SELECT version FROM "+cronMonitorsLatest("cron_id = $1 AND site_id = $2"),
+		cronID, siteID)
+	if err != nil {
+		return fmt.Errorf("monitoring: delete cron lookup: %w", err)
+	}
+	if len(latest) == 0 {
+		return fmt.Errorf("monitoring: cron not found")
+	}
+	prior, _ := strconv.ParseInt(latest[0].Version, 10, 64)
+	next := nextMutationVersion(prior, time.Now().UTC().UnixMilli())
+	_, err = s.db.SQL().Exec(ctx,
 		`INSERT INTO cron_monitors (cron_id, tenant_id, site_id, name, slug, schedule,
 			grace_period, enabled, ping_token, created_at, version)
 		 SELECT cron_id, tenant_id, site_id, name, slug, schedule,
 			grace_period, 'false', ping_token, created_at, $3
 		 FROM `+cronMonitorsLatest("cron_id = $1 AND site_id = $2"),
-		cronID, siteID, now,
+		cronID, siteID, next,
 	)
 	if err != nil {
 		return fmt.Errorf("monitoring: delete cron: %w", err)
@@ -408,7 +567,11 @@ func (s *CronService) RecordCheckinByToken(ctx context.Context, token, status st
 }
 
 // RecordCheckin records a heartbeat checkin for a cron job identified by slug.
-// Retained for the legacy slug check-in routes; new monitors use ping tokens.
+// Retained for internal/legacy callers only; the public slug routes are
+// retired (R05, round 4). A monitor that carries a ping token can NEVER be
+// checked in through this path — possession of the opaque token is the
+// authorization for its heartbeats, and a slug that happens to be known or
+// guessed must not bypass it.
 func (s *CronService) RecordCheckin(ctx context.Context, siteID, slug, status string, durationMs int64) error {
 	// Look up the cron monitor by slug
 	crons, err := nucleus.Query[CronMonitor](ctx, s.db.SQL(),
@@ -424,6 +587,9 @@ func (s *CronService) RecordCheckin(ctx context.Context, siteID, slug, status st
 	}
 	if len(crons) == 0 {
 		return fmt.Errorf("%w: %q/%q", ErrCronNotFound, siteID, slug)
+	}
+	if crons[0].PingToken != "" {
+		return fmt.Errorf("%w: %q/%q requires its ping token", ErrCronNotFound, siteID, slug)
 	}
 	return s.insertCheckin(ctx, crons[0], status, durationMs)
 }

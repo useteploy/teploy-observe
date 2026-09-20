@@ -232,9 +232,30 @@ func (s *Store) CreateLocal(ctx context.Context, username, email, passwordHash, 
 
 // SetRole changes a principal's role and bumps token_version, so every JWT
 // issued under the old role stops authenticating on its next use (audit F03:
-// role changes must revoke tokens). Returns the updated principal.
+// role changes must revoke tokens). R08 (round 4): demoting the LAST local
+// administrator is refused inside the serialized mutation — without a local
+// admin, setup stays closed (local principals exist) while the ordinary
+// password-reset recovery path has no account to reset. OIDC-managed roles
+// (UpsertOIDC) are deliberately not guarded here: the IdP is authoritative
+// for them, and SSO-only installs document break-glass via
+// OBSERVE_ADMIN_USER provisioning instead. Returns the updated principal.
 func (s *Store) SetRole(ctx context.Context, id, role string) (*Principal, error) {
 	return s.replace(ctx, id, func(p *Principal) error {
+		if p.Kind == KindLocal && p.Role == "admin" && role != "admin" {
+			rows, err := nucleus.Query[struct {
+				N int64 `db:"n"`
+			}](ctx, s.db.SQL(),
+				"SELECT COUNT(*) AS n FROM "+principalsLatest("")+
+					" WHERE kind = 'local' AND role = 'admin' AND id != $1", id)
+			if err != nil {
+				// Fail closed: an unreadable principal store must not permit
+				// removing the last break-glass admin.
+				return fmt.Errorf("principals: check remaining local admins: %w", err)
+			}
+			if len(rows) != 1 || rows[0].N == 0 {
+				return fmt.Errorf("principals: cannot demote the last local administrator")
+			}
+		}
 		p.Role = role
 		p.TokenVersion++
 		return nil

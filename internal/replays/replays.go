@@ -15,12 +15,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
 	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-dev/neutron-go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 	"github.com/useteploy/teploy-observe/internal/heatmaps"
 	"github.com/useteploy/teploy-observe/internal/identity"
+	"github.com/useteploy/teploy-observe/internal/ingest"
 	"github.com/useteploy/teploy-observe/internal/query"
 )
 
@@ -210,6 +211,27 @@ func validateReplayProtocol(in *IngestInput) error {
 	return nil
 }
 
+// validReplayIdentities enforces the canonical bounded alphabet on a batch's
+// v2 identity fields before its children are written (R27). The ledger-hit
+// path above has already returned by the time this runs, so retries of
+// committed work are unaffected.
+func validReplayIdentities(in *IngestInput, replayID string) error {
+	if !in.idempotent() {
+		return nil
+	}
+	for _, pair := range []struct{ name, value string }{
+		{"producer_id", in.ProducerID},
+		{"batch_id", in.BatchID},
+		{"replay_id", replayID},
+	} {
+		if !validProtocolID(pair.value) {
+			return neutron.ErrBadRequest(fmt.Sprintf(
+				"%s must be 8-64 characters of [A-Za-z0-9_-] (canonical identity alphabet)", pair.name))
+		}
+	}
+	return nil
+}
+
 // batchDigest is the sha256 over the canonical JSON encoding of the batch's
 // event list. Go marshals struct fields in declaration order and map keys
 // sorted, so the same events always digest identically on producer and
@@ -224,6 +246,26 @@ func (in *IngestInput) batchDigest() string {
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
+}
+
+// validProtocolID reports whether a v2 identity field uses the canonical
+// bounded URL-safe alphabet (R27, round 4). The deterministic child id hashes
+// a pipe-joined tuple; a '|' in producer_id or batch_id makes different
+// tuples collide on the same child id ("producer|extra" + "batch" vs
+// "producer" + "extra|batch"). First-party producers emit hex ids, so this
+// rejects nothing legitimate while making the encoding collision
+// unconstructible for NEW batches.
+func validProtocolID(s string) bool {
+	if len(s) < 8 || len(s) > 64 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+			c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 // DeterministicChildID derives one replay child event id from
@@ -261,7 +303,7 @@ func replayBatchLatest(where string) string {
 
 // ledgerLookup returns the committed ledger row for a batch key, or nil.
 // TO-019: the key is producer-scoped; when the producer-scoped lookup
-// misses, a LEGACY row (producer_id='', written pre-043) for the same
+// misses, a LEGACY row (producer_id=”, written pre-043) for the same
 // batch is honored — an in-flight retry of a pre-upgrade batch keeps
 // deduplicating across the migration. Legacy rows are never written.
 func (s *ReplayService) ledgerLookup(ctx context.Context, sqlc *nucleus.SQLModel, siteID, replayID, producerID, batchID string) (*ledgerRow, error) {
@@ -428,13 +470,20 @@ func (s *ReplayService) upsertSession(ctx context.Context, sqlc *nucleus.SQLMode
 		hasErrStr = "true"
 	}
 
+	// R28 (round 4): the session's captured URL gets the same privacy
+	// boundary as analytics (F41) and error ingestion — userinfo, query, and
+	// fragment never persist; unparseable/non-http(s) drops. Legacy and
+	// third-party replay producers can no longer park password-reset tokens
+	// in the session row.
+	storedURL := ingest.CapturedURL(input.URL)
+
 	_, err = sqlc.Exec(ctx,
 		`INSERT INTO replay_sessions (replay_id, tenant_id, site_id, session_id, start_time,
 			duration_ms, page_count, url, browser, os, device, has_error, distinct_id, version)
 		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 		replayID, input.SiteID, input.SessionID, dbutil.IntParam(startTime),
 		strconv.FormatInt(duration, 10), strconv.FormatInt(pages, 10),
-		input.URL, input.Browser, input.OS, input.Device, hasErrStr, distinctID,
+		storedURL, input.Browser, input.OS, input.Device, hasErrStr, distinctID,
 		dbutil.IntParam(version),
 	)
 	if err != nil {
@@ -553,6 +602,13 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (Result, 
 			}
 			return Result{ReplayID: replayID, Deduped: true}, nil
 		}
+		// R27 (round 4): charset validation runs AFTER the ledger check, so
+		// a retry of an already-committed batch (whatever its identity looked
+		// like when it was accepted) still dedupes cleanly; only batches
+		// about to be WRITTEN must carry canonical, collision-free identities.
+		if err := validReplayIdentities(&input, replayID); err != nil {
+			return Result{}, err
+		}
 	}
 
 	if err := s.upsertSession(ctx, sqlc, &input, replayID, agg, distinctID); err != nil {
@@ -606,8 +662,9 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (Result, 
 			// happened on (captured per-click by current trackers), not
 			// the URL observed at flush time — a click followed by SPA
 			// navigation used to be credited to the post-navigation page.
-			// Legacy clicks without page context fall back to the batch URL.
-			page := input.URL
+			// Legacy clicks without page context fall back to the (R28:
+			// sanitized) batch URL.
+			page := ingest.CapturedURL(input.URL)
 			if raw, ok := ev.Data.(map[string]any); ok {
 				if pu, ok := raw["page_url"].(string); ok {
 					if cleaned := telemetryPageURL(pu); cleaned != "" {
@@ -755,7 +812,7 @@ func (s *ReplayService) ListReplays(ctx context.Context, siteID string, from, to
 
 // GetReplayEvents returns the events of one replay, scoped to the site that
 // owns it (audit F08). Legacy rows written before the site column existed
-// carry site_id='' and still belong to the owning session's site.
+// carry site_id=” and still belong to the owning session's site.
 //
 // AUD-020 (round 2): event_id is the deterministic tiebreak — timestamp
 // alone left equal-timestamp events in storage order, which shifts between

@@ -10,8 +10,10 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -87,7 +89,11 @@ const otlpMaxBodyBytes = 10 << 20
 var uiFS embed.FS
 
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// R23 (round 4): diagnostics go to stderr. `observe backup` writes the
+	// archive to stdout; a logger on stdout interleaves text with the tar
+	// (or encrypted) stream and corrupts it for any consumer that captures
+	// stdout verbatim.
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfg := config.Load()
 
 	// Subcommand dispatch. Default (no args) runs the HTTP server.
@@ -533,6 +539,15 @@ func main() {
 				return nil
 			},
 		}),
+		// R22 (round 4): webhook delivery drains on shutdown instead of
+		// dying with the process mid-alert.
+		neutron.WithLifecycle(neutron.LifecycleHook{
+			Name: "webhook-delivery",
+			OnStop: func(ctx context.Context) error {
+				webhookSvc.Shutdown()
+				return nil
+			},
+		}),
 		neutron.WithLifecycle(neutron.LifecycleHook{
 			Name: "scheduler",
 			OnStart: func(ctx context.Context) error {
@@ -955,7 +970,13 @@ func main() {
 	)
 
 	// --- Feedback (public, no auth for user submissions) ---
-	r.HandleFunc("POST /api/v1/feedback", feedbackSubmitHandler(feedbackSvc))
+	// R41 (round 4): a body cap alone is not an abuse boundary. Public
+	// submissions are site-existence-checked (fail closed on a store error —
+	// an invented site must not produce rows) and rate-limited per client IP
+	// AND per site, so one client cannot flood and many clients cannot
+	// combine to flood a single site.
+	publicWriteLimiter := ingest.NewRateLimiter(10, time.Minute, 20)
+	r.Handle("POST /api/v1/feedback", ipRateLimitMW(publicWriteLimiter)(feedbackSubmitHandler(feedbackSvc, siteSvc, publicWriteLimiter)))
 
 	// --- Integrations (JWT auth; admin-only writes) ---
 	intGroup := r.Group("/api/v1/integrations", jwtMW)
@@ -1309,7 +1330,7 @@ func main() {
 		neutron.WithTags("logs"), neutron.WithSummary("Log counts per level"))
 	neutron.Get(logGroup, "/histogram", logHistogramHandler(logSvc),
 		neutron.WithTags("logs"), neutron.WithSummary("Log volume histogram by level"))
-	r.Handle("GET /api/v1/logs/stream", jwtMW(logStreamHandler(logSvc)))
+	r.Handle("GET /api/v1/logs/stream", jwtMW(logStreamHandler(logSvc, authSvc)))
 
 	// --- Goals API (JWT auth; editor+ writes) ---
 	goalGroup := r.Group("/api/v1/goals", jwtMW)
@@ -1348,11 +1369,16 @@ func main() {
 	// (returned at creation): possession of the token authorizes the heartbeat.
 	r.HandleFunc("POST /api/v1/checkin/token/{ping_token}", cronCheckinByTokenHandler(cronSvc))
 	r.HandleFunc("GET /api/v1/checkin/token/{ping_token}", cronCheckinByTokenHandler(cronSvc))
-	// Legacy slug forms, retained for back-compat with existing monitors.
-	r.HandleFunc("POST /api/v1/checkin/{site_id}/{slug}", cronCheckinHandler(cronSvc))
-	r.HandleFunc("GET /api/v1/checkin/{site_id}/{slug}", cronCheckinHandler(cronSvc))
-	r.HandleFunc("POST /api/v1/checkin/{slug}", cronCheckinHandler(cronSvc))
-	r.HandleFunc("GET /api/v1/checkin/{slug}", cronCheckinHandler(cronSvc))
+	// R05 (round 4): the legacy guessable (site_id, slug) check-in routes are
+	// RETIRED — they recorded heartbeats for tokenized monitors without the
+	// token, so the token route never carried the authorization boundary its
+	// comments claimed. Existing clients must switch to the token URL
+	// returned at creation; the service layer additionally refuses slug
+	// check-ins for any monitor that has a ping token.
+	r.HandleFunc("POST /api/v1/checkin/{site_id}/{slug}", retiredCronCheckinHandler)
+	r.HandleFunc("GET /api/v1/checkin/{site_id}/{slug}", retiredCronCheckinHandler)
+	r.HandleFunc("POST /api/v1/checkin/{slug}", retiredCronCheckinHandler)
+	r.HandleFunc("GET /api/v1/checkin/{slug}", retiredCronCheckinHandler)
 
 	// --- Dashboards (JWT auth; editor+ writes) ---
 	dashGroup := r.Group("/api/v1/dashboards", jwtMW)
@@ -1429,30 +1455,46 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_, err := db.SQL().Exec(req.Context(), "SELECT 1")
 		if err != nil {
-			w.WriteHeader(503)
-			fmt.Fprintf(w, `{"status":"error","error":%q}`, err.Error())
+			writeJSONError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
 		durability := "wal"
+		degraded := false
 		if walDegraded {
 			durability = "memory-only"
 		} else if buf.WorkerErr() != nil {
 			// AUD-016 (round 2): a dead flush worker leaves a process that
 			// acknowledges nothing and flushes nothing — report it.
 			durability = "flush-worker-failed"
+			degraded = true
+		} else if errorBuf.WorkerErr() != nil {
+			// R15 (round 4): same contract for the error pipeline — a dead
+			// error worker still acking admissions is a failed readiness,
+			// not a healthy process.
+			durability = "error-worker-failed"
+			degraded = true
 		} else if eventsQ != nil && eventsQ.LastError() != nil {
 			// Audit F14: a WAL failure after healthy startup (disk full,
 			// I/O error) latches in the queue; ingestion is refused while
 			// the durability contract is broken, and health must show it
 			// instead of reporting "wal" on a queue that stopped writing.
 			durability = "wal-degraded"
+			degraded = true
 		}
+		// R15 (round 4): readiness tells the truth — a degraded durability
+		// state is a 503 so HTTP-status-based supervisors, deployment gates
+		// and the container healthcheck stop seeing a broken pipeline as
+		// healthy. The DB probe above remains the other 503 source. Liveness
+		// (process up, whatever the pipeline state) is the process itself —
+		// a separate /livez is deliberately not added here because no
+		// supervisor in the shipped deployment consumes it.
 		health := map[string]any{
-			"status":     "ok",
 			"version":    version,
 			"commit":     commit,
 			"durability": durability,
 		}
+		queued, queuedBytes := errorBuf.Stats()
+		health["errors"] = map[string]any{"queued": queued, "bytes": queuedBytes}
 		if eventsQ != nil {
 			// F16: the WAL's disk state is operator-visible at the health
 			// endpoint — segment count, total bytes against the high-water,
@@ -1460,6 +1502,12 @@ func main() {
 			// before they were checkpointed.
 			health["wal"] = eventsQ.Stats()
 		}
+		if degraded {
+			health["status"] = "degraded"
+			writeJSONError(w, http.StatusServiceUnavailable, "telemetry pipeline degraded: "+durability)
+			return
+		}
+		health["status"] = "ok"
 		_ = json.NewEncoder(w).Encode(health)
 	})
 	r.Handle("GET /assets/", http.FileServer(http.FS(uiSub)))
@@ -1938,55 +1986,88 @@ type setupCreateInput struct {
 	Password string `json:"password"`
 }
 
+// readJSONBody decodes exactly one bounded JSON document into dst (R02,
+// round 4). Oversized bodies are 413, malformed or trailing documents 400.
+// Returns false when the response has been written.
+func readJSONBody(w http.ResponseWriter, r *http.Request, limit int64, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	fail := func(err error) bool {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		} else {
+			writeJSONError(w, http.StatusBadRequest, "invalid JSON request")
+		}
+		return false
+	}
+	if err := dec.Decode(dst); err != nil {
+		return fail(err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("multiple JSON values")
+		}
+		return fail(err)
+	}
+	return true
+}
+
 func setupCreateHandler(authSvc *auth.AuthService) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
 		// Audit F01: public local-account bootstrap is closed while OIDC SSO
 		// is enabled — otherwise anyone who can reach the dashboard listener
 		// mints a local administrator and sidesteps the IdP's admission
 		// policy. Local break-glass remains possible via the trusted
 		// OBSERVE_ADMIN_USER/OBSERVE_ADMIN_PASSWORD startup provisioning.
 		if authSvc.OIDCEnabled() {
-			w.WriteHeader(http.StatusForbidden)
-			w.Write([]byte(`{"error":"public local-account setup is disabled while OIDC is enabled"}`))
+			writeJSONError(w, http.StatusForbidden, "public local-account setup is disabled while OIDC is enabled")
+			return
+		}
+		// R02 (round 4): check whether setup is already complete BEFORE any
+		// body parsing or password hashing — on a claimed instance the route
+		// is a fixed-cost conflict, not an unbounded-decode target. The
+		// authoritative atomic check remains inside EnsureAdmin.
+		if hasAdmins, err := authSvc.HasAdminUsers(req.Context()); err == nil && hasAdmins {
+			writeJSONError(w, http.StatusConflict, "setup already complete")
 			return
 		}
 		var input setupCreateInput
-		if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"error":"invalid JSON"}`))
+		if !readJSONBody(w, req, 8<<10, &input) {
 			return
 		}
-		if input.Username == "" || input.Password == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"error":"username and password required"}`))
+		input.Username = strings.TrimSpace(input.Username)
+		// Shared credential-length policy at every password entry point: a
+		// username is bounded for storage sanity, 72 bytes is bcrypt's input
+		// block size.
+		if input.Username == "" || len(input.Username) > 128 ||
+			input.Password == "" || len(input.Password) > 72 {
+			writeJSONError(w, http.StatusBadRequest, "invalid username or password length")
 			return
 		}
 		// AUD-009: the setup wizard previously enforced its own minimum;
 		// every password entry point now shares auth.ValidatePassword.
 		if err := auth.ValidatePassword(input.Password); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			msg, _ := json.Marshal(map[string]string{"error": err.Error()})
-			w.Write(msg)
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		created, err := authSvc.EnsureAdmin(req.Context(), input.Username, input.Password)
 		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`{"error":"failed to create admin"}`))
+			writeJSONError(w, http.StatusInternalServerError, "failed to create admin")
 			return
 		}
 		if !created {
-			w.WriteHeader(http.StatusConflict)
-			w.Write([]byte(`{"error":"setup already complete"}`))
+			writeJSONError(w, http.StatusConflict, "setup already complete")
 			return
 		}
 		token, err := authSvc.Login(req.Context(), input.Username, input.Password)
 		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`{"error":"login after setup failed"}`))
+			writeJSONError(w, http.StatusInternalServerError, "login after setup failed")
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"token": token})
 	}
 }
@@ -2010,18 +2091,28 @@ func loginHandler(authSvc *auth.AuthService, auditSvc *audit.Service) neutron.Ha
 		token, err := authSvc.Login(ctx, input.Username, input.Password)
 		// Best-effort audit: record who attempted to log in and whether it
 		// succeeded. A failed audit write must never block (or fail) a login,
-		// so the error is intentionally dropped. Source IP isn't available on
-		// this typed handler; the auth trail still captures actor/when/result.
+		// so the error is intentionally dropped. R42 (round 4): the resolved
+		// client IP and user agent ARE available on this typed handler — the
+		// global request-info middleware put them in the context — so failed
+		// -login investigations finally carry attribution.
 		result := audit.ResultSuccess
 		if err != nil {
 			result = audit.ResultFailure
 		}
-		_ = auditSvc.Record(ctx, audit.AuditEvent{
+		ua := ingest.UserAgentFromContext(ctx)
+		if len(ua) > 1024 {
+			ua = strings.ToValidUTF8(ua[:1024], "")
+		}
+		if aer := auditSvc.Record(ctx, audit.AuditEvent{
 			Actor:     input.Username,
 			ActorType: audit.ActorUser,
 			Action:    "auth.login",
 			Result:    result,
-		})
+			SourceIP:  ingest.ClientIPFromContext(ctx),
+			UserAgent: ua,
+		}); aer != nil {
+			slog.Warn("login audit write failed", "action", "auth.login", "err", aer)
+		}
 		if err != nil {
 			return loginResponse{}, neutron.ErrUnauthorized("invalid credentials")
 		}
@@ -2056,13 +2147,26 @@ func streamTicketHandler(authSvc *auth.AuthService) neutron.HandlerFunc[streamTi
 		if sub == "" {
 			return streamTicketResponse{}, neutron.ErrUnauthorized("invalid token")
 		}
-		// Embed the CURRENT token version so revocation retires outstanding
-		// tickets: the middleware's version check is unconditional.
-		tv, err := authSvc.CurrentTokenVersion(ctx, sub)
-		if err != nil {
-			return streamTicketResponse{}, neutron.ErrUnauthorized("session invalid")
+		// R09 (round 4): the ticket inherits the PARENT token's version,
+		// never the current one. Reading CurrentTokenVersion and stamping it
+		// onto stale role/identity claims upgraded a token that a concurrent
+		// demotion or revocation had just invalidated into a fresh-version
+		// ticket — defeating the revocation boundary for the ticket's
+		// lifetime. The parent's version is still re-checked against current
+		// state (below) so an already-revoked session cannot mint anything;
+		// what changes is that a revocation racing AFTER this check leaves
+		// the ticket carrying the OLD, now-invalid version, which the
+		// middleware's unconditional check retires at its next use.
+		parent, okTV := claims["tv"].(float64)
+		if !okTV || parent < 0 || parent > 9007199254740991 || math.Trunc(parent) != parent {
+			return streamTicketResponse{}, neutron.ErrUnauthorized("invalid token version")
 		}
-		ticket, err := authSvc.GenerateStreamTicket(claims, input.Route, tv)
+		parentTV := int64(parent)
+		currentTV, err := authSvc.CurrentTokenVersion(ctx, sub)
+		if err != nil || currentTV != parentTV {
+			return streamTicketResponse{}, neutron.ErrUnauthorized("session revoked")
+		}
+		ticket, err := authSvc.GenerateStreamTicket(claims, input.Route, parentTV)
 		if err != nil {
 			return streamTicketResponse{}, err
 		}
@@ -2203,6 +2307,10 @@ func setSitePrivacyHandler(siteSvc *sites.SiteService) neutron.HandlerFunc[setSi
 type createAPIKeyInput struct {
 	SiteID string `path:"site_id"`
 	Label  string `json:"label"`
+	// Scopes selects the key's capabilities (R07, round 4): "telemetry"
+	// (default — keyed ingest) and/or "publish" (source-map upload, the
+	// CI-only capability). Omitted = telemetry-only.
+	Scopes []string `json:"scopes"`
 }
 
 type createAPIKeyResponse struct {
@@ -2218,9 +2326,9 @@ func createAPIKeyHandler(authSvc *auth.AuthService) neutron.HandlerFunc[createAP
 		if input.Label == "" {
 			input.Label = "default"
 		}
-		key, info, err := authSvc.CreateAPIKey(ctx, input.SiteID, input.Label)
+		key, info, err := authSvc.CreateAPIKey(ctx, input.SiteID, input.Label, input.Scopes)
 		if err != nil {
-			return createAPIKeyResponse{}, err
+			return createAPIKeyResponse{}, neutron.ErrBadRequest(err.Error())
 		}
 		return createAPIKeyResponse{Key: key, Info: info}, nil
 	}
@@ -2361,13 +2469,22 @@ func revokeShareHandler(shareSvc *share.ShareService) neutron.HandlerFunc[revoke
 
 func errorIngestHandler(buf *obserrors.ErrorBuffer) neutron.HandlerFunc[obserrors.ErrorInput, obserrors.ErrorResponse] {
 	return func(ctx context.Context, input obserrors.ErrorInput) (obserrors.ErrorResponse, error) {
-		siteID := input.SiteID
-		if siteID == "" {
-			siteID = ingest.SiteIDFromContext(ctx)
+		// R04 (round 4): the key-bound site is authoritative and REQUIRED.
+		// The handler used to start from input.SiteID, so a key for site A
+		// could write errors under site B by naming B in the body — the one
+		// keyed-ingest route without the BoundSite invariant. With no
+		// authenticated context there is nothing to bind to (keyless ingest
+		// has been gone since AUD-002), so the request is refused rather
+		// than trusted.
+		authenticated := ingest.SiteIDFromContext(ctx)
+		if authenticated == "" {
+			return obserrors.ErrorResponse{}, neutron.ErrUnauthorized("missing authenticated site")
 		}
-		if siteID == "" {
-			return obserrors.ErrorResponse{}, neutron.ErrBadRequest("missing site_id")
+		siteID, err := ingest.BoundSite(ctx, input.SiteID)
+		if err != nil {
+			return obserrors.ErrorResponse{}, neutron.ErrForbidden("site_id does not match the authenticated key")
 		}
+		input.SiteID = siteID
 		if !buf.Push(siteID, input) {
 			return obserrors.ErrorResponse{}, neutron.ErrRateLimited("error buffer full")
 		}
@@ -2532,7 +2649,10 @@ type llmStatsInput struct {
 
 func llmStatsHandler(svc *llm.LLMService) neutron.HandlerFunc[llmStatsInput, llm.LLMStats] {
 	return func(ctx context.Context, input llmStatsInput) (llm.LLMStats, error) {
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return llm.LLMStats{}, neutron.ErrBadRequest(err.Error())
+		}
 		s, err := svc.Stats(ctx, input.SiteID, from, to)
 		if err != nil {
 			return llm.LLMStats{}, err
@@ -2543,7 +2663,10 @@ func llmStatsHandler(svc *llm.LLMService) neutron.HandlerFunc[llmStatsInput, llm
 
 func llmModelsHandler(svc *llm.LLMService) neutron.HandlerFunc[llmStatsInput, []llm.ModelStats] {
 	return func(ctx context.Context, input llmStatsInput) ([]llm.ModelStats, error) {
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		return emptyOnNil(svc.ModelBreakdown(ctx, input.SiteID, from, to))
 	}
 }
@@ -2597,7 +2720,10 @@ type infraHistoryInput struct {
 
 func infraHistoryHandler(svc *infra.InfraService) neutron.HandlerFunc[infraHistoryInput, []infra.HostMetric] {
 	return func(ctx context.Context, input infraHistoryInput) ([]infra.HostMetric, error) {
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		return emptyOnNil(svc.HostHistory(ctx, input.SiteID, input.Hostname, from, to, 100))
 	}
 }
@@ -2660,7 +2786,10 @@ func groupMetricsHandler(svc *groups.GroupService) neutron.HandlerFunc[groupMetr
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		return emptyOnNil(svc.GroupMetrics(ctx, input.SiteID, from, to))
 	}
 }
@@ -2709,7 +2838,10 @@ type correlationInput struct {
 
 func correlationHandler(svc *query.StatsService) neutron.HandlerFunc[correlationInput, []query.Correlation] {
 	return func(ctx context.Context, input correlationInput) ([]query.Correlation, error) {
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		target := input.Target
 		if target == "" {
 			target = "signup"
@@ -2799,12 +2931,11 @@ func incidentsListHandler(svc *incidents.Service) http.HandlerFunc {
 		} else {
 			list, err = svc.Active(r.Context(), siteID)
 		}
-		w.Header().Set("Content-Type", "application/json")
 		if err != nil {
-			w.WriteHeader(500)
-			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		if list == nil {
 			list = []incidents.Incident{}
 		}
@@ -2820,12 +2951,11 @@ func incidentsCreateHandler(svc *incidents.Service) http.HandlerFunc {
 			return
 		}
 		out, err := svc.Create(r.Context(), input, "user")
-		w.Header().Set("Content-Type", "application/json")
 		if err != nil {
-			w.WriteHeader(400)
-			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(201)
 		json.NewEncoder(w).Encode(out)
 	}
@@ -2849,12 +2979,11 @@ func incidentsCloseHandler(svc *incidents.Service) http.HandlerFunc {
 func exportsListHandler(svc *jobs.ExportService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		list, err := svc.List(r.Context())
-		w.Header().Set("Content-Type", "application/json")
 		if err != nil {
-			w.WriteHeader(500)
-			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		if list == nil {
 			list = []jobs.ScheduledExport{}
 		}
@@ -2870,12 +2999,11 @@ func exportsCreateHandler(svc *jobs.ExportService) http.HandlerFunc {
 			return
 		}
 		out, err := svc.Create(r.Context(), input)
-		w.Header().Set("Content-Type", "application/json")
 		if err != nil {
-			w.WriteHeader(400)
-			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(201)
 		json.NewEncoder(w).Encode(out)
 	}
@@ -2904,12 +3032,11 @@ func exportsRunNowHandler(svc *jobs.ExportService) http.HandlerFunc {
 			return
 		}
 		err := svc.RunExport(r.Context(), id)
-		w.Header().Set("Content-Type", "application/json")
 		if err != nil {
-			w.WriteHeader(500)
-			fmt.Fprintf(w, `{"ok":false,"error":%q}`, err.Error())
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"ok":true}`)
 	}
 }
@@ -2917,12 +3044,11 @@ func exportsRunNowHandler(svc *jobs.ExportService) http.HandlerFunc {
 func aiConfigGetHandler(svc *aiquery.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cfg, err := svc.GetConfig(r.Context())
-		w.Header().Set("Content-Type", "application/json")
 		if err != nil {
-			w.WriteHeader(500)
-			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(cfg)
 	}
 }
@@ -2944,14 +3070,48 @@ func aiConfigPutHandler(svc *aiquery.Service) http.HandlerFunc {
 	}
 }
 
+// R40 (round 4): per-user rate limit and process-wide concurrency gate for
+// AI query generation — the route is authenticated-JWT reachable and each
+// call costs real provider money; the upstream 30s timeout bounds one call,
+// not aggregate concurrency or spend.
+var (
+	aiQueryLimiter = ingest.NewRateLimiter(10, time.Minute, 10)
+	aiQuerySlots   = make(chan struct{}, 4)
+)
+
 func aiQueryHandler(svc *aiquery.Service, card *aiquery.SchemaCard, llmSvc *llm.LLMService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// R40: bounded body — a question is text, not a document.
+		r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 		var input struct {
 			Question string `json:"question"`
 			SiteID   string `json:"site_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil || input.Question == "" {
 			http.Error(w, "question required", http.StatusBadRequest)
+			return
+		}
+		if len(input.Question) > 4000 {
+			http.Error(w, "question too long", http.StatusBadRequest)
+			return
+		}
+		// R40: principal-keyed admission before the provider call (the
+		// middleware's role/revocation checks have already run).
+		sub := ""
+		if claims, cerr := neutronauth.ClaimsFromContext(r.Context()); cerr == nil {
+			sub, _ = claims["sub"].(string)
+		}
+		if sub == "" || !aiQueryLimiter.Allow("ai", sub) {
+			w.Header().Set("Retry-After", "10")
+			writeJSONError(w, http.StatusTooManyRequests, "AI query rate limit exceeded")
+			return
+		}
+		select {
+		case aiQuerySlots <- struct{}{}:
+			defer func() { <-aiQuerySlots }()
+		default:
+			w.Header().Set("Retry-After", "5")
+			writeJSONError(w, http.StatusTooManyRequests, "AI query capacity is busy")
 			return
 		}
 		siteID := input.SiteID
@@ -2987,12 +3147,11 @@ func aiQueryHandler(svc *aiquery.Service, card *aiquery.SchemaCard, llmSvc *llm.
 				Completion:       result.SQL,
 			})
 		}(err == nil, errStr(err))
-		w.Header().Set("Content-Type", "application/json")
 		if err != nil {
-			w.WriteHeader(502)
-			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			writeJSONError(w, http.StatusBadGateway, err.Error())
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(result)
 	}
 }
@@ -3572,7 +3731,7 @@ func replayDeliveryHandler(svc *integrations.IntegrationService) neutron.Handler
 
 // --- Feedback handlers ---
 
-func feedbackSubmitHandler(svc *feedback.FeedbackService) http.HandlerFunc {
+func feedbackSubmitHandler(svc *feedback.FeedbackService, siteSvc *sites.SiteService, publicWriteLimiter *ingest.RateLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Audit F22: public, unauthenticated JSON route — bound before
 		// decoding so a large body cannot be buffered whole.
@@ -3580,6 +3739,24 @@ func feedbackSubmitHandler(svc *feedback.FeedbackService) http.HandlerFunc {
 		var input feedback.FeedbackInput
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		// R41 (round 4): the site must exist before a public write, and the
+		// lookup failing must not become permission to write. The per-IP
+		// budget was already consumed at the middleware; this is the
+		// per-site quota.
+		exists, err := siteSvc.Exists(r.Context(), input.SiteID)
+		if err != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "site validation temporarily unavailable")
+			return
+		}
+		if !exists {
+			writeJSONError(w, http.StatusNotFound, "site not found")
+			return
+		}
+		if !publicWriteLimiter.Allow(input.SiteID, "") {
+			w.Header().Set("Retry-After", "60")
+			writeJSONError(w, http.StatusTooManyRequests, "submission rate limit exceeded")
 			return
 		}
 		id, err := svc.Submit(r.Context(), input)
@@ -3602,7 +3779,10 @@ type listFeedbackInput struct {
 
 func listFeedbackHandler(svc *feedback.FeedbackService) neutron.HandlerFunc[listFeedbackInput, []feedback.FeedbackEntry] {
 	return func(ctx context.Context, input listFeedbackInput) ([]feedback.FeedbackEntry, error) {
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		return emptyOnNil(svc.List(ctx, input.SiteID, from, to, input.Limit))
 	}
 }
@@ -3658,7 +3838,10 @@ type releaseHealthInput struct {
 
 func releaseHealthHandler(svc *obserrors.IssueService) neutron.HandlerFunc[releaseHealthInput, []obserrors.ReleaseHealth] {
 	return func(ctx context.Context, input releaseHealthInput) ([]obserrors.ReleaseHealth, error) {
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		return emptyOnNil(svc.ReleaseHealthList(ctx, input.SiteID, from, to))
 	}
 }
@@ -3671,7 +3854,10 @@ func releaseHealthV2Handler(svc *obserrors.ReleaseHealthService) neutron.Handler
 		if input.SiteID == "" {
 			input.SiteID = "default"
 		}
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		stats, err := svc.Health(ctx, input.SiteID, from.UnixMilli(), to.UnixMilli())
 		if err != nil {
 			return nil, err
@@ -3794,7 +3980,10 @@ func logSearchHandler(svc *logs.LogService) neutron.HandlerFunc[logSearchInput, 
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		return emptyOnNil(svc.SearchLogs(ctx, input.SiteID, from, to, input.Level, input.Service, input.Query, input.Limit, input.Offset))
 	}
 }
@@ -3810,7 +3999,10 @@ func logStatsHandler(svc *logs.LogService) neutron.HandlerFunc[logStatsInput, []
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		return emptyOnNil(svc.LogStats(ctx, input.SiteID, from, to))
 	}
 }
@@ -3827,24 +4019,60 @@ func logHistogramHandler(svc *logs.LogService) neutron.HandlerFunc[logHistogramI
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		return emptyOnNil(svc.Histogram(ctx, input.SiteID, from, to, input.BucketMs))
 	}
 }
 
+// writeSSE writes one SSE frame under a fresh bounded write deadline and
+// flushes it (R16, round 4). The dashboard server carries a total
+// WriteTimeout (10s default in the vendored app); without renewing the
+// deadline per frame, every long-lived stream dies on its first write after
+// the connection's deadline passes — the 25s keepalive made disconnects
+// routine. The per-write deadline stays finite so a stalled client cannot
+// pin the handler forever. Middleware wrappers must implement
+// Unwrap() http.ResponseWriter (the neutron router's do) for
+// http.NewResponseController to reach the real connection.
+func writeSSE(w http.ResponseWriter, frame string) error {
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return fmt.Errorf("set stream deadline: %w", err)
+	}
+	if _, err := io.WriteString(w, frame); err != nil {
+		return err
+	}
+	return rc.Flush()
+}
+
 // logStreamHandler returns a Server-Sent Events handler that streams new logs
 // for the given site_id as they arrive.
-func logStreamHandler(svc *logs.LogService) http.HandlerFunc {
+//
+// R10 (round 4): an open stream no longer outlives its session. The handler
+// captured identity at connect and never looked again, so a revoked
+// principal kept receiving future logs until it hung up. The stream now
+// revalidates the principal's token_version on a 30s ticker and closes as
+// soon as revocation, role change, or password reset lands. The 2-minute
+// stream ticket remains a connection-opening credential only — its TTL was
+// never a stream lifetime.
+func logStreamHandler(svc *logs.LogService, authSvc *auth.AuthService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		siteID := r.URL.Query().Get("site_id")
 		if siteID == "" {
 			http.Error(w, "site_id required", http.StatusBadRequest)
 			return
 		}
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-			return
+
+		sub, expectedTV := "", int64(-1)
+		if claims, cerr := neutronauth.ClaimsFromContext(r.Context()); cerr == nil {
+			if s, ok := claims["sub"].(string); ok {
+				sub = s
+			}
+			if tv, ok := claims["tv"].(float64); ok {
+				expectedTV = int64(tv)
+			}
 		}
 
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -3852,26 +4080,40 @@ func logStreamHandler(svc *logs.LogService) http.HandlerFunc {
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no")
 
-		sub := svc.Bx.Subscribe(siteID)
-		defer svc.Bx.Close(sub)
+		subscription := svc.Bx.Subscribe(siteID)
+		defer svc.Bx.Close(subscription)
 
 		// Hello event so clients know the stream is open.
-		_, _ = fmt.Fprintf(w, ": connected\n\n")
-		flusher.Flush()
+		if err := writeSSE(w, ": connected\n\n"); err != nil {
+			return
+		}
 
 		keepalive := time.NewTicker(25 * time.Second)
 		defer keepalive.Stop()
+		recheck := time.NewTicker(30 * time.Second)
+		defer recheck.Stop()
 
 		for {
 			select {
 			case <-r.Context().Done():
 				return
 			case <-keepalive.C:
-				if _, err := fmt.Fprintf(w, ": ping\n\n"); err != nil {
+				if err := writeSSE(w, ": ping\n\n"); err != nil {
 					return
 				}
-				flusher.Flush()
-			case log, ok := <-sub.Ch:
+			case <-recheck.C:
+				// R10: fail CLOSED on a recheck error — an unreadable
+				// principal store must not read as "still valid".
+				if sub == "" {
+					continue
+				}
+				checkCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+				currentTV, err := authSvc.CurrentTokenVersion(checkCtx, sub)
+				cancel()
+				if err != nil || currentTV != expectedTV {
+					return
+				}
+			case log, ok := <-subscription.Ch:
 				if !ok {
 					return
 				}
@@ -3879,10 +4121,9 @@ func logStreamHandler(svc *logs.LogService) http.HandlerFunc {
 				if err != nil {
 					continue
 				}
-				if _, err := fmt.Fprintf(w, "data: %s\n\n", raw); err != nil {
+				if err := writeSSE(w, "data: "+string(raw)+"\n\n"); err != nil {
 					return
 				}
-				flusher.Flush()
 			}
 		}
 	}
@@ -3898,7 +4139,10 @@ type listGoalsInput struct {
 
 func listGoalsHandler(svc *query.StatsService) neutron.HandlerFunc[listGoalsInput, []query.GoalConversion] {
 	return func(ctx context.Context, input listGoalsInput) ([]query.GoalConversion, error) {
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		return emptyOnNil(svc.GoalConversions(ctx, input.SiteID, from, to))
 	}
 }
@@ -4009,11 +4253,16 @@ func listMonitorsHandler(svc *monitoring.UptimeService) neutron.HandlerFunc[list
 }
 
 type createMonitorInput struct {
-	SiteID         string `json:"site_id"`
-	Name           string `json:"name"`
-	URL            string `json:"url"`
-	IntervalSecs   int    `json:"interval_secs"`
-	ExpectedStatus int    `json:"expected_status"`
+	SiteID string `json:"site_id"`
+	Name   string `json:"name"`
+	URL    string `json:"url"`
+	Method string `json:"method"`
+	// Enabled distinguishes omission (defaults to true) from an explicit
+	// false (R20, round 4): a disabled monitor used to be impossible to
+	// create — the service silently flipped it on.
+	Enabled        *bool `json:"enabled"`
+	IntervalSecs   int   `json:"interval_secs"`
+	ExpectedStatus int   `json:"expected_status"`
 }
 
 func createMonitorHandler(svc *monitoring.UptimeService) neutron.HandlerFunc[createMonitorInput, monitoring.Monitor] {
@@ -4022,11 +4271,17 @@ func createMonitorHandler(svc *monitoring.UptimeService) neutron.HandlerFunc[cre
 			return monitoring.Monitor{}, neutron.ErrBadRequest("site_id and url required")
 		}
 		m := monitoring.Monitor{
-			SiteID: input.SiteID, Name: input.Name, URL: input.URL,
+			SiteID: input.SiteID, Name: input.Name, URL: input.URL, Method: input.Method,
 			IntervalSecs: input.IntervalSecs, ExpectedStatus: input.ExpectedStatus,
+			// R20: the default is applied once, here at the boundary; the
+			// service preserves exactly what it is given.
+			Enabled: input.Enabled == nil || *input.Enabled,
 		}
 		created, err := svc.CreateMonitor(ctx, m)
 		if err != nil {
+			if verr := monitoring.ValidateMonitor(m); verr != nil {
+				return monitoring.Monitor{}, neutron.ErrBadRequest(verr.Error())
+			}
 			return monitoring.Monitor{}, err
 		}
 		return *created, nil
@@ -4067,7 +4322,25 @@ type listCronsInput struct {
 
 func listCronsHandler(svc *monitoring.CronService) neutron.HandlerFunc[listCronsInput, []monitoring.CronMonitor] {
 	return func(ctx context.Context, input listCronsInput) ([]monitoring.CronMonitor, error) {
-		return emptyOnNil(svc.ListCrons(ctx, input.SiteID))
+		crons, err := svc.ListCrons(ctx, input.SiteID)
+		if err != nil {
+			return nil, err
+		}
+		// R06 (round 4): a ping token is a heartbeat credential. The listing
+		// is viewer-readable, so the token is stripped for anyone below
+		// editor — a viewer must not be able to lift it from a read-only
+		// response and post successful heartbeats outside RBAC. Creation
+		// (editor-only) remains the one-time reveal; rotation is delete +
+		// recreate.
+		if auth.RoleFromContext(ctx) != auth.RoleEditor && auth.RoleFromContext(ctx) != auth.RoleAdmin {
+			for i := range crons {
+				crons[i].PingToken = ""
+			}
+		}
+		if crons == nil {
+			crons = []monitoring.CronMonitor{}
+		}
+		return crons, nil
 	}
 }
 
@@ -4075,13 +4348,16 @@ type createCronInput struct {
 	SiteID string `json:"site_id"`
 	Name   string `json:"name"`
 	// Slug is the URL-safe identifier a heartbeat's POST
-	// /api/v1/checkin/{site_id}/{slug} matches against — defaults to a
+	// /api/v1/checkin/{site_id}/{slug} matched against — defaults to a
 	// slugified Name when omitted. Never set: every monitor created via
 	// this endpoint got slug='' (CreateCron inserts CronMonitor.Slug
 	// verbatim, never derives it), so no heartbeat could ever match a
 	// monitor created this way. Fixed here rather than left for callers
 	// to work around, since RecordCheckin's lookup is strictly by slug.
-	Slug        string `json:"slug"`
+	Slug string `json:"slug"`
+	// Enabled distinguishes omission (defaults to true) from an explicit
+	// false (R20, round 4).
+	Enabled     *bool  `json:"enabled"`
 	Schedule    string `json:"schedule"`
 	GracePeriod int    `json:"grace_period"`
 }
@@ -4117,45 +4393,29 @@ func createCronHandler(svc *monitoring.CronService) neutron.HandlerFunc[createCr
 		}
 		cm := monitoring.CronMonitor{
 			SiteID: input.SiteID, Name: input.Name, Slug: slug,
+			// R20: default once at the boundary; the service preserves it.
+			Enabled:  input.Enabled == nil || *input.Enabled,
 			Schedule: input.Schedule, GracePeriod: input.GracePeriod,
 		}
 		c, err := svc.CreateCron(ctx, cm)
 		if err != nil {
+			if verr := monitoring.ValidateCron(cm); verr != nil {
+				return monitoring.CronMonitor{}, neutron.ErrBadRequest(verr.Error())
+			}
 			return monitoring.CronMonitor{}, err
 		}
 		return *c, nil
 	}
 }
 
-// cronCheckinHandler records a heartbeat for the cron identified by {site_id}
-// and {slug}. The single-segment route omits {site_id} and falls back to the
-// "default" site for single-tenant installs. Arguments must be passed to
-// RecordCheckin in (site_id, slug) order — passing the slug as the site_id was
-// a latent bug that made every check-in 404 and fired missed-check for all crons.
-func cronCheckinHandler(svc *monitoring.CronService) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		slug := r.PathValue("slug")
-		if slug == "" {
-			http.Error(w, "missing slug", http.StatusBadRequest)
-			return
-		}
-		siteID := r.PathValue("site_id")
-		if siteID == "" {
-			siteID = "default"
-		}
-		if err := svc.RecordCheckin(r.Context(), siteID, slug, "ok", 0); err != nil {
-			// Only a genuine not-found is 404; backend errors are 5xx so the
-			// heartbeat client retries instead of giving up.
-			if errors.Is(err, monitoring.ErrCronNotFound) {
-				http.Error(w, err.Error(), http.StatusNotFound)
-			} else {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-			}
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"ok":true}`))
-	}
+// retiredCronCheckinHandler answers the removed legacy slug check-in routes
+// with 410 (R05, round 4). No check-in is recorded and no incident hook can
+// fire from these routes; the message tells the caller where the real
+// endpoint is.
+func retiredCronCheckinHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSONError(w, http.StatusGone,
+		"slug check-ins are retired; use this monitor's token-based ping URL (/api/v1/checkin/token/{ping_token})")
 }
 
 type deleteCronInput struct {
@@ -4324,7 +4584,15 @@ func updatePanelLayoutHandler(svc *dashboards.DashboardService) neutron.HandlerF
 			target.Height = input.Height
 		}
 		target.DashboardID = input.DashboardID
-		return neutron.Empty{}, svc.UpdatePanel(ctx, *target)
+		if err := svc.UpdatePanel(ctx, *target); err != nil {
+			// R36: a rejected layout value (nonnumeric/out-of-range) is a
+			// caller error, not a backend failure.
+			if verr := dashboards.ValidatePanel(target); verr != nil {
+				return neutron.Empty{}, neutron.ErrBadRequest(verr.Error())
+			}
+			return neutron.Empty{}, err
+		}
+		return neutron.Empty{}, nil
 	}
 }
 
@@ -4400,7 +4668,10 @@ type listReplaysInput struct {
 
 func listReplaysHandler(svc *replays.ReplayService) neutron.HandlerFunc[listReplaysInput, []replays.ReplaySession] {
 	return func(ctx context.Context, input listReplaysInput) ([]replays.ReplaySession, error) {
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		return emptyOnNil(svc.ListReplays(ctx, input.SiteID, from, to, input.Limit, input.Offset))
 	}
 }
@@ -4432,7 +4703,10 @@ func queryHeatmapHandler(svc *heatmaps.Service) neutron.HandlerFunc[queryHeatmap
 		if input.URL == "" {
 			return nil, neutron.ErrBadRequest("url required")
 		}
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		clicks, err := svc.Query(ctx, input.SiteID, input.URL, from.UnixMilli(), to.UnixMilli())
 		if err != nil {
 			return nil, err
@@ -4512,12 +4786,28 @@ func apiKeyOrEditorJWT(
 				editorOnly.ServeHTTP(w, r)
 				return
 			}
-			siteID, err := authSvc.ValidateAPIKey(r.Context(), key)
+			validated, err := authSvc.ValidateAPIKey(r.Context(), key)
 			if err != nil {
+				// R12 (round 4): same absence-vs-outage split as the ingest
+				// middleware — a store outage is retryable (503), not a
+				// credential verdict (401).
+				if errors.Is(err, auth.ErrAuthUnavailable) {
+					w.Header().Set("Retry-After", "5")
+					writeJSONError(w, http.StatusServiceUnavailable, "authentication temporarily unavailable")
+					return
+				}
 				neutron.WriteError(w, r, neutron.ErrUnauthorized(err.Error()))
 				return
 			}
-			ctx := ingest.WithSiteID(r.Context(), siteID)
+			// R07 (round 4): uploading source maps is a publication
+			// capability, not telemetry — the browser-published ingest key
+			// must not carry it. CI mints a dedicated publish key
+			// (POST /api/v1/sites/{id}/keys with scopes:["publish"]).
+			if !auth.HasScope(validated.Scopes, auth.ScopePublish) {
+				neutron.WriteError(w, r, neutron.ErrForbidden("api key lacks the publish capability"))
+				return
+			}
+			ctx := ingest.WithSiteID(r.Context(), validated.SiteID)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -4819,8 +5109,35 @@ func listWebhooksHandler(svc *platform.WebhookService) neutron.HandlerFunc[listW
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		return emptyOnNil(svc.List(ctx, input.SiteID))
+		hooks, err := svc.List(ctx, input.SiteID)
+		if err != nil {
+			return nil, err
+		}
+		// R06 (round 4): a webhook URL IS a posting credential (a Slack
+		// incoming-webhook URL carries its capability in the path; the HMAC
+		// signing secret is already excluded). Viewers get only the endpoint
+		// host so the listing stays useful without disclosing write access.
+		if auth.RoleFromContext(ctx) != auth.RoleEditor && auth.RoleFromContext(ctx) != auth.RoleAdmin {
+			for i := range hooks {
+				hooks[i].URL = endpointHost(hooks[i].URL)
+			}
+		}
+		if hooks == nil {
+			hooks = []platform.Webhook{}
+		}
+		return hooks, nil
 	}
+}
+
+// endpointHost reduces a webhook URL to its hostname for viewer-visible
+// metadata (R06). Unparseable endpoints contribute an empty string rather
+// than the raw value.
+func endpointHost(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
 
 type createWebhookInput struct {
@@ -4878,7 +5195,10 @@ func listServicesHandler(svc *tracing.QueryService) neutron.HandlerFunc[listServ
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		return emptyOnNil(svc.ListServices(ctx, input.SiteID, from, to))
 	}
 }
@@ -4895,7 +5215,10 @@ func listOperationsHandler(svc *tracing.QueryService) neutron.HandlerFunc[listOp
 		if input.SiteID == "" || input.Service == "" {
 			return nil, neutron.ErrBadRequest("site_id and service required")
 		}
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		return emptyOnNil(svc.ListOperations(ctx, input.SiteID, input.Service, from, to))
 	}
 }
@@ -4918,7 +5241,10 @@ func searchTracesHandler(svc *tracing.QueryService) neutron.HandlerFunc[searchTr
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		return emptyOnNil(svc.SearchTraces(ctx, input.SiteID, from, to, input.Service, input.Operation, input.Status, input.MinDuration, input.MaxDuration, input.Limit, input.Offset))
 	}
 }
@@ -4969,21 +5295,40 @@ func serviceDepsHandler(svc *tracing.QueryService) neutron.HandlerFunc[serviceDe
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		return emptyOnNil(svc.ServiceDependencies(ctx, input.SiteID, from, to))
 	}
 }
 
-func parseTimeRange(fromStr, toStr string) (time.Time, time.Time) {
-	from, _ := time.Parse(time.RFC3339, fromStr)
-	to, _ := time.Parse(time.RFC3339, toStr)
-	if from.IsZero() {
-		from = time.Now().UTC().Add(-24 * time.Hour)
+// parseTimeRange resolves a from/to window. Omitted values default (last 24
+// hours / now). R35 (round 4): an explicitly supplied but malformed timestamp
+// is a 400-grade error, not a silent fallback to the default window — the old
+// behavior turned a caller's typo into a different, valid-looking query. A
+// range that is empty or reversed is likewise rejected; use a closed range if
+// a single instant is intended.
+func parseTimeRange(fromStr, toStr string) (time.Time, time.Time, error) {
+	now := time.Now().UTC()
+	from, to := now.Add(-24*time.Hour), now
+	var err error
+	if fromStr != "" {
+		from, err = time.Parse(time.RFC3339, fromStr)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid from timestamp (RFC3339 required)")
+		}
 	}
-	if to.IsZero() {
-		to = time.Now().UTC()
+	if toStr != "" {
+		to, err = time.Parse(time.RFC3339, toStr)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid to timestamp (RFC3339 required)")
+		}
 	}
-	return from, to
+	if !from.Before(to) {
+		return time.Time{}, time.Time{}, fmt.Errorf("from must be before to")
+	}
+	return from.UTC(), to.UTC(), nil
 }
 
 // --- Error search handler ---
@@ -5024,17 +5369,38 @@ func dailyErrorCountsHandler(svc *obserrors.IssueService) neutron.HandlerFunc[da
 	}
 }
 
+// writeJSONError emits a guaranteed-valid JSON error envelope (R34, round 4).
+// Go's %q escaping is not JSON escaping — control characters become \a or
+// \xNN, which produces a response no JSON parser accepts — so every raw
+// handler error branch goes through encoding/json. Set status before calling;
+// the helper adds content-type and no-store.
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
 // ipRateLimitMW rate-limits by client IP alone (no site_id), for public,
 // unauthenticated endpoints like login where we want to throttle brute force.
+// R11 (round 4): the key is the trusted-proxy-resolved client IP from the
+// request context when present (RequestInfoMiddleware resolves it from
+// configured proxies only); r.RemoteAddr is the fallback for direct
+// connections. Keying on RemoteAddr alone made every client behind a reverse
+// proxy share one bucket.
 func ipRateLimitMW(rl *ingest.RateLimiter) neutron.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ip := r.RemoteAddr
-			if host, _, err := net.SplitHostPort(ip); err == nil {
-				ip = host
+			ip := ingest.ClientIPFromContext(r.Context())
+			if ip == "" {
+				ip = r.RemoteAddr
+				if host, _, err := net.SplitHostPort(ip); err == nil {
+					ip = host
+				}
 			}
 			if !rl.Allow("", ip) {
-				http.Error(w, `{"error":"too many requests"}`, http.StatusTooManyRequests)
+				w.Header().Set("Retry-After", "60")
+				writeJSONError(w, http.StatusTooManyRequests, "too many requests")
 				return
 			}
 			next.ServeHTTP(w, r)
@@ -5108,6 +5474,12 @@ func shareViewHandler(shareSvc *share.ShareService, uiFS fs.FS) http.HandlerFunc
 			html.EscapeString(siteID), html.EscapeString(token))
 		page := strings.Replace(string(data), "</head>", inject+"</head>", 1)
 
+		// R30 (round 4): the share page embeds a capability (the token) —
+		// it must not persist in intermediary/browser caches or leak through
+		// referrers to same-origin outbound links.
+		w.Header().Set("Cache-Control", "private, no-store")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(page))
 	}

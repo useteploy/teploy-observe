@@ -62,7 +62,7 @@ func TestFireHTTPSignsBodyWithTimestamp(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := testWebhookService(t).fireHTTP(srv.URL, secret, samplePayload()); err != nil {
+	if err := testWebhookService(t).fireHTTP("test-delivery-id", srv.URL, secret, samplePayload()); err != nil {
 		t.Fatalf("fireHTTP: %v", err)
 	}
 
@@ -85,12 +85,15 @@ func TestFireHTTPSignsBodyWithTimestamp(t *testing.T) {
 	if gotSig != want {
 		t.Errorf("X-Observe-Signature = %q, want %q", gotSig, want)
 	}
-	if len(gotID) != 32 {
-		t.Errorf("X-Observe-Delivery = %q, want a 32-char id", gotID)
+	if gotID != "test-delivery-id" {
+		t.Errorf("X-Observe-Delivery = %q, want the caller's logical delivery id echoed verbatim", gotID)
 	}
 }
 
-func TestFireHTTPDeliveryIDIsUniquePerAttempt(t *testing.T) {
+// R22 (round 4): the delivery id is the LOGICAL identity — stable across
+// attempts of the same firing, distinct across firings. A fresh id per send
+// gave receivers no way to dedupe a retried delivery.
+func TestFireHTTPDeliveryIDStablePerFiring(t *testing.T) {
 	var ids []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, r.Header.Get("X-Observe-Delivery"))
@@ -99,13 +102,24 @@ func TestFireHTTPDeliveryIDIsUniquePerAttempt(t *testing.T) {
 	defer srv.Close()
 
 	svc := testWebhookService(t)
+	// Two attempts of ONE logical delivery (same id) ...
 	for i := 0; i < 2; i++ {
-		if err := svc.fireHTTP(srv.URL, "", samplePayload()); err != nil {
+		if err := svc.fireHTTP("delivery-aaa", srv.URL, "", samplePayload()); err != nil {
 			t.Fatalf("fireHTTP: %v", err)
 		}
 	}
-	if len(ids) != 2 || ids[0] == ids[1] {
-		t.Errorf("delivery ids %v, want two distinct values", ids)
+	// ... then a distinct firing.
+	if err := svc.fireHTTP("delivery-bbb", srv.URL, "", samplePayload()); err != nil {
+		t.Fatalf("fireHTTP: %v", err)
+	}
+	if len(ids) != 3 {
+		t.Fatalf("ids = %v, want 3 deliveries", ids)
+	}
+	if ids[0] != "delivery-aaa" || ids[1] != "delivery-aaa" {
+		t.Errorf("retries of one firing must reuse its id: %v", ids)
+	}
+	if ids[2] != "delivery-bbb" {
+		t.Errorf("a new firing must get a new id: %v", ids)
 	}
 	// An unsigned webhook still gets one: replay protection does not depend on
 	// whether a secret happens to be configured.
@@ -123,7 +137,7 @@ func TestFireHTTPOmitsSignatureHeadersWithoutASecret(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := testWebhookService(t).fireHTTP(srv.URL, "", samplePayload()); err != nil {
+	if err := testWebhookService(t).fireHTTP("test-delivery-id", srv.URL, "", samplePayload()); err != nil {
 		t.Fatalf("fireHTTP: %v", err)
 	}
 	if sig != "" || ts != "" {
@@ -162,7 +176,7 @@ func TestFireHTTPReturnsErrorOnFailureStatus(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := testWebhookService(t).fireHTTP(srv.URL, "s", samplePayload()); err == nil {
+	if err := testWebhookService(t).fireHTTP("test-delivery-id", srv.URL, "s", samplePayload()); err == nil {
 		t.Error("fireHTTP returned nil for a 500 response")
 	}
 }

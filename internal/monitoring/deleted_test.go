@@ -68,7 +68,7 @@ func TestDeletedUptimeMonitorStopsBeingListed(t *testing.T) {
 	ctx := context.Background()
 
 	const site = "delsite"
-	m, err := svc.CreateMonitor(ctx, Monitor{SiteID: site, Name: "n", URL: "https://example.com"})
+	m, err := svc.CreateMonitor(ctx, Monitor{SiteID: site, Name: "n", URL: "https://example.com", Enabled: true})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestDeletedCronPingTokenIsRejected(t *testing.T) {
 	ctx := context.Background()
 
 	const site = "cronsite"
-	c, err := svc.CreateCron(ctx, CronMonitor{SiteID: site, Name: "nightly", Slug: "nightly"})
+	c, err := svc.CreateCron(ctx, CronMonitor{SiteID: site, Name: "nightly", Slug: "nightly", Enabled: true})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}

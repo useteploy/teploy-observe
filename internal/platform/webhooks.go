@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -24,7 +25,32 @@ type WebhookService struct {
 	db     *nucleus.Client
 	logger *slog.Logger
 	client *http.Client
+
+	// R22 (round 4): delivery runs on lifecycle-owned bounded workers with a
+	// bounded queue instead of one unowned goroutine per hook — an alert
+	// burst can no longer spawn unbounded goroutines, and Shutdown drains
+	// what is queued. Each firing keeps ONE stable delivery id across its
+	// attempts (and gets a bounded retry), so a receiver can dedupe a resent
+	// alert. Durable across-restart delivery remains deferred (needs the
+	// derived-work outbox design, same class as the R14/R26 durable work).
+	deliverMu  sync.Mutex
+	deliverQ   []deliveryJob
+	deliverWg  sync.WaitGroup
+	deliverSem chan struct{}
+	stopped    bool
 }
+
+type deliveryJob struct {
+	id      string // stable logical delivery id, reused across attempts
+	hook    Webhook
+	payload AlertPayload
+}
+
+const (
+	maxQueuedDeliveries = 1000
+	deliveryWorkers     = 4
+	maxDeliveryAttempts = 3
+)
 
 func NewWebhookService(db *nucleus.Client, logger *slog.Logger) *WebhookService {
 	return &WebhookService{
@@ -34,7 +60,8 @@ func NewWebhookService(db *nucleus.Client, logger *slog.Logger) *WebhookService 
 		// declared where their own services live. Empty by default, in which
 		// case this is exactly netsafe.Client. See netsafe.Allow for why the
 		// allowance is CIDRs and why link-local is never allowlistable.
-		client: netsafe.ClientWithAllow(10*time.Second, webhookAllow()),
+		client:     netsafe.ClientWithAllow(10*time.Second, webhookAllow()),
+		deliverSem: make(chan struct{}, deliveryWorkers),
 	}
 }
 
@@ -119,7 +146,11 @@ type AlertPayload struct {
 	Timestamp string  `json:"timestamp"`
 }
 
-// Fire sends an alert payload to all enabled webhooks for a site.
+// Fire enqueues an alert payload for delivery to all enabled webhooks for a
+// site (R22, round 4). Delivery happens on the owned worker set: bounded
+// queue (drop-newest-oldest-first refused — a full queue drops the NEWEST
+// job with a loud log, never silently), bounded workers, one stable delivery
+// id per firing reused across retries, and Shutdown waits for the drain.
 func (s *WebhookService) Fire(ctx context.Context, siteID string, payload AlertPayload) {
 	hooks, err := s.List(ctx, siteID)
 	if err != nil {
@@ -128,34 +159,102 @@ func (s *WebhookService) Fire(ctx context.Context, siteID string, payload AlertP
 	}
 
 	for _, hook := range hooks {
-		go func(h Webhook) {
-			var err error
-			switch h.WebhookType {
-			case "slack":
-				err = s.fireSlack(h.URL, payload)
-			default:
-				err = s.fireHTTP(h.URL, h.Secret, payload)
-			}
-			if err != nil {
-				s.logger.Error("webhook fire failed", "webhook", h.Name, "type", h.WebhookType, "err", err)
-			}
-		}(hook)
+		// One logical delivery id per (firing, hook): receivers dedupe on it
+		// so a retry cannot re-run what the first delivery started.
+		job := deliveryJob{id: genID(), hook: hook, payload: payload}
+		s.deliverMu.Lock()
+		if s.stopped {
+			s.deliverMu.Unlock()
+			s.logger.Error("webhook delivery refused — service stopped", "webhook", hook.Name)
+			return
+		}
+		if len(s.deliverQ) >= maxQueuedDeliveries {
+			// The queue is full: the OLDEST entries have had their chance;
+			// dropping the newest would silently swallow the current alert.
+			// Drop from the front and log loudly.
+			old := s.deliverQ[0]
+			s.deliverQ = s.deliverQ[1:]
+			s.logger.Error("webhook delivery queue overflow — dropped oldest queued delivery",
+				"webhook", old.hook.Name, "delivery_id", old.id, "alert", old.payload.AlertID)
+		}
+		s.deliverQ = append(s.deliverQ, job)
+		s.deliverMu.Unlock()
+		select {
+		case s.deliverSem <- struct{}{}:
+			s.deliverWg.Add(1)
+			go s.deliveryWorker()
+		default:
+			// Enough workers are already draining; they will pick this up.
+		}
 	}
 }
 
-func (s *WebhookService) fireHTTP(url, secret string, payload AlertPayload) error {
+// deliveryWorker drains the queue until empty, then releases its slot.
+func (s *WebhookService) deliveryWorker() {
+	defer s.deliverWg.Done()
+	defer func() { <-s.deliverSem }()
+	for {
+		s.deliverMu.Lock()
+		if len(s.deliverQ) == 0 {
+			s.deliverMu.Unlock()
+			return
+		}
+		job := s.deliverQ[0]
+		s.deliverQ = s.deliverQ[1:]
+		s.deliverMu.Unlock()
+		s.attemptDelivery(job)
+	}
+}
+
+// attemptDelivery sends one job with a bounded retry; the delivery id is
+// stable across attempts.
+func (s *WebhookService) attemptDelivery(job deliveryJob) {
+	var lastErr error
+	for attempt := 1; attempt <= maxDeliveryAttempts; attempt++ {
+		var err error
+		switch job.hook.WebhookType {
+		case "slack":
+			err = s.fireSlack(job.hook.URL, job.payload)
+		default:
+			err = s.fireHTTP(job.id, job.hook.URL, job.hook.Secret, job.payload)
+		}
+		if err == nil {
+			return
+		}
+		lastErr = err
+		// Bounded backoff between attempts; a full sleep is acceptable on a
+		// worker goroutine, and shutdown does not wait on the backoff tail
+		// beyond the current attempt.
+		time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+	}
+	s.logger.Error("webhook fire failed",
+		"webhook", job.hook.Name, "type", job.hook.WebhookType,
+		"delivery_id", job.id, "attempts", maxDeliveryAttempts, "err", lastErr)
+}
+
+// Shutdown stops admission and waits for in-flight deliveries (R22).
+func (s *WebhookService) Shutdown() {
+	s.deliverMu.Lock()
+	s.stopped = true
+	s.deliverMu.Unlock()
+	s.deliverWg.Wait()
+}
+
+func (s *WebhookService) fireHTTP(deliveryID, url, secret string, payload AlertPayload) error {
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	// A delivery id, unique per attempt. Receivers dedupe on it so a resend
-	// cannot re-run whatever the first delivery started; without one they have
-	// to fall back to hashing the body, which does not distinguish a resend
-	// from a genuinely repeated alert. Set unconditionally — an unsigned
-	// webhook needs replay protection at least as much as a signed one.
-	req.Header.Set("X-Observe-Delivery", genID())
+	// The delivery id is the LOGICAL delivery identity (R22): stable across
+	// retries of the same firing, fresh per firing. Receivers dedupe on it so
+	// a resend cannot re-run whatever the first delivery started; without one
+	// they have to fall back to hashing the body, which does not distinguish
+	// a resend from a genuinely repeated alert. Set unconditionally — an
+	// unsigned webhook needs replay protection at least as much as a signed
+	// one.
+	req.Header.Set("X-Observe-Delivery", deliveryID)
 	// Sign so the receiver can verify authenticity:
 	//   X-Observe-Signature: sha256=hex(HMAC-SHA256(secret, timestamp + "." + body))
 	if secret != "" {

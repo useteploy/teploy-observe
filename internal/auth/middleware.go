@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -234,13 +236,30 @@ func APIKeyAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 				return
 			}
 
-			siteID, err := authSvc.ValidateAPIKey(r.Context(), key)
+			validated, err := authSvc.ValidateAPIKey(r.Context(), key)
 			if err != nil {
+				// R12 (round 4): an unreachable auth store is 503, not 401 —
+				// callers that distinguish permanent credential failure from
+				// a retryable outage must not retire good keys because the
+				// database blinked. Still fails closed: no handler runs.
+				if errors.Is(err, ErrAuthUnavailable) {
+					w.Header().Set("Content-Type", "application/json; charset=utf-8")
+					w.Header().Set("Retry-After", "5")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "authentication temporarily unavailable"})
+					return
+				}
 				neutron.WriteError(w, r, neutron.ErrUnauthorized(err.Error()))
 				return
 			}
+			// R07 (round 4): capability check — a publish-only key is a CI
+			// credential, not an ingest credential.
+			if !HasScope(validated.Scopes, ScopeTelemetry) {
+				neutron.WriteError(w, r, neutron.ErrForbidden("api key lacks the telemetry capability"))
+				return
+			}
 
-			ctx := ingest.WithSiteID(r.Context(), siteID)
+			ctx := ingest.WithSiteID(r.Context(), validated.SiteID)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

@@ -55,7 +55,7 @@ func TestCheckMissed_DetectsAndRecovers(t *testing.T) {
 	svc := NewCronService(db, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 
 	site := fmt.Sprintf("test-cron-%d", time.Now().UnixNano())
-	created, err := svc.CreateCron(ctx, CronMonitor{SiteID: site, Name: "nightly", GracePeriod: 1})
+	created, err := svc.CreateCron(ctx, CronMonitor{SiteID: site, Name: "nightly", Enabled: true, GracePeriod: 1})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestCheckMissed_HonoursTheSchedulePeriod(t *testing.T) {
 
 	site := fmt.Sprintf("test-sched-%d", time.Now().UnixNano())
 	hourly, err := svc.CreateCron(ctx, CronMonitor{
-		SiteID: site, Name: "hourly", Slug: "hourly",
+		SiteID: site, Name: "hourly", Slug: "hourly", Enabled: true,
 		Schedule: "0 * * * *", GracePeriod: 1,
 	})
 	if err != nil {
@@ -140,7 +140,7 @@ func TestCheckMissed_HonoursTheSchedulePeriod(t *testing.T) {
 	// A monitor with no schedule to read still alerts on grace alone, which is
 	// what proves the sleep below is long enough to matter.
 	graceOnly, err := svc.CreateCron(ctx, CronMonitor{
-		SiteID: site, Name: "gracely", Slug: "gracely", GracePeriod: 1,
+		SiteID: site, Name: "gracely", Slug: "gracely", Enabled: true, GracePeriod: 1,
 	})
 	if err != nil {
 		t.Fatalf("create grace-only: %v", err)

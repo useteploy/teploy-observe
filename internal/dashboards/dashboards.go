@@ -111,14 +111,29 @@ func (s *DashboardService) Get(ctx context.Context, dashboardID string) (*Dashbo
 }
 
 func (s *DashboardService) Delete(ctx context.Context, dashboardID string) error {
-	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	// Soft delete by setting name to empty with higher version. Reading through
 	// the collapse is what keeps this to one row per call.
-	_, err := s.db.SQL().Exec(ctx,
+	// R19 (round 4): the tombstone version is strictly greater than the
+	// latest row's — a tied/regressed version would collapse away and
+	// resurrect the dashboard.
+	latest, err := nucleus.Query[struct {
+		V string `db:"v"`
+	}](ctx, s.db.SQL(),
+		"SELECT CAST(MAX(version) AS TEXT) AS v FROM "+dashboardsLatest("dashboard_id = $1"),
+		dashboardID)
+	if err != nil {
+		return fmt.Errorf("dashboards: delete lookup: %w", err)
+	}
+	if len(latest) == 0 {
+		return fmt.Errorf("dashboards: dashboard not found")
+	}
+	prior, _ := strconv.ParseInt(latest[0].V, 10, 64)
+	next := nextVersionMS(prior, time.Now().UTC().UnixMilli())
+	_, err = s.db.SQL().Exec(ctx,
 		`INSERT INTO dashboards (dashboard_id, tenant_id, site_id, name, description, created_by, created_at, version)
 		 SELECT dashboard_id, tenant_id, site_id, '', description, created_by, created_at, $2
 		 FROM `+dashboardsLatest("dashboard_id = $1"),
-		dashboardID, now)
+		dashboardID, next)
 	return err
 }
 
@@ -142,56 +157,89 @@ func isValidQueryType(t string) bool {
 	return false
 }
 
-func (s *DashboardService) AddPanel(ctx context.Context, dashboardID string, panel Panel) (*Panel, error) {
-	panel.PanelID = genID()
-	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+// ValidatePanel is the exported boundary check (handlers map rejection to
+// 400); AddPanel and UpdatePanel apply it as the write gate.
+func ValidatePanel(p *Panel) error { return validatePanel(p) }
 
-	if panel.PanelType != "" && !IsValidPanelType(panel.PanelType) {
-		return nil, fmt.Errorf("dashboards: unsupported panel_type %q", panel.PanelType)
+// validatePanel is the one normalization/validation gate for panel writes
+// (R36, round 4), applied identically by AddPanel and UpdatePanel. Create
+// used to accept an empty panel_type that ListPanels then filtered as a
+// tombstone (a successful create that immediately disappears), arbitrary
+// position strings that broke the whole listing's BIGINT cast, and Update
+// bypassed every check AddPanel had.
+func validatePanel(p *Panel) error {
+	if p.PanelType == "" || !IsValidPanelType(p.PanelType) {
+		return fmt.Errorf("dashboards: panel_type must be a supported nonempty value")
 	}
-	// metric_series stores its query in query_config — ensure it parses
-	// before the row lands so the dashboard view doesn't crash later.
-	if panel.PanelType == "metric_series" {
+	if p.QueryType == "" || !isValidQueryType(p.QueryType) {
+		return fmt.Errorf("dashboards: query_type must be a supported nonempty value")
+	}
+	if p.QueryConfig != "" && !json.Valid([]byte(p.QueryConfig)) {
+		return fmt.Errorf("dashboards: query_config must be valid JSON")
+	}
+	fields := []struct {
+		name     string
+		value    *string
+		fallback int
+		min, max int
+	}{
+		{"position_x", &p.PositionX, 0, 0, 23},
+		{"position_y", &p.PositionY, 0, 0, 100000},
+		{"width", &p.Width, 6, 1, 24},
+		{"height", &p.Height, 4, 1, 100},
+	}
+	for _, f := range fields {
+		n := f.fallback
+		if *f.value != "" {
+			parsed, err := strconv.Atoi(*f.value)
+			if err != nil {
+				return fmt.Errorf("dashboards: %s must be an integer", f.name)
+			}
+			n = parsed
+		}
+		if n < f.min || n > f.max {
+			return fmt.Errorf("dashboards: %s out of range [%d, %d]", f.name, f.min, f.max)
+		}
+		*f.value = strconv.Itoa(n)
+	}
+	// metric_series stores its query in query_config — ensure it parses and
+	// names a metric before the row lands so the dashboard view doesn't
+	// crash later.
+	if p.PanelType == "metric_series" || p.QueryType == "metric_series" {
 		var cfg PanelConfig
-		if panel.QueryConfig != "" {
-			if err := json.Unmarshal([]byte(panel.QueryConfig), &cfg); err != nil {
-				return nil, fmt.Errorf("dashboards: query_config invalid JSON: %w", err)
+		if p.QueryConfig != "" {
+			if err := json.Unmarshal([]byte(p.QueryConfig), &cfg); err != nil {
+				return fmt.Errorf("dashboards: query_config invalid JSON: %w", err)
 			}
 		}
 		if cfg.Metric == "" {
-			return nil, fmt.Errorf("dashboards: metric_series panels require query_config.metric")
+			return fmt.Errorf("dashboards: metric_series panels require query_config.metric")
 		}
 		if cfg.Agg != "" && !metrics.IsValidAggregation(cfg.Agg) {
-			return nil, fmt.Errorf("dashboards: unsupported agg %q", cfg.Agg)
+			return fmt.Errorf("dashboards: unsupported agg %q", cfg.Agg)
 		}
 		if _, err := metrics.ParseStep(cfg.Step); err != nil {
-			return nil, err
-		}
-		if panel.QueryType == "" {
-			panel.QueryType = "metric_series"
+			return err
 		}
 	}
+	return nil
+}
 
-	// Reject query types ExecutePanel can't run (e.g. the never-implemented
-	// custom_sql) so an unrenderable panel never lands in the DB.
-	if panel.QueryType != "" && !isValidQueryType(panel.QueryType) {
-		return nil, fmt.Errorf("dashboards: unsupported query_type %q", panel.QueryType)
+func (s *DashboardService) AddPanel(ctx context.Context, dashboardID string, panel Panel) (*Panel, error) {
+	panel.PanelID = genID()
+	// R19 (round 4): strictly-monotonic replacement version — the layout
+	// write must not tie or regress against the latest row's version.
+	prior, err := s.latestPanelVersion(ctx, dashboardID, panel.PanelID)
+	if err != nil {
+		return nil, err
 	}
+	now := nextVersionMS(prior, time.Now().UTC().UnixMilli())
 
-	if panel.Width == "" {
-		panel.Width = "6"
-	}
-	if panel.Height == "" {
-		panel.Height = "4"
-	}
-	if panel.PositionX == "" {
-		panel.PositionX = "0"
-	}
-	if panel.PositionY == "" {
-		panel.PositionY = "0"
+	if err := validatePanel(&panel); err != nil {
+		return nil, err
 	}
 
-	_, err := s.db.SQL().Exec(ctx,
+	_, err = s.db.SQL().Exec(ctx,
 		`INSERT INTO dashboard_panels (panel_id, tenant_id, dashboard_id, panel_type, title, query_type, query_config, position_x, position_y, width, height, version)
 		 VALUES ($1, 'default', $2, $3, $4, $5, NULLIF($6, ''), $7, $8, $9, $10, $11)`,
 		panel.PanelID, dashboardID, panel.PanelType, panel.Title, panel.QueryType,
@@ -202,6 +250,39 @@ func (s *DashboardService) AddPanel(ctx context.Context, dashboardID string, pan
 	}
 	panel.DashboardID = dashboardID
 	return &panel, nil
+}
+
+// latestPanelVersion reads the max collapsed version for a panel (0 when
+// none), so replacement writes can be made strictly newer (R19). Scoped to
+// the dashboard so a panel id cannot cross dashboards.
+func (s *DashboardService) latestPanelVersion(ctx context.Context, dashboardID, panelID string) (int64, error) {
+	rows, err := nucleus.Query[struct {
+		V string `db:"v"`
+	}](ctx, s.db.SQL(),
+		"SELECT CAST(MAX(version) AS TEXT) AS v FROM "+panelsLatestShim(dashboardID, panelID),
+		dashboardID, panelID)
+	if err != nil {
+		return 0, fmt.Errorf("dashboards: read panel version: %w", err)
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	v, _ := strconv.ParseInt(rows[0].V, 10, 64)
+	return v, nil
+}
+
+// panelsLatestShim is the collapsed per-panel read used by version checks.
+func panelsLatestShim(dashboardID, panelID string) string {
+	return panelsLatest("dashboard_id = $1 AND panel_id = $2")
+}
+
+// nextVersionMS returns a version strictly greater than prior.
+func nextVersionMS(prior, nowMS int64) string {
+	next := nowMS
+	if prior+1 > next {
+		next = prior + 1
+	}
+	return strconv.FormatInt(next, 10)
 }
 
 func (s *DashboardService) ListPanels(ctx context.Context, dashboardID string) ([]Panel, error) {
@@ -232,9 +313,21 @@ func (s *DashboardService) ListPanels(ctx context.Context, dashboardID string) (
 	return rows, nil
 }
 
+// UpdatePanel replaces a panel row. R36 (round 4): update passes the SAME
+// validation gate as create (it used to bypass every check — an update could
+// land an empty panel_type tombstone or nonnumeric coordinates that broke the
+// whole listing). R19: the replacement version is strictly greater than the
+// latest row's.
 func (s *DashboardService) UpdatePanel(ctx context.Context, panel Panel) error {
-	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
-	_, err := s.db.SQL().Exec(ctx,
+	if err := validatePanel(&panel); err != nil {
+		return err
+	}
+	prior, err := s.latestPanelVersion(ctx, panel.DashboardID, panel.PanelID)
+	if err != nil {
+		return err
+	}
+	now := nextVersionMS(prior, time.Now().UTC().UnixMilli())
+	_, err = s.db.SQL().Exec(ctx,
 		`INSERT INTO dashboard_panels (panel_id, tenant_id, dashboard_id, panel_type, title, query_type, query_config, position_x, position_y, width, height, version)
 		 VALUES ($1, 'default', $2, $3, $4, $5, NULLIF($6, ''), $7, $8, $9, $10, $11)`,
 		panel.PanelID, panel.DashboardID, panel.PanelType, panel.Title, panel.QueryType,
@@ -244,12 +337,28 @@ func (s *DashboardService) UpdatePanel(ctx context.Context, panel Panel) error {
 }
 
 func (s *DashboardService) DeletePanel(ctx context.Context, panelID string) error {
-	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
-	_, err := s.db.SQL().Exec(ctx,
+	// R19 (round 4): tombstone version strictly greater than the latest
+	// row's — a same-millisecond delete after an update could collapse away
+	// and resurrect the live panel.
+	latest, err := nucleus.Query[struct {
+		DashboardID string `db:"dashboard_id"`
+		V           string `db:"v"`
+	}](ctx, s.db.SQL(),
+		"SELECT dashboard_id, CAST(MAX(version) AS TEXT) AS v FROM "+panelsLatest("panel_id = $1"),
+		panelID)
+	if err != nil {
+		return fmt.Errorf("dashboards: delete panel lookup: %w", err)
+	}
+	if len(latest) == 0 {
+		return fmt.Errorf("dashboards: panel not found")
+	}
+	prior, _ := strconv.ParseInt(latest[0].V, 10, 64)
+	next := nextVersionMS(prior, time.Now().UTC().UnixMilli())
+	_, err = s.db.SQL().Exec(ctx,
 		`INSERT INTO dashboard_panels (panel_id, tenant_id, dashboard_id, panel_type, title, query_type, query_config, position_x, position_y, width, height, version)
 		 SELECT panel_id, tenant_id, dashboard_id, '', '', '', NULL, '0', '0', '0', '0', $2
 		 FROM `+panelsLatest("panel_id = $1"),
-		panelID, now)
+		panelID, next)
 	return err
 }
 
@@ -257,7 +366,11 @@ func (s *DashboardService) DeletePanel(ctx context.Context, panelID string) erro
 func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, panel Panel, from, to string) (any, error) {
 	var config PanelConfig
 	if panel.QueryConfig != "" {
-		json.Unmarshal([]byte(panel.QueryConfig), &config)
+		// R36 (round 4): a config that cannot parse is a descriptive error,
+		// not an ignored one that silently queries with zero values.
+		if err := json.Unmarshal([]byte(panel.QueryConfig), &config); err != nil {
+			return nil, fmt.Errorf("dashboards: query_config invalid JSON: %w", err)
+		}
 	}
 
 	// metric_series panels run their query against the metrics service

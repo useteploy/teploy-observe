@@ -35,12 +35,15 @@ func listPerformanceIssuesHandler(svc *tracing.QueryService) neutron.HandlerFunc
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
-		from, to := parseTimeRange(input.From, input.To)
+		from, to, err := parseTimeRange(input.From, input.To)
+		if err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		fromMs := from.UnixMilli()
 		toMs := to.UnixMilli()
 		// Defensive: a caller passing 0/0 would otherwise return the entire
-		// table. The default in parseTimeRange is last-24h, so this is
-		// belt-and-braces for parse failures.
+		// table. parseTimeRange now rejects malformed input (R35), so this
+		// only guards an explicitly unbounded ask.
 		if fromMs == 0 && toMs == 0 {
 			fromMs, _ = strconv.ParseInt("0", 10, 64)
 			toMs = 1<<62 - 1
