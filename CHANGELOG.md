@@ -4,6 +4,62 @@ All notable changes to Observe are recorded here.
 
 ## [Unreleased]
 
+## v0.2.0 — 2026-09-20
+
+Four ChatGPT audit rounds plus a security hardening pass landed between
+v0.1.9 and here; the register (`AUDIT_OPEN.md`) carries per-finding records.
+Highlights and operator-visible changes:
+
+### Security
+
+- **Unified principal store** (migration 040): managed users can now sign in,
+  role changes revoke live sessions/tokens, and OIDC identities are namespaced
+  by issuer (`oidc:<hash>:<sub>`) and revocable — SSO sessions no longer
+  bypass revocation.
+- **Audit-key store** (migration 042): the audit chain is keyed by a dedicated
+  persistent key (`data/audit.key`, or `OBSERVE_AUDIT_KEY`), with a rotation
+  keyring (`OBSERVE_AUDIT_KEYRING`) and per-row key ids. Legacy rows verify
+  against the legacy candidate set.
+- **Stream tickets replace JWTs in query strings**: `EventSource`/export
+  routes mint short-lived route-bound tickets (`POST /api/v1/auth/stream-ticket`).
+  **Breaking:** normal JWTs are no longer accepted as `?token=` — consumers
+  must mint tickets.
+- **URL/privacy contract**: trackers send origin+path only; attribution rides
+  explicit `utm_*` fields. Credentials/query/fragment never leave the page.
+- Replay snapshots mask attributes; the asset proxy (`/api/v1/replay-assets`)
+  gates replay-adjacent images behind a host allowlist.
+
+### Reliability
+
+- **Idempotent ingest (wire protocol v2)**: producers stamp stable event ids;
+  duplicate batches dedupe; replay retries are exactly-once (deterministic
+  child ids + `replay_batches` ledger, migration 041). Retried chunks
+  re-send identity-intact. SDKs ship with the server — bump tracker SDKs
+  together with the server.
+- **WAL segments**: the ingest WAL rolls at `maxBytes` with a real total cap
+  (`OBSERVE_WAL_MAX_TOTAL_BYTES`, default 512 MiB, oldest-segment drop,
+  surfaced in `/healthz`) and streaming replay (no backlog materialization).
+- **Snapshot-lease backups** (requires Nucleus v1.1.1): dumps run inside
+  `ACQUIRE SNAPSHOT LEASE` — one point-in-time across SQL tables and KV
+  source maps, which are now included in the archive and verified at restore.
+- Browser tracker: bounded automatic retry with backoff and drop-oldest.
+
+### Operations
+
+- **CI keys**: telemetry/sourcemap-upload keys must be minted with
+  `scopes:["publish"]` (plain telemetry keys no longer publish) — mint new
+  keys if CI uploads sourcemaps.
+- CI gained a ui-freshness gate, a pinned-Nucleus integration job, and
+  Playwright e2e smoke tests.
+- Nucleus engine pin bumped **v1.0.0 → v1.1.1** (see `teploy.yml`): WAL
+  format v2 (auto-upgrade on first open; the original log is preserved as
+  `mvcc.wal.v1` for rollback), stable MVCC ids, atomic commit records,
+  tail GC, and the snapshot-lease primitive this release's backups use.
+  Verified: full suite (44 packages) green against the v1.1.x image.
+- Migrations 041-044 apply automatically on boot; 043 leaves
+  `replay_batches_pre043` as a recovery artifact (drop manually after
+  the copy is confirmed).
+
 ## v0.1.9 — 2026-08-26
 
 ### Added
