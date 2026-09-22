@@ -1155,3 +1155,56 @@ suite — no Nucleus fixture / running server available; gated tests skip via
 nucleustest.DSN by design. Real-exporter/Collector diagnostics inspection
 and unsupported metric shapes remain programme O02 work; durable processing
 remains O01.
+
+## 2026-09-21 O03 pre-edit obligations locked — identity model ADR + oracle fixtures
+
+Programme workstream O03 ("One explicit identity and session model")
+requires expected answers locked BEFORE any identity code changes. Done,
+with NO production identity code changed:
+
+- docs/IDENTITY_MODEL_ADR.md — the entity model (anonymous visitor
+  ESTIMATE — explicitly an estimate, not people; persistent anonymous
+  client ID as a target entity; identified person; visit/session naming;
+  replay session; device-as-attribute), the query-visible entity per
+  surface (funnel/retention/stats group on session_id = the monthly
+  estimate; persons groups on distinct_id), identify/alias/merge/logout
+  semantics targets, salt persistence + rotation policy (rotation opens a
+  salt era: historical rows untouched/versioned, new rows use the new
+  era, cross-era queries report mixed coverage), event-time vs
+  ingestion-time (current code is ingestion-time everywhere — the wire
+  protocol has no client timestamp; the model REQUIRES event-time), and
+  the recommended default per the programme decision table (anonymous
+  and identified both supported explicitly; query entity visible).
+- internal/session/reference_test.go — the executable regression oracle
+  against the real derivation functions for the five mandatory
+  scenarios: (a) anonymous→login→logout under one browser — login/
+  logout changes nothing about session/visit derivation; person exists
+  only on identified events (visitors=1, sessions=2, persons=1);
+  (b) two people behind one NAT — different UAs split, IDENTICAL UAs
+  merge into one estimate (the pinned limitation; UA enters the
+  fingerprint byte-exact, case-sensitive); (c) one person two devices —
+  distinct_id unifies the person, session surfaces double-count
+  (visitors=2, sessions=2, persons=1); (d) month boundary — the UTC
+  month key is in the hash preimage, so the same visitor splits into two
+  estimates across a boundary (pinned as the documented anonymous-
+  estimate limitation, NOT correct person identity); (e) delayed
+  delivery — no event-time field exists; a late event lands in the
+  ingestion-hour visit, ingestion-month estimate, and is stored with the
+  ingestion timestamp. Plus TestReference_SaltEras: fixed salt = stable
+  across restarts (derivation is stateless); global-salt rotation
+  re-keys session_id/visit_id but NOT distinct_id on site-backed
+  installs (per-site DB salt), while the unknown-site fallback (global
+  salt as HMAC key) DOES re-key persons. Golden literal + a
+  month-key-equivalence proof let cross-month rows run through the
+  documented formula while remaining chained to production ID().
+- Era rule recorded in both files: any future behavior change (O04+)
+  bumps an era and updates the tables consciously; history is never
+  rewritten.
+
+Validation: the eight new storage-free tests in internal/session only
+(`go test ./internal/session/ -run 'TestReference_|TestReference_SaltEras'`,
+all pass) and `go vet ./internal/session/` (clean). No Nucleus-gated
+suite, no containers, per the shared-fixture constraint. Residual O03
+scope (next slices): the model implementation itself (persistent
+anonymous client ID, era stamping, event-time acceptance), alias/merge
+resolution, person-level funnel/retention modes, UI entity labeling.
