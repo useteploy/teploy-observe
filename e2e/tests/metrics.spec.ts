@@ -52,9 +52,13 @@ test.describe("Metrics (W3.A Phase 1)", () => {
       headers: { "Content-Type": "application/json" },
     });
     expect(ingest.ok(), `ingest ${ingest.status()}: ${await ingest.text()}`).toBeTruthy();
+    // OTLP conformance: a JSON export gets the official protobuf-JSON
+    // ExportMetricsServiceResponse — full success is the empty message ("{}"),
+    // not a custom ok/points body. Diagnostics come from the query endpoint
+    // below (both points are verified there via per-region filters).
+    expect(ingest.headers()["content-type"]).toContain("application/json");
     const ingestBody = await ingest.json();
-    expect(ingestBody.ok).toBe(true);
-    expect(ingestBody.points).toBe(2);
+    expect(ingestBody.partialSuccess).toBeUndefined();
 
     // Query back. Uses JWT auth since it's under /api/v1/.
     const token = await adminToken(api);
@@ -92,6 +96,17 @@ test.describe("Metrics (W3.A Phase 1)", () => {
     const qfBody = await qFilt.json();
     expect(qfBody.length).toBeGreaterThanOrEqual(1);
     expect(qfBody[0].value).toBeCloseTo(42.5, 1);
+
+    // The eu-west-1 filter proving the second ingested point stored — this
+    // replaces the old points-count assertion on the ingest response.
+    const qFilt2 = await api.get(
+      `${OBSERVE_URL}/api/v1/metrics/query?site_id=default&name=${metricName}&from=${fromMs}&to=${toMs}&agg=last&label.region=eu-west-1`,
+      { headers },
+    );
+    expect(qFilt2.ok()).toBeTruthy();
+    const qf2Body = await qFilt2.json();
+    expect(qf2Body.length).toBeGreaterThanOrEqual(1);
+    expect(qf2Body[0].value).toBeCloseTo(17.0, 1);
 
     await api.dispose();
   });

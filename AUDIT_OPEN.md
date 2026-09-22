@@ -1111,3 +1111,47 @@ valid fallback; no stored telemetry or site records are removed.
 Validation: Go suite (DB-dependent cases require Nucleus), UI unit suite,
 production UI rebuild, four Chromium regressions covering fresh selection,
 URL precedence, remembered selection, and bootstrap-only installs.
+
+## 2026-09-21 OTLP response conformance — fixed
+
+All three OTLP transport boundaries (/v1/traces, /v1/metrics, /v1/logs) now
+answer with the official OTLP/HTTP response contract instead of custom JSON.
+Responses follow the request's wire format: application/x-protobuf requests
+get Content-Type application/x-protobuf + proto-encoded
+Export*ServiceResponse; application/json requests get protobuf-JSON (int64
+as string — the official mapping). Full success is the zero-value message
+(empty proto body / "{}"); logs partial rejection carries
+ExportLogsPartialSuccess{rejectedLogRecords, errorMessage:""}. Storage
+failure is 503 + Retry-After: 5 on all three signals (the logs audit-F13
+precedent; tracing/metrics previously 500'd, which OTLP exporters treat as
+non-retryable and drop). Unknown/unparseable content types are 415 naming
+the received type (previously any non-proto prefix silently took the JSON
+decoder — a text/plain body 400'd as "invalid JSON"); media-type parameters
+(;charset=) are now tolerated via proper parsing. An oversized decompressed
+body is 413 (previously silent LimitReader truncation ended as a misleading
+400), and the chain's neutron.BodyLimit raw-cap error is translated to 413
+the same way. Request decoding is unchanged — the hand-rolled JSON decoders
+stay (OTLP/JSON hex ids cannot be parsed by protojson); only responses
+changed encoding. Handler seams: one narrow per-package interface over the
+existing ingest method (traceIngester/metricIngester/logIngester), concrete
+services unchanged; constructors keep accepting the concrete types.
+
+Evidence: conformance suites in internal/tracing/otlp_http_test.go,
+internal/metrics/otlp_http_test.go, internal/logs/otlp_http_test.go — real
+serialized requests (proto.Marshal of hand-built Export*ServiceRequest, plus
+the JSON shapes) through ServeHTTP with the site ID injected via the real
+ingest.WithSiteID helper, through the real gzip path and the real
+neutron.BodyLimit chain wrapper; each response decoded with the official
+type (proto/protojson) and the stub-verified decoded record count asserted.
+TDD: suites written first and failing against the old handlers (8 failing
+per signal on content type, official decode, 503, 415, 413), then
+implementation, then green; one mutation (encoder selection swapped in
+tracing) failed both full-success tests naming the seam, then reverted.
+e2e/tests/metrics.spec.ts updated to the official ingest shape (200 +
+application/json + no partialSuccess; point counts verified via the
+per-region query filters). Not run in this session: the three
+Nucleus-gated round-trip tests (TestOTLP*RoundTrip*) and the Playwright
+suite — no Nucleus fixture / running server available; gated tests skip via
+nucleustest.DSN by design. Real-exporter/Collector diagnostics inspection
+and unsupported metric shapes remain programme O02 work; durable processing
+remains O01.

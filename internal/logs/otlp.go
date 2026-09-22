@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	logspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
@@ -102,15 +104,27 @@ func severityToLevel(number int, text string) string {
 
 // OTLPLogsHandler serves POST /v1/logs in both wire formats.
 type OTLPLogsHandler struct {
-	svc *LogService
+	svc logIngester
+}
+
+// logIngester is the transport-boundary seam the handler tests drive with a
+// recording stub. *LogService satisfies it; the service's own DTOs and
+// storage stay untouched.
+type logIngester interface {
+	IngestLogs(ctx context.Context, inputs []LogInput) (LogBatchResult, error)
 }
 
 func NewOTLPLogsHandler(svc *LogService) *OTLPLogsHandler {
 	return &OTLPLogsHandler{svc: svc}
 }
 
+// otlpMaxDecompressedBytes caps the DECOMPRESSED export body. The production
+// chain (cmd/observe otlpChain) separately caps the raw bytes via
+// neutron.BodyLimit; this one bounds gzip expansion.
+const otlpMaxDecompressedBytes = 10 * 1024 * 1024
+
 func (h *OTLPLogsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
+	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -118,6 +132,24 @@ func (h *OTLPLogsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	siteID := ingest.SiteIDFromContext(r.Context())
 	if siteID == "" {
 		http.Error(w, `{"error":"missing site_id"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Parse the media type so parameters (`application/json; charset=...`)
+	// are tolerated; anything outside the two OTLP wire formats is a 415,
+	// not a silent fallthrough to the JSON decoder.
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("unsupported content type %q", r.Header.Get("Content-Type")), http.StatusUnsupportedMediaType)
+		return
+	}
+	isProto := false
+	switch mediaType {
+	case "application/x-protobuf", "application/protobuf":
+		isProto = true
+	case "application/json":
+	default:
+		http.Error(w, fmt.Sprintf("unsupported content type %q", mediaType), http.StatusUnsupportedMediaType)
 		return
 	}
 
@@ -131,15 +163,26 @@ func (h *OTLPLogsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer gz.Close()
 		src = gz
 	}
-	body, err := io.ReadAll(io.LimitReader(src, 10*1024*1024))
+
+	// Read one byte past the cap so an oversized (e.g. gzip-expanded) body is
+	// detected instead of silently truncated into a misleading 400.
+	body, err := io.ReadAll(io.LimitReader(src, otlpMaxDecompressedBytes+1))
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "read error", http.StatusBadRequest)
 		return
 	}
+	if len(body) > otlpMaxDecompressedBytes {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
 
-	ct := r.Header.Get("Content-Type")
 	var inputs []LogInput
-	if strings.HasPrefix(ct, "application/x-protobuf") || strings.HasPrefix(ct, "application/protobuf") {
+	if isProto {
 		inputs, err = protoLogInputs(body, siteID)
 	} else {
 		inputs, err = jsonLogInputs(body, siteID)
@@ -162,12 +205,41 @@ func (h *OTLPLogsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "storage unavailable", http.StatusServiceUnavailable)
 		return
 	}
+
+	resp := &logspb.ExportLogsServiceResponse{}
+	if result.Rejected > 0 {
+		// A clean reject carries the count with an empty errorMessage; the
+		// per-record reasons are not in the service's result DTO and are not
+		// invented here.
+		resp.PartialSuccess = &logspb.ExportLogsPartialSuccess{
+			RejectedLogRecords: int64(result.Rejected),
+		}
+	}
+	writeExportResponse(w, isProto, resp)
+}
+
+// writeExportResponse encodes an ExportLogsServiceResponse in the request's
+// wire format: proto bytes for protobuf requests, protobuf-JSON for JSON
+// requests. The JSON encoder renders int64 fields as strings — that IS the
+// official protobuf-JSON mapping, not a bug to fix.
+func writeExportResponse(w http.ResponseWriter, isProto bool, resp *logspb.ExportLogsServiceResponse) {
+	if isProto {
+		body, err := proto.Marshal(resp)
+		if err != nil {
+			http.Error(w, "encode response", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.Write(body)
+		return
+	}
+	body, err := protojson.Marshal(resp)
+	if err != nil {
+		http.Error(w, "encode response", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	// OTLP's success response is an empty ExportLogsServiceResponse; anything
-	// JSON-shaped satisfies the exporters, which only check the status code.
-	json.NewEncoder(w).Encode(map[string]any{"partialSuccess": map[string]any{
-		"rejectedLogRecords": result.Rejected,
-	}})
+	w.Write(body)
 }
 
 // ingestExport feeds one OTLP export through IngestLogs in maxLogBatchSize
@@ -180,7 +252,7 @@ func (h *OTLPLogsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // That surfaces as a 500, which the OTLP spec classes as non-retryable — the
 // exporter drops the batch instead of resending, losing every record. The cap
 // stays as-is (it also bounds the multi-row INSERT); the export is split to fit.
-func ingestExport(ctx context.Context, svc *LogService, inputs []LogInput) (LogBatchResult, error) {
+func ingestExport(ctx context.Context, svc logIngester, inputs []LogInput) (LogBatchResult, error) {
 	total := LogBatchResult{}
 	for start := 0; start < len(inputs); start += maxLogBatchSize {
 		end := start + maxLogBatchSize
