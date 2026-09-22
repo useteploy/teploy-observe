@@ -170,6 +170,18 @@
     return type + '|' + msg + '|' + (file || '') + '|' + (line || 0);
   }
 
+  function randomHexId() {
+    var arr = new Uint8Array(16);
+    if (window.crypto && window.crypto.getRandomValues) {
+      window.crypto.getRandomValues(arr);
+    } else {
+      for (var i = 0; i < arr.length; i++) arr[i] = Math.floor(Math.random() * 256);
+    }
+    var out = '';
+    for (var j = 0; j < arr.length; j++) out += ('0' + arr[j].toString(16)).slice(-2);
+    return out;
+  }
+
   function reportError(type, value, stack, handled, mechanism) {
     var frames = parseStack(stack);
     var key = dedupeKey(type, value, frames.length ? frames[0].filename : '', frames.length ? frames[0].lineno : 0);
@@ -187,6 +199,7 @@
     } catch (e) { /* ignore */ }
     var payload = {
       site_id: siteId,
+      event_id: randomHexId(),
       session_id: '',
       replay_id: replayId,
       error_type: type || 'Error',

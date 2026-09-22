@@ -69,12 +69,11 @@ the round-4 series):
   /healthz.
 - R14 (contained half): each flushed record gets its own bounded context —
   one slow storage call can no longer exhaust a shared deadline and take
-  the whole batch tail with it. The durable idempotent-inbox half stays
-  DEFERRED (same class as TO-020: needs stable producer event identity +
-  payload digest + applied-events ledger committed atomically before the
-  HTTP ack; IngestErrorEvent mints fresh ids per call, so blind requeueing
-  would double-count issue counters — recorded in the buffer's package
-  comment since round 2).
+  the whole batch tail with it. The durable idempotent-inbox half is
+  LANDED 2026-09-22 (O01 slice 2, see the slice record below): stable
+  producer event identity + payload digest + error_inbox ledger claimed
+  inside the error_events apply transaction, durable WAL acks, PENDING
+  retry instead of drop-on-flush-failure.
 - R15: /healthz returns 503 with status "degraded" for flush-worker-failed,
   error-worker-failed, wal-degraded, and memory-only (WAL attach failure —
   never a deliberate mode in this app), plus the DB probe. The error
@@ -199,8 +198,10 @@ Round-4 deferrals (new):
 - R24/R25 = TO-021/TO-022 + F39-full (unchanged — replay pagination +
   causal ordering ride the versioned player protocol).
 - R26 = TO-020 (unchanged — durable derived-work outbox design).
-- R14 durable half, R22 durable half: new deferrals of the same
-  derived-work class as TO-020 (see their entries above).
+- R14 durable half, R22 durable half: R14's durable half LANDED
+  2026-09-22 (O01 slice 2); R22's durable half (across-restart webhook
+  delivery) remains deferred to the derived-work outbox (slice 3, same
+  class as TO-020).
 - R45 digest-pinning residual: needs real reviewed digests; the permissions
   /concurrency/timeout hardening landed.
 
@@ -232,10 +233,50 @@ the same change (the O03 rule the ADR carries). Record of slices:
   high-water refusal + retry-after-checkpoint, lossy fast-ack/delete,
   sync-failure latch, crash-at-ack recovery, replayed-on-restart counter,
   429/503 split, Retry-After middleware). Mutation-checked both ways
-  (no-fsync-before-ack fails 6 pins; delete-at-high-water fails the
+  (  no-fsync-before-ack fails 6 pins; delete-at-high-water fails the
   refusal pin). ADR era-2 record + §3 events row updated. Remaining O01
   scope: error inbox (slice 2), derived-work outbox, quarantine + full
   counter block, ledger retention, OTLP duplicate mitigation (§6.2-6.6).
+
+- **2026-09-22, slice 2 — error inbox + durable error path (ADR §5.6,
+  §5.4; closes R14's deferred half).** The errors signal rides the SAME
+  generalized WAL machinery as its own "errors" queue instance
+  (`wal_version:2` records frames; one DiskQueue implementation, frames
+  never interchange across kinds). An errors 200 means fsynced
+  (group commit; `OBSERVE_WAL_LOSSY` + window env vars apply to both
+  queues); apply failures leave records PENDING (requeued, checkpoint
+  stops at the gap, retried — never dropped); undecodable-after-admission
+  poison diverts to a bounded quarantine spool, counted, stream
+  unblocked; K-attempt SQL-layer diversion stays slice 4. Identity: the
+  SDK audit found NO producer error id on the wire — sentry-shim now
+  sends the id it already minted, browser SDK + tracker mint per capture
+  (`[A-Za-z0-9_-]{8,64}`, optional `producer_id`); digest is sha256 of
+  the frozen body. Dedupe: 10-min admission cache (duplicate →
+  `{ok,deduped:true}`, conflict → 409 + counter) over the durable
+  `error_inbox` ledger (migration 045) checked+claimed inside the
+  error_events apply tx; post-restart conflicts counted at flush, never
+  applied/merged; no event_id → v1 duplicate posture, documented. Status
+  split: 429 capacity (unchanged) / 503 durability + Retry-After /
+  409 conflict / 400 malformed identity — additive for existing SDKs.
+  healthz `errors` counter block (accepted/durably_acked/applied/
+  deduped/quarantined/conflicting_id/pending + queued/bytes/
+  replayed_on_restart/flush_failing) + `errors_wal` stats + degraded
+  states (errors-memory-only, error-wal-degraded, error-flush-failing).
+  Deliberate pin update: `internal/errors/o01_pin_test.go` rewritten to
+  era 3. New pins: `internal/errors/o01_inbox_test.go` (duplicate,
+  conflict at admission + after restart, crash-after-ack, crash-mid-
+  apply, lost-response retry, identity-less v1, quarantine, pending-gap
+  checkpoint — Nucleus-gated, self-migrating), `internal/ingest/
+  o01_records_frame_test.go`, `cmd/observe/error_ingest_o01_test.go`
+  (status split). Mutation-checked both ways: skipping WaitCommit fails
+  the durable-ack pin; drop-on-flush-failure fails the PENDING pin and
+  the gap test. SDKs bumped in the same change (sentry-shim, browser,
+  tracker snippet) with per-capture event_id tests. ADR era-3 record,
+  §3 errors row, §5.6 marked IMPLEMENTED. Remaining O01 scope:
+  derived-work outbox (slice 3), WAL fence-and-quarantine + SQL-layer
+  K-attempt diversion + events-side counter block (slice 4), ledger
+  retention incl. error_inbox 30d (slice 5), OTLP duplicate mitigation
+  (slice 6).
 
 Pass record (2026-09-17 audit, remediation session same day):
 

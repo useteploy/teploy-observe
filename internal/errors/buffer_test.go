@@ -19,7 +19,7 @@ func TestErrorBufferByteBudgetBounded(t *testing.T) {
 	accepted := 0
 	for i := 0; i < 20; i++ {
 		in := ErrorInput{SiteID: "s", ErrorType: "T", ErrorValue: big}
-		if !b.Push("s", in) {
+		if b.Push("s", in) != nil {
 			break
 		}
 		accepted++
@@ -30,19 +30,22 @@ func TestErrorBufferByteBudgetBounded(t *testing.T) {
 	if accepted == 20 {
 		t.Fatal("byte budget never rejected admission")
 	}
-	queued, used := b.Stats()
-	if queued != accepted {
-		t.Fatalf("queued=%d accepted=%d", queued, accepted)
+	st := b.Stats()
+	if st.Queued != accepted {
+		t.Fatalf("queued=%d accepted=%d", st.Queued, accepted)
 	}
-	if used > b.maxBytes {
-		t.Fatalf("usedBytes %d exceeds budget %d", used, b.maxBytes)
+	if st.Bytes > b.maxBytes {
+		t.Fatalf("usedBytes %d exceeds budget %d", st.Bytes, b.maxBytes)
 	}
 	// Count budget still enforced independently.
 	small := NewErrorBuffer(nil, 2, 100, time.Hour, slog.New(slog.DiscardHandler))
-	if !small.Push("s", ErrorInput{ErrorType: "T"}) || !small.Push("s", ErrorInput{ErrorType: "T"}) {
-		t.Fatal("count budget rejected early")
+	if err := small.Push("s", ErrorInput{ErrorType: "T"}); err != nil {
+		t.Fatalf("count budget rejected early: %v", err)
 	}
-	if small.Push("s", ErrorInput{ErrorType: "T"}) {
+	if err := small.Push("s", ErrorInput{ErrorType: "T"}); err != nil {
+		t.Fatalf("count budget rejected second record: %v", err)
+	}
+	if err := small.Push("s", ErrorInput{ErrorType: "T"}); err == nil {
 		t.Fatal("count budget not enforced")
 	}
 }
@@ -53,8 +56,8 @@ func TestErrorBufferPushFreezesInput(t *testing.T) {
 	b := NewErrorBuffer(nil, 10, 100, time.Hour, slog.New(slog.DiscardHandler))
 	inner := map[string]string{"k": "original"}
 	in := ErrorInput{SiteID: "s", ErrorType: "T", Extra: inner}
-	if !b.Push("s", in) {
-		t.Fatal("push rejected")
+	if err := b.Push("s", in); err != nil {
+		t.Fatalf("push rejected: %v", err)
 	}
 	inner["k"] = "mutated"
 	in.ErrorType = "MutatedAfterCapture"
@@ -80,7 +83,7 @@ func TestErrorBufferPushFreezesInput(t *testing.T) {
 func TestErrorBufferRejectsOversizedRecord(t *testing.T) {
 	b := NewErrorBuffer(nil, 50000, 100, time.Hour, slog.New(slog.DiscardHandler))
 	huge := strings.Repeat("x", maxErrorRecordBytes+1)
-	if b.Push("s", ErrorInput{ErrorValue: huge}) {
+	if err := b.Push("s", ErrorInput{ErrorValue: huge}); err == nil {
 		t.Fatal("oversized record admitted")
 	}
 }
@@ -88,11 +91,11 @@ func TestErrorBufferRejectsOversizedRecord(t *testing.T) {
 // R15: a latched worker failure closes admission and is observable.
 func TestErrorBufferWorkerFailureClosesAdmission(t *testing.T) {
 	b := NewErrorBuffer(nil, 10, 100, time.Hour, slog.New(slog.DiscardHandler))
-	if !b.Push("s", ErrorInput{ErrorType: "T"}) {
-		t.Fatal("healthy buffer rejected admission")
+	if err := b.Push("s", ErrorInput{ErrorType: "T"}); err != nil {
+		t.Fatalf("healthy buffer rejected admission: %v", err)
 	}
 	b.fail(errWorkerPanicForTest)
-	if b.Push("s", ErrorInput{ErrorType: "T"}) {
+	if err := b.Push("s", ErrorInput{ErrorType: "T"}); err == nil {
 		t.Fatal("admission accepted after fatal worker failure")
 	}
 	if b.WorkerErr() == nil {
@@ -104,16 +107,16 @@ func TestErrorBufferWorkerFailureClosesAdmission(t *testing.T) {
 func TestErrorBufferReleaseRestoresBudget(t *testing.T) {
 	b := NewErrorBuffer(nil, 10, 100, time.Hour, slog.New(slog.DiscardHandler))
 	in := ErrorInput{SiteID: "s", ErrorType: "T", ErrorValue: strings.Repeat("x", 400)}
-	if !b.Push("s", in) {
-		t.Fatal("push rejected")
+	if err := b.Push("s", in); err != nil {
+		t.Fatalf("push rejected: %v", err)
 	}
-	_, usedBefore := b.Stats()
+	usedBefore := b.Stats().Bytes
 	ev := b.events[0]
 	b.mu.Lock()
 	b.events = nil
 	b.mu.Unlock()
 	b.release(ev)
-	_, usedAfter := b.Stats()
+	usedAfter := b.Stats().Bytes
 	if usedAfter >= usedBefore {
 		t.Fatalf("release did not retire the reservation: before=%d after=%d", usedBefore, usedAfter)
 	}

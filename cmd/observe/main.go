@@ -341,6 +341,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	// O01 slice 2 (ADR §5.6): the errors signal rides the SAME generalized
+	// WAL machinery as its own queue instance ("errors") — durable acks,
+	// group commit, disk high-water refusal, checkpointed replay — with
+	// the same sync-mode and window env vars. Attached after the error
+	// buffer is constructed below.
+	errorsQ, err := ingest.NewDiskQueueWithLimits(queueDir, "errors", 500*time.Millisecond, maxQueueBytes, effectiveWalCap, logger)
+	errorWalDegraded := false
+	if err == nil {
+		errorsQ.WithGroupCommitDelay(groupCommitDelay)
+		if walLossy {
+			errorsQ.WithLossySync()
+			logger.Warn("OBSERVE_WAL_LOSSY is set — error records are acknowledged without an fsync (same declared loss budget as events)")
+		}
+	} else {
+		errorWalDegraded = true
+		logger.Warn("errors WAL: init failed, error ingest running in-memory only", "err", err)
+	}
+
 	// Retention policies are the single source for both the cleanup job and
 	// the analytics read path: a unique count can only be answered by a table
 	// that still holds the rows, so the query layer tiers its source off the
@@ -504,6 +522,23 @@ func main() {
 
 	// Error buffer (async processing for throughput)
 	errorBuf := obserrors.NewErrorBuffer(errorHandler, 50000, 100, 2*time.Second, logger)
+	// O01 slice 2: attach the errors WAL — replay of the previous
+	// process's uncheckpointed records runs here, before serving. An
+	// attach failure downgrades the error path to memory-only (visible at
+	// /healthz; fatal under OBSERVE_REQUIRE_WAL), never a silent mode.
+	if errorsQ != nil {
+		if err := errorBuf.AttachQueue(errorsQ); err != nil {
+			errorWalDegraded = true
+			if cerr := errorsQ.Close(); cerr != nil {
+				logger.Warn("errors WAL: closing unattached queue failed", "err", cerr)
+			}
+			logger.Warn("errors WAL: attach failed, error ingest running in-memory only", "err", err)
+		}
+	}
+	if errorWalDegraded && requireWAL {
+		logger.Error("OBSERVE_REQUIRE_WAL is set but the errors WAL is unavailable — refusing to start in memory-only mode")
+		os.Exit(1)
+	}
 
 	// Background jobs: rollups + retention
 	rollups := jobs.NewRollupService(db, logger)
@@ -1507,6 +1542,24 @@ func main() {
 			// instead of reporting "wal" on a queue that stopped writing.
 			durability = "wal-degraded"
 			degraded = true
+		} else if errorWalDegraded {
+			// O01 slice 2: the errors path's own WAL never attached — error
+			// acks are memory-only, which the durability label must not
+			// paper over.
+			durability = "errors-memory-only"
+			degraded = true
+		} else if errorsQ != nil && errorsQ.LastError() != nil {
+			// O01 slice 2: F14 latch on the errors queue — error admission
+			// is refused while the queue cannot back an ack.
+			durability = "error-wal-degraded"
+			degraded = true
+		} else if errorBuf.Stats().FlushFailing {
+			// O01 §5.4: records are PENDING, not dropped, but the pipeline
+			// cannot drain — a sustained apply failure is a degraded state,
+			// not a healthy one (it will turn into 429s as the budget
+			// fills).
+			durability = "error-flush-failing"
+			degraded = true
 		}
 		// R15 (round 4): readiness tells the truth — a degraded durability
 		// state is a 503 so HTTP-status-based supervisors, deployment gates
@@ -1520,8 +1573,11 @@ func main() {
 			"commit":     commit,
 			"durability": durability,
 		}
-		queued, queuedBytes := errorBuf.Stats()
-		health["errors"] = map[string]any{"queued": queued, "bytes": queuedBytes}
+		// O01 (ADR §5.10): the errors counter block — independent counts
+		// for accepted / durably-acked / applied / deduped / quarantined /
+		// conflicting-id / pending (plus the legacy queued/bytes backlog
+		// fields and replayed-on-restart).
+		health["errors"] = errorBuf.Stats()
 		// O01 (ADR §5.10): per-signal admission counters for the events
 		// path — accepted vs durably-acked (the gap is lossy mode's live
 		// loss budget) and replayed-on-restart. The high-water refusal and
@@ -1534,6 +1590,9 @@ func main() {
 			// before they were checkpointed. O01 adds the sync mode, the
 			// durable-mode refusal counter, and the unsynced-events gauge.
 			health["wal"] = eventsQ.Stats()
+		}
+		if errorsQ != nil {
+			health["errors_wal"] = errorsQ.Stats()
 		}
 		if degraded {
 			health["status"] = "degraded"
@@ -2518,8 +2577,31 @@ func errorIngestHandler(buf *obserrors.ErrorBuffer) neutron.HandlerFunc[obserror
 			return obserrors.ErrorResponse{}, neutron.ErrForbidden("site_id does not match the authenticated key")
 		}
 		input.SiteID = siteID
-		if !buf.Push(siteID, input) {
-			return obserrors.ErrorResponse{}, neutron.ErrRateLimited("error buffer full")
+		// O01 slice 2 (ADR §5.4/§5.6): admission refusal classes. Capacity
+		// stays 429 (unchanged consumer contract); durability refusals
+		// (latched/failed errors WAL, disk high-water) are 503 — the
+		// RetryAfterOnUnavailable middleware stamps Retry-After, same as
+		// events; a duplicate retry acks {ok, deduped}; a conflicting
+		// event_id reuse is 409. The 409 and the deduped flag are new wire
+		// shapes only identity-carrying SDKs can produce.
+		if err := buf.Push(siteID, input); err != nil {
+			switch {
+			case errors.Is(err, obserrors.ErrAdmittedDuplicate):
+				return obserrors.ErrorResponse{OK: true, Deduped: true}, nil
+			case errors.Is(err, obserrors.ErrEventIDConflict):
+				return obserrors.ErrorResponse{}, neutron.ErrConflict(err.Error())
+			case errors.Is(err, obserrors.ErrInvalidEventID):
+				return obserrors.ErrorResponse{}, neutron.ErrBadRequest(err.Error())
+			case errors.Is(err, obserrors.ErrErrorBufferFull):
+				return obserrors.ErrorResponse{}, neutron.ErrRateLimited("error buffer full")
+			default:
+				return obserrors.ErrorResponse{}, &neutron.AppError{
+					Status: http.StatusServiceUnavailable,
+					Code:   "https://neutron.dev/errors/service-unavailable",
+					Title:  "Service Unavailable",
+					Detail: "error durability unavailable, retry later",
+				}
+			}
 		}
 		return obserrors.ErrorResponse{OK: true}, nil
 	}

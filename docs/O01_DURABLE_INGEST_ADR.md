@@ -43,6 +43,48 @@ now pinned under explicit lossy mode). New era-2 pins:
 `internal/ingest/o01_group_commit_test.go`. The §3 events row below is
 the era-2 reality; §1.1's hop table remains the era-1 record.
 
+**ERA 3 — 2026-09-22, implementation slice 2 landed (error inbox +
+durable error path, §5.6/§5.4).** The errors signal now rides the SAME
+generalized WAL machinery as its own queue instance ("errors" — one
+DiskQueue implementation, a version-2 "records" frame kind carrying
+opaque JSON payloads; events frames and record frames never interchange
+on one queue). Consequence: OBSERVE_WAL_MAX_TOTAL_BYTES is a PER-QUEUE
+cap — a deployment running both queues bounds worst-case WAL disk at 2x
+the configured value (refusal, never deletion, in durable mode). An errors 200 means the record's frame is fsynced (group
+commit, same env vars and lossy opt-out as events); a storage failure at
+apply leaves the record PENDING (requeued at the head, retried, never
+dropped), the checkpoint stops at the first pending gap, and poison
+records (undecodable after admission) divert to a bounded quarantine
+spool with counters. Identity: an identity audit found NO producer event
+id on the wire (the sentry-shim minted a Sentry-shaped id per capture
+but only returned it to the caller; the browser SDK and tracker sent
+none) — all three now send `event_id` (the shim reuses its minted id),
+validated `[A-Za-z0-9_-]{8,64}`, with sha256-of-frozen-body digest;
+identity-less producers keep v1 semantics (durable ack, no cross-request
+dedupe — the server does not fabricate identity it cannot honestly
+promise). Dedupe is two-layered: in-process admission cache (duplicate
+-> `{ok, deduped:true}`, conflict -> 409 + counter) and the durable
+`error_inbox` ledger (migration 045) checked and claimed INSIDE the
+error_events apply transaction (post-restart conflicts counted, never
+applied, never merged). Status split: capacity 429 (unchanged),
+durability 503 + Retry-After (middleware), conflict 409, malformed
+identity 400 — all additive for existing SDKs, which cannot produce the
+new statuses. Deliberate pin update in the same change:
+`internal/errors/o01_pin_test.go` rewritten to the era-3 contract
+(memory-only-ack and drop-on-flush-failure pins replaced by
+durable-ack-ordering and PENDING-retention pins). New pins:
+`internal/errors/o01_inbox_test.go` (duplicate/conflict/crash windows/
+quarantine/gap-checkpoint, Nucleus-gated) and
+`internal/ingest/o01_records_frame_test.go` (frame generalization).
+Mutation-checked both directions: skipping WaitCommit fails the
+durable-ack pin; reintroducing drop-on-failure fails the PENDING pin and
+the gap test. healthz: `errors` block now carries the §5.10 counter set
+(accepted / durably_acked / applied / deduped / quarantined /
+conflicting_id / pending + queued/bytes + replayed_on_restart +
+flush_failing), `errors_wal` carries the queue stats, and degraded
+durability states cover errors-memory-only, error-wal-degraded, and
+error-flush-failing.
+
 ---
 
 ## 1. Inventory — every ingest signal, end to end
@@ -318,7 +360,7 @@ retry appends a duplicate row; DISTINCT-user analysis tolerates it.
 | Signal | ACK sent after | Bytes durably safe after | Server retry safety | Identity | Crash-between-ACK-and-durable loses |
 | --- | --- | --- | --- | --- | --- |
 | events (single/batch) — ERA 2 (2026-09-22, slice 1) | group-commit fsync of the batch's WAL frame (default; lossy mode: memory admission only) | the ack's own fsync (≤ group-commit window + one fsync); lossy mode: periodic fsync (≤500 ms) | dedupe ≤24 h horizon (durable), 10 min cache; durability refusals are 503 + Retry-After | site-scoped event_id (v2) | durable: nothing on 200 — the disk high-water REFUSES (counted) instead of deleting; lossy: ≤1 sync interval of acked events (declared budget) |
-| errors | memory admission | SQL commit at flush (2 s cadence) | none — retry double-counts issues/counts | none | everything unflushed; storage failure drops acked records |
+| errors — ERA 3 (2026-09-22, slice 2) | group-commit fsync of the record's WAL frame on the errors queue (default; lossy mode: memory admission only) | the ack's own fsync; lossy mode: periodic fsync (<=500 ms) | two layers: 10 min admission cache (duplicate -> deduped ack, conflict -> 409 + counter), durable `error_inbox` ledger in the apply tx (covers restarts/replay); identity-less producers: none (v1 posture) | site-scoped (site, producer_id, event_id) + payload digest, when the producer sends event_id | durable: nothing on 200 — storage failure leaves the record PENDING (retried), poison quarantined; lossy: <=1 sync interval of acked records |
 | logs | sync SQL commit | same moment | 503 retry duplicates committed prefix | none (O02) | nothing on 200; duplication on 503+retry |
 | traces | sync span commit | same moment | 503 retry duplicates committed prefix; rollups not retryable at all | none (O02) | spans safe on 200; derived rollups/detectors can be silently missing |
 | metrics | sync SQL commit | same moment | 503 retry duplicates committed prefix | none (O02) | nothing on 200; duplication on 503+retry |
@@ -326,12 +368,13 @@ retry appends a duplicate row; DISTINCT-user analysis tolerates it.
 | replays (v1) | SQL COMMIT | same moment | none | none | nothing, but retries duplicate |
 | exposures/conversions | sync SQL commit | same moment | analysis is DISTINCT-user (duplicate rows tolerated) | none | nothing on 200; raw rows duplicate on retry |
 
-Availability posture under pressure — ERA 2 (2026-09-22, slice 1):
-events REFUSE at the disk high-water with a retryable 503 + Retry-After
-(durable default, counted — never delete-to-admit);
+Availability posture under pressure — ERA 3 (2026-09-22, slices 1-2):
+events and errors both REFUSE at the disk high-water with a retryable
+503 + Retry-After (durable default, counted — never delete-to-admit);
 `OBSERVE_WAL_LOSSY=true` restores keep-admitting-by-deleting explicitly
-(counted, loss budget visible at /healthz); errors refuse (429); OTLP
-signals 503; replays 503 (DB is the store).
+(counted, loss budget visible at /healthz) for both queues; errors
+refuse on capacity with 429; OTLP signals 503; replays 503 (DB is the
+store).
 
 ### 3.1 Doc overclaims fixed in this slice
 
@@ -439,15 +482,28 @@ point only — the per-site rate limiter already bounds request rate).
 
 ### 5.6 Error inbox (stable producer identity + digest + atomic ledger)
 
-Mirror the replay ledger exactly: SDK sends `event_id` (producer-stable,
-validated alphabet) + the server derives `sha256` of the canonical
-payload; `error_inbox` row (site, producer_id, event_id, digest)
-commits in the SAME transaction as issue resolution + error_events
-insert; duplicate + same digest → `{ok, deduped:true}` zero writes;
-duplicate + different digest → 409 (conflicting id); retry after ledger
-retention expiry → processed as new (documented, §5.8). Retries may
-safely return success exactly when the ledger row exists with a matching
-digest. This closes R14's durable half.
+**IMPLEMENTED 2026-09-22 (slice 2, era 3).** As shipped: the errors
+signal runs on the generalized DiskQueue (its own "errors" instance,
+version-2 records frames) - durable group-commit ack, high-water
+refusal, checkpointed write-through replay at attach. Identity audit
+finding: no producer sent an error event id (the sentry-shim minted one
+per capture and returned it to the caller without sending it); the
+sentry-shim now sends its minted id, the browser SDK and the tracker
+snippet mint per capture, all validated `[A-Za-z0-9_-]{8,64}`; the
+digest is sha256 over the frozen body at admission. `error_inbox`
+(migration 045, ReplacingMergeTree keyed on the full identity) is
+checked and claimed INSIDE the error_events apply transaction - the
+replay_batches 041 boundary, not KV-SetNX-then-INSERT. (Issue
+resolution rides the pool beside that transaction by necessity - its KV
+cache cannot join a SQL tx; reads recompute event_count from
+error_events, so a rolled-back attempt self-heals.) Duplicate + same
+digest -> `{ok, deduped:true}` zero writes (admission cache fast path,
+ledger at flush); duplicate + different digest -> 409 + counter at
+admission when the cache knows the id, and post-restart the flush counts
+it conflicting and applies nothing (never silently merged). No event_id
+-> no ledger row: durable ack, v1 duplicate posture, documented. Retry
+after ledger retention expiry -> processed as new (5.8, slice 5).
+Closes R14's durable half.
 
 ### 5.7 Derived-work outbox (rollups, detectors, heatmaps, webhooks)
 
@@ -528,8 +584,11 @@ implementation slices see it.
 1. **Events group commit + refusal high-water (5.1-5.3)** — LANDED
      2026-09-22 (era 2 above; the three ingest pinning tests were updated
      deliberately in the same change).
-2. **Error inbox + durable error path (5.6, 5.4)** — closes R14's
-   deferred half; extends the errors pinning test to dedupe semantics.
+2. **Error inbox + durable error path (5.6, 5.4)** — LANDED 2026-09-22
+   (era 3 above; closes R14's deferred half; the errors pinning test was
+   rewritten to the durable/PENDING contract in the same change, with
+   inbox crash-window pins added and both directions
+   mutation-checked).
 3. **Derived-work outbox (5.7)** — closes TO-020's class + R22 durable
    half; migration + worker; trace rollups move into it.
 4. **Quarantine + counters (5.9, 5.10)** — WAL fence-and-quarantine,

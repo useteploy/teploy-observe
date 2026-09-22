@@ -175,6 +175,9 @@ test("stack parser accepts URL, port, and file frames", async () => {
   assert.equal(f2.filename, "https://shop.example:8443/app.js");
   assert.equal(f3.filename, "C:\\app\\main.js");
   assert.equal(f4.function, "checkout");
+  // O01 §5.6: error payloads carry the producer-stable event_id the
+  // server dedupes on.
+  assert.match(errPayload.event_id, /^[0-9a-f]{32}$/, "error event_id is sent");
 });
 
 test("properties are capped at the server limit of 50", async () => {

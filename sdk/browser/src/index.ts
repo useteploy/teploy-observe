@@ -93,6 +93,9 @@ export const PROTOCOL_VERSION = 2;
 
 export interface ErrorPayload {
   site_id: string;
+  /** Producer-stable error identity — the server's dedupe key (O01 §5.6).
+   * Minted per capture so a retried submission dedupes server-side. */
+  event_id?: string;
   error_type: string;
   error_value: string;
   stack_trace?: Array<{ filename: string; function: string; lineno: number; colno: number; in_app?: boolean }>;
@@ -666,6 +669,7 @@ export function captureException(err: Error, ctx?: CaptureContext): Promise<void
 function captureExceptionFor(target: Client, err: Error, ctx?: CaptureContext): Promise<void> {
   const payload: ErrorPayload = {
     site_id: target.opts.siteId,
+    event_id: makeId(),
     error_type: err.name || "Error",
     error_value: err.message || String(err),
     release_tag: ctx?.release ?? target.opts.release,

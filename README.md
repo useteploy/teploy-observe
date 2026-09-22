@@ -176,6 +176,18 @@ the exact image and version.
   (`events.accepted` vs `events.durably_acked`, `wal.unsynced_events`).
   The full acknowledgment/commit contract is specified in
   `docs/O01_DURABLE_INGEST_ADR.md`.
+- **Error ingest is durable and idempotent** — error records ride the
+  same WAL machinery (their own `errors` queue in
+  `$OBSERVE_QUEUE_DIR`): an errors 200 means the
+  record's frame is fsynced, a storage failure leaves it PENDING
+  (retried, never dropped), and crash recovery replays
+  uncheckpointed records. SDKs that send a stable `event_id` get
+  idempotent application: a retry of the same id + payload is
+  acknowledged once and applied once (`{ok:true, deduped:true}`), the
+  same id with a different payload is rejected 409, and the same
+  guarantees hold across restarts via the `error_inbox` ledger.
+  Counters live at `/healthz` under `errors` (accepted, durably_acked,
+  applied, deduped, quarantined, conflicting_id, pending).
 - **Per-site rate limiting** — each site has its own token bucket. One
   noisy site can't starve a quiet one. Admin-editable via
   `PUT /api/v1/sites/{id}/ratelimit`.

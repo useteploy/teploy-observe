@@ -62,6 +62,7 @@ var Tables = []string{
 	"stats_hourly",
 	"stats_daily",
 	"error_events",
+	"error_inbox",
 	"issues",
 	"performance_issues",
 	"logs",

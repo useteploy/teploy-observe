@@ -97,6 +97,10 @@ export interface StackFrame {
 
 export interface ErrorEnvelope {
   site_id: string;
+  /** Producer-stable error identity (server-side dedupe key, O01 §5.6).
+   * Minted per capture BEFORE beforeSend so a mutated-or-retried envelope
+   * keeps the id it was first assigned. */
+  event_id?: string;
   error_type: string;
   error_value: string;
   level: SeverityLevel;
@@ -314,6 +318,7 @@ function buildErrorEnvelope(
       : new Error(typeof err === "string" ? err : safeStringify(err));
   const env: ErrorEnvelope = {
     site_id: cfg.siteId,
+    event_id: randomId(),
     error_type: e.name || "Error",
     error_value: e.message || String(err),
     level: hint?.level ?? "error",
@@ -342,7 +347,6 @@ export function captureException(
 ): string {
   if (!config) return "";
   const env = buildErrorEnvelope(err, activeScope(), hint);
-  const id = randomId();
   void (async () => {
     let payload: ErrorEnvelope | null = env;
     if (config?.beforeSend) {
@@ -354,7 +358,9 @@ export function captureException(
     }
     if (payload) await postJSON("/api/v1/errors", payload);
   })();
-  return id;
+  // The returned id IS the envelope's event_id (previously a synthetic id
+  // the server never saw).
+  return env.event_id ?? "";
 }
 
 /** Sentry: capture a message. Routed to /api/v1/logs as a structured log. */

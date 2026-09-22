@@ -175,7 +175,7 @@ func (q *DiskQueue) Stats() QueueStats {
 		RefusedHighWater:       q.refusedHighWater,
 		Mode:                   mode,
 		UnsyncedEvents:         q.unsyncedEvents,
-		GroupCommitDelayMs:      q.groupDelay.Milliseconds(),
+		GroupCommitDelayMs:     q.groupDelay.Milliseconds(),
 	}
 }
 
@@ -317,18 +317,18 @@ func NewDiskQueueWithLimits(dir, name string, fsyncInterval time.Duration, maxBy
 	}
 
 	q := &DiskQueue{
-		dir:            full,
-		name:           name,
-		fsyncInterval:  fsyncInterval,
-		maxBytes:       maxBytes,
-		maxTotalBytes:  maxTotalBytes,
-		stopCh:         make(chan struct{}),
-		logger:         logger,
-		activeIdx:      0,
-		cpSeg:          0,
-		cpOff:          0,
-		groupDelay:     DefaultGroupCommitDelay,
-		commitWake:     make(chan struct{}, 1),
+		dir:           full,
+		name:          name,
+		fsyncInterval: fsyncInterval,
+		maxBytes:      maxBytes,
+		maxTotalBytes: maxTotalBytes,
+		stopCh:        make(chan struct{}),
+		logger:        logger,
+		activeIdx:     0,
+		cpSeg:         0,
+		cpOff:         0,
+		groupDelay:    DefaultGroupCommitDelay,
+		commitWake:    make(chan struct{}, 1),
 	}
 
 	// Discover the segment set: the legacy current.log (segment 0, if it
@@ -548,40 +548,77 @@ type walBatchFrame struct {
 	Events     []Event `json:"events"`
 }
 
+// walRecordFrame (O01 slice 2) carries opaque JSON records — the payload
+// type DiskQueue was generalized to serve. Per-signal consumers (the errors
+// inbox) own the record schema; the queue only frames, syncs, checkpoints,
+// and replays bytes. A records frame on the events queue (or vice versa)
+// is a replay ERROR — the frame kind is part of each queue's contract.
+type walRecordFrame struct {
+	WALVersion int               `json:"wal_version"`
+	Records    []json.RawMessage `json:"records"`
+}
+
 const (
 	walBatchVersion    = 1
+	walRecordVersion   = 2
 	walMaxFrameBytes   = 8 << 20 // 100 events x 64 KiB event cap, plus envelope
 	legacyFrameVersion = 0
 )
 
-// decodeWALLine decodes one newline-delimited WAL record, accepting both
-// legacy single-event lines and versioned batch frames.
-func decodeWALLine(line []byte) ([]Event, error) {
+// walFrame is one decoded WAL record, either kind.
+type walFrame struct {
+	isRecords bool
+	events    []Event
+	records   []json.RawMessage
+}
+
+// decodeWALFrame decodes one newline-delimited WAL record of either kind
+// (O01 slice 2). wal_version absent means a legacy one-event line.
+func decodeWALFrame(line []byte) (walFrame, error) {
 	var probe struct {
-		WALVersion *int    `json:"wal_version"`
-		Events     []Event `json:"events"`
+		WALVersion *int              `json:"wal_version"`
+		Events     []Event           `json:"events"`
+		Records    []json.RawMessage `json:"records"`
 	}
 	if err := json.Unmarshal(line, &probe); err != nil {
-		return nil, err
+		return walFrame{}, err
 	}
 	if probe.WALVersion == nil {
 		// Legacy line: the whole record is one Event. Re-decode to surface
 		// type mismatches the probe struct tolerated.
 		var e Event
 		if err := json.Unmarshal(line, &e); err != nil {
-			return nil, err
+			return walFrame{}, err
 		}
-		return []Event{e}, nil
+		return walFrame{events: []Event{e}}, nil
 	}
 	switch *probe.WALVersion {
 	case walBatchVersion:
 		if probe.Events == nil {
-			return nil, errors.New("batch frame carries no events")
+			return walFrame{}, errors.New("batch frame carries no events")
 		}
-		return probe.Events, nil
+		return walFrame{events: probe.Events}, nil
+	case walRecordVersion:
+		if probe.Records == nil {
+			return walFrame{}, errors.New("record frame carries no records")
+		}
+		return walFrame{isRecords: true, records: probe.Records}, nil
 	default:
-		return nil, fmt.Errorf("unsupported WAL frame version %d", *probe.WALVersion)
+		return walFrame{}, fmt.Errorf("unsupported WAL frame version %d", *probe.WALVersion)
 	}
+}
+
+// decodeWALLine decodes an EVENTS frame (legacy or versioned). A records
+// frame is an error here: the events queue must never carry one.
+func decodeWALLine(line []byte) ([]Event, error) {
+	f, err := decodeWALFrame(line)
+	if err != nil {
+		return nil, err
+	}
+	if f.isRecords {
+		return nil, errors.New("record frame on an events queue")
+	}
+	return f.events, nil
 }
 
 // Append writes one event to the write-ahead log and returns the WAL byte
@@ -625,6 +662,33 @@ func (q *DiskQueue) AppendBatch(events []Event) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	return q.appendFrame(raw, int64(len(events)))
+}
+
+// AppendRecords writes one RECORDS frame (O01 slice 2) — opaque JSON
+// payloads owned by the caller's signal — and returns the offset after
+// it. Same durability discipline as AppendBatch: enqueue only, the ack
+// boundary is WaitCommit; same roll/refusal/latch behavior (the frame
+// kind changes nothing about the disk budget or failure posture).
+func (q *DiskQueue) AppendRecords(records []json.RawMessage) (int64, error) {
+	if len(records) == 0 {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		return q.offset, nil
+	}
+	frame := walRecordFrame{WALVersion: walRecordVersion, Records: records}
+	raw, err := json.Marshal(frame)
+	if err != nil {
+		return 0, err
+	}
+	return q.appendFrame(raw, int64(len(records)))
+}
+
+// appendFrame is the shared append path for both frame kinds: cap check,
+// roll (with the §5.2 durable-mode refusal / lossy deletion), write, and
+// accounting. unsynced counts the payload items the gauge reports
+// (events or records).
+func (q *DiskQueue) appendFrame(raw []byte, unsynced int64) (int64, error) {
 	if len(raw) > walMaxFrameBytes {
 		return 0, fmt.Errorf("ingest queue: WAL frame too large (%d bytes)", len(raw))
 	}
@@ -677,8 +741,14 @@ func (q *DiskQueue) AppendBatch(events []Event) (int64, error) {
 	q.offset += int64(n)
 	active.size += int64(n)
 	q.dirtySinceFlush = true
-	q.unsyncedEvents += int64(len(events))
+	q.unsyncedEvents += unsynced
 	return q.offset, nil
+}
+
+// Dir returns the queue's on-disk directory (sibling artifacts — e.g. a
+// poison-record quarantine spool — live beside the segments).
+func (q *DiskQueue) Dir() string {
+	return q.dir
 }
 
 // WaitCommit blocks until ONE fsync covering the frame ending at off
@@ -1202,6 +1272,33 @@ func syncDir(dir string) error {
 // AUD-014 (round 2): a complete-but-corrupt record is a replay ERROR, not
 // a skip (see Pending). A non-nil error from fn aborts the walk.
 func (q *DiskQueue) StreamPending(fn func(events []Event) error) error {
+	return q.streamFrames(func(f walFrame, endOffset int64) error {
+		if f.isRecords {
+			return fmt.Errorf("ingest queue: record frame on an events queue (queue %s)", q.name)
+		}
+		return fn(f.events)
+	})
+}
+
+// StreamRecordFrames replays record frames appended after the last
+// checkpoint (O01 slice 2) — the records-signal twin of StreamPending.
+// fn receives each frame's opaque records plus the logical WAL offset
+// AFTER the frame (the caller's checkpoint target once every record in it
+// reaches a final disposition). An events frame on a records queue is a
+// replay error.
+func (q *DiskQueue) StreamRecordFrames(fn func(records []json.RawMessage, endOffset int64) error) error {
+	return q.streamFrames(func(f walFrame, endOffset int64) error {
+		if !f.isRecords {
+			return fmt.Errorf("ingest queue: events frame on a records queue (queue %s)", q.name)
+		}
+		return fn(f.records, endOffset)
+	})
+}
+
+// streamFrames is the shared replay walk: streams every frame after the
+// checkpoint, one frame in memory at a time, tracking the logical offset
+// so consumers can checkpoint against final dispositions.
+func (q *DiskQueue) streamFrames(fn func(f walFrame, endOffset int64) error) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.stopped {
@@ -1240,25 +1337,30 @@ func (q *DiskQueue) StreamPending(fn func(events []Event) error) error {
 			_ = f.Close()
 			return err
 		}
+		pos := seg.base + start
 		scanner := bufio.NewScanner(f)
 		scanner.Buffer(make([]byte, 1<<20), walMaxFrameBytes+1<<20)
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			if len(line) == 0 {
+				pos++
 				continue
 			}
-			events, err := decodeWALLine(line)
+			frame, err := decodeWALFrame(line)
 			if err != nil {
 				_ = f.Close()
 				return fmt.Errorf("ingest queue: WAL corruption — refusing to skip a complete record (queue %s, segment %s): %w", q.name, seg.name, err)
 			}
-			for _, e := range events {
-				if e.EventID == "" || e.SiteID == "" {
-					_ = f.Close()
-					return fmt.Errorf("ingest queue: WAL record is missing its event/site identity (queue %s, segment %s)", q.name, seg.name)
+			if !frame.isRecords {
+				for _, e := range frame.events {
+					if e.EventID == "" || e.SiteID == "" {
+						_ = f.Close()
+						return fmt.Errorf("ingest queue: WAL record is missing its event/site identity (queue %s, segment %s)", q.name, seg.name)
+					}
 				}
 			}
-			if err := fn(events); err != nil {
+			pos += int64(len(line)) + 1
+			if err := fn(frame, pos); err != nil {
 				_ = f.Close()
 				return fmt.Errorf("ingest queue: replay consumer failed (queue %s): %w", q.name, err)
 			}

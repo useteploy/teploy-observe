@@ -105,6 +105,9 @@ test("captureException: posts to /api/v1/errors with parsed stack", async () => 
   assert.equal(body.environment, "test");
   assert.equal(body.level, "error");
   assert.ok(Array.isArray(body.stack_trace) && body.stack_trace.length > 0);
+  // O01 §5.6: the envelope carries the producer-stable event_id (32 hex,
+  // Sentry's shape) — the server's dedupe key.
+  assert.match(body.event_id, /^[0-9a-f]{32}$/, "event_id is sent");
 });
 
 test("captureException: wraps non-Error values", async () => {

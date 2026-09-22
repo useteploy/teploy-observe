@@ -55,6 +55,13 @@ type ErrorInput struct {
 	// and the row falls back to timestamp-window correlation.
 	TraceID string `json:"trace_id"`
 	SpanID  string `json:"span_id"`
+	// EventID is the producer-stable error identity (O01 §5.6): when
+	// present, the record is deduplicated and conflict-checked against the
+	// error_inbox ledger under (site_id, ProducerID, EventID). Empty means
+	// an identity-less producer — durable ack, no cross-request dedupe.
+	EventID string `json:"event_id,omitempty"`
+	// ProducerID optionally namespaces EventID (scoped inbox key).
+	ProducerID string `json:"producer_id,omitempty"`
 }
 
 // Breadcrumb is a user action that preceded the error.
@@ -71,6 +78,10 @@ type Breadcrumb struct {
 type ErrorResponse struct {
 	OK      bool   `json:"ok"`
 	IssueID string `json:"issue_id,omitempty"`
+	// Deduped marks a retry this process already admitted (same event_id
+	// and digest) — acknowledged, applied once (O01 §5.6). Additive wire
+	// field; existing SDKs ignore it.
+	Deduped bool `json:"deduped,omitempty"`
 }
 
 // PrivacyLookup resolves the per-site distinct-id hashing config without
@@ -137,6 +148,25 @@ func NewErrorHandler(db *nucleus.Client, issueSvc *IssueService, searchSvc *Sear
 //
 // Returns the issue_id so callers can present a link to the user.
 func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (string, error) {
+	errorID, issueID, err := s.insertErrorEvent(ctx, s.db.SQL(), input)
+	if err != nil {
+		return "", err
+	}
+	if s.searchSvc != nil {
+		if err := s.searchSvc.IndexError(ctx, input.SiteID, errorID, input.ErrorType, input.ErrorValue); err != nil {
+			slog.Warn("errors: FTS indexing failed (search will lag until reindex)",
+				"site", input.SiteID, "error_id", errorID, "err", err)
+		}
+	}
+	return issueID, nil
+}
+
+// insertErrorEvent is steps 1-4 of IngestErrorEvent on an explicit SQL
+// handle (pool for the legacy path, the inbox transaction for ApplyInbox
+// — O01 §5.6: the claim and the event insert share one commit). Issue
+// resolution still writes through the pool handle beside the caller's
+// transaction; see ApplyInbox for why that exposure self-heals.
+func (s *Service) insertErrorEvent(ctx context.Context, sqlc *nucleus.SQLModel, input ErrorInput) (errorID, issueID string, err error) {
 	now := time.Now().UTC()
 
 	// Accept either `release` or `release_tag` for the release identifier so a
@@ -175,9 +205,9 @@ func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (strin
 	culprit := IssueCulprit(input.StackTrace)
 
 	// Resolve or create issue
-	issueID, err := s.issueSvc.ResolveIssue(ctx, input.SiteID, groupHash, title, culprit, input.Level, input.ReleaseTag, now.UnixMilli())
+	issueID, err = s.issueSvc.ResolveIssue(ctx, input.SiteID, groupHash, title, culprit, input.Level, input.ReleaseTag, now.UnixMilli())
 	if err != nil {
-		return "", fmt.Errorf("resolve issue: %w", err)
+		return "", "", fmt.Errorf("resolve issue: %w", err)
 	}
 
 	// Serialize JSONB fields
@@ -185,7 +215,7 @@ func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (strin
 
 	// Resolve minified stack trace via source maps (if available)
 	if input.ReleaseTag != "" && s.srcmapSvc != nil {
-		if resolved, err := s.srcmapSvc.ResolveStackTrace(ctx, input.SiteID, input.ReleaseTag, stackJSON); err == nil {
+		if resolved, rerr := s.srcmapSvc.ResolveStackTrace(ctx, input.SiteID, input.ReleaseTag, stackJSON); rerr == nil {
 			stackJSON = resolved
 		}
 	}
@@ -194,7 +224,7 @@ func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (strin
 	contextsJSON := jsonOrEmpty(input.Contexts)
 	extraJSON := jsonOrEmpty(input.Extra)
 
-	errorID := genID()
+	errorID = genID()
 	handled := "true"
 	if !input.Handled {
 		handled = "false"
@@ -226,7 +256,7 @@ func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (strin
 	}
 
 	// Insert error event
-	_, err = s.db.SQL().Exec(ctx,
+	_, err = sqlc.Exec(ctx,
 		`INSERT INTO error_events (
 			error_id, tenant_id, site_id, session_id, replay_id, issue_id, group_hash,
 			timestamp, error_type, error_value, mechanism, handled, level,
@@ -239,21 +269,9 @@ func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (strin
 		stackJSON, breadcrumbsJSON, contextsJSON, extraJSON, distinctID, input.TraceID, input.SpanID,
 	)
 	if err != nil {
-		return "", fmt.Errorf("insert error event: %w", err)
+		return "", "", fmt.Errorf("insert error event: %w", err)
 	}
-
-	// Index in FTS for BM25 search (non-fatal — search degrades gracefully,
-	// and operators can rebuild via `observe reindex`). The failure is
-	// logged (audit F27) so search falling behind is visible operationally
-	// instead of silently diverging; the event contents are not logged.
-	if s.searchSvc != nil {
-		if err := s.searchSvc.IndexError(ctx, input.SiteID, errorID, input.ErrorType, input.ErrorValue); err != nil {
-			slog.Warn("errors: FTS indexing failed (search will lag until reindex)",
-				"site", input.SiteID, "error_id", errorID, "err", err)
-		}
-	}
-
-	return issueID, nil
+	return errorID, issueID, nil
 }
 
 // Handle is the legacy HTTP-shape wrapper around IngestErrorEvent. Returns
