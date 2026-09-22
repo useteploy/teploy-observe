@@ -105,11 +105,15 @@ func (s *AlertService) ListRules(ctx context.Context, siteID string) ([]AlertRul
 
 func (s *AlertService) DeleteRule(ctx context.Context, ruleID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+	// Strictly-monotonic version (the 70f6eff version-tie defect): a
+	// same-millisecond create+delete must not tie, or the tombstone loses
+	// the collapse and the deleted rule keeps evaluating.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO alert_rules (rule_id, tenant_id, site_id, name, metric, operator, threshold,
-			window_minutes, check_interval, cooldown, enabled, created_by, created_at, version)
+		 window_minutes, check_interval, cooldown, enabled, created_by, created_at, version)
 		 SELECT rule_id, tenant_id, site_id, name, metric, operator, threshold,
-			window_minutes, check_interval, cooldown, 'false', created_by, created_at, $2
+			window_minutes, check_interval, cooldown, 'false', created_by, created_at,
+		        GREATEST(CAST($2 AS BIGINT), version + 1)
 		 FROM `+alertRulesLatest("rule_id = $1"),
 		ruleID, now,
 	)

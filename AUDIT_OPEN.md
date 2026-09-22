@@ -1231,3 +1231,72 @@ order-unsafe Observe tests. Not blocking committed slices (all pass
 within their runs and standalone). Do not claim the v1.1.1 full-suite
 green until this is closed; CI needs a v1.1.1 arm64 job either way
 (see _internal/X01_COMPATIBILITY_MANIFEST_2026-09-21.md).
+
+**RESOLVED 2026-09-22 (supersedes the entry above; classification
+settled as OURS, not an engine defect).** Root cause: Observe's own
+version-tie ambiguity. Every version-rewriting write stamped `version`
+(or its updated_at-as-version equivalent) from
+`time.Now().UTC().UnixMilli()`, and every latest-row read resolves via
+`argMax(col, version) ... GROUP BY key` (internal/query/replacing.go and
+the incidents/mcp/exports/aiquery argMax-or-ORDER-DESC variants). Two
+writes to the same key inside one millisecond produce TIED versions;
+argMax then resolves the tie arbitrarily — a just-enabled SSO config
+lists disabled, a revoked MCP token surfaces, a closed incident reads
+ongoing, a survey flips inactive. Native arm64 + Nucleus v1.1.1 runs
+ops sub-millisecond, so tight test sequences collided routinely; slow
+and emulated environments never collided, which is why CI (v0.1.8,
+amd64-emulated) could not see it and why the failing package MOVED.
+Engine behavior on tied argMax versions is unspecified-but-acceptable —
+newest-wins is only promised for STRICTLY greater versions, so the
+defect lived in our write stamps, not in Nucleus. No upstream report is
+warranted.
+
+Fix: strictly-monotonic versions per key at 18 write sites (working
+tree at the time of this entry; see the per-file
+`GREATEST(CAST($now AS BIGINT), version + 1)` stamps and the two
+Go-side max(now, prior+1) stamps):
+
+- INSERT..SELECT-from-latest, version := GREATEST(now, version + 1)
+  (16 statements): sso Enable; surveys Activate + Close; flags Toggle;
+  platform DeleteRule + Delete (webhooks); integrations Delete;
+  logs/pipelines Delete; reports Delete + markSent; errors bumpIssue +
+  UpdateStatus; experiments Start + Stop.
+- updated_at-as-version, same GREATEST stamp: incidents Close and
+  jobs/exports recordRun (both keep their load-bearing ORDER BY DESC
+  LIMIT 1).
+- Go-side max(now, prior+1) on VALUES-form writes: mcp TokenStore
+  (prior carried from the collapsed read) and aiquery writeSetting
+  (prior read first).
+
+First inserts keep version = now — safe because every rewriting write
+now reads the latest version and bumps past it, which also protects the
+same-ms create-then-rewrite burst. Verified already-monotonic and left
+alone: monitoring + dashboards (R19 stamps), principals (nextVersion),
+replays upsertSession (039 stamp), cohorts Update/Delete (Go-side
+force), rollups + goals + boards + views (delete-then-insert or hard
+delete). Sites examined and confirmed NOT tie-exposed: share_links and
+api_keys (plain tables with real UPDATEs), audit_events (sequence
+chain, single writer), service_stats/service_dependencies and
+click_heatmaps (no argMax consumer; raw spans/ SUM reads are the source
+of truth), and the append-only tables (llm_traces, feedback, logs,
+events, spans, exposures/conversions, results/checkins, deliveries,
+replay children/ledger). `version` is never interpreted as wall-clock
+time anywhere (all DTO fields are `json:"-"`; ordering is by created_at;
+payload timestamps like last_sent/started_at/ended_at deliberately
+remain wall-clock, only the version column went monotonic), so
+monotonic-but-occasionally-now+1 changes no observable semantics.
+
+Evidence: deterministic mechanism tests (future-seeded prior version —
+the same GREATEST arm, zero timing luck) + tight same-ms loop
+regressions (the flake's exact shape, no sleeps) in internal/sso,
+internal/incidents, internal/mcp, internal/surveys, internal/platform,
+internal/flags, internal/experiments, internal/errors, plus an
+engine-level expression pin in internal/query (version_bump_test.go).
+Red demonstrated pre-fix on sso (tie at 1790108686374 ==
+1790108686374), incidents, surveys, and mcp's deterministic arm; green
+post-fix. Gates: go vet ./... clean; touched packages green serially
+and under -race against live Nucleus v1.1.1; the four worst packages
+(sso, incidents, mcp, surveys) 20/20 full-suite loop runs green, other
+fixed packages 5/5. The moving serial-suite failures close with this
+entry. Remaining honest caveats, unchanged: Nucleus v1.1.1 arm64 still
+lacks CI coverage (X01 item) and v0.1.8's arm64 image remains broken.

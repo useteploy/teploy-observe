@@ -65,9 +65,13 @@ func (s *SSOService) List(ctx context.Context) ([]SSOConfig, error) {
 
 func (s *SSOService) Enable(ctx context.Context, ssoID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+	// Strictly-monotonic version: GREATEST(now, latest version + 1) — a
+	// same-millisecond create+enable must not tie, or argMax resolves the
+	// disabled row (the 70f6eff version-tie defect).
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO sso_configs (sso_id, tenant_id, provider, entity_id, sso_url, certificate, attribute_map, enabled, created_at, version)
-		 SELECT sso_id, tenant_id, provider, entity_id, sso_url, certificate, NULLIF(CAST(attribute_map AS TEXT), ''), 'true', created_at, $2
+		 SELECT sso_id, tenant_id, provider, entity_id, sso_url, certificate, NULLIF(CAST(attribute_map AS TEXT), ''), 'true', created_at,
+		        GREATEST(CAST($2 AS BIGINT), version + 1)
 		 FROM `+ssoConfigsLatest("sso_id = $1"),
 		ssoID, now)
 	return err

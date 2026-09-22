@@ -97,9 +97,13 @@ func (s *IntegrationService) List(ctx context.Context, siteID string) ([]Integra
 
 func (s *IntegrationService) Delete(ctx context.Context, integrationID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+	// Strictly-monotonic version (the 70f6eff version-tie defect): a
+	// same-millisecond create+delete must not tie, or the tombstone loses
+	// the collapse and the deleted integration keeps firing.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO integrations (integration_id, tenant_id, site_id, name, int_type, config, enabled, created_at, version)
-		 SELECT integration_id, tenant_id, site_id, name, int_type, NULLIF(CAST(config AS TEXT), ''), 'false', created_at, $2
+		 SELECT integration_id, tenant_id, site_id, name, int_type, NULLIF(CAST(config AS TEXT), ''), 'false', created_at,
+		        GREATEST(CAST($2 AS BIGINT), version + 1)
 		 FROM `+integrationsLatest("integration_id = $1"),
 		integrationID, now)
 	return err

@@ -150,10 +150,14 @@ func (s *IssueService) bumpIssue(ctx context.Context, issueID, siteID string, la
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	lastSeenStr := strconv.FormatInt(lastSeen, 10)
 	newCountStr := strconv.FormatInt(newCount, 10)
+	// Strictly-monotonic version (the 70f6eff version-tie defect): two
+	// error-batch flushes inside one millisecond must not tie, or the
+	// collapse resolves arbitrary counters for the issue.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO issues (issue_id, tenant_id, site_id, group_hash, title, culprit, level, status, first_seen, last_seen, event_count, user_count, release_tag, version)
 		 SELECT issue_id, tenant_id, site_id, group_hash, title, culprit, level, status,
-			first_seen, $3 AS last_seen, $4 AS event_count, user_count, release_tag, $5 AS version
+			first_seen, $3 AS last_seen, $4 AS event_count, user_count, release_tag,
+		        GREATEST(CAST($5 AS BIGINT), version + 1) AS version
 		 FROM `+issuesLatest("issue_id = $1 AND site_id = $2"),
 		issueID, siteID, lastSeenStr, newCountStr, now,
 	)
@@ -163,10 +167,13 @@ func (s *IssueService) bumpIssue(ctx context.Context, issueID, siteID string, la
 // UpdateStatus changes an issue's status (open, resolved, ignored).
 func (s *IssueService) UpdateStatus(ctx context.Context, issueID, siteID, status string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+	// Same monotonic stamp as bumpIssue: a status flip inside the same
+	// millisecond as a bump must still win the collapse.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO issues (issue_id, tenant_id, site_id, group_hash, title, culprit, level, status, first_seen, last_seen, event_count, user_count, release_tag, version)
 		 SELECT issue_id, tenant_id, site_id, group_hash, title, culprit, level, $3 AS status,
-			first_seen, last_seen, event_count, user_count, release_tag, $4 AS version
+			first_seen, last_seen, event_count, user_count, release_tag,
+		        GREATEST(CAST($4 AS BIGINT), version + 1) AS version
 		 FROM `+issuesLatest("issue_id = $1 AND site_id = $2"),
 		issueID, siteID, status, now,
 	)

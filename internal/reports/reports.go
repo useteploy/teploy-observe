@@ -67,9 +67,13 @@ func (s *ReportService) List(ctx context.Context, siteID string) ([]ReportSchedu
 
 func (s *ReportService) Delete(ctx context.Context, scheduleID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+	// Strictly-monotonic version (the 70f6eff version-tie defect): a
+	// same-millisecond create+delete must not tie, or the tombstone loses
+	// the collapse and the deleted schedule keeps emailing.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO report_schedules (schedule_id, tenant_id, site_id, name, frequency, recipients, enabled, last_sent, created_at, version)
-		 SELECT schedule_id, tenant_id, site_id, name, frequency, recipients, 'false', last_sent, created_at, $2
+		 SELECT schedule_id, tenant_id, site_id, name, frequency, recipients, 'false', last_sent, created_at,
+		        GREATEST(CAST($2 AS BIGINT), version + 1)
 		 FROM `+reportSchedulesLatest("schedule_id = $1"),
 		scheduleID, now)
 	return err
@@ -275,9 +279,13 @@ func genID() string {
 // every send.
 func (s *ReportService) markSent(ctx context.Context, scheduleID string, atMs int64) error {
 	at := strconv.FormatInt(atMs, 10)
+	// last_sent carries the wall-clock send time; the VERSION is the
+	// monotonic stamp (the 70f6eff version-tie defect), so a send recorded
+	// in the same millisecond as a create/delete still resolves newest.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO report_schedules (schedule_id, tenant_id, site_id, name, frequency, recipients, enabled, last_sent, created_at, version)
-		 SELECT schedule_id, tenant_id, site_id, name, frequency, recipients, enabled, $2, created_at, $3
+		 SELECT schedule_id, tenant_id, site_id, name, frequency, recipients, enabled, $2, created_at,
+		        GREATEST(CAST($3 AS BIGINT), version + 1)
 		 FROM `+reportSchedulesLatest("schedule_id = $1"),
 		scheduleID, at, at)
 	return err

@@ -108,3 +108,46 @@ func physicalRows(ctx context.Context, t *testing.T, db *nucleus.Client, experim
 	}
 	return rows[0].N
 }
+
+// TestSameMillisecondCreateStartStopResolvesCompleted is the version-tie
+// regression for the 70f6eff defect: Create, Start, and Stop all stamp
+// version from the clock, so an immediate create+start+stop (the UI's "start
+// then end immediately" path, no sleeps) ties and argMax resolves
+// arbitrarily — a completed experiment can keep reporting as running. The
+// monotonic stamp resolves the transitions in write order.
+func TestSameMillisecondCreateStartStopResolvesCompleted(t *testing.T) {
+	ctx := context.Background()
+	db, err := nucleus.Connect(ctx, nucleustest.DSN(t))
+	if err != nil {
+		t.Skipf("connect: %v", err)
+	}
+	defer db.Close()
+
+	nucleustest.AsPlainMergeTree(t, db, "experiments", experimentColumns,
+		"(tenant_id, site_id, experiment_id)", "version")
+
+	svc := NewExperimentService(db)
+	const site = "exp-tie-site"
+
+	for i := 0; i < 5; i++ {
+		exp, err := svc.Create(ctx, site, "Tie test", "tie-key", "pageview", "", "", 100)
+		if err != nil {
+			t.Fatalf("iter %d create: %v", i, err)
+		}
+		if err := svc.Start(ctx, exp.ExperimentID); err != nil {
+			t.Fatalf("iter %d start: %v", i, err)
+		}
+		if err := svc.Stop(ctx, exp.ExperimentID); err != nil {
+			t.Fatalf("iter %d stop: %v", i, err)
+		}
+		list, err := svc.List(ctx, site)
+		if err != nil {
+			t.Fatalf("iter %d list: %v", i, err)
+		}
+		for _, e := range list {
+			if e.ExperimentID == exp.ExperimentID && e.Status != "completed" {
+				t.Fatalf("iter %d: List reported status %q, want completed — a same-millisecond tie resolved a superseded version", i, e.Status)
+			}
+		}
+	}
+}

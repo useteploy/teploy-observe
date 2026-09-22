@@ -155,9 +155,13 @@ func ValidateRules(rules string) error {
 
 func (s *PipelineService) Delete(ctx context.Context, pipelineID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+	// Strictly-monotonic version (the 70f6eff version-tie defect): a
+	// same-millisecond create+delete must not tie, or the tombstone loses
+	// the collapse and the deleted pipeline keeps processing logs.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO log_pipelines (pipeline_id, tenant_id, site_id, name, priority, rules, enabled, created_at, version)
-		 SELECT pipeline_id, tenant_id, site_id, name, priority, NULLIF(CAST(rules AS TEXT), ''), 'false', created_at, $2
+		 SELECT pipeline_id, tenant_id, site_id, name, priority, NULLIF(CAST(rules AS TEXT), ''), 'false', created_at,
+		        GREATEST(CAST($2 AS BIGINT), version + 1)
 		 FROM `+pipelinesLatest("pipeline_id = $1"),
 		pipelineID, now)
 	if err == nil {

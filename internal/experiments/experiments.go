@@ -87,9 +87,13 @@ func (s *ExperimentService) List(ctx context.Context, siteID string) ([]Experime
 
 func (s *ExperimentService) Start(ctx context.Context, experimentID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+	// started_at carries the wall-clock start; the VERSION is the monotonic
+	// stamp (the 70f6eff version-tie defect), so a same-millisecond
+	// create+start resolves running.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO experiments (experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample, variants, started_at, ended_at, created_at, version)
-		 SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, 'running', min_sample, variants, $2, '0', created_at, $3
+		 SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, 'running', min_sample, variants, $2, '0', created_at,
+		        GREATEST(CAST($3 AS BIGINT), version + 1)
 		 FROM `+experimentsLatest("experiment_id = $1"),
 		experimentID, now, now)
 	return err
@@ -97,9 +101,12 @@ func (s *ExperimentService) Start(ctx context.Context, experimentID string) erro
 
 func (s *ExperimentService) Stop(ctx context.Context, experimentID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+	// ended_at carries the wall-clock end; same monotonic version stamp as
+	// Start, so a start+stop inside one millisecond resolves completed.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO experiments (experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample, variants, started_at, ended_at, created_at, version)
-		 SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, 'completed', min_sample, variants, started_at, $2, created_at, $3
+		 SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, 'completed', min_sample, variants, started_at, $2, created_at,
+		        GREATEST(CAST($3 AS BIGINT), version + 1)
 		 FROM `+experimentsLatest("experiment_id = $1"),
 		experimentID, now, now)
 	return err

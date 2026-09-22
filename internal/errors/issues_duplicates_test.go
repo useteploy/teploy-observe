@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
 
@@ -191,5 +193,44 @@ func TestFindIssueByHashCollapses(t *testing.T) {
 	}
 	if found.LastSeen.UnixMilli() != 2003 {
 		t.Fatalf("find by hash returned last_seen %d, want 2003 — an older version won", found.LastSeen.UnixMilli())
+	}
+}
+
+// TestSameMillisecondBumpAndStatusChangeResolveNewest is the version-tie
+// regression for the 70f6eff defect: ResolveIssue's create and bumpIssue /
+// UpdateStatus all stamp version from the clock, so two error-batch flushes
+// (or a create and an immediate status change) inside one millisecond tie
+// and argMax resolves arbitrarily — a resolved issue can read open again.
+// The monotonic stamp resolves every rewrite in write order.
+func TestSameMillisecondBumpAndStatusChangeResolveNewest(t *testing.T) {
+	db := issuesTestDB(t)
+	ctx := context.Background()
+	svc := NewIssueService(db)
+	const site = "iss-tie-site"
+	suffix := uniqSuffix(t)
+
+	for i := 0; i < 5; i++ {
+		hash := "tie-hash-" + suffix + "-" + strconv.Itoa(i)
+		issueID, err := svc.ResolveIssue(ctx, site, hash, "boom", "culprit", "error", "", time.Now().UnixMilli())
+		if err != nil {
+			t.Fatalf("iter %d resolve: %v", i, err)
+		}
+		// Same-millisecond second bump: another event for the same group.
+		if _, err := svc.ResolveIssue(ctx, site, hash, "boom", "culprit", "error", "", time.Now().UnixMilli()); err != nil {
+			t.Fatalf("iter %d second resolve: %v", i, err)
+		}
+		if err := svc.UpdateStatus(ctx, issueID, site, "resolved"); err != nil {
+			t.Fatalf("iter %d update status: %v", i, err)
+		}
+		got, err := svc.GetIssue(ctx, issueID, site)
+		if err != nil {
+			t.Fatalf("iter %d get: %v", i, err)
+		}
+		if got == nil {
+			t.Fatalf("iter %d: issue vanished", i)
+		}
+		if got.Status != "resolved" {
+			t.Fatalf("iter %d: GetIssue reported status %q, want resolved — a same-millisecond tie resolved a superseded version", i, got.Status)
+		}
 	}
 }

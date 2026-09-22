@@ -71,6 +71,10 @@ type Token struct {
 	CreatedAt  int64  `json:"created_at" db:"created_at"`
 	LastUsedAt int64  `json:"last_used_at" db:"last_used_at"`
 	RevokedAt  int64  `json:"revoked_at" db:"revoked_at"`
+	// UpdatedAt is the row's version (updated_at doubles as it on this plain
+	// mergetree) from the collapsed read; a rewrite stamps
+	// max(now, UpdatedAt+1) so same-millisecond writes cannot tie.
+	UpdatedAt int64 `json:"-" db:"updated_at"`
 }
 
 // ReadOnly reports whether the token may only call read-only tools. Read-only
@@ -130,7 +134,7 @@ func (s *TokenStore) Create(ctx context.Context, name, role string) (string, Tok
 		Role:      normalizeRole(role),
 		CreatedAt: now,
 	}
-	if err := s.write(ctx, t, now); err != nil {
+	if err := s.write(ctx, t, 0, now); err != nil {
 		return "", Token{}, err
 	}
 	return plaintext, t, nil
@@ -171,7 +175,10 @@ func (s *TokenStore) Revoke(ctx context.Context, id string) error {
 	t := rows[0]
 	now := time.Now().UTC().UnixMilli()
 	t.RevokedAt = now
-	return s.write(ctx, t, now)
+	// Prior version carried from the collapsed read: a create+revoke inside
+	// one millisecond must not tie, or argMax resolves the pre-revoke row
+	// and a revoked token surfaces as live.
+	return s.write(ctx, t, t.UpdatedAt, now)
 }
 
 // Verify checks a presented plaintext token and reports the matching record.
@@ -195,7 +202,10 @@ func (s *TokenStore) Verify(ctx context.Context, plaintext string) (Token, bool)
 	if now-tok.LastUsedAt >= lastUsedInterval.Milliseconds() {
 		used := tok
 		used.LastUsedAt = now
-		if err := s.write(ctx, used, now); err == nil {
+		// The 5-minute throttle means the clock has always advanced past
+		// the prior row here, but the monotonic stamp is kept anyway — the
+		// invariant is cheap and uniform across every rewrite.
+		if err := s.write(ctx, used, tok.UpdatedAt, now); err == nil {
 			tok.LastUsedAt = now
 		}
 	}
@@ -220,13 +230,25 @@ func match(rows []Token, plaintext string) (Token, bool) {
 	return Token{}, false
 }
 
-func (s *TokenStore) write(ctx context.Context, t Token, updatedAt int64) error {
+// nextUpdatedAt is the strictly-monotonic version stamp for mcp_tokens (the
+// 70f6eff version-tie defect): updated_at doubles as the version this table's
+// reads collapse by, so a rewrite must strictly exceed the prior row's
+// updated_at even when the wall clock has not ticked (or has moved
+// backwards). A first insert passes prior = 0 and gets the clock verbatim.
+func nextUpdatedAt(prior, now int64) int64 {
+	if prior+1 > now {
+		return prior + 1
+	}
+	return now
+}
+
+func (s *TokenStore) write(ctx context.Context, t Token, priorUpdatedAt, now int64) error {
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO mcp_tokens (`+tokenColumns+`)
 		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8)`,
 		t.ID, t.Name, t.Hash, t.Role,
 		dbutil.IntParam(t.CreatedAt), dbutil.IntParam(t.LastUsedAt),
-		dbutil.IntParam(t.RevokedAt), dbutil.IntParam(updatedAt))
+		dbutil.IntParam(t.RevokedAt), dbutil.IntParam(nextUpdatedAt(priorUpdatedAt, now)))
 	if err != nil {
 		return fmt.Errorf("mcp: writing token: %w", err)
 	}
@@ -251,7 +273,8 @@ func latestTokens(whereFrag string) string {
 	               argMax(role, updated_at)         AS role,
 	               argMax(created_at, updated_at)   AS created_at,
 	               argMax(last_used_at, updated_at) AS last_used_at,
-	               argMax(revoked_at, updated_at)   AS revoked_at
+	               argMax(revoked_at, updated_at)   AS revoked_at,
+	               MAX(updated_at)                  AS updated_at
 	        FROM mcp_tokens WHERE ` + whereFrag + `
 	        GROUP BY token_id`
 }

@@ -3,6 +3,7 @@ package flags
 import (
 	"context"
 	"os"
+	"strconv"
 	"testing"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -95,5 +96,55 @@ func TestEvaluateResolvesLatestToggle(t *testing.T) {
 	}
 	if seen != 1 {
 		t.Fatalf("List returned the flag %d times, want 1 — one row per surviving version", seen)
+	}
+}
+
+// TestSameMillisecondCreateToggleYieldsStrictlyIncreasingVersions is the
+// version-tie regression for the 70f6eff defect: Create and Toggle both stamp
+// version from the clock, so an immediate create+toggle ties and argMax
+// resolves arbitrarily. The monotonic stamp makes v(toggle) > v(create)
+// always. No sleeps: the flake's exact shape.
+func TestSameMillisecondCreateToggleYieldsStrictlyIncreasingVersions(t *testing.T) {
+	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
+	if dsn == "" {
+		dsn = nucleustest.DefaultDSN
+	}
+	db, err := nucleus.Connect(context.Background(), dsn)
+	if err != nil {
+		t.Skipf("connect: %v", err)
+	}
+	nucleustest.AsPlainMergeTree(t, db, "feature_flags", flagColumns,
+		"(tenant_id, site_id, flag_id)", "version")
+
+	svc := NewFlagService(db)
+	ctx := context.Background()
+	const site = "flag-tie-site"
+
+	type vrow struct {
+		Version string `db:"version"`
+	}
+	for i := 0; i < 5; i++ {
+		key := "tie-" + strconv.Itoa(i)
+		flag, err := svc.Create(ctx, site, key, "Tie", "", "boolean", "", "", 100)
+		if err != nil {
+			t.Fatalf("iter %d create: %v", i, err)
+		}
+		if err := svc.Toggle(ctx, flag.FlagID, true); err != nil {
+			t.Fatalf("iter %d toggle: %v", i, err)
+		}
+		rows, err := nucleus.Query[vrow](ctx, db.SQL(),
+			`SELECT CAST(version AS TEXT) AS version FROM feature_flags WHERE flag_id = $1 ORDER BY version ASC`,
+			flag.FlagID)
+		if err != nil {
+			t.Fatalf("iter %d read versions: %v", i, err)
+		}
+		if len(rows) != 2 {
+			t.Fatalf("iter %d: %d version rows, want 2", i, len(rows))
+		}
+		v1, _ := strconv.ParseInt(rows[0].Version, 10, 64)
+		v2, _ := strconv.ParseInt(rows[1].Version, 10, 64)
+		if v2 <= v1 {
+			t.Fatalf("iter %d: toggle version %d does not strictly exceed create version %d — a same-millisecond tie leaves argMax free to resolve the disabled row", i, v2, v1)
+		}
 	}
 }

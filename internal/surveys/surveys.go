@@ -78,9 +78,13 @@ func (s *SurveyService) List(ctx context.Context, siteID string) ([]Survey, erro
 
 func (s *SurveyService) Activate(ctx context.Context, surveyID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+	// Strictly-monotonic version (the 70f6eff version-tie defect): a
+	// same-millisecond create+activate must not tie, or argMax resolves the
+	// superseded status arbitrarily.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO surveys (survey_id, tenant_id, site_id, name, questions, appearance, targeting, status, created_at, version)
-		 SELECT survey_id, tenant_id, site_id, name, NULLIF(CAST(questions AS TEXT), ''), NULLIF(CAST(appearance AS TEXT), ''), NULLIF(CAST(targeting AS TEXT), ''), 'active', created_at, $2
+		 SELECT survey_id, tenant_id, site_id, name, NULLIF(CAST(questions AS TEXT), ''), NULLIF(CAST(appearance AS TEXT), ''), NULLIF(CAST(targeting AS TEXT), ''), 'active', created_at,
+		        GREATEST(CAST($2 AS BIGINT), version + 1)
 		 FROM `+surveysLatest("survey_id = $1"),
 		surveyID, now)
 	return err
@@ -88,9 +92,12 @@ func (s *SurveyService) Activate(ctx context.Context, surveyID string) error {
 
 func (s *SurveyService) Close(ctx context.Context, surveyID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+	// Same monotonic stamp as Activate: an activate+close inside one
+	// millisecond must resolve closed.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO surveys (survey_id, tenant_id, site_id, name, questions, appearance, targeting, status, created_at, version)
-		 SELECT survey_id, tenant_id, site_id, name, NULLIF(CAST(questions AS TEXT), ''), NULLIF(CAST(appearance AS TEXT), ''), NULLIF(CAST(targeting AS TEXT), ''), 'closed', created_at, $2
+		 SELECT survey_id, tenant_id, site_id, name, NULLIF(CAST(questions AS TEXT), ''), NULLIF(CAST(appearance AS TEXT), ''), NULLIF(CAST(targeting AS TEXT), ''), 'closed', created_at,
+		        GREATEST(CAST($2 AS BIGINT), version + 1)
 		 FROM `+surveysLatest("survey_id = $1"),
 		surveyID, now)
 	return err

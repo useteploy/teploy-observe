@@ -145,9 +145,13 @@ func (s *FlagService) Toggle(ctx context.Context, flagID string, enabled bool) e
 	if enabled {
 		val = "true"
 	}
+	// Strictly-monotonic version (the 70f6eff version-tie defect): a
+	// same-millisecond create+toggle must not tie, or Evaluate serves the
+	// pre-toggle value arbitrarily.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO feature_flags (flag_id, tenant_id, site_id, flag_key, name, description, flag_type, enabled, rollout_pct, variants, targeting, created_at, version)
-		 SELECT flag_id, tenant_id, site_id, flag_key, name, description, flag_type, $2, rollout_pct, NULLIF(CAST(variants AS TEXT), ''), NULLIF(CAST(targeting AS TEXT), ''), created_at, $3
+		 SELECT flag_id, tenant_id, site_id, flag_key, name, description, flag_type, $2, rollout_pct, NULLIF(CAST(variants AS TEXT), ''), NULLIF(CAST(targeting AS TEXT), ''), created_at,
+		        GREATEST(CAST($3 AS BIGINT), version + 1)
 		 FROM `+flagsLatest("flag_id = $1"),
 		flagID, val, now)
 	if err != nil {

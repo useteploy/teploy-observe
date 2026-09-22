@@ -120,9 +120,13 @@ func (s *WebhookService) List(ctx context.Context, siteID string) ([]Webhook, er
 
 func (s *WebhookService) Delete(ctx context.Context, webhookID string) error {
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+	// Strictly-monotonic version (the 70f6eff version-tie defect): a
+	// same-millisecond create+delete must not tie, or the tombstone loses
+	// the collapse and the deleted webhook keeps receiving payloads.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO webhooks (webhook_id, tenant_id, site_id, name, webhook_type, url, secret, enabled, created_at, version)
-		 SELECT webhook_id, tenant_id, site_id, name, webhook_type, url, secret, 'false', created_at, $2
+		 SELECT webhook_id, tenant_id, site_id, name, webhook_type, url, secret, 'false', created_at,
+		        GREATEST(CAST($2 AS BIGINT), version + 1)
 		 FROM `+webhooksLatest("webhook_id = $1"),
 		webhookID, now,
 	)

@@ -305,12 +305,34 @@ func (s *Service) readSetting(ctx context.Context, key string) (string, error) {
 }
 
 func (s *Service) writeSetting(ctx context.Context, key, value string) error {
-	now := dbutil.IntParam(time.Now().UnixMilli())
+	now := time.Now().UnixMilli()
 	// MergeTree append-style upsert: insert a new version; read side
-	// picks the newest row by updated_at.
-	_, err := s.db.SQL().Exec(ctx,
+	// picks the newest row by updated_at. updated_at doubles as the
+	// version, so the stamp is strictly-monotonic per key (the 70f6eff
+	// version-tie defect): two writes to the same key inside one
+	// millisecond must not tie, or the newest-row read resolves the older
+	// value. The prior is read first; a first insert gets the clock
+	// verbatim.
+	type row struct {
+		UpdatedAt int64 `db:"updated_at"`
+	}
+	prior := int64(0)
+	rows, err := nucleus.Query[row](ctx, s.db.SQL(),
+		"SELECT updated_at FROM instance_settings WHERE key = $1 ORDER BY updated_at DESC LIMIT 1",
+		key)
+	if err != nil {
+		return fmt.Errorf("aiquery: write setting lookup: %w", err)
+	}
+	if len(rows) > 0 {
+		prior = rows[0].UpdatedAt
+	}
+	next := now
+	if prior+1 > next {
+		next = prior + 1
+	}
+	_, err = s.db.SQL().Exec(ctx,
 		"INSERT INTO instance_settings (key, value, updated_at) VALUES ($1, $2, $3)",
-		key, value, now)
+		key, value, dbutil.IntParam(next))
 	if err != nil {
 		return fmt.Errorf("aiquery: write setting: %w", err)
 	}

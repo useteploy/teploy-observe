@@ -144,13 +144,20 @@ func (s *Service) Create(ctx context.Context, in CreateInput, createdBy string) 
 // 1, 2, 4, 8 on successive calls - and confirmed on the live instance, where
 // `incidents` holds exactly 2 rows for each of 6,170 closed incidents and 1 for
 // each of the 13 open ones. TestCloseWritesExactlyOneRow pins it.
+//
+// updated_at doubles as the version, so it gets the strictly-monotonic stamp
+// (the 70f6eff version-tie defect): GREATEST(now, latest updated_at + 1). A
+// create+close inside one millisecond must not tie, or argMax resolves the
+// open row and a closed incident reads ongoing. ended_at keeps the wall-clock
+// close time.
 func (s *Service) Close(ctx context.Context, incidentID string) error {
 	now := dbutil.IntParam(time.Now().UnixMilli())
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO incidents (incident_id, tenant_id, site_id, title, description, severity,
 		 source, rule_id, started_at, ended_at, created_by, updated_at)
 		 SELECT incident_id, tenant_id, site_id, title, description, severity,
-		        source, rule_id, started_at, $2, created_by, $2
+		        source, rule_id, started_at, $2, created_by,
+		        GREATEST(CAST($2 AS BIGINT), updated_at + 1)
 		 FROM incidents WHERE incident_id = $1 ORDER BY updated_at DESC LIMIT 1`,
 		incidentID, now)
 	return err

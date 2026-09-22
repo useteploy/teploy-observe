@@ -321,12 +321,18 @@ func (s *ExportService) recordRun(ctx context.Context, id string, start time.Tim
 	// it is what keeps this INSERT…SELECT-from-the-same-table to ONE row per
 	// call. Verified on Nucleus v0.1.8 — the identical statement without the
 	// LIMIT goes 1, 2, 4, 8 … on successive calls. Do not remove it.
+	//
+	// updated_at is the version this table collapses by, so it gets the
+	// strictly-monotonic stamp (the 70f6eff version-tie defect): a create +
+	// "Run now" inside one millisecond, or two runs inside one millisecond,
+	// must not tie or the newest-row reads resolve arbitrarily.
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO scheduled_exports
 		 (export_id, tenant_id, name, sql, format, cron, destination_type, destination_cfg,
 		  enabled, last_run_at, last_status, last_error, last_rows, created_at, updated_at)
 		 SELECT export_id, tenant_id, name, sql, format, cron, destination_type, destination_cfg,
-		        enabled, $2, $3, $4, $5, created_at, $6
+		        enabled, $2, $3, $4, $5, created_at,
+		        GREATEST(CAST($6 AS BIGINT), updated_at + 1)
 		 FROM scheduled_exports WHERE export_id = $1 ORDER BY updated_at DESC LIMIT 1`,
 		id, ran, status, errMsg, dbutil.IntParam(rowCount), now)
 	return err
