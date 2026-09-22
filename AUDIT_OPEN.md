@@ -1300,3 +1300,102 @@ and under -race against live Nucleus v1.1.1; the four worst packages
 fixed packages 5/5. The moving serial-suite failures close with this
 entry. Remaining honest caveats, unchanged: Nucleus v1.1.1 arm64 still
 lacks CI coverage (X01 item) and v0.1.8's arm64 image remains broken.
+
+## 2026-09-22 O01 pre-implementation contract — durable-ingest inventory + ADR + oracle
+
+Programme workstream O01 ("durable acceptance and idempotent processing
+for every signal", P0) locked its expected answers BEFORE any ingest
+code changes, in the O03 ADR+oracle pattern. NO production ingest
+behavior changed; the one production-adjacent edit is a README
+truth-labeling fix (below). Audited tree `4697beb` (the checked-out
+branch tip; the handoff's `fd2986c` is an unbranched amended variant of
+the same fix whose tree additionally carries a `tmp_repro/main.go`
+scratch file and a `data/audit.key` blob — neither is on the branch,
+and the dangling commit should never be pushed as-is).
+
+Deliverables:
+
+- **ADR:** `docs/O01_DURABLE_INGEST_ADR.md` — per-signal
+  acknowledgment/commit diagrams (mermaid), the honest CURRENT
+  guarantees table (hop-by-hop: memory-only / WAL-with-periodic-sync /
+  synchronous SQL), the fault-model matrix (crash after ACK, crash
+  apply-before-checkpoint, lost response, concurrent duplicate, storage
+  unavailable, full disk, corrupt/truncated tail), and the DESTINATION
+  contract per the programme default: bounded group commit before
+  acknowledgment for durable mode, disk-budget admission refusal instead
+  of deleting uncheckpointed segments, explicit lossy mode with visible
+  counters, count/byte/disk quota design points, poison-record
+  quarantine + replay horizon, the finite dedupe-retention-window
+  statement (24 h events horizon; `replay_batches` ledger currently
+  UNBOUNDED — needs an explicit policy), the error-inbox design (R14's
+  durable half, replay-ledger pattern), the derived-work outbox
+  (TO-020/R22-durable class), and the per-signal counter taxonomy
+  (accepted/rejected/refused/quarantined/applied/pending + the
+  dropped-post-ack counter that exists nowhere today).
+- **Oracle:** `internal/ingest/o01_pin_test.go` (3 storage-free tests)
+  pins the WAL periodic-sync loss window (an AppendBatch success — the
+  basis of the HTTP 200 — leaves bytes in the 64 KiB userspace bufio,
+  recoverable only after the 500 ms periodic fsync; crash-equivalent
+  restart then replays them), and the buffer-level ack ordering (200
+  sent before any storage hop). `internal/errors/o01_pin_test.go`
+  (Nucleus-gated) pins the errors path: ack is memory-only AND a flush
+  failure DROPS the acked record (budget released, nothing requeued).
+  Each test names the destination-contract line it guards; the slices
+  must flip them deliberately. Already-pinned semantics verified, not
+  duplicated: high-water breach drop, torn-tail repair, corrupt-frame
+  refusal, checkpoint bounds/monotonicity, replay/flush dedupe, replay
+  batch ledger (409 on digest conflict).
+- **README truth-labeling:** "Ingest is WAL-backed" overclaimed a
+  durable mirror — now names the periodic-sync window and the
+  high-water's lossy default, cites the ADR.
+
+Inventory findings — every place a success response precedes durability
+(ADR §1/§3 for citations):
+
+1. **Analytics events:** 200 OK after memory admission + an UNSYNCED
+   WAL buffer write; up to 500 ms of acked events lost on hard crash
+   (pinned). Under disk pressure the high-water DELETES UNCHECKPOINTED
+   segments to keep admitting — an availability-over-durability DEFAULT
+   without an explicit lossy opt-in (counted, but the programme contract
+   says durable mode must refuse instead).
+2. **Errors:** 200 OK after a memory-only Push; storage failure at flush
+   drops the acked record (pinned); no producer identity, no inbox —
+   R14's durable half, designed in ADR §5.6.
+3. **OTLP logs/traces/metrics:** 200 comes after synchronous commit
+   (honest), BUT the chunked-autocommit + 503-retry shape duplicates the
+   committed prefix when an exporter retries (no signal identity — the
+   documented O02 limit). Traces additionally schedule rollups +
+   detectors in a detached post-response goroutine with NO outbox:
+   committed spans can silently miss their derived work forever
+   (TO-020 class).
+4. **Replays (v2):** the reference durable shape — ledger + digest +
+   deterministic children in ONE tx, ack after commit, 409 on
+   conflicting batch reuse. Residual: `replay_batches` has NO retention
+   policy (unbounded dedupe memory) and post-commit heatmaps are
+   best-effort (TO-020).
+5. **Corrupt WAL frame at startup** = replay error → AttachQueue fails
+   → process silently degrades to memory-only analytics unless
+   OBSERVE_REQUIRE_WAL — a poison record kills durability for the whole
+   signal instead of being quarantined (ADR §5.9).
+6. **Webhook deliveries:** in-memory queue (R22 contained) — restart
+   drops undelivered alerts; rides the derived-work outbox slice.
+
+Implementation slices this unblocks, in order (ADR §6): (1) events
+group commit + refusal high-water + explicit lossy mode; (2) error
+inbox + durable error path (closes R14 durable half); (3) derived-work
+outbox (closes TO-020's class + R22 durable half); (4) quarantine +
+healthz counter block; (5) ledger retention policies; (6) OTLP retry-
+duplicate mitigation (post-O02, only if measurably distorting). The Dash
+admission-write replay note from the implementation handoff is recorded
+in ADR §5.11: auto-replaying queued records changes a safety contract —
+resolve explicitly before restart-resume; Observe's WAL auto-replay is
+dedupe-guarded by design, but the pattern must not be exported to
+admission-write queues unguarded.
+
+Validation this session: `go vet ./internal/ingest/ ./internal/errors/`
+clean; both packages green with `-count=1` and `-race` against the
+shared Nucleus v1.1.1 fixture (`OBSERVE_NUCLEUS_URL`), tests
+`TestO01_*` (4 new, all passing; the Nucleus-gated one self-skips
+without the fixture). Full suite deliberately NOT run (shared-fixture
+constraint); `gofmt` note: `internal/ingest/queue.go` is unformatted at
+HEAD — pre-existing, untouched by this slice.

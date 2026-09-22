@@ -157,9 +157,18 @@ the exact image and version.
 - **RBAC** enforced — JWT carries a role claim (`admin` / `editor` /
   `viewer`). Writes require editor or admin; destructive config routes
   require admin.
-- **Ingest is WAL-backed** — accepted events are mirrored to
-  `$OBSERVE_QUEUE_DIR` when the queue is available. Graceful shutdown fsyncs
-  the queue; crash recovery replays records since the last checkpoint.
+- **Ingest is WAL-backed, with a bounded sync window** — accepted
+  events are mirrored to `$OBSERVE_QUEUE_DIR` when the queue is
+  available. The mirror is flushed and fsynced periodically (500 ms) and
+  at each database checkpoint, so a hard crash can lose up to one sync
+  interval of already-acknowledged events; graceful shutdown fsyncs the
+  queue. Crash recovery replays records since the last checkpoint, and
+  the disk high-water (`OBSERVE_WAL_MAX_TOTAL_BYTES`) may drop the
+  oldest UNCHECKPOINTED segment to keep accepting writes — counted and
+  surfaced in `/healthz`. The full acknowledgment/commit contract, its
+  current limits, and the durable-mode destination (group commit before
+  acknowledgment, admission refusal instead of deletion) are specified
+  in `docs/O01_DURABLE_INGEST_ADR.md`.
 - **Per-site rate limiting** — each site has its own token bucket. One
   noisy site can't starve a quiet one. Admin-editable via
   `PUT /api/v1/sites/{id}/ratelimit`.
