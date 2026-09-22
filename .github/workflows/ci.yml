@@ -170,6 +170,59 @@ jobs:
   # its known flake (intermittent committed-upsert loss on accumulated
   # data, also fixed in the tree) is why the capability job exists
   # separately rather than replacing this one.
+  # X01 compatibility matrix: the same suite against the engine version
+  # production actually runs (v1.1.1) on arm64. This combination found two
+  # real defects the v0.1.8 job structurally cannot see (the version-tie
+  # ambiguity — fast native runs collide at millisecond granularity while
+  # slower CI engines never do — and the v0.1.8 arm64 image is broken
+  # outright: GLIBC_2.38 not found). Do not remove; widen deliberately.
+  nucleus-integration-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Start pinned Nucleus v1.1.1
+        run: |
+          docker run -d --name nucleus -p 55432:5432 \
+            -e NUCLEUS_ALLOW_NO_AUTH=1 \
+            -e NUCLEUS_ALLOW_INSECURE_CLUSTER=1 \
+            -e NUCLEUS_ALLOW_INSECURE_REPLICATION=1 \
+            ghcr.io/neutron-build/nucleus:v1.1.1 \
+            start --host 0.0.0.0 --port 5432 --cluster-port 5433 --data /data --max-memory 512
+          for i in $(seq 1 60); do
+            if (exec 3<>/dev/tcp/127.0.0.1/55432) 2>/dev/null; then exec 3>&-; exit 0; fi
+            sleep 1
+          done
+          echo "nucleus did not come up" >&2
+          docker logs nucleus >&2 || true
+          exit 1
+      - name: Build observe
+        run: go build -o /tmp/observe ./cmd/observe
+      - name: Boot once to apply migrations
+        run: |
+          OBSERVE_NUCLEUS_URL='postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable' \
+          OBSERVE_ADMIN_PASSWORD=ci-migration-boot \
+          OBSERVE_JWT_SECRET=ci-migration-secret \
+          /tmp/observe &
+          OBS_PID=$!
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:3000/healthz >/dev/null 2>&1; then
+              kill "$OBS_PID" 2>/dev/null || true
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "observe did not become healthy" >&2
+          kill "$OBS_PID" 2>/dev/null || true
+          exit 1
+      - name: Full suite against live Nucleus v1.1.1
+        env:
+          OBSERVE_NUCLEUS_URL: postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable
+        run: go test -p 1 ./...
+
   nucleus-integration:
     runs-on: ubuntu-latest
     timeout-minutes: 45
