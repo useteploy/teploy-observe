@@ -1208,3 +1208,26 @@ suite, no containers, per the shared-fixture constraint. Residual O03
 scope (next slices): the model implementation itself (persistent
 anonymous client ID, era stamping, event-time acceptance), alias/merge
 resolution, person-level funnel/retention modes, UI entity labeling.
+
+## 2026-09-21 OPEN DEFECT — serial suite fails intermittently against live Nucleus v1.1.1 (moving target)
+
+Reproducible locally (podman machine, arm64, Nucleus v1.1.1, migrations
+booted, `OBSERVE_NUCLEUS_URL=... go test -p 1 -count=1 ./...`): one
+package fails per full run and the failing package MOVES between runs
+(observed: internal/incidents TestInRangeCollapsesVersions +
+internal/sso TestEnableWritesOneRowAndListResolvesLatest together;
+later bench; later cmd/observe). Every failure passes standalone on the
+same store immediately after, and a subset run excluding the previously
+failing packages shifts the failure elsewhere. All 147 storage-gated
+tests otherwise pass against v1.1.1 (down from 147 skips to 2). The
+v0.1.8 (amd64-emulated) subset runs clean — CI's full-suite job pins
+v0.1.8, so CI cannot see this. v0.1.8's arm64 image is broken outright
+(GLIBC_2.38 not found) — Apple Silicon contributors get silent skips.
+
+Classification pending (next slice): sustained-serial-load instability
+on v1.1.1 — engine-side (→ Teploy/_internal/UPSTREAM_BUGS.md with a
+minimal reproducer once the common assertion is isolated) vs
+order-unsafe Observe tests. Not blocking committed slices (all pass
+within their runs and standalone). Do not claim the v1.1.1 full-suite
+green until this is closed; CI needs a v1.1.1 arm64 job either way
+(see _internal/X01_COMPATIBILITY_MANIFEST_2026-09-21.md).
