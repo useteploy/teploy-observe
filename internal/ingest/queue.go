@@ -20,12 +20,18 @@ import (
 // crash recovery: events pushed since the last Checkpoint are replayed on the
 // next process start.
 //
-// Durability model: Append writes to an OS-buffered file handle for
-// throughput. A background goroutine fsyncs every fsyncInterval. On
-// graceful Close, an explicit fsync flushes any buffered data. A SIGKILL may
-// therefore lose up to one fsyncInterval's worth of events, which is still
-// strictly better than the in-memory-only alternative that loses everything
-// buffered since the last flush.
+// Durability model (O01 slice 1, ADR §5.1-§5.3): durable mode is the
+// default. AppendBatch enqueues a frame into the OS-buffered handle and
+// returns; WaitCommit then blocks the caller until ONE shared flush+fsync
+// covering its frame completes (group commit — all frames admitted inside a
+// commit window of at most groupDelay, or walGroupCommitBytes of unsynced
+// bytes, share a single fsync). An ack issued after WaitCommit returns nil
+// is backed by an fsynced WAL segment. The periodic fsyncLoop remains as a
+// backstop for bytes nobody waits on, not as the durability boundary.
+//
+// Lossy mode (WithLossySync — the pre-O01 semantics, now an explicit
+// opt-in): WaitCommit returns immediately, the fsyncLoop (fsyncInterval) is
+// the only sync, and a SIGKILL may lose up to one interval of acked events.
 //
 // File layout under dir/ (audit F16 — numbered segments, maxBytes is a CAP
 // enforced by rolling, not just a compaction threshold):
@@ -40,13 +46,12 @@ import (
 //	                and means segment 0. Segments fully below the checkpoint
 //	                are deleted (acknowledged-segment GC).
 //
-// Disk high-water: maxTotalBytes bounds the sum of all segment sizes. When a
-// roll would push the queue past the cap, the OLDEST segment is deleted even
-// if it is not checkpointed — those events lose their crash-recovery copy
-// (they are still in the flush buffer) but ingestion keeps accepting work.
-// Every such breach is counted in Stats and logged loudly; /healthz surfaces
-// it. This is the operator-visible policy: availability over
-// crash-recoverability past the configured cap, never silent.
+// Disk high-water (O01 §5.2): maxTotalBytes bounds the sum of all segment
+// sizes. DURABLE mode refuses the admission whose roll would breach the cap
+// (ErrWALHighWaterRefused, counted in Stats, retryable once the checkpoint
+// advances) — an uncheckpointed segment is never deleted to keep
+// acknowledging. LOSSY mode keeps the F16 behavior: the oldest segment is
+// deleted even uncheckpointed, counted and logged loudly.
 type DiskQueue struct {
 	mu              sync.Mutex
 	dir             string
@@ -68,12 +73,34 @@ type DiskQueue struct {
 	// High-water breach accounting (F16), guarded by mu.
 	droppedUnackedSegments int64
 	droppedUnackedBytes    int64
+	// O01 group commit state, guarded by mu unless noted.
+	lossySync        bool          // explicit opt-in (ADR §5.3); default durable
+	groupDelay       time.Duration // commit window bound (ADR §5.1)
+	waiters          []*commitWaiter
+	syncedOffset     int64 // logical offset covered by the last successful sync (or the checkpoint at open)
+	refusedHighWater int64 // durable-mode admission refusals at the disk high-water (ADR §5.2)
+	unsyncedEvents   int64 // events admitted but not yet covered by any sync — the lossy-mode loss gauge (ADR §5.3)
+	// commitWake (cap 1) hands waiters to the committer goroutine; written
+	// without holding mu (channel ops are the synchronization).
+	commitWake chan struct{}
+	// syncHook is the fsync seam: every fsync of a WAL segment goes through
+	// it. Production leaves it nil (direct file.Sync); tests count fsyncs
+	// or inject failures through it. Guarded by mu.
+	syncHook func(*os.File) error
 	// lastErr is the first sticky WAL failure (audit F14). Once set it is
 	// never cleared automatically — a WAL-backed deployment that starts
 	// losing writes must stop claiming durability, and only a process
 	// restart (with replay) re-establishes the contract. Surfaced through
 	// LastError for /healthz and admission checks.
 	lastErr error
+}
+
+// commitWaiter is one caller blocked in WaitCommit (O01 §5.1). done receives
+// nil when an fsync covering off completed, or the latched failure.
+type commitWaiter struct {
+	off      int64
+	enqueued time.Time
+	done     chan error // buffered 1
 }
 
 // walSegment is one on-disk segment file. base is the logical offset its
@@ -89,16 +116,41 @@ type walSegment struct {
 // segments (F16). 512 MiB = eight default-sized (64 MiB) segments.
 const DefaultWALMaxTotalBytes = 512 << 20
 
-// QueueStats is the operator-visible WAL state (F16): segment count, total
-// bytes on disk, and the breach counters for segments dropped past the
-// high-water cap before they were checkpointed.
+// DefaultGroupCommitDelay bounds the durable-mode commit window (O01 §5.1,
+// OBSERVE_WAL_GROUP_COMMIT_MAX_DELAY): a request's ack waits at most this
+// long after the FIRST waiter in its group arrived before one shared
+// flush+fsync runs. 25 ms keeps added ack latency imperceptible while
+// collapsing concurrent ingest bursts into a handful of fsyncs per second.
+const DefaultGroupCommitDelay = 25 * time.Millisecond
+
+// walGroupCommitBytes fires the group fsync early once this much unsynced
+// data has accumulated (ADR §5.1's "or group byte cap") so a large burst
+// does not buffer unboundedly behind the timer.
+const walGroupCommitBytes = 1 << 20
+
+// ErrWALHighWaterRefused is the durable-mode disk-high-water refusal
+// (O01 §5.2): the roll this admission needs would breach
+// OBSERVE_WAL_MAX_TOTAL_BYTES with no reclaimable checkpointed segments.
+// Retryable — admission resumes once the flush/checkpoint advances. Never
+// latched, never a deletion.
+var ErrWALHighWaterRefused = errors.New("ingest queue: WAL disk high-water reached — admission refused until the checkpoint advances (raise OBSERVE_WAL_MAX_TOTAL_BYTES or drain the database)")
+
+// QueueStats is the operator-visible WAL state (F16 + O01 §5.2/§5.3):
+// segment count, total bytes on disk, the breach counters for segments
+// dropped past the high-water cap before they were checkpointed (lossy
+// mode), the durable-mode refusal counter, the sync mode, and the
+// potentially-lost events gauge (lossy mode's live loss window).
 type QueueStats struct {
-	Segments               int   `json:"segments"`
-	Bytes                  int64 `json:"bytes"`
-	MaxBytes               int64 `json:"max_bytes"`
-	MaxTotalBytes          int64 `json:"max_total_bytes"`
-	DroppedUnackedSegments int64 `json:"dropped_unacked_segments"`
-	DroppedUnackedBytes    int64 `json:"dropped_unacked_bytes"`
+	Segments               int    `json:"segments"`
+	Bytes                  int64  `json:"bytes"`
+	MaxBytes               int64  `json:"max_bytes"`
+	MaxTotalBytes          int64  `json:"max_total_bytes"`
+	DroppedUnackedSegments int64  `json:"dropped_unacked_segments"`
+	DroppedUnackedBytes    int64  `json:"dropped_unacked_bytes"`
+	RefusedHighWater       int64  `json:"refused_high_water"`
+	Mode                   string `json:"mode"`
+	UnsyncedEvents         int64  `json:"unsynced_events"`
+	GroupCommitDelayMs     int64  `json:"group_commit_delay_ms"`
 }
 
 // Stats returns a snapshot of the WAL state for health surfacing.
@@ -109,6 +161,10 @@ func (q *DiskQueue) Stats() QueueStats {
 	for i := range q.segments {
 		total += q.segments[i].size
 	}
+	mode := "durable"
+	if q.lossySync {
+		mode = "lossy"
+	}
 	return QueueStats{
 		Segments:               len(q.segments),
 		Bytes:                  total,
@@ -116,7 +172,53 @@ func (q *DiskQueue) Stats() QueueStats {
 		MaxTotalBytes:          q.maxTotalBytes,
 		DroppedUnackedSegments: q.droppedUnackedSegments,
 		DroppedUnackedBytes:    q.droppedUnackedBytes,
+		RefusedHighWater:       q.refusedHighWater,
+		Mode:                   mode,
+		UnsyncedEvents:         q.unsyncedEvents,
+		GroupCommitDelayMs:      q.groupDelay.Milliseconds(),
 	}
+}
+
+// Lossy reports whether the queue runs in explicit lossy mode (ADR §5.3).
+// The Buffer consults this to decide whether an admission waits for its
+// group commit.
+func (q *DiskQueue) Lossy() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.lossySync
+}
+
+// WithLossySync opts the queue into explicit lossy mode (ADR §5.3): fast
+// acks without fsync (the fsyncInterval backstop is the durability bound)
+// and delete-at-high-water instead of refusal. Must be called before
+// concurrent use. Default is durable mode.
+func (q *DiskQueue) WithLossySync() *DiskQueue {
+	q.mu.Lock()
+	q.lossySync = true
+	q.mu.Unlock()
+	return q
+}
+
+// WithGroupCommitDelay bounds the durable-mode commit window
+// (OBSERVE_WAL_GROUP_COMMIT_MAX_DELAY). Clamped to [1ms, 1s]; values
+// outside are warned and clamped, never silently honored. Must be called
+// before concurrent use.
+func (q *DiskQueue) WithGroupCommitDelay(d time.Duration) *DiskQueue {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	switch {
+	case d <= 0:
+		q.logger.Warn("ingest queue: OBSERVE_WAL_GROUP_COMMIT_MAX_DELAY not positive — using the default commit window", "configured", d, "effective", DefaultGroupCommitDelay)
+		q.groupDelay = DefaultGroupCommitDelay
+	case d < time.Millisecond:
+		q.groupDelay = time.Millisecond
+	case d > time.Second:
+		q.logger.Warn("ingest queue: OBSERVE_WAL_GROUP_COMMIT_MAX_DELAY above 1s — clamped", "configured", d, "effective", time.Second)
+		q.groupDelay = time.Second
+	default:
+		q.groupDelay = d
+	}
+	return q
 }
 
 // WithMaxTotalBytes sets the disk high-water (F16). Values below maxBytes
@@ -225,6 +327,8 @@ func NewDiskQueueWithLimits(dir, name string, fsyncInterval time.Duration, maxBy
 		activeIdx:      0,
 		cpSeg:          0,
 		cpOff:          0,
+		groupDelay:     DefaultGroupCommitDelay,
+		commitWake:     make(chan struct{}, 1),
 	}
 
 	// Discover the segment set: the legacy current.log (segment 0, if it
@@ -357,6 +461,11 @@ func NewDiskQueueWithLimits(dir, name string, fsyncInterval time.Duration, maxBy
 	q.writer = bufio.NewWriterSize(f, 64*1024)
 	q.offset = q.segmentEnd(q.activeIdx)
 	q.cpSeg, q.cpOff = cpSeg, cpOff
+	// O01: the checkpoint boundary is known-durable (Checkpoint fsyncs
+	// before persisting), so group-commit coverage starts there. Bytes past
+	// it were written by the previous process and are only promised what
+	// its fsyncs durable-wrote — replay handles them as usual.
+	q.syncedOffset = q.cpLogical()
 
 	// F16 + TO-013: reclaim acknowledged sealed segments left behind by a
 	// crash between checkpoint and GC — safe, they are below the
@@ -368,6 +477,7 @@ func NewDiskQueueWithLimits(dir, name string, fsyncInterval time.Duration, maxBy
 	q.gcSegmentsLocked()
 
 	go q.fsyncLoop()
+	go q.committerLoop()
 	return q, nil
 }
 
@@ -496,6 +606,14 @@ func (q *DiskQueue) Append(e Event) (int64, error) {
 // F16: if the frame would push the active segment past maxBytes, the queue
 // rolls to a fresh segment first — maxBytes is a cap, not a threshold that
 // only compaction honors.
+//
+// O01 §5.2: in DURABLE mode that roll first reclaims acknowledged segments
+// and then, if the admission would still breach maxTotalBytes, REFUSES it
+// (ErrWALHighWaterRefused, counted) — an uncheckpointed segment is never
+// deleted to keep acknowledging. LOSSY mode keeps the F16 delete-oldest.
+//
+// This enqueues only; durability before acknowledgment is the caller's
+// WaitCommit (O01 §5.1).
 func (q *DiskQueue) AppendBatch(events []Event) (int64, error) {
 	if len(events) == 0 {
 		q.mu.Lock()
@@ -524,6 +642,20 @@ func (q *DiskQueue) AppendBatch(events []Event) (int64, error) {
 	}
 	active := &q.segments[len(q.segments)-1]
 	if active.size > 0 && active.size+int64(len(raw)) > q.maxBytes {
+		if !q.lossySync {
+			// O01 §5.2: free acknowledged segments first; if the admission
+			// would still breach the disk budget, refuse it (retryable —
+			// the flush/checkpoint path can advance past the backlog and
+			// unblock). Never delete uncheckpointed data in durable mode.
+			q.gcSegmentsLocked()
+			if q.totalBytesLocked()+int64(len(raw)) > q.maxTotalBytes {
+				q.refusedHighWater++
+				q.logger.Error("ingest queue: WAL disk high-water reached — refusing admission (durable mode never deletes uncheckpointed segments)",
+					"queue", q.name, "bytes", q.totalBytesLocked(), "maxTotalBytes", q.maxTotalBytes,
+					"policy", "retry after the checkpoint advances, raise OBSERVE_WAL_MAX_TOTAL_BYTES, or drain the database")
+				return q.offset, ErrWALHighWaterRefused
+			}
+		}
 		if err := q.rollLocked(); err != nil {
 			return q.offset, err
 		}
@@ -545,7 +677,199 @@ func (q *DiskQueue) AppendBatch(events []Event) (int64, error) {
 	q.offset += int64(n)
 	active.size += int64(n)
 	q.dirtySinceFlush = true
+	q.unsyncedEvents += int64(len(events))
 	return q.offset, nil
+}
+
+// WaitCommit blocks until ONE fsync covering the frame ending at off
+// completes (O01 §5.1 group commit — all frames admitted within the commit
+// window share it), then returns nil. An error means the bytes are NOT
+// proven durable: the queue latched a flush/fsync failure (F14 posture) or
+// closed first. The wait is bounded by the commit window (groupDelay, or
+// walGroupCommitBytes of accumulated unsynced data) plus one fsync; it
+// deliberately has no client-side timeout, because returning before the
+// fsync would turn a durable ack into a guess (a stalled disk surfaces
+// through the HTTP server's own write timeouts and the F14 latch).
+//
+// In lossy mode this returns immediately without syncing (ADR §5.3).
+func (q *DiskQueue) WaitCommit(off int64) error {
+	q.mu.Lock()
+	if q.lossySync {
+		q.mu.Unlock()
+		return nil
+	}
+	if q.syncedOffset >= off {
+		// Already covered (a concurrent group, checkpoint, or roll synced
+		// past this frame while the caller was getting here).
+		q.mu.Unlock()
+		return nil
+	}
+	if q.stopped {
+		q.mu.Unlock()
+		return errors.New("ingest queue: closed before commit")
+	}
+	if q.lastErr != nil {
+		err := q.lastErr
+		q.mu.Unlock()
+		return fmt.Errorf("ingest queue: degraded since earlier failure: %w", err)
+	}
+	w := &commitWaiter{off: off, enqueued: time.Now(), done: make(chan error, 1)}
+	q.waiters = append(q.waiters, w)
+	q.mu.Unlock()
+	select {
+	case q.commitWake <- struct{}{}:
+	default:
+	}
+	return <-w.done
+}
+
+// committerLoop is the group-commit leader (O01 §5.1): it wakes when a
+// waiter arrives, holds the commit window open for at most groupDelay from
+// the FIRST outstanding waiter (or fires early at walGroupCommitBytes of
+// unsynced data) WITHOUT holding q.mu — appends keep joining the group —
+// then performs ONE flush+fsync under q.mu and releases every waiter its
+// sync covered.
+func (q *DiskQueue) committerLoop() {
+	for {
+		select {
+		case <-q.stopCh:
+			q.failOrCoverWaiters()
+			return
+		case <-q.commitWake:
+		}
+		for {
+			q.mu.Lock()
+			if len(q.waiters) == 0 {
+				q.mu.Unlock()
+				break
+			}
+			first := q.waiters[0].enqueued
+			unsynced := q.offset - q.syncedOffset
+			wait := q.groupDelay - time.Since(first)
+			q.mu.Unlock()
+			if wait > 0 && unsynced < walGroupCommitBytes {
+				timer := time.NewTimer(wait)
+				select {
+				case <-timer.C:
+				case <-q.commitWake: // new bytes may have crossed the cap — re-evaluate
+					timer.Stop()
+				case <-q.stopCh:
+					timer.Stop()
+					q.failOrCoverWaiters()
+					return
+				}
+				continue
+			}
+			if !q.syncGroup() {
+				break // waiters resolved (or queue closed); re-arm on next wake
+			}
+		}
+	}
+}
+
+// syncGroup performs one shared flush+fsync and resolves the current
+// waiter list. Returns false when the caller should fall back to the outer
+// select (no waiters left, or the queue closed).
+func (q *DiskQueue) syncGroup() bool {
+	q.mu.Lock()
+	if len(q.waiters) == 0 {
+		q.mu.Unlock()
+		return false
+	}
+	if q.stopped {
+		q.mu.Unlock()
+		q.failOrCoverWaiters()
+		return false
+	}
+	// Short-circuit: a checkpoint, roll, or fsyncLoop pass may already have
+	// synced past every waiter's frame while the window was open. Waiters
+	// register in registration order, which is not append order — scan for
+	// the highest offset, do not assume the list is sorted.
+	var maxOff int64
+	for _, w := range q.waiters {
+		if w.off > maxOff {
+			maxOff = w.off
+		}
+	}
+	if q.syncedOffset >= maxOff && q.lastErr == nil {
+		ws := q.waiters
+		q.waiters = nil
+		q.mu.Unlock()
+		for _, w := range ws {
+			w.done <- nil
+		}
+		return true
+	}
+	covered := q.offset
+	var err error
+	if q.lastErr != nil {
+		err = q.lastErr
+	} else if err = q.writer.Flush(); err == nil {
+		if err = q.syncActiveLocked(); err == nil {
+			q.syncedOffset = covered
+			q.dirtySinceFlush = false
+			q.unsyncedEvents = 0
+		}
+	}
+	if err != nil {
+		// F14: a group-commit flush/sync failure latches exactly like the
+		// periodic loop's — the queue stops claiming durability until
+		// restart.
+		q.setErrLocked(fmt.Errorf("WAL group sync: %w", err))
+	}
+	ws := q.waiters
+	q.waiters = nil
+	q.mu.Unlock()
+	for _, w := range ws {
+		if err != nil {
+			w.done <- err
+		} else if w.off <= covered {
+			w.done <- nil
+		} else {
+			// Unreachable (waiters register only after their append, and
+			// offset is monotonic) — resolve loudly rather than ack.
+			w.done <- fmt.Errorf("ingest queue: group sync did not cover offset %d (covered <= %d)", w.off, covered)
+		}
+	}
+	return true
+}
+
+// failOrCoverWaiters drains the waiter list at shutdown. A waiter whose
+// frame Close()'s final flush+fsync already covered resolves nil; the rest
+// get the closed error (their bytes stay in the WAL for replay — the
+// producer retry is deduped at flush).
+func (q *DiskQueue) failOrCoverWaiters() {
+	q.mu.Lock()
+	ws := q.waiters
+	q.waiters = nil
+	synced := q.syncedOffset
+	q.mu.Unlock()
+	for _, w := range ws {
+		if w.off <= synced {
+			w.done <- nil
+		} else {
+			w.done <- errors.New("ingest queue: closed before commit")
+		}
+	}
+}
+
+// syncActiveLocked fsyncs the active segment through the fsync seam — every
+// segment fsync in the queue goes through here so tests can count fsyncs
+// (group-commit coalescing) or inject failures. Callers hold q.mu.
+func (q *DiskQueue) syncActiveLocked() error {
+	if q.syncHook != nil {
+		return q.syncHook(q.file)
+	}
+	return q.file.Sync()
+}
+
+// totalBytesLocked sums the segment sizes. Callers hold q.mu.
+func (q *DiskQueue) totalBytesLocked() int64 {
+	var total int64
+	for i := range q.segments {
+		total += q.segments[i].size
+	}
+	return total
 }
 
 // rollLocked seals the active segment and opens the next numbered one as
@@ -572,10 +896,14 @@ func (q *DiskQueue) rollLocked() error {
 		_ = f.Close()
 		return q.setErrLocked(fmt.Errorf("WAL roll flush: %w", err))
 	}
-	if err := q.file.Sync(); err != nil {
+	if err := q.syncActiveLocked(); err != nil {
 		_ = f.Close()
 		return q.setErrLocked(fmt.Errorf("WAL roll sync: %w", err))
 	}
+	// The sealed segment's bytes are flushed AND fsynced — everything up to
+	// q.offset (which the roll itself does not move) is now durable.
+	q.syncedOffset = q.offset
+	q.unsyncedEvents = 0
 	if err := q.file.Close(); err != nil {
 		_ = f.Close()
 		return q.setErrLocked(fmt.Errorf("WAL roll close: %w", err))
@@ -723,9 +1051,13 @@ func (q *DiskQueue) Checkpoint(target int64) error {
 	if err := q.writer.Flush(); err != nil {
 		return q.setErrLocked(fmt.Errorf("WAL flush: %w", err))
 	}
-	if err := q.file.Sync(); err != nil {
+	if err := q.syncActiveLocked(); err != nil {
 		return q.setErrLocked(fmt.Errorf("WAL sync: %w", err))
 	}
+	// The flush pushed every buffered byte and the sync made it durable:
+	// coverage now extends to the WAL end at this instant.
+	q.syncedOffset = q.offset
+	q.unsyncedEvents = 0
 	// The checkpoint write must happen inside the SAME lock hold as the
 	// flush above. Writing it after releasing q.mu let an Append land
 	// between the two: the append set dirtySinceFlush, the checkpoint
@@ -960,7 +1292,10 @@ func (q *DiskQueue) Pending() ([]Event, error) {
 	return out, nil
 }
 
-// Close stops the fsync goroutine and fsyncs any buffered writes.
+// Close stops the fsync goroutine and fsyncs any buffered writes. Waiters
+// blocked in WaitCommit are resolved by the committer's shutdown drain
+// (covered frames get nil, the rest an error — their bytes remain in the
+// WAL for replay).
 func (q *DiskQueue) Close() error {
 	q.mu.Lock()
 	if q.stopped {
@@ -971,7 +1306,15 @@ func (q *DiskQueue) Close() error {
 	close(q.stopCh)
 	err := q.writer.Flush()
 	if err == nil {
-		err = q.file.Sync()
+		err = q.syncActiveLocked()
+	}
+	if err == nil {
+		// The graceful-close sync covered everything; the committer's drain
+		// (running concurrently off stopCh) reads syncedOffset under mu, so
+		// publish the coverage BEFORE it snapshots — waiters whose frames
+		// this flush covered resolve nil instead of a spurious error.
+		q.syncedOffset = q.offset
+		q.unsyncedEvents = 0
 	}
 	if cerr := q.file.Close(); cerr != nil && err == nil {
 		err = cerr
@@ -1001,7 +1344,7 @@ func (q *DiskQueue) fsyncLoop() {
 				// were never on disk.
 				if err := q.writer.Flush(); err != nil {
 					q.setErrLocked(fmt.Errorf("WAL flush: %w", err))
-				} else if err := q.file.Sync(); err != nil {
+				} else if err := q.syncActiveLocked(); err != nil {
 					q.setErrLocked(fmt.Errorf("WAL sync: %w", err))
 				} else {
 					// TO-016: a successful periodic sync clears the dirty
@@ -1009,6 +1352,12 @@ func (q *DiskQueue) fsyncLoop() {
 					// re-fsync every interval until some other path
 					// happened to reset it.
 					q.dirtySinceFlush = false
+					// O01: the backstop's sync also extends group-commit
+					// coverage (in durable mode it is normally idle — the
+					// committer keeps up; in lossy mode it IS the
+					// durability bound, so the loss gauge resets here).
+					q.syncedOffset = q.offset
+					q.unsyncedEvents = 0
 				}
 			}
 			q.mu.Unlock()

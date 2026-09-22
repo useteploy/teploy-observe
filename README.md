@@ -157,18 +157,25 @@ the exact image and version.
 - **RBAC** enforced — JWT carries a role claim (`admin` / `editor` /
   `viewer`). Writes require editor or admin; destructive config routes
   require admin.
-- **Ingest is WAL-backed, with a bounded sync window** — accepted
-  events are mirrored to `$OBSERVE_QUEUE_DIR` when the queue is
-  available. The mirror is flushed and fsynced periodically (500 ms) and
-  at each database checkpoint, so a hard crash can lose up to one sync
-  interval of already-acknowledged events; graceful shutdown fsyncs the
-  queue. Crash recovery replays records since the last checkpoint, and
-  the disk high-water (`OBSERVE_WAL_MAX_TOTAL_BYTES`) may drop the
-  oldest UNCHECKPOINTED segment to keep accepting writes — counted and
-  surfaced in `/healthz`. The full acknowledgment/commit contract, its
-  current limits, and the durable-mode destination (group commit before
-  acknowledgment, admission refusal instead of deletion) are specified
-  in `docs/O01_DURABLE_INGEST_ADR.md`.
+- **Ingest is WAL-backed with durable acknowledgment (group commit)** —
+  accepted events are mirrored to `$OBSERVE_QUEUE_DIR` when the queue is
+  available, and (the default durable mode) an ingest 200 is sent only
+  after the batch's WAL frame has been fsynced: requests admitted within
+  one commit window (default 25 ms, `OBSERVE_WAL_GROUP_COMMIT_MAX_DELAY`)
+  share a single fsync, so a hard crash loses nothing that was
+  acknowledged. Crash recovery replays fsynced-but-uncheckpointed
+  records since the last checkpoint. When the WAL's disk high-water
+  (`OBSERVE_WAL_MAX_TOTAL_BYTES`) is reached, durable mode REFUSES new
+  events with a retryable 503 + Retry-After until the checkpoint
+  advances — uncheckpointed segments are never deleted. Operators who
+  prefer the older availability-first behavior can set
+  `OBSERVE_WAL_LOSSY=true`: acknowledgments return without an fsync, the
+  periodic sync (500 ms) bounds the declared loss budget (up to one sync
+  interval of acked events, plus segments a high-water breach then
+  deletes — loudly counted), and `/healthz` surfaces the counters
+  (`events.accepted` vs `events.durably_acked`, `wal.unsynced_events`).
+  The full acknowledgment/commit contract is specified in
+  `docs/O01_DURABLE_INGEST_ADR.md`.
 - **Per-site rate limiting** — each site has its own token bucket. One
   noisy site can't starve a quiet one. Admin-editable via
   `PUT /api/v1/sites/{id}/ratelimit`.
@@ -247,7 +254,9 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 | `OBSERVE_DATA_DIR` | `./data` | Root dir for WAL, queue, local state. |
 | `OBSERVE_QUEUE_DIR` | `$OBSERVE_DATA_DIR/queue` | Ingest WAL directory. |
 | `OBSERVE_WAL_MAX_SEGMENT_BYTES` | `67108864` | Per-segment cap: appends past it roll to a fresh numbered WAL segment. |
-| `OBSERVE_WAL_MAX_TOTAL_BYTES` | `536870912` | Disk high-water across all WAL segments. On breach the oldest segment is dropped (loudly, counted in `/healthz`) — those events lose their crash-recovery copy but ingestion keeps accepting work. |
+| `OBSERVE_WAL_MAX_TOTAL_BYTES` | `536870912` | Disk high-water across all WAL segments. Durable mode (default): a roll that would breach it refuses admission with a retryable 503 until the checkpoint advances (`wal.refused_high_water` at `/healthz`). Lossy mode: the oldest segment is dropped (loudly, counted) — those events lose their crash-recovery copy but ingestion keeps accepting work. |
+| `OBSERVE_WAL_GROUP_COMMIT_MAX_DELAY` | `25` | Durable mode: bound of the group-commit window in ms — ingest 200s wait for one shared WAL fsync per window instead of an fsync per event. |
+| `OBSERVE_WAL_LOSSY` | (unset) | Set to `true` (or `1`) to opt into lossy mode: acknowledgments return without an fsync (declared loss budget: one 500 ms sync interval plus high-water headroom) and the disk high-water deletes instead of refusing. Default is durable mode. |
 | `OBSERVE_AUDIT_KEY` | | Audit-chain HMAC key: base64 (>=32 decoded bytes) or raw (>=32 bytes). Unset uses the persistent generated key at `$OBSERVE_DATA_DIR/audit.key`. |
 | `OBSERVE_AUDIT_KEYRING` | | Comma-separated `id:base64key` historical audit keys kept for verification through rotation (startup logs the ready-to-paste entry for the file key). |
 | `OBSERVE_REPLAY_ASSET_HOSTS` | | Comma-separated hostnames the replay asset proxy may fetch images from (empty disables proxied replay images). |

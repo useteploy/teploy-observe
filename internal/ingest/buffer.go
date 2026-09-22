@@ -3,10 +3,12 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/neutron-dev/neutron-go/nucleus"
@@ -100,6 +102,44 @@ type Buffer struct {
 	// hook plus a test defer, or concurrent shutdown paths) must not close
 	// an already-closed channel.
 	stopOnce sync.Once
+	// O01 counters (ADR §5.10), atomics — the admission path must not take
+	// a second lock for accounting. Accepted counts events given a 200
+	// (both modes); DurablyAcked counts events whose group-commit fsync
+	// completed before the ack (durable mode only — in lossy mode it stays
+	// 0 and the gap is the mode's declared loss budget); ReplayedOnRestart
+	// counts events recovered from the WAL at attach.
+	accepted          atomic.Int64
+	durablyAcked      atomic.Int64
+	replayedOnRestart atomic.Int64
+}
+
+// ErrBufferFull is a capacity-class admission refusal: count cap, byte
+// budget, or the buffer being stopped/shut down. Maps to HTTP 429 (today's
+// consumer contract).
+var ErrBufferFull = errors.New("ingest buffer full or closed")
+
+// ErrDurabilityUnavailable is a durability-class admission refusal (O01
+// §5.1/§5.2): the WAL latched a write/sync failure (F14), or the group
+// commit for this batch failed. Maps to HTTP 503 — retryable, never a
+// 200-over-undurable-bytes.
+var ErrDurabilityUnavailable = errors.New("ingest durability unavailable")
+
+// BufferStats is the events-signal counter block surfaced at /healthz
+// (O01 §5.10). The high-water refusal and potentially-lost gauges live on
+// the WAL's own stats block — one source of truth each.
+type BufferStats struct {
+	Accepted          int64 `json:"accepted"`
+	DurablyAcked      int64 `json:"durably_acked"`
+	ReplayedOnRestart int64 `json:"replayed_on_restart"`
+}
+
+// Stats returns a snapshot of the admission counters.
+func (b *Buffer) Stats() BufferStats {
+	return BufferStats{
+		Accepted:          b.accepted.Load(),
+		DurablyAcked:      b.durablyAcked.Load(),
+		ReplayedOnRestart: b.replayedOnRestart.Load(),
+	}
 }
 
 // defaultMaxBufferedBytes bounds the queued+in-flight serialized bytes
@@ -185,6 +225,7 @@ func (b *Buffer) AttachQueue(q *DiskQueue) error {
 	if dropped > 0 {
 		b.logger.Info("ingest queue: skipped already-committed events on recovery", "dropped", dropped)
 	}
+	b.replayedOnRestart.Add(int64(recovered))
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -350,13 +391,12 @@ func (b *Buffer) WorkerErr() error {
 	return b.workerErr
 }
 
-// Push adds an event to the buffer. Returns false if the buffer is full
-// (backpressure signal), if a WAL append failed while the WAL is attached
-// (audit F14: a WAL-backed deployment must not acknowledge events as
-// crash-safe when the log write failed — silent fallback to memory-only
-// ingestion turned disk-full into data loss with healthy-looking acks), or
-// if the buffer is stopped / its flush worker has died (AUD-016).
-func (b *Buffer) Push(e Event) bool {
+// Push adds an event to the buffer. Returns nil when admitted (and, with a
+// WAL attached in durable mode, group-commit fsynced — the condition the
+// HTTP handler turns into 200 OK, O01 §5.1); ErrBufferFull for
+// capacity-class refusals (429); ErrDurabilityUnavailable when the WAL
+// cannot back an ack (503 — audit F14 posture).
+func (b *Buffer) Push(e Event) error {
 	return b.PushBatch([]Event{e})
 }
 
@@ -365,18 +405,26 @@ func (b *Buffer) Push(e Event) bool {
 // concurrent requests can no longer both pass a capacity snapshot and then
 // interleave pushes that accept a prefix and refuse the tail: either every
 // event in events is admitted (memory + ONE WAL frame) or none is.
-func (b *Buffer) PushBatch(events []Event) bool {
+//
+// O01 §5.1 (durable mode): the WAL frame is appended under the buffer lock
+// (batch atomicity), but the group-commit WAIT happens after releasing it —
+// waiting under b.mu would serialize every request behind each 25 ms
+// window instead of letting them share one. PushBatch returns nil only
+// after the shared fsync covering this batch's frame completed; the ack is
+// durable. In lossy mode (ADR §5.3) there is no wait — the admission is
+// fast and the fsyncInterval backstop bounds the declared loss window.
+func (b *Buffer) PushBatch(events []Event) error {
 	if len(events) == 0 {
-		return true
+		return nil
 	}
 	b.mu.Lock()
 	if b.stopped || b.workerErr != nil {
 		b.mu.Unlock()
-		return false
+		return ErrBufferFull
 	}
 	if len(events) > b.maxSize-len(b.events) {
 		b.mu.Unlock()
-		return false
+		return ErrBufferFull
 	}
 	// AUD-015: acquire the whole batch's serialized-byte credit (queued +
 	// in-flight) before journaling it.
@@ -386,8 +434,9 @@ func (b *Buffer) PushBatch(events []Event) bool {
 	}
 	if b.bufferedBytes+b.inFlightBytes+cost > b.maxBufferedBytes {
 		b.mu.Unlock()
-		return false
+		return ErrBufferFull
 	}
+	var waitOff int64 = -1
 	if b.queue != nil {
 		off, err := b.queue.AppendBatch(events)
 		if err != nil {
@@ -398,9 +447,12 @@ func (b *Buffer) PushBatch(events []Event) bool {
 			// until it recovers, and /healthz reports the degradation.
 			b.mu.Unlock()
 			b.logger.Error("ingest queue: append failed — refusing admission (WAL-backed durability unavailable)", "err", err)
-			return false
+			return fmt.Errorf("%w: %w", ErrDurabilityUnavailable, err)
 		}
 		b.lastOffset = off
+		if !b.queue.Lossy() {
+			waitOff = off
+		}
 	}
 	b.events = append(b.events, events...)
 	for _, e := range events {
@@ -410,6 +462,20 @@ func (b *Buffer) PushBatch(events []Event) bool {
 	shouldFlush := len(b.events) >= b.flushSize
 	b.mu.Unlock()
 
+	if waitOff >= 0 {
+		// O01 §5.1: the ack boundary. An error here means the fsync backing
+		// this batch failed (or the queue closed first) — refuse so the
+		// producer retries. The events stay admitted (memory + WAL buffer):
+		// they will flush or replay, and the flush-time event-id dedupe
+		// absorbs the retry — at-least-once, never a lossy 200.
+		if err := b.queue.WaitCommit(waitOff); err != nil {
+			b.logger.Error("ingest queue: group commit failed — refusing to acknowledge", "err", err)
+			return fmt.Errorf("%w: %w", ErrDurabilityUnavailable, err)
+		}
+		b.durablyAcked.Add(int64(len(events)))
+	}
+	b.accepted.Add(int64(len(events)))
+
 	if shouldFlush {
 		// Non-blocking wakeup of the owned flush loop: one outstanding
 		// signal is enough — the loop drains until below threshold.
@@ -418,7 +484,7 @@ func (b *Buffer) PushBatch(events []Event) bool {
 		default:
 		}
 	}
-	return true
+	return nil
 }
 
 // Avail returns how many more events the buffer can accept before backpressure.

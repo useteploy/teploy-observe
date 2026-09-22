@@ -199,10 +199,29 @@ func Handler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.Handl
 			// Bot traffic: dropped silently with OK so bots don't retry.
 			return IngestResponse{OK: true}, nil
 		}
-		if !buf.Push(*e) {
-			return IngestResponse{}, neutron.ErrRateLimited("buffer full, try again later")
+		if err := buf.Push(*e); err != nil {
+			return IngestResponse{}, admissionError(err)
 		}
 		return IngestResponse{OK: true}, nil
+	}
+}
+
+// admissionError maps a Buffer admission refusal to its HTTP error class
+// (O01 ADR §5.2/§5.4): capacity refusals stay 429 (today's consumer
+// contract — the browser SDK and tracker treat it as backoff); durability
+// refusals (latched WAL, failed group commit, disk high-water) are 503 —
+// retryable, and the RetryAfterOnUnavailable middleware adds Retry-After.
+// The AppError is built inline because the vendored neutron pin predates
+// ErrServiceUnavailable (same RFC 7807 shape upstream would emit).
+func admissionError(err error) error {
+	if errors.Is(err, ErrBufferFull) {
+		return neutron.ErrRateLimited("buffer full, try again later")
+	}
+	return &neutron.AppError{
+		Status: http.StatusServiceUnavailable,
+		Code:   "https://neutron.dev/errors/service-unavailable",
+		Title:  "Service Unavailable",
+		Detail: "event durability unavailable, retry the batch later",
 	}
 }
 
@@ -647,9 +666,8 @@ func BatchHandler(buf *Buffer, salt string, siteSvc *sites.SiteService, deduper 
 				return IngestResponse{OK: true, Deduped: true}, nil
 			}
 		}
-		if !buf.PushBatch(prepared) {
-			return IngestResponse{}, neutron.ErrRateLimited(
-				fmt.Sprintf("buffer capacity below batch size %d, retry the whole batch later", len(prepared)))
+		if err := buf.PushBatch(prepared); err != nil {
+			return IngestResponse{}, admissionError(err)
 		}
 		if batchKey != "" {
 			deduper.record(batchKey, batchDigest)

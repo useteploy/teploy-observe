@@ -208,6 +208,35 @@ Round-4 restatements of standing items: none beyond the mappings above.
 AUD-017 and AUD-054's site-attribution half remain unchanged open hardening
 notes.
 
+## O01 implementation slices (durable ingest, under ADR contract)
+
+Behavior changes on the ingest path land against
+`docs/O01_DURABLE_INGEST_ADR.md` §5 and update that ADR's pinning tests in
+the same change (the O03 rule the ADR carries). Record of slices:
+
+- **2026-09-22, slice 1 — events group commit (ADR §5.1-§5.3, §5.10).**
+  Durable mode is the events default: an ingest 200 now means the batch's
+  WAL frame is fsynced (group commit — one shared fsync per ≤25 ms window
+  or 1 MiB of unsynced bytes; `OBSERVE_WAL_GROUP_COMMIT_MAX_DELAY`), the
+  disk high-water REFUSES with a retryable 503 + Retry-After instead of
+  deleting uncheckpointed segments, and `OBSERVE_WAL_LOSSY=true` opts back
+  into the era-1 fast-ack/delete semantics with the loss budget visible at
+  /healthz (`events.accepted|durably_acked|replayed_on_restart`,
+  `wal.mode|refused_high_water|unsynced_events`). Capacity refusals stay
+  429 (consumer contract unchanged); durability refusals are 503.
+  Deliberate pin updates in the same change:
+  `internal/ingest/o01_pin_test.go` (all three era-1 pins),
+  `TestDiskQueue_HighWaterBreachDropsOldestSegmentLoudly` (lossy-mode
+  pin). New pins: `internal/ingest/o01_group_commit_test.go` (durable-ack
+  ordering, fsync coalescing N-events-to-M-fsyncs via a counting seam,
+  high-water refusal + retry-after-checkpoint, lossy fast-ack/delete,
+  sync-failure latch, crash-at-ack recovery, replayed-on-restart counter,
+  429/503 split, Retry-After middleware). Mutation-checked both ways
+  (no-fsync-before-ack fails 6 pins; delete-at-high-water fails the
+  refusal pin). ADR era-2 record + §3 events row updated. Remaining O01
+  scope: error inbox (slice 2), derived-work outbox, quarantine + full
+  counter block, ledger retention, OTLP duplicate mitigation (§6.2-6.6).
+
 Pass record (2026-09-17 audit, remediation session same day):
 
 - Fixed: F01, F03, F04, F05, F06, F07, F08, F09, F10, F11, F12 (admission

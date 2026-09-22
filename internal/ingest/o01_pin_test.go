@@ -1,11 +1,21 @@
 package ingest
 
-// O01 pinning oracle (docs/O01_DURABLE_INGEST_ADR.md §8 references this
-// file). These tests pin CURRENT WAL/ack semantics so an implementation
+// O01 pinning oracle (docs/O01_DURABLE_INGEST_ADR.md references this
+// file). These tests pin the WAL/ack semantics so a later implementation
 // slice cannot silently regress them. Each test names the
-// destination-contract line it guards; when a slice from ADR §5 lands,
-// it must UPDATE the corresponding test deliberately in the same change
-// and record the era in the ADR.
+// destination-contract line it guards; a slice that changes semantics must
+// UPDATE the corresponding test deliberately in the same change and record
+// the era in the ADR.
+//
+// ERA 2 (2026-09-22, slice 1 — group commit): durable mode is the default.
+// The buffer-level ack (PushBatch nil) now WAITS for the group fsync, and
+// the disk high-water REFUSES instead of deleting (lossy mode is the
+// explicit opt-in that keeps era-1 semantics). The three era-1 pins were
+// updated in the same change as the implementation:
+//
+//   - WALAckedAppendIsMemoryOnlyUntilPeriodicSync  -> WALAppendWithoutWaitIsNotADurabilityBoundary
+//   - WALPeriodicSyncMakesAppendRecoverable        -> kept (fsyncLoop is now the backstop)
+//   - BufferAckOrderReturnsBeforeAnyStorage        -> BufferAckOrderWaitsForGroupCommit
 
 import (
 	"bytes"
@@ -51,20 +61,20 @@ func frameContains(raw []byte, id string) bool {
 	return false
 }
 
-// TestO01_WALAckedAppendIsMemoryOnlyUntilPeriodicSync pins TODAY's
-// durability gap on the analytics path: AppendBatch returning success
-// (the event Buffer.PushBatch needs before the HTTP handler sends 200
-// OK) writes the frame into a 64 KiB userspace bufio — the bytes are in
-// NEITHER the file NOR the OS page cache until the periodic fsync loop
-// (500 ms in production wiring, cmd/observe/main.go) or a flush/
-// checkpoint runs. A crash in this window loses an event the producer
-// was told was accepted.
+// TestO01_WALAppendWithoutWaitIsNotADurabilityBoundary pins the ASYNC
+// primitive: AppendBatch enqueues into the 64 KiB userspace bufio and
+// returns — the bytes are in NEITHER the file NOR the OS page cache until
+// a sync path runs. In era 2 this is still true BY DESIGN: the durability
+// boundary is the caller's WaitCommit (group commit), and lossy mode
+// (ADR §5.3) deliberately rides this unsynced window as its declared loss
+// budget. Nobody may treat AppendBatch's success alone as durability.
 //
-// Guards ADR §5.1 ("durable mode = bounded group commit before
-// acknowledgment"): when group commit lands, the ack-time assertion
-// below FLIPS — the frame must be fsynced before AppendBatch's caller
-// can acknowledge. Update this test deliberately in that slice.
-func TestO01_WALAckedAppendIsMemoryOnlyUntilPeriodicSync(t *testing.T) {
+// Guards ADR §5.1's "the periodic loop remains a backstop, not the
+// durability boundary" line (inverted: the enqueue is explicitly NOT the
+// boundary). Era-1 form (WALAckedAppendIsMemoryOnlyUntilPeriodicSync)
+// pinned the ACK on this window; era 2 moved the ack behind WaitCommit —
+// see TestO01_GroupCommit_AckWaitsForFsync in o01_group_commit_test.go.
+func TestO01_WALAppendWithoutWaitIsNotADurabilityBoundary(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	// Interval long enough that no periodic sync fires during the test —
@@ -83,28 +93,26 @@ func TestO01_WALAckedAppendIsMemoryOnlyUntilPeriodicSync(t *testing.T) {
 		t.Fatal("append must advance the WAL offset")
 	}
 
-	// The queue BELIEVES the record exists (offset advanced) — that
-	// belief is the basis of the HTTP 200. The disk does not have it.
+	// The queue BELIEVES the record exists (offset advanced). The disk
+	// does not have it — an ack issued here (the lossy-mode window) is not
+	// backed by anything.
 	if raw := readSegmentRaw(t, dir, "events"); frameContains(raw, "o01-acked-not-synced") {
-		t.Fatal("CURRENT-semantics pin violated: the appended frame reached the segment file " +
-			"before any flush/sync — if group-commit-before-ack landed, flip this assertion and " +
-			"record the era in docs/O01_DURABLE_INGEST_ADR.md")
+		t.Fatal("pin violated: the appended frame reached the segment file " +
+			"before any flush/sync — AppendBatch must stay an async enqueue, or " +
+			"the lossy-mode loss-budget documentation (ADR §5.3) is a lie")
 	}
-	// Documented loss bound (queue.go durability comment): up to one
-	// fsyncInterval of acked events, plus anything still in the bufio.
-	// There is deliberately no assertion that recovers the record here —
-	// TODAY it is gone for a crashed process.
 }
 
-// TestO01_WALPeriodicSyncMakesAppendRecoverable pins the OTHER edge of
-// the same window: once the periodic fsync loop has run, the frame is in
-// the file, and a process-equivalent restart (re-open) recovers it as
-// pending replay output. Together with the test above this pins the
-// exact boundary of today's durability: sync-or-lose, per interval.
+// TestO01_WALPeriodicSyncMakesAppendRecoverable pins the OTHER edge of the
+// same window: once the periodic fsync loop has run, the frame is in the
+// file, and a process-equivalent restart (re-open) recovers it as pending
+// replay output.
 //
-// Guards ADR §5.1's "recovery-tested fsync/checkpoint semantics" line:
-// group commit must preserve recoverability while moving the boundary
-// earlier (to the ack).
+// Guards ADR §5.1's "recovery-tested fsync/checkpoint semantics" line: the
+// group-commit committer must preserve recoverability (it reuses the same
+// flush+fsync under the same lock as this loop and Checkpoint). In era 2
+// the loop is the BACKSTOP for bytes nobody waits on (lossy mode, or a
+// waiter lost to shutdown) — still load-bearing.
 func TestO01_WALPeriodicSyncMakesAppendRecoverable(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -154,19 +162,19 @@ func TestO01_WALPeriodicSyncMakesAppendRecoverable(t *testing.T) {
 	}
 }
 
-// TestO01_BufferAckOrderReturnsBeforeAnyStorage pins the ACK ORDERING of
-// the analytics HTTP boundary end to end at the buffer level: PushBatch
-// returning true is exactly the condition under which the handler sends
+// TestO01_BufferAckOrderWaitsForGroupCommit pins the ACK ORDERING of the
+// analytics HTTP boundary end to end at the buffer level: PushBatch
+// returning nil is exactly the condition under which the handler sends
 // 200 OK (internal/ingest/handler.go). At that instant the event is (a)
-// in the in-memory buffer, (b) NOT in the WAL file on disk (userspace
-// bufio), and (c) obviously not in the database — no flush has run, and
-// none is synchronous with the request.
+// in the in-memory buffer, (b) IN THE WAL FILE ON DISK — the group-commit
+// fsync covering its frame completed before the return — and (c) not yet
+// in the database (flush is still asynchronous).
 //
-// Guards ADR §5.1 (the ack must move behind the group fsync) and the
-// inventory line "200 OK is sent before every durable hop"
-// (O01_DURABLE_INGEST_ADR.md §2.1). A slice that makes PushBatch wait
-// for durability must update the (b) assertion in the same change.
-func TestO01_BufferAckOrderReturnsBeforeAnyStorage(t *testing.T) {
+// Guards ADR §5.1 ("the HTTP 200 is sent only after the fsync covering the
+// request's frame returns"). Era-1 form (BufferAckOrderReturnsBeforeAny-
+// Storage) asserted (b) was FALSE at ack time; era 2 flips it — this is
+// the deliberate pin update recorded in the ADR's era log.
+func TestO01_BufferAckOrderWaitsForGroupCommit(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	q, err := NewDiskQueueWithLimits(dir, "events", time.Hour, 1<<20, 8<<20, logger)
@@ -180,15 +188,16 @@ func TestO01_BufferAckOrderReturnsBeforeAnyStorage(t *testing.T) {
 		t.Fatalf("attach: %v", err)
 	}
 
-	if !buf.PushBatch([]Event{ev("o01-ack-order")}) {
-		t.Fatal("PushBatch must admit — this true is what the handler turns into 200 OK")
+	if err := buf.PushBatch([]Event{ev("o01-ack-order")}); err != nil {
+		t.Fatal("PushBatch must admit — this nil is what the handler turns into 200 OK")
 	}
 	if got := buf.Len(); got != 1 {
 		t.Fatalf("admitted event must be memory-buffered, got %d", got)
 	}
-	if raw := readSegmentRaw(t, dir, "events"); frameContains(raw, "o01-ack-order") {
-		t.Fatal("CURRENT-semantics pin violated: the frame was durable in the WAL file at ack time — " +
-			"if group-commit-before-ack landed, flip this assertion and record the era in the ADR")
+	if raw := readSegmentRaw(t, dir, "events"); !frameContains(raw, "o01-ack-order") {
+		t.Fatal("durable-ack pin violated: at PushBatch return the frame was NOT in the WAL file — " +
+			"an ack issued now would be memory-only (the era-1 condition). If the ordering changed " +
+			"deliberately, update this pin and record the era in docs/O01_DURABLE_INGEST_ADR.md")
 	}
 	// The event is pending (admitted, not applied) — the state ADR §5.10
 	// counts independently. No Stop() here: the buffer's shutdown flush

@@ -177,6 +177,11 @@ func TestDiskQueue_AcknowledgedSegmentsAreDeleted(t *testing.T) {
 // loudly, and counted, when that segment still held unacknowledged events.
 // Admission keeps working; the crash-recovery copy of the dropped events is
 // what is lost.
+//
+// O01 era 2 (2026-09-22, ADR §5.2): this delete-at-breach behavior now
+// lives ONLY in explicit lossy mode (WithLossySync) — durable mode refuses
+// admission instead (pinned in o01_group_commit_test.go). The test opts
+// into lossy to keep pinning the F16 semantics where they survive.
 func TestDiskQueue_HighWaterBreachDropsOldestSegmentLoudly(t *testing.T) {
 	dir := t.TempDir()
 	var logBuf memorySink
@@ -188,6 +193,7 @@ func TestDiskQueue_HighWaterBreachDropsOldestSegmentLoudly(t *testing.T) {
 		t.Fatalf("NewDiskQueue: %v", err)
 	}
 	q.WithMaxTotalBytes(maxTotal)
+	q.WithLossySync()
 	var appended []string
 	for i := 0; i < 200; i++ {
 		id := fmt.Sprintf("e%03d", i)

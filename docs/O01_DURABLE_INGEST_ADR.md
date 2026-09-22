@@ -28,6 +28,21 @@ destination-contract line it guards):
 Rule carried from O03: a future behavior change must update the pinning
 test in the SAME change, deliberately, and record the era here.
 
+**ERA 2 — 2026-09-22, implementation slice 1 landed (events group
+commit).** Durable mode is now the default for the events signal: a 200
+means the batch's WAL frame is fsynced (group commit, §5.1), the disk
+high-water refuses admission instead of deleting (§5.2), and
+`OBSERVE_WAL_LOSSY=true` is the explicit opt-in that restores the era-1
+semantics with visible counters (§5.3). Pin updates made in the same
+change: `internal/ingest/o01_pin_test.go` (all three era-1 pins —
+ack-ordering flipped to waits-for-group-commit, the async-append pin
+renamed to its lossy-mode role, the periodic-sync recovery pin kept with
+its backstop framing) and
+`TestDiskQueue_HighWaterBreachDropsOldestSegmentLoudly` (delete-at-breach
+now pinned under explicit lossy mode). New era-2 pins:
+`internal/ingest/o01_group_commit_test.go`. The §3 events row below is
+the era-2 reality; §1.1's hop table remains the era-1 record.
+
 ---
 
 ## 1. Inventory — every ingest signal, end to end
@@ -302,7 +317,7 @@ retry appends a duplicate row; DISTINCT-user analysis tolerates it.
 
 | Signal | ACK sent after | Bytes durably safe after | Server retry safety | Identity | Crash-between-ACK-and-durable loses |
 | --- | --- | --- | --- | --- | --- |
-| events (single/batch) | memory admission + unsynced WAL buffer | periodic fsync (≤500 ms) then SQL commit | dedupe ≤24 h horizon (durable), 10 min cache | site-scoped event_id (v2) | ≤500 ms of acked events (or ALL of them past a high-water breach that deleted their segment) |
+| events (single/batch) — ERA 2 (2026-09-22, slice 1) | group-commit fsync of the batch's WAL frame (default; lossy mode: memory admission only) | the ack's own fsync (≤ group-commit window + one fsync); lossy mode: periodic fsync (≤500 ms) | dedupe ≤24 h horizon (durable), 10 min cache; durability refusals are 503 + Retry-After | site-scoped event_id (v2) | durable: nothing on 200 — the disk high-water REFUSES (counted) instead of deleting; lossy: ≤1 sync interval of acked events (declared budget) |
 | errors | memory admission | SQL commit at flush (2 s cadence) | none — retry double-counts issues/counts | none | everything unflushed; storage failure drops acked records |
 | logs | sync SQL commit | same moment | 503 retry duplicates committed prefix | none (O02) | nothing on 200; duplication on 503+retry |
 | traces | sync span commit | same moment | 503 retry duplicates committed prefix; rollups not retryable at all | none (O02) | spans safe on 200; derived rollups/detectors can be silently missing |
@@ -311,9 +326,12 @@ retry appends a duplicate row; DISTINCT-user analysis tolerates it.
 | replays (v1) | SQL COMMIT | same moment | none | none | nothing, but retries duplicate |
 | exposures/conversions | sync SQL commit | same moment | analysis is DISTINCT-user (duplicate rows tolerated) | none | nothing on 200; raw rows duplicate on retry |
 
-Availability posture under pressure (current defaults): events keep
-admitting by deleting uncheckpointed WAL (lossy default, counted);
-errors refuse (429); OTLP signals 503; replays 503 (DB is the store).
+Availability posture under pressure — ERA 2 (2026-09-22, slice 1):
+events REFUSE at the disk high-water with a retryable 503 + Retry-After
+(durable default, counted — never delete-to-admit);
+`OBSERVE_WAL_LOSSY=true` restores keep-admitting-by-deleting explicitly
+(counted, loss budget visible at /healthz); errors refuse (429); OTLP
+signals 503; replays 503 (DB is the store).
 
 ### 3.1 Doc overclaims fixed in this slice
 
@@ -351,33 +369,51 @@ updating its pinning test in the same change.
 
 ### 5.1 Durable mode = bounded group commit before acknowledgment (events)
 
-Admission path gains a commit group: `AppendBatch` enqueues the frame
-and the request waits (bounded: `OBSERVE_WAL_GROUP_COMMIT_MAX_DELAY`,
-default 25 ms; or group byte cap) for ONE shared flush+fsync covering
-all frames in the group; the HTTP 200 is sent only after the fsync
-covering the request's frame returns. Graceful-close semantics
-unchanged. The 500 ms periodic loop remains as a backstop, not the
-durability boundary. fsync on the OBSERVE HOST is the boundary (client
-fsync was never claimed). A parsed request proves nothing; the group
-fsync + the WAL frame checksum... — frames are already newline-delimited
-JSON with identity; the torn-tail repair stays the integrity check.
+**IMPLEMENTED 2026-09-22 (slice 1).** Shape as shipped: `AppendBatch`
+enqueues the frame (async, unchanged); `WaitCommit(offset)` blocks the
+request until ONE shared flush+fsync covering its frame completes. A
+dedicated committer goroutine holds the commit window open for at most
+`OBSERVE_WAL_GROUP_COMMIT_MAX_DELAY` (default 25 ms) from the FIRST
+outstanding waiter — WITHOUT holding the queue mutex, so concurrent
+requests keep joining the group — or fires early at 1 MiB of unsynced
+bytes; appends arriving while the fsync runs queue on the mutex and join
+the NEXT group. `Buffer.PushBatch` appends under its lock, releases it,
+then waits (waiting under the buffer lock would serialize requests
+behind each window instead of sharing it). Group-commit flush/sync
+failures latch the queue F14-style. Graceful-close semantics unchanged.
+The 500 ms periodic loop remains as a backstop, not the durability
+boundary. fsync on the OBSERVE HOST is the boundary (client fsync was
+never claimed). Frames are newline-delimited JSON with identity; the
+torn-tail repair stays the integrity check. Coverage may also arrive via
+Checkpoint/roll/periodic sync (waiters resolve against the
+`syncedOffset` watermark).
 
 ### 5.2 Disk-budget admission refusal replaces deletion (durable mode)
 
-Under durable mode, the high-water policy INVERTS: a roll that would
-breach `OBSERVE_WAL_MAX_TOTAL_BYTES` refuses admission (503, counted)
-until the checkpoint advances — an uncheckpointed segment is NEVER
-deleted to keep acknowledging traffic. The current delete-oldest
-behavior survives only as EXPLICIT lossy mode.
+**IMPLEMENTED 2026-09-22 (slice 1).** At roll time in durable mode the
+queue first reclaims acknowledged segments, then — if the admission
+would still breach `OBSERVE_WAL_MAX_TOTAL_BYTES` (default 512 MiB;
+eight default 64 MiB segments, sized so a healthy flush keeps the WAL
+well under the cap while a stalled database has a long durable runway)
+— refuses it with `ErrWALHighWaterRefused` (503 + Retry-After via the
+ingest group's middleware, counted at `wal.refused_high_water`), an
+uncheckpointed segment is NEVER deleted to keep acknowledging traffic.
+The refusal is retryable, not latched: admission resumes once the
+checkpoint advances. The delete-oldest behavior survives only in
+EXPLICIT lossy mode.
 
 ### 5.3 Explicit lossy mode with visible counters
 
-`OBSERVE_WAL_LOSSY=true` (per-deployment opt-in, never default in
-durable mode): today's semantics — periodic sync only, high-water
+**IMPLEMENTED 2026-09-22 (slice 1).** `OBSERVE_WAL_LOSSY=true`
+(per-deployment opt-in, never default): era-1 semantics — periodic sync
+only (WaitCommit returns immediately, acks carry no fsync), high-water
 deletes uncheckpointed segments — with the existing counters
-(`dropped_unacked_segments/bytes`) plus NEW accepted-vs-durable gap
-counters surfaced at `/healthz`, and a declared loss budget (≤1 sync
-interval + high-water headroom). The README documents the mode and its
+(`dropped_unacked_segments/bytes`) plus the accepted-vs-durable gap at
+`/healthz` (`events.accepted` vs `events.durably_acked`, with
+`wal.unsynced_events` as the live potentially-lost gauge). Declared
+loss budget: up to one sync interval (500 ms) of acked events, plus any
+events whose segment a high-water breach drops (headroom above the
+budget is the operator's cap). The README documents the mode and its
 budget. Default when unset: durable mode per 5.1/5.2.
 
 ### 5.4 Bounded retryable backpressure everywhere
@@ -489,10 +525,9 @@ implementation slices see it.
 
 ## 6. Implementation slices unlocked, in order
 
-1. **Events group commit + refusal high-water (5.1-5.3)** — the P0
-   durability boundary; updates the three ingest pinning tests
-   deliberately (they are written to fail loudly when the contract
-   tightens).
+1. **Events group commit + refusal high-water (5.1-5.3)** — LANDED
+     2026-09-22 (era 2 above; the three ingest pinning tests were updated
+     deliberately in the same change).
 2. **Error inbox + durable error path (5.6, 5.4)** — closes R14's
    deferred half; extends the errors pinning test to dedupe semantics.
 3. **Derived-work outbox (5.7)** — closes TO-020's class + R22 durable

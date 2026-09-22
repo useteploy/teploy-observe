@@ -23,7 +23,7 @@ func TestBuffer_PushAndLen(t *testing.T) {
 	buf := NewBuffer(nil, 100, 50, time.Hour, nil)
 
 	e := Event{EventID: "test-1", SiteID: "s1", Timestamp: time.Now().UnixMilli()}
-	if !buf.Push(e) {
+	if err := buf.Push(e); err != nil {
 		t.Fatal("push should succeed when buffer is not full")
 	}
 	if buf.Len() != 1 {
@@ -36,15 +36,15 @@ func TestBuffer_Backpressure(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		e := Event{EventID: "test", SiteID: "s1", Timestamp: time.Now().UnixMilli()}
-		if !buf.Push(e) {
-			t.Fatalf("push %d should succeed", i)
+		if err := buf.Push(e); err != nil {
+			t.Fatalf("push %d should succeed: %v", i, err)
 		}
 	}
 
 	// Buffer is now full (maxSize=3)
 	e := Event{EventID: "overflow", SiteID: "s1", Timestamp: time.Now().UnixMilli()}
-	if buf.Push(e) {
-		t.Fatal("push should return false when buffer is full")
+	if err := buf.Push(e); err == nil {
+		t.Fatal("push must be refused when the buffer is full")
 	}
 	if buf.Len() != 3 {
 		t.Fatalf("expected len=3 after backpressure, got %d", buf.Len())
@@ -55,7 +55,7 @@ func TestBuffer_DrainOnFlush(t *testing.T) {
 	buf := NewBuffer(nil, 100, 50, time.Hour, nil)
 
 	for i := 0; i < 5; i++ {
-		buf.Push(Event{EventID: "test", SiteID: "s1", Timestamp: time.Now().UnixMilli()})
+		_ = buf.Push(Event{EventID: "test", SiteID: "s1", Timestamp: time.Now().UnixMilli()})
 	}
 	if buf.Len() != 5 {
 		t.Fatalf("expected 5 events, got %d", buf.Len())
@@ -129,8 +129,8 @@ func TestBuffer_FlushFailureSurvivesRetryAndRestart(t *testing.T) {
 	ts := time.Now().UTC().UnixMilli()
 	push := func(i int) {
 		id := fmt.Sprintf("%s-e%d", site, i)
-		if !buf.Push(Event{EventID: id, TenantID: "default", SiteID: site, SessionID: "s", VisitID: "s", EventType: "pageview", Timestamp: ts}) {
-			t.Fatalf("push %d refused", i)
+		if err := buf.Push(Event{EventID: id, TenantID: "default", SiteID: site, SessionID: "s", VisitID: "s", EventType: "pageview", Timestamp: ts}); err != nil {
+			t.Fatalf("push %d refused: %v", i, err)
 		}
 	}
 	for i := 1; i <= 4; i++ {
@@ -199,8 +199,8 @@ func TestBuffer_FlushFailureDoesNotLivelock(t *testing.T) {
 	defer buf.Stop()
 
 	for i := 0; i < 4; i++ {
-		if !buf.Push(ev(fmt.Sprintf("e%d", i))) {
-			t.Fatalf("push %d refused", i)
+		if err := buf.Push(ev(fmt.Sprintf("e%d", i))); err != nil {
+			t.Fatalf("push %d refused: %v", i, err)
 		}
 	}
 	// nil db -> insertBatch panics inside Flush, recovered by the worker's
@@ -273,7 +273,7 @@ func TestBuffer_PushBatchAtomicUnderConcurrency(t *testing.T) {
 			for j := range batch {
 				batch[j] = ev(fmt.Sprintf("g%d", j))
 			}
-			if buf.PushBatch(batch) {
+			if err := buf.PushBatch(batch); err == nil {
 				successes.Add(1)
 			}
 		}()
@@ -293,10 +293,10 @@ func TestBuffer_RejectsAdmissionAfterStop(t *testing.T) {
 	buf := NewBuffer(nil, 10, 100, time.Hour, nil)
 	buf.Start()
 	buf.Stop()
-	if buf.Push(ev("late")) {
+	if err := buf.Push(ev("late")); err == nil {
 		t.Fatal("push after Stop must be refused")
 	}
-	if batch := []Event{ev("a"), ev("b")}; buf.PushBatch(batch) {
+	if batch := []Event{ev("a"), ev("b")}; buf.PushBatch(batch) == nil {
 		t.Fatal("pushBatch after Stop must be refused")
 	}
 }
@@ -307,11 +307,11 @@ func TestBuffer_ByteBudgetRefusesOversizedAdmission(t *testing.T) {
 	buf := NewBuffer(nil, 100, 100, time.Hour, nil).WithMaxBufferedBytes(1024)
 	big := ev("big")
 	big.Title = strings.Repeat("x", 900)
-	if buf.Push(big) {
+	if err := buf.Push(big); err == nil {
 		t.Fatal("event exceeding the byte budget must be refused")
 	}
 	small := ev("small")
-	if !buf.Push(small) {
+	if err := buf.Push(small); err != nil {
 		t.Fatal("small event must be admitted")
 	}
 }

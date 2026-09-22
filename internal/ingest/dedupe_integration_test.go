@@ -62,7 +62,7 @@ func TestFlushDuplicateProducerIDsInsertedOnce(t *testing.T) {
 		producerEvent(id1, site, time.Now().UnixMilli()),
 		producerEvent(id2, site, time.Now().UnixMilli()),
 	}
-	if !buf.PushBatch(first) {
+	if err := buf.PushBatch(first); err != nil {
 		t.Fatal("first admission failed")
 	}
 	buf.Flush()
@@ -74,7 +74,7 @@ func TestFlushDuplicateProducerIDsInsertedOnce(t *testing.T) {
 		producerEvent(id1, site, time.Now().Add(time.Second).UnixMilli()),
 		producerEvent(id2, site, time.Now().Add(time.Second).UnixMilli()),
 	}
-	if !buf.PushBatch(retry) {
+	if err := buf.PushBatch(retry); err != nil {
 		t.Fatal("retry admission failed")
 	}
 	buf.Flush()
@@ -117,7 +117,7 @@ func TestFlushMixedDuplicateAndFresh(t *testing.T) {
 	dupID := fmt.Sprintf("mix-id-%d-1", time.Now().UnixNano())
 	freshID := fmt.Sprintf("mix-id-%d-2", time.Now().UnixNano())
 	first := []Event{producerEvent(dupID, site, time.Now().UnixMilli())}
-	if !buf.PushBatch(first) {
+	if err := buf.PushBatch(first); err != nil {
 		t.Fatal("first admission failed")
 	}
 	buf.Flush()
@@ -126,7 +126,7 @@ func TestFlushMixedDuplicateAndFresh(t *testing.T) {
 		producerEvent(dupID, site, time.Now().UnixMilli()),   // duplicate
 		producerEvent(freshID, site, time.Now().UnixMilli()), // fresh
 	}
-	if !buf.PushBatch(mixed) {
+	if err := buf.PushBatch(mixed); err != nil {
 		t.Fatal("second admission failed")
 	}
 	buf.Flush()
@@ -165,7 +165,7 @@ func TestFlush_CrossSiteEventIDsAreDistinct(t *testing.T) {
 	ts := time.Now().UTC().UnixMilli()
 
 	first := Event{EventID: sharedID, TenantID: "default", SiteID: siteA, SessionID: "s", VisitID: "s", EventType: "pageview", Timestamp: ts}
-	if !buf.PushBatch([]Event{first}) {
+	if err := buf.PushBatch([]Event{first}); err != nil {
 		t.Fatal("site A admission failed")
 	}
 	buf.Flush()
@@ -173,13 +173,13 @@ func TestFlush_CrossSiteEventIDsAreDistinct(t *testing.T) {
 	// Same id, different site: must store a SECOND record.
 	second := first
 	second.SiteID = siteB
-	if !buf.PushBatch([]Event{second}) {
+	if err := buf.PushBatch([]Event{second}); err != nil {
 		t.Fatal("site B admission failed")
 	}
 	buf.Flush()
 
 	// Same id, same site A again: the durable dedupe drops it.
-	if !buf.PushBatch([]Event{first}) {
+	if err := buf.PushBatch([]Event{first}); err != nil {
 		t.Fatal("site A retry admission failed")
 	}
 	buf.Flush()

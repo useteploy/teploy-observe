@@ -274,6 +274,23 @@ func main() {
 			logger.Warn("OBSERVE_WAL_MAX_TOTAL_BYTES is not a positive integer — using the default high-water", "err", perr)
 		}
 	}
+	// O01 (ADR §5.1-§5.3): durable mode is the DEFAULT — an events 200
+	// means the batch's WAL frame is fsynced (group commit), and the disk
+	// high-water refuses admission instead of deleting uncheckpointed
+	// segments. OBSERVE_WAL_LOSSY=true opts a deployment back into the
+	// pre-O01 semantics (fast acks without fsync, delete-at-high-water)
+	// with the declared loss budget surfaced at /healthz.
+	walLossy := strings.EqualFold(os.Getenv("OBSERVE_WAL_LOSSY"), "true") || os.Getenv("OBSERVE_WAL_LOSSY") == "1"
+	// The group-commit window bound: requests admitted within one window
+	// share a single flush+fsync (target <=25 ms typical added ack latency).
+	groupCommitDelay := ingest.DefaultGroupCommitDelay
+	if raw := strings.TrimSpace(os.Getenv("OBSERVE_WAL_GROUP_COMMIT_MAX_DELAY")); raw != "" {
+		if n, perr := strconv.ParseInt(raw, 10, 64); perr == nil && n > 0 {
+			groupCommitDelay = time.Duration(n) * time.Millisecond
+		} else {
+			logger.Warn("OBSERVE_WAL_GROUP_COMMIT_MAX_DELAY is not a positive integer (ms) — using the default commit window", "err", perr)
+		}
+	}
 	// OBS-009: a WAL init/attach failure used to silently downgrade to
 	// memory-only ingestion — the project documents durable ingestion via the
 	// WAL, so this changed a stated guarantee without telling anyone.
@@ -297,6 +314,14 @@ func main() {
 	}
 	eventsQ, err := ingest.NewDiskQueueWithLimits(queueDir, "events", 500*time.Millisecond, maxQueueBytes, effectiveWalCap, logger)
 	if err == nil {
+		// O01: apply the sync mode + commit window BEFORE the replay/attach
+		// (§5.2: the refusal policy must be in force from the first
+		// post-replay admission; §5.3: lossy mode is the explicit opt-in).
+		eventsQ.WithGroupCommitDelay(groupCommitDelay)
+		if walLossy {
+			eventsQ.WithLossySync()
+			logger.Warn("OBSERVE_WAL_LOSSY is set — events are acknowledged without an fsync (declared loss budget: one 500 ms sync interval plus high-water headroom); durable mode is the default")
+		}
 		if err := buf.AttachQueue(eventsQ); err != nil {
 			walDegraded = true
 			// AUD-012 (round 2): close the created-but-unattached queue —
@@ -728,9 +753,11 @@ func main() {
 	})
 	// Auth runs before the limiter so the limiter can key on site_id. BodyLimit
 	// rejects oversized payloads with 413 before they are buffered/decoded
-	// (batch is capped at 100 events, so 2 MiB is ample).
+	// (batch is capped at 100 events, so 2 MiB is ample). RetryAfterOnUnavailable
+	// (O01 ADR §5.2) stamps Retry-After on the durable-mode 503s (disk
+	// high-water refusal, WAL latch) — the OTLP handlers' convention.
 	apiKeyMW := auth.APIKeyAuthMiddleware(authSvc)
-	ingestGroup := r.Group("/api/v1", ingestCORS, apiKeyMW, rateLimiter.Middleware, neutron.BodyLimit(2<<20))
+	ingestGroup := r.Group("/api/v1", ingestCORS, apiKeyMW, rateLimiter.Middleware, neutron.BodyLimit(2<<20), ingest.RetryAfterOnUnavailable(5*time.Second))
 	neutron.Post(ingestGroup, "/events", ingest.Handler(buf, cfg.SessionSalt, siteSvc),
 		neutron.WithTags("ingest"),
 		neutron.WithSummary("Ingest analytics event"),
@@ -1495,11 +1522,17 @@ func main() {
 		}
 		queued, queuedBytes := errorBuf.Stats()
 		health["errors"] = map[string]any{"queued": queued, "bytes": queuedBytes}
+		// O01 (ADR §5.10): per-signal admission counters for the events
+		// path — accepted vs durably-acked (the gap is lossy mode's live
+		// loss budget) and replayed-on-restart. The high-water refusal and
+		// potentially-lost gauges ride the wal block below (one source).
+		health["events"] = buf.Stats()
 		if eventsQ != nil {
 			// F16: the WAL's disk state is operator-visible at the health
 			// endpoint — segment count, total bytes against the high-water,
 			// and the breach counters for segments dropped past the cap
-			// before they were checkpointed.
+			// before they were checkpointed. O01 adds the sync mode, the
+			// durable-mode refusal counter, and the unsynced-events gauge.
 			health["wal"] = eventsQ.Stats()
 		}
 		if degraded {
