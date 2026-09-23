@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 )
 
 // DemoModeMiddleware blocks write operations when demo mode is enabled.

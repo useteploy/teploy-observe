@@ -145,11 +145,11 @@ github.com/jackc/puddle/v2/internal/genstack
 ## explicit; go 1.18
 github.com/leodido/go-urn
 github.com/leodido/go-urn/scim/schema
-# github.com/neutron-dev/neutron-go v0.0.0 => ../../Neutron/go
+# github.com/neutron-build/neutron/go v0.0.0 => ../../Neutron/go
 ## explicit; go 1.24.0
-github.com/neutron-dev/neutron-go/neutron
-github.com/neutron-dev/neutron-go/neutronauth
-github.com/neutron-dev/neutron-go/nucleus
+github.com/neutron-build/neutron/go/neutron
+github.com/neutron-build/neutron/go/neutronauth
+github.com/neutron-build/neutron/go/nucleus
 # github.com/useteploy/teploy-observe/sdk/go v0.0.0 => ./sdk/go
 ## explicit; go 1.22
 github.com/useteploy/teploy-observe/sdk/go
@@ -317,5 +317,5 @@ google.golang.org/protobuf/types/known/fieldmaskpb
 google.golang.org/protobuf/types/known/structpb
 google.golang.org/protobuf/types/known/timestamppb
 google.golang.org/protobuf/types/known/wrapperspb
-# github.com/neutron-dev/neutron-go => ../../Neutron/go
+# github.com/neutron-build/neutron/go => ../../Neutron/go
 # github.com/useteploy/teploy-observe/sdk/go => ./sdk/go

@@ -11,7 +11,7 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 
 	"github.com/useteploy/teploy-observe/internal/tracing"
 	"github.com/useteploy/teploy-observe/internal/views"

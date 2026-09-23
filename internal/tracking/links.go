@@ -9,7 +9,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // 1x1 transparent GIF (43 bytes).
@@ -33,15 +33,15 @@ func NewLinkService(db *nucleus.Client) *LinkService {
 
 // TrackedLink represents a shortened/tracked link stored in the links table.
 type TrackedLink struct {
-	LinkID     string `db:"link_id"`
-	TenantID   string `db:"tenant_id"`
-	SiteID     string `db:"site_id"`
-	Name       string `db:"name"`
+	LinkID      string `db:"link_id"`
+	TenantID    string `db:"tenant_id"`
+	SiteID      string `db:"site_id"`
+	Name        string `db:"name"`
 	Destination string `db:"destination"`
-	Slug       string `db:"slug"`
-	ClickCount string `db:"click_count"`
-	CreatedAt  string `db:"created_at"`
-	Version    string `db:"version"`
+	Slug        string `db:"slug"`
+	ClickCount  string `db:"click_count"`
+	CreatedAt   string `db:"created_at"`
+	Version     string `db:"version"`
 }
 
 // LinkClick represents a single click event on a tracked link.

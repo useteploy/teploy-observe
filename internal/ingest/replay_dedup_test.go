@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // TestReplayDedup_DropsAlreadyCommitted is the regression for exactly-once event

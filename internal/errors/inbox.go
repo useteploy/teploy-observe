@@ -37,7 +37,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // eventIDAlphabet is the same bounded identity alphabet the replay v2

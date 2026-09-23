@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/useteploy/teploy-observe/internal/principals"

@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 
 	observe "github.com/useteploy/teploy-observe/sdk/go"
 

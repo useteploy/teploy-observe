@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // SearchService provides full-text search over error messages using Nucleus FTS.

@@ -10,7 +10,7 @@ wrong because it is about a repository other than this one.
 
 Observe runs on Neutron and stores in Nucleus, and **both are editable from
 here — that is the trap.** `go.mod` replaces
-`github.com/neutron-dev/neutron-go` with `../../Neutron/go`, which is the real
+`github.com/neutron-build/neutron/go` with `../../Neutron/go`, which is the real
 upstream working tree, so "fixing the framework" from an Observe session edits
 the Neutron repository directly and silently. The `Neutron/` submodule in this
 repo is a pinned reference copy and is **not** what compiles.

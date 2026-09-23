@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.15
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.99.1
 	github.com/jackc/pgx/v5 v5.7.2
-	github.com/neutron-dev/neutron-go v0.0.0
+	github.com/neutron-build/neutron/go v0.0.0
 	golang.org/x/crypto v0.54.0
 )
 
@@ -40,7 +40,21 @@ require (
 	google.golang.org/grpc v1.82.1 // indirect
 )
 
-replace github.com/neutron-dev/neutron-go => ../../Neutron/go
+// Standing replace: the live Neutron workspace. With vendor/ present, builds
+// use vendor/ and ignore this — it only matters for FUTURE regeneration.
+// Regeneration procedure (vendor must always be generated from the PIN, not
+// the workspace):
+//   1. git -C ../../Neutron worktree add /tmp/neutron-pin-worktree <pin-sha> (detached)
+//   2. change this replace to => /tmp/neutron-pin-worktree/go
+//   3. go mod vendor
+//   3. go mod vendor
+//   4. restore this replace to ../../Neutron/go
+//   5. update the two "# ... => " annotation lines for this module in
+//      vendor/modules.txt to say ../../Neutron/go (go records the replace
+//      target used at generation time; leaving the worktree path there
+//      breaks -mod=vendor consistency)
+//   6. git -C Neutron checkout <pin-sha> so the submodule pin matches
+replace github.com/neutron-build/neutron/go => ../../Neutron/go
 
 replace github.com/useteploy/teploy-observe/sdk/go => ./sdk/go
 

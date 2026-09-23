@@ -6,7 +6,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // TestFTSSiteScoping verifies audit #147: a busy site's hits must not starve

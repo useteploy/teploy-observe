@@ -6,7 +6,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // DefaultDSN is where a scratch Nucleus is expected when OBSERVE_NUCLEUS_URL is

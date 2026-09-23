@@ -1,0 +1,467 @@
+package neutron
+
+import (
+	"bufio"
+	"fmt"
+	"net"
+	"net/http"
+	"reflect"
+	"runtime"
+	"strings"
+	"sync/atomic"
+)
+
+// frameworkPkg is this package's import path, used to walk past framework
+// frames when attributing a route registration to application code.
+const frameworkPkg = "github.com/neutron-build/neutron/go/neutron."
+
+// callerSite names the application line that registered a route.
+//
+// Every registration funnels through one line inside this file, so the panic
+// std ServeMux raises on a duplicate points at the router twice and never at
+// either of the two application files actually in conflict — which is the only
+// thing you need to know to fix it. Walking out to the first non-framework
+// frame recovers that, and walking (rather than counting frames) keeps it
+// correct whether the caller used Handle, HandleFunc, or a typed helper, each
+// of which sits at a different depth.
+func callerSite() string {
+	var pcs [24]uintptr
+	n := runtime.Callers(2, pcs[:])
+	frames := runtime.CallersFrames(pcs[:n])
+	for {
+		f, more := frames.Next()
+		// A test in this package is application code for this purpose;
+		// otherwise the framework's own tests could never see their own site.
+		outside := f.Function != "" && !strings.HasPrefix(f.Function, frameworkPkg)
+		if outside || strings.HasSuffix(f.File, "_test.go") {
+			return fmt.Sprintf("%s:%d", f.File, f.Line)
+		}
+		if !more {
+			return "unknown location"
+		}
+	}
+}
+
+// claimPattern records where a mux pattern was registered, and reports both
+// sites if it is registered twice.
+//
+// The check has to happen before the mux sees the pattern: ServeMux panics on
+// a duplicate itself, and once it does, the better message can no longer be
+// produced. Every registration also bumps the generation counter so a cached
+// OpenAPI spec can detect staliness (GO-13).
+func (r *Router) claimPattern(fullPattern string) {
+	site := callerSite()
+	if r.sites != nil {
+		if prev, taken := (*r.sites)[fullPattern]; taken {
+			panic(fmt.Sprintf(
+				"neutron: route %q registered twice\n  first: %s\n  again: %s",
+				fullPattern, prev, site))
+		}
+		(*r.sites)[fullPattern] = site
+	}
+	r.gen.Add(1)
+}
+
+// covers reports whether a registration equivalent to `pattern` — with or
+// without its method qualifier — is already claimed (GO-13). A user's
+// methodless "/health" and the framework's "GET /health" are the same
+// registration for override purposes; the built-in must yield to either.
+func (r *Router) covers(pattern string) bool {
+	if r.sites == nil {
+		return false
+	}
+	if _, taken := (*r.sites)[pattern]; taken {
+		return true
+	}
+	method, path := splitPattern(pattern)
+	if method != "" {
+		_, taken := (*r.sites)[path]
+		return taken
+	}
+	_, taken := (*r.sites)["GET "+pattern]
+	return taken
+}
+
+// Router wraps Go 1.22+ net/http.ServeMux with composable route groups and
+// middleware support.
+type Router struct {
+	mux        *http.ServeMux
+	prefix     string
+	middleware []Middleware
+	// routes is shared across a root router and its Group() descendants via
+	// pointer so OpenAPI sees every registered endpoint regardless of where
+	// it was registered.
+	routes *[]routeRecord
+	// sites maps a mux pattern to the application line that registered it,
+	// shared across the router tree the same way routes is. It exists only to
+	// make a collision panic name the two files in conflict.
+	sites *map[string]string
+	// gen counts registrations so cached artifacts (OpenAPI) can detect
+	// staliness (GO-13).
+	gen atomic.Uint64
+}
+
+// Generation reports the current registration generation.
+func (r *Router) Generation() uint64 { return r.gen.Load() }
+
+// routeRecord stores metadata about a registered route for OpenAPI.
+type routeRecord struct {
+	Method  string
+	Pattern string
+	InType  reflect.Type
+	OutType reflect.Type
+	Options routeOptions
+	// Untyped marks a route registered through Handle/HandleFunc/Mount rather
+	// than the typed helpers. It appears in Routes() but is withheld from
+	// OpenAPI, which has no schema for it.
+	Untyped bool
+}
+
+// RouteOption customizes per-route metadata (used for OpenAPI).
+type RouteOption func(*routeOptions)
+
+type routeOptions struct {
+	Summary     string
+	Description string
+	Tags        []string
+	Deprecated  bool
+	OperationID string
+}
+
+func WithSummary(s string) RouteOption {
+	return func(o *routeOptions) { o.Summary = s }
+}
+
+func WithDescription(s string) RouteOption {
+	return func(o *routeOptions) { o.Description = s }
+}
+
+func WithTags(tags ...string) RouteOption {
+	return func(o *routeOptions) { o.Tags = tags }
+}
+
+func WithDeprecated(d bool) RouteOption {
+	return func(o *routeOptions) { o.Deprecated = d }
+}
+
+func WithOperationID(id string) RouteOption {
+	return func(o *routeOptions) { o.OperationID = id }
+}
+
+// newRouter creates a root router.
+func newRouter() *Router {
+	var routes []routeRecord
+	sites := map[string]string{}
+	return &Router{
+		mux:    http.NewServeMux(),
+		routes: &routes,
+		sites:  &sites,
+	}
+}
+
+// Group creates a sub-router with a prefix and optional middleware.
+// Routes registered on the group inherit the prefix and middleware.
+func (r *Router) Group(prefix string, mw ...Middleware) *Router {
+	return &Router{
+		mux:        r.mux,
+		prefix:     r.prefix + prefix,
+		middleware: append(r.middleware[:len(r.middleware):len(r.middleware)], mw...),
+		routes:     r.routes, // pointer-shared across the whole tree
+		sites:      r.sites,  // same, so a collision across two groups is caught
+	}
+}
+
+// Mount attaches an http.Handler under a prefix. Useful for mounting external
+// handlers or sub-routers. The group's middleware applies to the mounted
+// handler the same as any other route on the group.
+//
+// The exact mount root (/service) is normalized to the same "/" subrequest
+// path that the slash-suffixed mount (/service/) produces, so a subrouter
+// with a root-only route answers both. Registering the raw handler on the
+// exact pattern used to hand it the unstripped "/service" path instead —
+// two path namespaces for one mount (audit neutron-22).
+func (r *Router) Mount(prefix string, handler http.Handler) {
+	fullPrefix := r.prefix + prefix
+	r.claimPattern(fullPrefix + "/")
+	r.claimPattern(fullPrefix)
+
+	root := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == fullPrefix {
+			rooted := req.Clone(req.Context())
+			rooted.URL.Path = "/"
+			rooted.URL.RawPath = ""
+			handler.ServeHTTP(w, rooted)
+			return
+		}
+		http.StripPrefix(fullPrefix, handler).ServeHTTP(w, req)
+	})
+	wrapped := applyMiddleware(root, r.middleware)
+	r.mux.Handle(fullPrefix+"/", wrapped)
+	r.mux.Handle(fullPrefix, wrapped)
+}
+
+// Handle registers a raw http.Handler for the given pattern.
+//
+// The pattern may carry a method, as `net/http` allows ("GET /x"). A group
+// prefix has to be spliced between the method and the path, not pasted onto the
+// front: `Group("/api").HandleFunc("GET /x", h)` used to build "/apiGET /x" and
+// panic with `invalid method "/apiGET"`. Only the typed Get/Post helpers got
+// this right, and nothing tested the untyped path.
+func (r *Router) Handle(pattern string, handler http.Handler) {
+	fullPattern := joinPattern(r.prefix, pattern)
+	r.claimPattern(fullPattern)
+	wrapped := applyMiddleware(handler, r.middleware)
+	r.mux.Handle(fullPattern, wrapped)
+
+	// Record it. Previously only the typed path did, so an app registering
+	// through Handle/HandleFunc got an empty Routes() and an empty
+	// /openapi.json with nothing reporting why.
+	if r.routes != nil {
+		method, path := splitPattern(pattern)
+		*r.routes = append(*r.routes, routeRecord{
+			Method:  method,
+			Pattern: r.prefix + path,
+			Untyped: true,
+		})
+	}
+}
+
+// handleIfAbsent registers a framework-supplied default route unless the
+// application has already claimed that pattern — or a method-equivalent
+// registration of it (GO-13): a methodless user "/health" and the built-in
+// "GET /health" are the same registration, and the built-in must yield to
+// either or it silently shadows the user's handler.
+//
+// Yielding is the right default for a framework route: an application
+// defining its own /health is ordinary, and the alternatives are both worse
+// than stepping aside — overwriting silently replaces the application's
+// handler with the framework's, and treating it as a collision turns a
+// reasonable app into one that panics on startup.
+func (r *Router) handleIfAbsent(pattern string, handler http.Handler) bool {
+	fullPattern := joinPattern(r.prefix, pattern)
+	if r.sites != nil {
+		if _, taken := (*r.sites)[fullPattern]; taken {
+			return false
+		}
+		if r.covers(fullPattern) {
+			return false
+		}
+	}
+	r.Handle(pattern, handler)
+	return true
+}
+
+// splitPattern separates an optional leading method from the path.
+func splitPattern(pattern string) (method, path string) {
+	if m, p, found := strings.Cut(pattern, " "); found {
+		return m, p
+	}
+	return "", pattern
+}
+
+// joinPattern applies a group prefix to a possibly method-qualified pattern.
+func joinPattern(prefix, pattern string) string {
+	method, path := splitPattern(pattern)
+	if method == "" {
+		return prefix + path
+	}
+	return method + " " + prefix + path
+}
+
+// HandleFunc registers a raw http.HandlerFunc for the given pattern.
+func (r *Router) HandleFunc(pattern string, handler http.HandlerFunc) {
+	r.Handle(pattern, handler)
+}
+
+// register adds a route with full metadata tracking.
+func (r *Router) register(method, pattern string, handler http.Handler, inType, outType reflect.Type, opts routeOptions) {
+	fullPattern := method + " " + r.prefix + pattern
+	r.claimPattern(fullPattern)
+	wrapped := applyMiddleware(handler, r.middleware)
+	r.mux.Handle(fullPattern, wrapped)
+
+	if r.routes != nil {
+		*r.routes = append(*r.routes, routeRecord{
+			Method:  method,
+			Pattern: r.prefix + pattern,
+			InType:  inType,
+			OutType: outType,
+			Options: opts,
+		})
+	}
+}
+
+// ServeHTTP implements http.Handler.
+//
+// P0.3: the std ServeMux replies to unmatched routes with plain text, violating
+// the framework's own RFC 7807 contract. We render 404 and 405 as
+// application/problem+json instead. Go 1.22's mux returns an empty pattern when
+// no route matches the path (genuine 404) and a non-empty pattern when the path
+// matches but the method does not (405) — so we distinguish them via Handler().
+func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// Only the mux's own unmatched/method-mismatch outcomes get rewritten.
+	// Asking the mux which pattern wins separates them from a REGISTERED
+	// application handler that happens to answer 404 or 405 with its own
+	// body: rewriting those swallowed application error codes and payloads
+	// behind a generic problem document (audit neutron-23). The interceptor
+	// forwards Flush/Hijack/Unwrap so SSE/WebSocket are unaffected.
+	if _, pattern := r.mux.Handler(req); pattern == "" {
+		r.mux.ServeHTTP(&errInterceptor{ResponseWriter: w, req: req}, req)
+		return
+	}
+	r.mux.ServeHTTP(w, req)
+}
+
+// errInterceptor rewrites the std ServeMux's built-in plain-text 404/405 replies
+// as RFC 7807 problem+json. It only ever wraps requests the mux could not route
+// to a registered pattern, so an application handler's own 404/405 — custom
+// JSON, an HTML not-found page — always passes through untouched. Go 1.22's
+// mux returns an empty pattern for both genuine 404s and method-mismatch 405s,
+// so the status code + the mux-set Allow header are the reliable signals, not
+// the pattern.
+type errInterceptor struct {
+	http.ResponseWriter
+	req       *http.Request
+	rewritten bool
+}
+
+func (w *errInterceptor) WriteHeader(code int) {
+	if (code == http.StatusNotFound || code == http.StatusMethodNotAllowed) && !w.rewritten {
+		ct := w.ResponseWriter.Header().Get("Content-Type")
+		if !strings.Contains(ct, "application/problem+json") {
+			w.rewritten = true
+			// The mux sets the Allow header before WriteHeader; WriteError keeps it.
+			if code == http.StatusMethodNotAllowed {
+				WriteError(w.ResponseWriter, w.req,
+					ErrMethodNotAllowed("The request method is not supported for this resource."))
+			} else {
+				WriteError(w.ResponseWriter, w.req,
+					ErrNotFound("No route matches the requested path."))
+			}
+			return
+		}
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *errInterceptor) Write(b []byte) (int, error) {
+	if w.rewritten {
+		return len(b), nil // swallow the std plain-text body
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *errInterceptor) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *errInterceptor) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *errInterceptor) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("neutron: underlying ResponseWriter does not support Hijack")
+}
+
+func applyMiddleware(h http.Handler, mw []Middleware) http.Handler {
+	for i := len(mw) - 1; i >= 0; i-- {
+		h = mw[i](h)
+	}
+	return h
+}
+
+// Static serves files from a directory on disk under the given URL prefix.
+// For example, r.Static("/assets/", "./public") serves files from ./public
+// when requests hit /assets/*. The group's middleware applies to the served
+// files.
+func (r *Router) Static(prefix, dir string) {
+	fullPrefix := r.prefix + prefix
+	fs := http.FileServer(http.Dir(dir))
+	r.mux.Handle(fullPrefix, applyMiddleware(http.StripPrefix(fullPrefix, fs), r.middleware))
+}
+
+// StaticFS serves files from an http.FileSystem (e.g. embed.FS) under the
+// given URL prefix. The group's middleware applies to the served files.
+func (r *Router) StaticFS(prefix string, fs http.FileSystem) {
+	fullPrefix := r.prefix + prefix
+	fileServer := http.FileServer(fs)
+	r.mux.Handle(fullPrefix, applyMiddleware(http.StripPrefix(fullPrefix, fileServer), r.middleware))
+}
+
+// RouteInfo describes a registered route for debugging/inspection.
+type RouteInfo struct {
+	Method  string
+	Pattern string
+	Summary string
+	Tags    []string
+}
+
+// Routes returns a list of all registered routes for debugging/inspection.
+func (r *Router) Routes() []RouteInfo {
+	if r.routes == nil {
+		return nil
+	}
+	records := *r.routes
+	infos := make([]RouteInfo, 0, len(records))
+	for _, rec := range records {
+		infos = append(infos, RouteInfo{
+			Method:  rec.Method,
+			Pattern: rec.Pattern,
+			Summary: rec.Options.Summary,
+			Tags:    rec.Options.Tags,
+		})
+	}
+	return infos
+}
+
+// PrintRoutes prints all registered routes to stdout in a formatted table.
+func (r *Router) PrintRoutes() {
+	routes := r.Routes()
+	if len(routes) == 0 {
+		fmt.Println("No routes registered.")
+		return
+	}
+
+	// Determine column widths
+	mw, pw, sw := len("METHOD"), len("PATTERN"), len("SUMMARY")
+	for _, ri := range routes {
+		if len(ri.Method) > mw {
+			mw = len(ri.Method)
+		}
+		if len(ri.Pattern) > pw {
+			pw = len(ri.Pattern)
+		}
+		if len(ri.Summary) > sw {
+			sw = len(ri.Summary)
+		}
+	}
+
+	fmtStr := fmt.Sprintf("%%-%ds  %%-%ds  %%-%ds  %%s\n", mw, pw, sw)
+	fmt.Printf(fmtStr, "METHOD", "PATTERN", "SUMMARY", "TAGS")
+	fmt.Printf(fmtStr,
+		strings.Repeat("-", mw),
+		strings.Repeat("-", pw),
+		strings.Repeat("-", sw),
+		strings.Repeat("-", 4))
+	for _, ri := range routes {
+		tags := ""
+		if len(ri.Tags) > 0 {
+			tags = strings.Join(ri.Tags, ", ")
+		}
+		fmt.Printf(fmtStr, ri.Method, ri.Pattern, ri.Summary, tags)
+	}
+}
+
+// extractPathParams returns path parameter names from a pattern like /users/{id}.
+func extractPathParams(pattern string) []string {
+	var params []string
+	for _, part := range strings.Split(pattern, "/") {
+		if strings.HasPrefix(part, "{") && strings.HasSuffix(part, "}") {
+			params = append(params, part[1:len(part)-1])
+		}
+	}
+	return params
+}

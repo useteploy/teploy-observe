@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 )
 
 // StatsInput is the common query input for dashboard API endpoints.
@@ -421,8 +421,12 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 	neutron.Get(api, "/event-properties", func(ctx context.Context, input eventPropsInput) ([]PropertyStat, error) {
 		from, _ := time.Parse(time.RFC3339, input.From)
 		to, _ := time.Parse(time.RFC3339, input.To)
-		if from.IsZero() { from = time.Now().UTC().Add(-24 * time.Hour) }
-		if to.IsZero() { to = time.Now().UTC() }
+		if from.IsZero() {
+			from = time.Now().UTC().Add(-24 * time.Hour)
+		}
+		if to.IsZero() {
+			to = time.Now().UTC()
+		}
 		return svc.EventProperties(ctx, input.SiteID, from, to, input.EventType, input.Limit)
 	}, neutron.WithTags("stats"), neutron.WithSummary("Property breakdown for a custom event"))
 
@@ -470,7 +474,9 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 	}) ([]Correlation, error) {
 		from, to := input.TimeRange()
 		target := input.Target
-		if target == "" { target = "signup" }
+		if target == "" {
+			target = "signup"
+		}
 		return svc.CorrelationAnalysis(ctx, input.SiteID, target, from, to)
 	}, neutron.WithTags("stats"))
 

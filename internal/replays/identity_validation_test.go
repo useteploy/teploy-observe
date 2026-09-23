@@ -3,7 +3,7 @@ package replays
 import (
 	"testing"
 
-	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 )
 
 // R27 (round 4): the reviewed delimiter collision — two different

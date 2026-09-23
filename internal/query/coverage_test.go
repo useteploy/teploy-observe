@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // The bug these cover: after unique counts moved off the non-additive rollup

@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 
 	obserrors "github.com/useteploy/teploy-observe/internal/errors"
 	"github.com/useteploy/teploy-observe/internal/ingest"

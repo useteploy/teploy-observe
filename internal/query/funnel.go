@@ -6,8 +6,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
-
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // FunnelStep defines one step in a funnel (event type or pathname match).

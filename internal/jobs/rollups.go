@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // RollupService aggregates raw events into hourly and daily summary tables.

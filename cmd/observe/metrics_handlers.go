@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 
 	"github.com/useteploy/teploy-observe/internal/metrics"
 )

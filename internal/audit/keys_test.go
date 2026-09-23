@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
@@ -137,7 +137,7 @@ func TestLoadKeyring_KeyringEntryValidation(t *testing.T) {
 }
 
 // F46: rows verify across a rotation — the pre-rotation rows carry the old
-// key's id (or '' for pre-042 rows), the post-rotation rows the new key's,
+// key's id (or ” for pre-042 rows), the post-rotation rows the new key's,
 // and one Verify walk accepts both.
 func TestKeyring_VerificationAcrossRotation(t *testing.T) {
 	oldKey := []byte(strings.Repeat("o", 32))

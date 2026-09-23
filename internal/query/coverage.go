@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // Which table can answer a unique (visitor / session) count, and how much of

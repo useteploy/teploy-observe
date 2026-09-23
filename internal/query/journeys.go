@@ -6,8 +6,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
-
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // JourneyStep represents a page-to-page transition with its count.

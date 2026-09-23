@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 
 	obserrors "github.com/useteploy/teploy-observe/internal/errors"
 	"github.com/useteploy/teploy-observe/internal/logs"

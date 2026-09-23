@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
@@ -159,7 +159,7 @@ func (s *Service) computeHash(ev AuditEvent) string {
 //
 //   - matchKeyed: the row names a key id that resolves and its MAC matches
 //     — authenticated under that key.
-//   - matchLegacy: a pre-042 key_id='' row whose MAC matches one of the
+//   - matchLegacy: a pre-042 key_id=” row whose MAC matches one of the
 //     configured SECRET legacy candidates — authenticated under that key.
 //   - matchUnkeyed: the row verifies only with the EMPTY (public) key —
 //     internally consistent but NOT tamper-evident against a database
@@ -210,7 +210,7 @@ func (s *Service) rowHashMatches(ev AuditEvent) bool {
 	return s.rowMatchKind(ev) != matchNone
 }
 
-// keyKnown reports whether a row's key id resolves (legacy '' always does).
+// keyKnown reports whether a row's key id resolves (legacy ” always does).
 func (s *Service) keyKnown(keyID string) bool {
 	if s.keys == nil || keyID == "" {
 		return true

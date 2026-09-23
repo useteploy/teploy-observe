@@ -65,13 +65,10 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 			entry.TraceID = span.TraceID()
 			entry.SpanID = span.SpanID()
 		}
-		h.client.mu.Lock()
-		h.client.logs = append(h.client.logs, entry)
-		full := len(h.client.logs) >= h.client.opts.LogBatchSize
-		h.client.mu.Unlock()
-		if full {
-			go func() { _ = h.client.flushLogs(context.Background()) }()
-		}
+		// AUD-036 (round 2): shared admission path — serialize at admission,
+		// bounded queue, owned-worker wakeup (the old direct append raced
+		// the byte accounting and spawned an untracked flush goroutine).
+		h.client.admitLog(entry)
 	}
 	return wrapErr
 }

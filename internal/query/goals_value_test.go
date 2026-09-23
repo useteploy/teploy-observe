@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // goalSite gives each run its own site id. The events table is append-only

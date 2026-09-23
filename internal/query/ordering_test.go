@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // The bug these cover: the breakdown panels on the dashboard rank by a metric

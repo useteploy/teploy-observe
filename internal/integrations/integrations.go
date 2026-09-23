@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/mailx"
 	"github.com/useteploy/teploy-observe/internal/netsafe"
@@ -323,8 +323,8 @@ func (s *IntegrationService) fireGitHub(configJSON string, p AlertPayload) error
 		return fmt.Errorf("github: missing owner, repo, or token")
 	}
 	body, _ := json.Marshal(map[string]any{
-		"title": p.Title,
-		"body":  p.Message,
+		"title":  p.Title,
+		"body":   p.Message,
 		"labels": []string{"observe-alert"},
 	})
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues", cfg.Owner, cfg.Repo)

@@ -9,7 +9,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // CohortResolver returns the list of distinct_ids for a cohort. It's

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // TestExecuteRespectsTimeout is the regression harness for OBS-017: Nucleus

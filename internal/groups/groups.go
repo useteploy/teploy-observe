@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
@@ -24,13 +24,13 @@ func NewGroupService(db *nucleus.Client) *GroupService {
 
 type Group struct {
 	GroupID    string `json:"group_id" db:"group_id"`
-	TenantID  string `json:"-" db:"tenant_id"`
-	SiteID    string `json:"site_id" db:"site_id"`
-	GroupType string `json:"group_type" db:"group_type"`
-	Name      string `json:"name" db:"name"`
+	TenantID   string `json:"-" db:"tenant_id"`
+	SiteID     string `json:"site_id" db:"site_id"`
+	GroupType  string `json:"group_type" db:"group_type"`
+	Name       string `json:"name" db:"name"`
 	Properties string `json:"properties" db:"properties"`
-	CreatedAt string `json:"created_at" db:"created_at"`
-	Version   string `json:"-" db:"version"`
+	CreatedAt  string `json:"created_at" db:"created_at"`
+	Version    string `json:"-" db:"version"`
 }
 
 type GroupStats struct {
@@ -87,14 +87,18 @@ func (s *GroupService) GroupMetrics(ctx context.Context, siteID string, from, to
 
 	var results []GroupStats
 	for _, g := range groups {
-		type countRow struct{ Count string `db:"count"` }
+		type countRow struct {
+			Count string `db:"count"`
+		}
 
 		// Member count
 		memberRows, _ := nucleus.Query[countRow](ctx, s.db.SQL(),
 			`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count FROM group_members WHERE group_id = $1 AND site_id = $2`,
 			g.GroupID, siteID)
 		memberCount := "0"
-		if len(memberRows) > 0 { memberCount = memberRows[0].Count }
+		if len(memberRows) > 0 {
+			memberCount = memberRows[0].Count
+		}
 
 		// Event count for members in time range
 		eventRows, _ := nucleus.Query[countRow](ctx, s.db.SQL(),
@@ -103,7 +107,9 @@ func (s *GroupService) GroupMetrics(ctx context.Context, siteID string, from, to
 			   AND session_id IN (SELECT session_id FROM group_members WHERE group_id = $4 AND site_id = $1)`,
 			siteID, fromMs, toMs, g.GroupID)
 		eventCount := "0"
-		if len(eventRows) > 0 { eventCount = eventRows[0].Count }
+		if len(eventRows) > 0 {
+			eventCount = eventRows[0].Count
+		}
 
 		results = append(results, GroupStats{Group: g, MemberCount: memberCount, EventCount: eventCount})
 	}

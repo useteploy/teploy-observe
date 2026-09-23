@@ -14,7 +14,7 @@ import (
 	"context"
 	"embed"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 //go:embed migrations/*.sql

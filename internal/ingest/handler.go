@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 
 	"github.com/useteploy/teploy-observe/internal/geo"
 	"github.com/useteploy/teploy-observe/internal/identity"

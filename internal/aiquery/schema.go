@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // SchemaCard caches a prose description of the Observe schema that the

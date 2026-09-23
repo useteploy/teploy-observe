@@ -5,14 +5,14 @@ import (
 	"os"
 	"testing"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // stubDetector returns whatever issue it currently holds, ignoring spans.
 type stubDetector struct{ iss Issue }
 
-func (s *stubDetector) Name() string                 { return "n_plus_one_db" }
-func (s *stubDetector) Detect(_ []Span) []Issue       { return []Issue{s.iss} }
+func (s *stubDetector) Name() string            { return "n_plus_one_db" }
+func (s *stubDetector) Detect(_ []Span) []Issue { return []Issue{s.iss} }
 
 // TestPersistAccumulates verifies audit #160: performance_issues is a
 // replacing_mergetree that Nucleus dedups on read, so re-detections of one

@@ -59,18 +59,53 @@ type Options struct {
 	// LogFlushInterval is the cadence for flushing buffered logs.
 	// Default: 2 seconds.
 	LogFlushInterval time.Duration
+
+	// OnError, when set, receives transport/admission failures (dropped
+	// oversized entries, failed background flushes). Never called from
+	// inside the client's locks; must not call back into the Client.
+	OnError func(error)
 }
 
 // Client submits events, errors, logs, traces, and metrics to Observe.
 type Client struct {
-	opts    Options
-	http    *http.Client
-	mu      sync.Mutex
-	logs    []LogEntry
+	opts Options
+	http *http.Client
+	mu   sync.Mutex
+	// logs holds entries serialized AT ADMISSION (AUD-036, round 2): the
+	// old code stored the caller's LogEntry with its live map attributes,
+	// so mutation after log() changed the eventual body and one
+	// unmarshalable attribute poisoned the whole detached batch.
+	logs    []json.RawMessage
+	logsN   int
 	spans   []pendingSpan
 	metrics *metricsBuf
 	closed  chan struct{}
 	done    chan struct{}
+	// flushWake coalesces size-triggered log flushes onto the owned worker
+	// (audit F35: they used to run in untracked goroutines Close never
+	// waited for).
+	flushWake chan struct{}
+	closing   bool
+	// pendingLogBytes bounds total queued log bytes (AUD-038, round 2) —
+	// the count cap alone let a slow endpoint grow memory without limit.
+	pendingLogBytes int64
+	// spansN/pendingSpanBytes bound the queued span batches (TO-038).
+	spansN           int
+	pendingSpanBytes int64
+	// pendingMetrics holds frozen metric envelopes whose POST failed
+	// (TO-039) — retried before any new snapshot is taken.
+	pendingMetrics []*frozenMetrics
+	// metricFlushMu serializes metric exports (TO-039).
+	metricFlushMu sync.Mutex
+	// logFlushMu serializes public Flush and worker flushes so one owner
+	// sends at a time and a failed chunk leaves its queue prefix intact
+	// (AUD-038).
+	logFlushMu sync.Mutex
+	// closeOnce + closeErr make Close safe under concurrent callers (audit
+	// F35: the select/default + close pair let two closers both take the
+	// default path and the second close panicked).
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Field represents a single key/value attribute on a log entry.
@@ -148,8 +183,18 @@ func New(opts Options) (*Client, error) {
 	if opts.SiteID == "" {
 		opts.SiteID = "default"
 	}
-	if opts.HTTPClient == nil {
-		opts.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+	base := opts.HTTPClient
+	if base == nil {
+		base = &http.Client{Timeout: 10 * time.Second}
+	}
+	// TO-037: telemetry carries the X-API-Key credential, and Go's default
+	// redirect follower forwards custom headers across origins — a
+	// redirecting (or compromised) endpoint would receive the key. The
+	// client is COPIED (never mutate a caller-owned client) and refuses
+	// redirects; postRaw accepts only 2xx.
+	owned := *base
+	owned.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
 	if opts.LogBatchSize <= 0 {
 		opts.LogBatchSize = 50
@@ -158,37 +203,37 @@ func New(opts Options) (*Client, error) {
 		opts.LogFlushInterval = 2 * time.Second
 	}
 	c := &Client{
-		opts:   opts,
-		http:   opts.HTTPClient,
-		closed: make(chan struct{}),
-		done:   make(chan struct{}),
+		opts:      opts,
+		http:      &owned,
+		closed:    make(chan struct{}),
+		done:      make(chan struct{}),
+		flushWake: make(chan struct{}, 1),
 	}
 	go c.loop()
 	return c, nil
 }
 
-// Close flushes any buffered logs and stops the background goroutine.
-// Safe to call multiple times.
+// Close flushes any buffered telemetry and stops the background goroutine.
+// Safe to call multiple times and from multiple goroutines: every caller
+// waits for the same single finalization and receives the same result
+// (audit F35 — the old select/default + close raced a double close panic,
+// and untracked flush goroutines could outlive Close's return).
 func (c *Client) Close() error {
-	select {
-	case <-c.closed:
-		return nil
-	default:
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closing = true // new admissions rejected from here on
+		c.mu.Unlock()
 		close(c.closed)
-	}
-	<-c.done
-	// Drain spans, metrics, then logs. Metrics share the same best-effort
-	// shutdown semantics as logs/spans (no retry on drop).
-	spanErr := c.flushSpans(context.Background())
-	metricErr := c.FlushMetrics(context.Background())
-	logErr := c.flushLogs(context.Background())
-	if spanErr != nil {
-		return spanErr
-	}
-	if metricErr != nil {
-		return metricErr
-	}
-	return logErr
+		<-c.done // includes ALL owned flush work, not only the ticker
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		c.closeErr = errors.Join(
+			c.flushSpans(ctx),
+			c.FlushMetrics(ctx),
+			c.flushLogs(ctx),
+		)
+	})
+	return c.closeErr
 }
 
 func (c *Client) loop() {
@@ -199,10 +244,32 @@ func (c *Client) loop() {
 		select {
 		case <-c.closed:
 			return
+		case <-c.flushWake:
+			// One bounded attempt per wakeup; a failing flush is retried
+			// by the ticker rather than a tight loop. AUD-038 (round 2):
+			// failures are REPORTED through the hook, not ignored — a
+			// silently dropped chunk used to look identical to success at
+			// Close time. TO-038: span/metric export failures are
+			// reported the same way.
+			if err := c.flushLogs(context.Background()); err != nil {
+				c.reportError(err)
+			}
+			if err := c.flushSpans(context.Background()); err != nil {
+				c.reportError(err)
+			}
+			if err := c.FlushMetrics(context.Background()); err != nil {
+				c.reportError(err)
+			}
 		case <-t.C:
-			_ = c.flushLogs(context.Background())
-			_ = c.flushSpans(context.Background())
-			_ = c.FlushMetrics(context.Background())
+			if err := c.flushLogs(context.Background()); err != nil {
+				c.reportError(err)
+			}
+			if err := c.flushSpans(context.Background()); err != nil {
+				c.reportError(err)
+			}
+			if err := c.FlushMetrics(context.Background()); err != nil {
+				c.reportError(err)
+			}
 		}
 	}
 }
@@ -247,43 +314,147 @@ func (c *Client) log(level, msg string, fields []Field) {
 	for _, f := range fields {
 		attrs[f.Key] = f.Value
 	}
-	entry := LogEntry{
+	c.admitLog(LogEntry{
 		SiteID:      c.opts.SiteID,
 		Level:       level,
 		Message:     msg,
 		ServiceName: c.opts.ServiceName,
 		Attributes:  attrs,
+	})
+}
+
+// admitLog serializes one entry NOW, owns the bytes, and queues it under
+// the byte budget (AUD-036/AUD-038, round 2). json.Marshal used to run
+// after the batch was detached, so a caller-mutated map changed the body
+// (or raced it), one unsupported value failed the entire batch, and the
+// queue had no bound at all.
+func (c *Client) admitLog(entry LogEntry) {
+	raw, err := json.Marshal(entry)
+	if err != nil || len(raw) > maxLogEntryBytes {
+		if err == nil {
+			err = fmt.Errorf("log entry exceeds %d bytes", maxLogEntryBytes)
+		}
+		c.reportError(fmt.Errorf("observe: dropping unserializable log entry: %w", err))
+		return
 	}
 	c.mu.Lock()
-	c.logs = append(c.logs, entry)
-	full := len(c.logs) >= c.opts.LogBatchSize
+	if c.closing {
+		// Post-close admission used to enqueue work with no guaranteed
+		// consumer (audit F35) — refuse instead.
+		c.mu.Unlock()
+		return
+	}
+	// AUD-038: bounded admission — a stalled endpoint must not turn the
+	// queue into unbounded memory.
+	if c.pendingLogBytes+int64(len(raw)) > maxPendingLogBytes {
+		c.mu.Unlock()
+		c.reportError(errors.New("observe: log queue byte limit reached — entry dropped"))
+		return
+	}
+	c.logs = append(c.logs, raw)
+	c.logsN++
+	c.pendingLogBytes += int64(len(raw))
+	full := c.logsN >= c.opts.LogBatchSize
 	c.mu.Unlock()
 	if full {
-		go func() { _ = c.flushLogs(context.Background()) }()
+		// Wake the owned worker; never spawn an untracked goroutine.
+		select {
+		case c.flushWake <- struct{}{}:
+		default:
+		}
 	}
+}
+
+// reportError routes a failure to the configured hook without panicking on
+// a nil hook or a hook that itself fails.
+func (c *Client) reportError(err error) {
+	if c.opts.OnError == nil {
+		return
+	}
+	func() {
+		defer func() { _ = recover() }()
+		c.opts.OnError(err)
+	}()
 }
 
 // Flush immediately sends any buffered logs.
 func (c *Client) Flush(ctx context.Context) error { return c.flushLogs(ctx) }
 
-func (c *Client) flushLogs(ctx context.Context) error {
-	c.mu.Lock()
-	if len(c.logs) == 0 {
-		c.mu.Unlock()
-		return nil
-	}
-	batch := c.logs
-	c.logs = nil
-	c.mu.Unlock()
+// serverLogBatchCap mirrors the server's /logs/batch limit.
+const serverLogBatchCap = 200
 
-	// The ingest endpoint accepts a single log per request today. Send sequentially.
-	var firstErr error
-	for _, entry := range batch {
-		if err := c.post(ctx, "/api/v1/logs", entry); err != nil && firstErr == nil {
-			firstErr = err
+// maxLogEntryBytes caps one serialized log entry at admission.
+const maxLogEntryBytes = 64 << 10
+
+// maxPendingLogBytes bounds total queued log bytes (AUD-038).
+const maxPendingLogBytes = 8 << 20
+
+// maxLogRequestBytes packs request bodies by encoded bytes (AUD-026,
+// round 2): 200 near-64-KiB entries exceeded the route's 2 MiB cap and the
+// whole batch was rejected. 1 MiB leaves envelope headroom.
+const maxLogRequestBytes = 1 << 20
+
+// flushLogs sends buffered entries through the batch endpoint as bounded
+// chunks (audit F35: one HTTP request per log amplified shutdown latency).
+//
+// AUD-038 (round 2): the queue prefix stays intact until its request
+// SUCCEEDS — the old code detached everything up front and dropped failed
+// chunks on the floor, so a 503 lost the batch while a later Close saw an
+// empty queue and reported success. Serialized by logFlushMu so public
+// Flush and the worker cannot double-send.
+func (c *Client) flushLogs(ctx context.Context) error {
+	c.logFlushMu.Lock()
+	defer c.logFlushMu.Unlock()
+
+	c.mu.Lock()
+	remaining := c.logsN // fixed watermark: continuous producers cannot extend this flush forever
+	c.mu.Unlock()
+	for remaining > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
+		c.mu.Lock()
+		n, size := 0, len(`{"logs":[]}`)
+		for n < remaining && n < c.logsN && n < serverLogBatchCap {
+			extra := len(c.logs[n])
+			if n > 0 {
+				extra++
+			}
+			if size+extra > maxLogRequestBytes && n > 0 {
+				break
+			}
+			size += extra
+			n++
+		}
+		batch := c.logs[:n]
+		c.mu.Unlock()
+		if n == 0 {
+			return errors.New("observe: single log entry exceeds the request byte budget")
+		}
+		if err := c.post(ctx, "/api/v1/logs/batch", logBatchWire{Logs: batch}); err != nil {
+			return err // the same queue prefix stays queued for the next attempt
+		}
+		c.mu.Lock()
+		var sent int64
+		for _, raw := range c.logs[:n] {
+			sent += int64(len(raw))
+		}
+		c.pendingLogBytes -= sent
+		if c.pendingLogBytes < 0 {
+			c.pendingLogBytes = 0
+		}
+		c.logs = c.logs[n:]
+		c.logsN -= n
+		remaining -= n
+		c.mu.Unlock()
 	}
-	return firstErr
+	return nil
+}
+
+// logBatchWire is the /logs/batch request shape. Logs holds pre-encoded
+// entries (AUD-036) — the wire JSON per element is unchanged.
+type logBatchWire struct {
+	Logs []json.RawMessage `json:"logs"`
 }
 
 func (c *Client) post(ctx context.Context, path string, body any) error {
@@ -296,12 +467,18 @@ func (c *Client) post(ctx context.Context, path string, body any) error {
 }
 
 // postRaw is the underlying HTTP call, used by post() and the OTLP trace path.
+// AUD-039 (round 2): every request carries its own deadline even when the
+// caller supplied a custom HTTPClient with no Timeout — Close used to be
+// able to wait forever on a stuck worker request that ctx.Background()
+// would never cancel.
 func (c *Client) postRaw(ctx context.Context, url string, body any, extraHeaders map[string]string) error {
+	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("observe: marshal: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return fmt.Errorf("observe: new request: %w", err)
 	}
@@ -317,7 +494,10 @@ func (c *Client) postRaw(ctx context.Context, url string, body any, extraHeaders
 		return fmt.Errorf("observe: post: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	// TO-037: only 2xx is success. Redirects are already refused by the
+	// owned client (they would forward the credential); a 3xx reaching
+	// this check means the caller's transport forced one through.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("observe: %s returned %d", url, resp.StatusCode)
 	}
 	return nil

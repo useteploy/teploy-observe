@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-build/neutron/go/neutron"
 )
 
 // countingSync is the fsync seam for the group-commit tests: every fsync of

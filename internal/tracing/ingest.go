@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 	"github.com/useteploy/teploy-observe/internal/tracing/detectors"
@@ -456,8 +456,8 @@ func percentile(sorted []int64, p float64) int64 {
 
 // nullableJSON maps an empty JSON string to a SQL NULL. The JSONB columns
 // (attributes, resource, events) are nullable; handing Nucleus an empty
-// string '' for a JSONB column makes the whole INSERT silently vanish (the
-// row count says 1 but nothing persists, since '' is not valid JSON). Spans
+// string ” for a JSONB column makes the whole INSERT silently vanish (the
+// row count says 1 but nothing persists, since ” is not valid JSON). Spans
 // frequently have no attributes/events, so those must be written as NULL.
 func nullableJSON(s string) any {
 	if s == "" {

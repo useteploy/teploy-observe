@@ -170,6 +170,41 @@ jobs:
   # its known flake (intermittent committed-upsert loss on accumulated
   # data, also fixed in the tree) is why the capability job exists
   # separately rather than replacing this one.
+  # X01: the vendor/ tree is what actually compiles, but go.mod's replace
+  # points at a LOCAL Neutron checkout — nothing proved vendor/ matches the
+  # pinned submodule until this check. Drift here means the shipped build
+  # and the reviewed pin are different code.
+  vendor-pin-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Vendored neutron-go must equal the pinned submodule
+        run: |
+          # Invariant: every file under vendor/github.com/neutron-build/neutron/go
+          # is byte-identical to the same path under the Neutron submodule pin;
+          # vendored files absent from the pin are drift. LICENSE is exempt
+          # (carried for license compliance, not build input). NOT a whole-tree
+          # diff: the pin legitimately contains packages vendor/ doesn't import.
+          cd vendor/github.com/neutron-build/neutron/go
+          find . -type f | while read f; do
+            [ "$f" = "./LICENSE" ] && continue
+            if [ ! -e "../../../../../Neutron/go/$f" ]; then
+              echo "VENDOR-ONLY: $f"
+            elif ! cmp -s "$f" "../../../../../Neutron/go/$f"; then
+              echo "CONTENT-DIFF: $f"
+            fi
+          done > /tmp/parity-drift.txt
+          if [ -s /tmp/parity-drift.txt ]; then
+            cat /tmp/parity-drift.txt >&2
+            echo "vendor/github.com/neutron-build/neutron/go differs from the Neutron submodule pin." >&2
+            echo "Regenerate from the pin (worktree the pin, point go.mod's replace at it," >&2
+            echo "go mod vendor, restore the workspace replace) and commit both together." >&2
+            exit 1
+          fi
+
   # X01 compatibility matrix: the same suite against the engine version
   # production actually runs (v1.1.1) on arm64. This combination found two
   # real defects the v0.1.8 job structurally cannot see (the version-tie

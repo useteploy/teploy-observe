@@ -8,8 +8,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
-
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // Correlation represents a property value correlated with a target event.

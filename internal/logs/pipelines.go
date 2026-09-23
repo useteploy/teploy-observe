@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // pipelineCacheTTL bounds how long the per-site pipeline set is cached on the
