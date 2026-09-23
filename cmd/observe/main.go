@@ -1551,6 +1551,10 @@ func main() {
 	r.HandleFunc("GET /t/observe.js", serveTracker)
 	r.HandleFunc("GET /t/observe-errors.js", serveErrorTracker)
 	r.HandleFunc("GET /t/observe-replay.js", serveReplayTracker)
+	// O06: the rrweb-based delta recorder. Additive — the structural
+	// recorder above keeps its route untouched; sites opt in by pointing
+	// their script tag here. Ingest is unchanged (same v2 batch envelope).
+	r.HandleFunc("GET /t/observe-replay-delta.js", serveReplayDeltaTracker)
 	r.HandleFunc("GET /t/observe-feedback.js", serveFeedbackWidget)
 
 	// Dashboard UI (embedded static files)
@@ -1669,6 +1673,13 @@ func main() {
 	// own route or the SPA fallback answers with index.html and the browser
 	// shows no icon. Public: the browser fetches it before anyone signs in.
 	r.Handle("GET /favicon.svg", http.FileServer(http.FS(uiSub)))
+
+	// O06: the replay player's runtime bundles (rrweb Replayer class +
+	// the play-time sanitizer) are committed static files under
+	// dist/rrweb/ — outside /assets/, so like the favicon they need an
+	// explicit route or the SPA fallback answers with index.html. Public
+	// same-origin scripts; inert tooling, no credentials.
+	r.Handle("GET /rrweb/", http.FileServer(http.FS(uiSub)))
 
 	// --- Public share dashboard ---
 	r.HandleFunc("GET /share/{token}", shareViewHandler(shareSvc, uiSub))
@@ -2539,6 +2550,15 @@ func serveReplayTracker(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.Write(replayTrackerScript)
+}
+
+//go:embed tracker/observe-replay-delta.js
+var replayDeltaTrackerScript []byte
+
+func serveReplayDeltaTracker(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Write(replayDeltaTrackerScript)
 }
 
 //go:embed tracker/observe-feedback.js

@@ -230,26 +230,49 @@ window.observeErrors.capture(new Error('payment failed'), {
       {
         slug: "replay-sdk",
         title: "Session Replay SDK",
-        content: `# Session Replay (observe-replay.js)
+        content: `# Session Replay
+
+Two recorders, one dashboard. Pick one per site — both use the same
+ingest, storage, and player envelope.
 
 ## Install
+
+Structural keyframes (bounded snapshots; mutations counted, not captured):
 
 \`\`\`html
 <script defer src="/t/observe-replay.js" data-site-id="SITE_ID"></script>
 \`\`\`
 
+Delta recording (rrweb-based; captures incremental DOM mutations,
+characterData included, plus 30 s keyframes):
+
+\`\`\`html
+<script defer src="/t/observe-replay-delta.js" data-site-id="SITE_ID"></script>
+\`\`\`
+
 ## What it captures
 
-- DOM snapshots on page load
+- Full DOM snapshots on load (and every 30 s, or \`data-checkout-interval\`)
+- Delta recorder only: DOM mutations between snapshots — added/removed
+  nodes, attribute and text changes
 - Mouse movements, clicks, scroll position
-- DOM mutations (input changes, new elements)
 - JS errors linked to the session
 
-Privacy-first: passwords and \`data-private\` elements are masked.
+## Privacy
+
+The recorder sanitizes every event BEFORE it leaves the browser, and the
+player re-sanitizes at play time: attributes pass an allowlist, input
+values are never recorded, and form controls, scripts, head subtrees,
+\`contenteditable\` regions, and \`data-observe-block\` subtrees are replaced
+with opaque placeholders. Image sources are sanitized to origin+path and
+re-loaded through the server's asset proxy. Replayed script tags stay
+inert.
 
 ## View replays
 
-Go to **Sessions** in the dashboard. Click any session to see the event timeline and page journey.
+Go to **Sessions** in the dashboard. Click any session to see the event
+timeline and page journey. Delta sessions replay through the rrweb
+replayer; keyframe sessions through the structural renderer.
 `,
       },
     ],

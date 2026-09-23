@@ -55,6 +55,10 @@ jobs:
         with:
           node-version: '20'
       - run: node --test tests/tracker/*.test.mjs
+      # O06: the rrweb delta recorder's sanitizer fixtures are
+      # dependency-free pure modules — pinned here without an npm install.
+      # (smoke.mjs / player-smoke.mjs need system Chrome and stay manual.)
+      - run: node --test cmd/observe/tracker/replay-delta/test/sanitizer.test.mjs
 
   sdk-go:
     runs-on: ubuntu-latest

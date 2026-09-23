@@ -762,7 +762,7 @@ out until a real consumer exists. Proofs: internal/replays assets tests
 403/disabled 404, redirect refusal, html/svg 415, 413-not-truncate,
 dial-time private refusal for an allowlisted host, malformed-target 400s).
 
-## F39 - P2 - Smaller step landed 2026-09-18; full protocol deferred
+## F39 - P2 - Smaller step landed 2026-09-18; delta recording landed 2026-09-23 via O06; pagination still deferred
 
 LANDED (the audit's throttled re-snapshot fallback): observe-replay.js
 records fresh mid-session snapshots periodically
@@ -775,11 +775,20 @@ indefinitely off a single initial DOM. Contract-tested in
 tests/tracker/observe-replay.test.mjs (burst over threshold past the gap
 records a second snapshot).
 
-DEFERRED (unchanged): the full versioned DOM-delta protocol — stable node
-IDs, deterministic seeking over deltas, keyset-paginated event windows
-(AUD-020's UI half rides with it). Real protocol design, not a bug patch;
-revisit when a product need asks for sub-snapshot fidelity or replay
-payloads need to shrink.
+LANDED 2026-09-23 (O06, the deferred protocol work — via adoption, not a
+custom protocol): observe-replay-delta.js wraps rrweb 2.1.6 (MIT) behind
+the Observe sanitizer (allowlist, private-tag placeholders, masked
+characterData — pure fold, fixture-pinned in cmd/observe/tracker/
+replay-delta/test/ + CI) and rides the unchanged v2 batch transport;
+the player feeds the rrweb Replayer class inside the existing
+sandbox/CSP/asset-proxy envelope with play-time re-sanitization.
+Stable node IDs, ordered deltas, 30 s keyframes, and deterministic
+seek come from rrweb (DELEGATED_DECISIONS 2026-09-23 section 2; the
+five reversal conditions there govern this adoption).
+
+STILL DEFERRED (unchanged): keyset-paginated event windows for replays
+(AUD-020's UI half) — now the remaining F39 residue. Revisit when
+replay payloads grow past what one request window should carry.
 
 ## F41 - P2 - Fixed 2026-09-18 (later still): URL/sensitive-data contract
 
