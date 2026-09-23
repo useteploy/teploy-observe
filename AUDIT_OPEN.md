@@ -2054,3 +2054,20 @@ O07 remainder (next slices):
   each series' first in-range sample is baseline-only (its pre-range
   increase is not attributed); a one-row-per-series lookback before
   `from` would recover it.
+
+## X02 S7 acceptance sweep — 2026-09-23
+
+`scripts/x02-acceptance-sweep.sh` (this repo's executable harness, ADR §6
+S7) — the identity-layer legs of the programme's acceptance line. Evidence
+(exit 0, all PASS, non-vacuous):
+
+| Leg | Package | Tests | Result |
+|---|---|---|---|
+| identity-ties | ./internal/sso | 2 (same-ms strictly increasing; enable bumps past future version) | PASS |
+| identity-tombstone | ./internal/platform | 1 (same-ms create+delete: tombstone wins) | PASS |
+| identity-sessions | ./internal/session | 1 (O04 timestamp tie-break) | PASS |
+| duplicate-delivery | ./internal/ingest | 4 (v2 duplicate admission; same-key-different-content NOT deduped; v1/malformed admit; producer event ids) | PASS |
+| history-retention | ./internal/jobs | 3 (old deleted recent kept; default ledger policies; processed pruned, dead letters never) | PASS |
+
+Vacuous-match guard included. Re-run and paste fresh output here on any
+contract change.
