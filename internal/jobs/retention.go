@@ -61,6 +61,10 @@ func DefaultPolicies(rawDays, hourlyDays int) []RetentionPolicy {
 		{Table: "spans", Column: "start_time", Days: 14},
 		{Table: "service_stats", Column: "ts_bucket", Days: 30},
 		{Table: "replay_sessions", Column: "start_time", Days: 14},
+		// O10: the evaluation ledger is a log, not a dedupe set - 14 days
+		// of transition edges is far beyond any operator investigation
+		// window while bounding the one-row-per-tick growth.
+		{Table: "alert_evaluations", Column: "evaluated_at", Days: 14},
 	}
 }
 
@@ -78,11 +82,17 @@ func DefaultPolicies(rawDays, hourlyDays int) []RetentionPolicy {
 // derived_outbox prunes PROCESSED intents only (processed_at > 0): rows
 // still pending, retrying, or dead-lettered are never auto-deleted — the
 // dead letters are the operator's queue, surfaced at /healthz counters.
+//
+// notification_outbox (O10) follows the same decided posture at the same
+// window: DELIVERED or SUPPRESSED intents prune at 7 days; pending,
+// retrying and dead-lettered notifications are never auto-deleted. The
+// window is fixed here (not env-tunable) to match the decided default.
 func DefaultLedgerPolicies(errorInboxDays, replayBatchesDays, outboxDays int) []RetentionPolicy {
 	return []RetentionPolicy{
 		{Table: "error_inbox", Column: "applied_at", Days: errorInboxDays},
 		{Table: "replay_batches", Column: "first_seen", Days: replayBatchesDays},
 		{Table: "derived_outbox", Column: "processed_at", Days: outboxDays, ExtraWhere: "processed_at > 0"},
+		{Table: "notification_outbox", Column: "created_at", Days: 7, ExtraWhere: "(delivered_at > 0 OR suppressed_at > 0)"},
 	}
 }
 

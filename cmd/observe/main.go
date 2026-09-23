@@ -408,7 +408,15 @@ func main() {
 	// Platform services
 	userSvc := platform.NewUserService(authSvc.Principals())
 	webhookSvc := platform.NewWebhookService(db, logger)
-	alertSvc := platform.NewAlertService(db, logger, webhookSvc)
+	// O10: the alerting engine drives incidents + the durable notification
+	// outbox, so both services exist before it. The notifier's timeline
+	// recorder appends 'notified'/'suppressed' events as deliveries land.
+	incidentSvc := incidents.NewService(db)
+	maintenanceSvc := platform.NewMaintenanceService(db, logger)
+	notifier := platform.NewNotifier(db, logger, maintenanceSvc, func(ctx context.Context, incidentID, kind, actor, detail string) error {
+		return incidentSvc.RecordEvent(ctx, incidentID, kind, actor, detail)
+	})
+	alertSvc := platform.NewAlertService(db, logger, webhookSvc, incidentSvc, notifier)
 
 	// Feature expansion services
 	reportSvc := reports.NewReportService(db, logger)
@@ -437,7 +445,6 @@ func main() {
 	aiSvc := aiquery.NewService(db, logger)
 	aiSchema := aiquery.NewSchemaCard(db)
 	scheduledExportSvc := jobs.NewExportService(db, explorerSvc, logger)
-	incidentSvc := incidents.NewService(db)
 	// Audit chain keys (F46). One signer, resolved in order:
 	// OBSERVE_AUDIT_KEY (dedicated, base64 >=32 bytes), the persistent
 	// generated key file (data/audit.key — every install's chain is keyed
@@ -513,22 +520,10 @@ func main() {
 		return query.SiteMeta{SiteID: s.SiteID, Name: s.Name, Domain: s.Domain}, true
 	})
 
-	// Auto-declare an incident whenever an alert rule fires. Dedup in
-	// the incident service by keying on rule_id + open state — a
-	// repeatedly-firing rule should open one incident and stay open.
-	alertSvc.OnTrigger = func(ctx context.Context, rule platform.AlertRule, value float64) {
-		_, _, err := incidentSvc.EnsureOpen(ctx, incidents.CreateInput{
-			SiteID:      rule.SiteID,
-			Title:       rule.Name,
-			Description: fmt.Sprintf("alert rule fired: %s=%.2f (threshold %.2f)", rule.Metric, value, rule.Threshold),
-			Severity:    "warning",
-			Source:      incidents.SourceAlert,
-			RuleID:      rule.RuleID,
-		}, "alert")
-		if err != nil {
-			logger.Warn("incident auto-create failed", "rule", rule.RuleID, "err", err)
-		}
-	}
+	// O10: incident auto-declare on alert firing moved INTO the evaluation
+	// engine (platform alerts_engine.go) - the old OnTrigger callback
+	// duplicated what the state machine now owns, and it fired once per
+	// cooldown tick instead of on the opening transition.
 
 	// Error buffer (async processing for throughput)
 	errorBuf := obserrors.NewErrorBuffer(errorHandler, 50000, 100, 2*time.Second, logger)
@@ -631,6 +626,22 @@ func main() {
 			},
 			OnStop: func(ctx context.Context) error {
 				traceIngest.Outbox().Stop()
+				return nil
+			},
+		}),
+		// O10: the notification outbox worker - same resume contract as
+		// the derived outbox: Start's immediate pass delivers the previous
+		// process's committed-but-undelivered notifications (receivers
+		// dedupe on the stable X-Observe-Delivery id), Stop waits for the
+		// in-flight delivery.
+		neutron.WithLifecycle(neutron.LifecycleHook{
+			Name: "notification-outbox",
+			OnStart: func(ctx context.Context) error {
+				notifier.Start()
+				return nil
+			},
+			OnStop: func(ctx context.Context) error {
+				notifier.Stop()
 				return nil
 			},
 		}),
@@ -1277,6 +1288,14 @@ func main() {
 	r.Handle("GET /api/v1/incidents", jwtMW(incidentsListHandler(incidentSvc)))
 	r.Handle("POST /api/v1/incidents", jwtMW(requireEditor(incidentsCreateHandler(incidentSvc))))
 	r.Handle("POST /api/v1/incidents/{incident_id}/close", jwtMW(requireEditor(incidentsCloseHandler(incidentSvc))))
+	// O10: incident acknowledgment + the append-only timeline (opened /
+	// recovered / notified / suppressed / ack), and maintenance windows
+	// (delivery suppression only - evaluation keeps recording).
+	r.Handle("POST /api/v1/incidents/{incident_id}/ack", jwtMW(requireEditor(incidentsAckHandler(incidentSvc, authSvc))))
+	r.Handle("GET /api/v1/incidents/{incident_id}/timeline", jwtMW(incidentsTimelineHandler(incidentSvc)))
+	r.Handle("GET /api/v1/maintenance-windows", jwtMW(maintenanceListHandler(maintenanceSvc)))
+	r.Handle("POST /api/v1/maintenance-windows", jwtMW(requireEditor(maintenanceCreateHandler(maintenanceSvc, authSvc))))
+	r.Handle("DELETE /api/v1/maintenance-windows/{window_id}", jwtMW(requireEditor(maintenanceDeleteHandler(maintenanceSvc))))
 
 	// --- Audit log (admin-only reads — the trail can expose secrets/PII;
 	// editor+ writes so trusted producers CLI/dash/Ship can emit events) ---
@@ -1632,6 +1651,10 @@ func main() {
 		// work (rollups, detector findings) is being skipped loudly rather
 		// than silently.
 		health["outbox"] = traceIngest.Outbox().Stats(req.Context())
+		// O10: notification outbox counters - pending/delivered/suppressed/
+		// dead-lettered per kind (restart-honest, read from the table) plus
+		// failed delivery attempts since this process started.
+		health["notifications"] = notifier.Stats(req.Context())
 		if degraded {
 			health["status"] = "degraded"
 			writeJSONError(w, http.StatusServiceUnavailable, "telemetry pipeline degraded: "+durability)
@@ -3141,6 +3164,112 @@ func incidentsCloseHandler(svc *incidents.Service) http.HandlerFunc {
 			return
 		}
 		if err := svc.Close(r.Context(), id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(204)
+	}
+}
+
+// requestActor resolves the username behind the request's bearer token (the
+// audit middleware's claims shape). Empty string when unattributable - the
+// services fall back to a labeled unknown rather than rejecting the action.
+func requestActor(authSvc *auth.AuthService, r *http.Request) string {
+	header := r.Header.Get("Authorization")
+	if !strings.HasPrefix(header, "Bearer ") {
+		return ""
+	}
+	claims, err := authSvc.ValidateToken(strings.TrimPrefix(header, "Bearer "))
+	if err != nil {
+		return ""
+	}
+	u, _ := claims["username"].(string)
+	return u
+}
+
+// O10: acknowledge an incident - recorded on the incident (idempotent) and
+// on its timeline with actor and time.
+func incidentsAckHandler(svc *incidents.Service, authSvc *auth.AuthService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("incident_id")
+		if id == "" {
+			http.Error(w, "incident_id required", http.StatusBadRequest)
+			return
+		}
+		actor := requestActor(authSvc, r)
+		if err := svc.Ack(r.Context(), id, actor); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(204)
+	}
+}
+
+// O10: the incident timeline - append-only events oldest first.
+func incidentsTimelineHandler(svc *incidents.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("incident_id")
+		if id == "" {
+			http.Error(w, "incident_id required", http.StatusBadRequest)
+			return
+		}
+		events, err := svc.Timeline(r.Context(), id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(events)
+	}
+}
+
+// O10: maintenance windows suppress notification delivery only.
+func maintenanceListHandler(svc *platform.MaintenanceService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		list, err := svc.List(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if list == nil {
+			list = []platform.MaintenanceWindow{}
+		}
+		json.NewEncoder(w).Encode(list)
+	}
+}
+
+func maintenanceCreateHandler(svc *platform.MaintenanceService, authSvc *auth.AuthService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var input struct {
+			SiteID   string `json:"site_id"`
+			StartsAt int64  `json:"starts_at"`
+			EndsAt   int64  `json:"ends_at"`
+			Reason   string `json:"reason"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		out, err := svc.Create(r.Context(), input.SiteID, input.StartsAt, input.EndsAt, input.Reason, requestActor(authSvc, r))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(out)
+	}
+}
+
+func maintenanceDeleteHandler(svc *platform.MaintenanceService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("window_id")
+		if id == "" {
+			http.Error(w, "window_id required", http.StatusBadRequest)
+			return
+		}
+		if err := svc.Delete(r.Context(), id); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}

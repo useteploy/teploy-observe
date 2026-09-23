@@ -22,18 +22,40 @@ const (
 	SourceCron   = "cron"
 )
 
+// Incident timeline event kinds (O10, migration 051). The timeline is the
+// append-only record every incident action lands on; 'ack' comes from the
+// API, the rest from the alerting engine and notifier.
+const (
+	EventOpened    = "opened"
+	EventRecovered = "recovered"
+	EventNotified  = "notified"
+	EventSuppressed = "suppressed"
+	EventAck       = "ack"
+)
+
 type Incident struct {
-	IncidentID  string `json:"incident_id" db:"incident_id"`
-	SiteID      string `json:"site_id" db:"site_id"`
-	Title       string `json:"title" db:"title"`
-	Description string `json:"description" db:"description"`
-	Severity    string `json:"severity" db:"severity"`
-	Source      string `json:"source" db:"source"`
-	RuleID      string `json:"rule_id" db:"rule_id"`
-	StartedAt   int64  `json:"started_at" db:"started_at"`
-	EndedAt     int64  `json:"ended_at" db:"ended_at"`
-	CreatedBy   string `json:"created_by" db:"created_by"`
-	UpdatedAt   int64  `json:"updated_at" db:"updated_at"`
+	IncidentID     string `json:"incident_id" db:"incident_id"`
+	SiteID         string `json:"site_id" db:"site_id"`
+	Title          string `json:"title" db:"title"`
+	Description    string `json:"description" db:"description"`
+	Severity       string `json:"severity" db:"severity"`
+	Source         string `json:"source" db:"source"`
+	RuleID         string `json:"rule_id" db:"rule_id"`
+	StartedAt      int64  `json:"started_at" db:"started_at"`
+	EndedAt        int64  `json:"ended_at" db:"ended_at"`
+	AcknowledgedAt int64  `json:"acknowledged_at" db:"acknowledged_at"`
+	AcknowledgedBy string `json:"acknowledged_by" db:"acknowledged_by"`
+	CreatedBy      string `json:"created_by" db:"created_by"`
+	UpdatedAt      int64  `json:"updated_at" db:"updated_at"`
+}
+
+// TimelineEvent is one entry of an incident's append-only timeline.
+type TimelineEvent struct {
+	EventID   string `json:"event_id" db:"event_id"`
+	At        int64  `json:"at" db:"at"`
+	Kind      string `json:"kind" db:"kind"`
+	Actor     string `json:"actor" db:"actor"`
+	Detail    string `json:"detail" db:"detail"`
 }
 
 type Service struct {
@@ -149,14 +171,15 @@ func (s *Service) Create(ctx context.Context, in CreateInput, createdBy string) 
 // (the 70f6eff version-tie defect): GREATEST(now, latest updated_at + 1). A
 // create+close inside one millisecond must not tie, or argMax resolves the
 // open row and a closed incident reads ongoing. ended_at keeps the wall-clock
-// close time.
+// close time. The ack columns ride along (051): an explicit column list that
+// omitted them would drop the acknowledgment on close.
 func (s *Service) Close(ctx context.Context, incidentID string) error {
 	now := dbutil.IntParam(time.Now().UnixMilli())
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO incidents (incident_id, tenant_id, site_id, title, description, severity,
-		 source, rule_id, started_at, ended_at, created_by, updated_at)
+		 source, rule_id, started_at, ended_at, acknowledged_at, acknowledged_by, created_by, updated_at)
 		 SELECT incident_id, tenant_id, site_id, title, description, severity,
-		        source, rule_id, started_at, $2, created_by,
+		        source, rule_id, started_at, $2, acknowledged_at, acknowledged_by, created_by,
 		        GREATEST(CAST($2 AS BIGINT), updated_at + 1)
 		 FROM incidents WHERE incident_id = $1 ORDER BY updated_at DESC LIMIT 1`,
 		incidentID, now)
@@ -198,7 +221,7 @@ func (s *Service) ActiveByRule(ctx context.Context, ruleID string) ([]Incident, 
 // from under it before the answer came back.
 func (s *Service) activeWhere(ctx context.Context, whereFrag string, args ...any) ([]Incident, error) {
 	query := `SELECT incident_id, site_id, title, description, severity, source, rule_id,
-	                 started_at, ended_at, created_by, updated_at
+	                 started_at, ended_at, acknowledged_at, acknowledged_by, created_by, updated_at
 	          FROM (` + latestSelect(whereFrag) + `) AS latest
 	          WHERE ended_at = 0
 	          ORDER BY started_at DESC, incident_id ASC`
@@ -239,6 +262,8 @@ func latestSelect(whereFrag string) string {
 	               argMax(rule_id, updated_at)     AS rule_id,
 	               argMax(started_at, updated_at)  AS started_at,
 	               argMax(ended_at, updated_at)    AS ended_at,
+	               argMax(acknowledged_at, updated_at) AS acknowledged_at,
+	               argMax(acknowledged_by, updated_at) AS acknowledged_by,
 	               argMax(created_by, updated_at)  AS created_by,
 	               MAX(updated_at)                 AS updated_at
 	        FROM incidents WHERE ` + whereFrag + `
@@ -254,7 +279,7 @@ func latestSelect(whereFrag string) string {
 // wire, which defeats a BIGINT range comparison in SQL.
 func (s *Service) InRange(ctx context.Context, siteID string, from, to int64) ([]Incident, error) {
 	query := `SELECT incident_id, site_id, title, description, severity, source, rule_id,
-	                 started_at, ended_at, created_by, updated_at
+	                 started_at, ended_at, acknowledged_at, acknowledged_by, created_by, updated_at
 	          FROM (` + latestSelect("site_id = $1") + `) AS latest
 	          ORDER BY started_at DESC, incident_id ASC`
 	rows, err := nucleus.Query[Incident](ctx, s.db.SQL(), query, siteID)
@@ -280,6 +305,90 @@ func (s *Service) InRange(ctx context.Context, siteID string, from, to int64) ([
 // Active returns all open incidents (ended_at = 0) for a site.
 func (s *Service) Active(ctx context.Context, siteID string) ([]Incident, error) {
 	return s.activeWhere(ctx, `site_id = $1`, siteID)
+}
+
+// Get returns one incident's latest version (nil when unknown).
+func (s *Service) Get(ctx context.Context, incidentID string) (*Incident, error) {
+	rows, err := nucleus.Query[Incident](ctx, s.db.SQL(),
+		`SELECT incident_id, site_id, title, description, severity, source, rule_id,
+		         started_at, ended_at, acknowledged_at, acknowledged_by, created_by, updated_at
+		 FROM (`+latestSelect("incident_id = $1")+`) AS latest`, incidentID)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return &rows[0], nil
+}
+
+// Ack records an acknowledgment on the incident (O10): the columns carry
+// the durable ack state (idempotent - a re-ack of an acknowledged incident
+// is a read, not a write), and the timeline row carries the human record
+// with actor and time. The version-rewriting insert follows Close's
+// pattern, ack columns and all, so nothing rides on a stale row.
+func (s *Service) Ack(ctx context.Context, incidentID, actor string) error {
+	known, err := s.Get(ctx, incidentID)
+	if err != nil {
+		return err
+	}
+	if known == nil {
+		return fmt.Errorf("incident %s not found", incidentID)
+	}
+	if known.AcknowledgedAt > 0 {
+		return nil
+	}
+	if actor == "" {
+		actor = "unknown"
+	}
+	now := dbutil.IntParam(time.Now().UnixMilli())
+	_, err = s.db.SQL().Exec(ctx,
+		`INSERT INTO incidents (incident_id, tenant_id, site_id, title, description, severity,
+		 source, rule_id, started_at, ended_at, acknowledged_at, acknowledged_by, created_by, updated_at)
+		 SELECT incident_id, tenant_id, site_id, title, description, severity,
+		        source, rule_id, started_at, ended_at, $2, $3, created_by,
+		        GREATEST(CAST($2 AS BIGINT), updated_at + 1)
+		 FROM incidents WHERE incident_id = $1 ORDER BY updated_at DESC LIMIT 1`,
+		incidentID, now, actor)
+	if err != nil {
+		return err
+	}
+	return s.RecordEvent(ctx, incidentID, EventAck, actor, "incident acknowledged")
+}
+
+// RecordEvent appends one timeline event. Unknown incident ids are refused
+// rather than orphaned (the timeline is read per incident, so an orphan row
+// is invisible clutter that reads as a lost action).
+func (s *Service) RecordEvent(ctx context.Context, incidentID, kind, actor, detail string) error {
+	if incidentID == "" {
+		return fmt.Errorf("incident_id required")
+	}
+	known, err := s.Get(ctx, incidentID)
+	if err != nil {
+		return err
+	}
+	if known == nil {
+		return fmt.Errorf("incident %s not found", incidentID)
+	}
+	_, err = s.db.SQL().Exec(ctx,
+		`INSERT INTO incident_events (event_id, tenant_id, incident_id, at, kind, actor, detail)
+		 VALUES ($1, 'default', $2, $3, $4, $5, $6)`,
+		genID(), incidentID, dbutil.IntParam(time.Now().UnixMilli()), kind, actor, detail)
+	return err
+}
+
+// Timeline returns an incident's events, oldest first.
+func (s *Service) Timeline(ctx context.Context, incidentID string) ([]TimelineEvent, error) {
+	rows, err := nucleus.Query[TimelineEvent](ctx, s.db.SQL(),
+		`SELECT event_id, at, kind, actor, detail FROM incident_events
+		 WHERE incident_id = $1 ORDER BY at ASC, event_id ASC`, incidentID)
+	if err != nil {
+		return nil, err
+	}
+	if rows == nil {
+		rows = []TimelineEvent{}
+	}
+	return rows, nil
 }
 
 func genID() string {
