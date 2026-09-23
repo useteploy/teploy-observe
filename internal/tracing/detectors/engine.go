@@ -66,15 +66,40 @@ func (e *Engine) RunAll(spans []Span) []Issue {
 }
 
 // Persist runs every detector and writes any findings into performance_issues.
-// Each insert is best-effort — a single bad row never aborts the batch.
+// Legacy direct path (tests, pre-outbox callers): accumulation semantics, no
+// per-intent dedupe markers. The outbox worker uses WriteIssues, which is
+// idempotent under at-least-once delivery.
 func (e *Engine) Persist(ctx context.Context, siteID string, spans []Span) {
-	issues := e.RunAll(spans)
+	_ = e.WriteIssues(ctx, "", siteID, e.RunAll(spans))
+}
+
+// WriteIssues persists pre-computed findings into performance_issues and
+// returns the first failure so the outbox worker can retry the intent.
+//
+// Idempotency (O01 section 5.7): the KV count accumulation is NOT naturally
+// idempotent — a naive re-derive double-counts. When intentID is non-empty
+// (the outbox path), each (intent, fingerprint) contribution is bracketed by
+// a KV completion marker: a marker hit skips that fingerprint entirely, so a
+// re-delivered intent writes nothing the second time. Residual window,
+// documented: a crash between a fingerprint's insert and its marker-set can
+// double-count that one fingerprint's severity counter on the retry (the
+// marker order is write-then-mark so the failure mode over-counts a
+// diagnostic metric rather than silently losing a detection). An empty
+// intentID keeps the legacy accumulate-on-every-call semantics.
+func (e *Engine) WriteIssues(ctx context.Context, intentID, siteID string, issues []Issue) error {
 	if len(issues) == 0 {
-		return
+		return nil
 	}
 	sql := e.db.SQL()
 	kv := e.db.KV()
+	var firstErr error
 	for _, iss := range issues {
+		if intentID != "" {
+			doneKey := "outbox:perf:" + intentID + ":" + iss.Fingerprint
+			if b, err := kv.Get(ctx, doneKey); err == nil && b != nil && string(b) == "1" {
+				continue
+			}
+		}
 		// performance_issues is a replacing_mergetree keyed on
 		// (tenant_id, site_id, fingerprint) with version_column=last_seen, and
 		// Nucleus DOES apply replacing dedup on read — so every re-detection
@@ -130,10 +155,24 @@ func (e *Engine) Persist(ctx context.Context, siteID string, spans []Span) {
 			dbutil.IntParam(iss.LastSeen),
 		)
 		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
 			e.logger.Warn("perf_issue: insert failed",
 				"detector", iss.DetectorName, "fingerprint", iss.Fingerprint, "err", err)
+			continue
+		}
+		if intentID != "" {
+			// Mark only after the contribution landed (see the comment on
+			// WriteIssues for the ordering rationale).
+			doneKey := "outbox:perf:" + intentID + ":" + iss.Fingerprint
+			if err := kv.Set(ctx, doneKey, []byte("1")); err != nil {
+				e.logger.Warn("perf_issue: completion marker set failed",
+					"intent", intentID, "fingerprint", iss.Fingerprint, "err", err)
+			}
 		}
 	}
+	return firstErr
 }
 
 // genID is a small wrapper around crypto/rand for opaque issue IDs. Hex-

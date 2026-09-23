@@ -70,6 +70,7 @@ var Tables = []string{
 	"spans",
 	"service_stats",
 	"service_dependencies",
+	"derived_outbox",
 	"llm_traces",
 	"metric_points",
 	"host_metrics",

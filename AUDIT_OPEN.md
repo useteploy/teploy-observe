@@ -197,11 +197,15 @@ Round-4 deferrals (new):
 - R03 = AUD-003/TO-006 (unchanged — atomic bootstrap claim-as-record).
 - R24/R25 = TO-021/TO-022 + F39-full (unchanged — replay pagination +
   causal ordering ride the versioned player protocol).
-- R26 = TO-020 (unchanged — durable derived-work outbox design).
+- R26 = TO-020 (trace half LANDED 2026-09-22 via O01 slice 3 — the
+  derived-work outbox; the replay-heatmap half of the finding remains
+  open, see the slice record below).
 - R14 durable half, R22 durable half: R14's durable half LANDED
   2026-09-22 (O01 slice 2); R22's durable half (across-restart webhook
-  delivery) remains deferred to the derived-work outbox (slice 3, same
-  class as TO-020).
+  delivery) remains deferred — the `derived_outbox` table + `webhook`
+  kind now exist (O01 slice 3, migration 046) but alert fire still
+  enqueues to the in-memory queue; wiring the alert-fire origin through
+  the outbox is the next slice.
 - R45 digest-pinning residual: needs real reviewed digests; the permissions
   /concurrency/timeout hardening landed.
 
@@ -277,6 +281,51 @@ the same change (the O03 rule the ADR carries). Record of slices:
   K-attempt diversion + events-side counter block (slice 4), ledger
   retention incl. error_inbox 30d (slice 5), OTLP duplicate mitigation
   (slice 6).
+
+- **2026-09-22, slice 3 — derived-work outbox, trace signal end to end
+  (ADR §5.7, era 4; lands the trace half of TO-020/R26).** Migration 046
+  (`derived_outbox`, ReplacingMergeTree keyed on intent id — the
+  state-advancing-row pattern of 041/045, worker marks as strictly-
+  monotonic version rewrites collapsed by the argMax form). Trace ingest
+  is now ONE transaction: span chunks + a `rollup` intent + a `detector`
+  intent commit together — the detached post-response goroutine is GONE,
+  and a failing span chunk rolls back the whole export (the OTLP
+  committed-prefix duplicate window for traces closes as a side effect;
+  503+retry now reprocesses cleanly). Payloads are the exact derived
+  inputs frozen at ingest (per-bucket rollup aggregates; computed
+  detector issues) — NOT span re-reads, which an exporter retry's
+  duplicate prefix would double-count. Worker (`internal/outbox`):
+  lifecycle-owned drain, immediate startup pass = crash resume,
+  exponential backoff, DURABLE dead-letter sentinel (next_attempt_at =
+  -1 — dead is a row state, not a worker-config property; a restart with
+  a bigger budget never resurrects a dead letter), last_error kept,
+  per-kind healthz counters (`outbox.by_kind.{pending, processed,
+  failed, dead_lettered}`). Idempotency inventory: rollup writes are
+  key-collapsed identical-row rewrites (idempotent today); detector
+  persistence was NOT (KV count accumulation + count-summing read) —
+  made idempotent per intent via KV completion markers keyed
+  `outbox:perf:<intent>:<fingerprint>`; documented residual: a crash in
+  the write-then-mark window can double-count one fingerprint's severity
+  count (over-counted diagnostics, never lost detections). Webhook
+  sends are NOT originated here (alert evaluation fires them — ADR §1.8)
+  and still ride the R22 in-memory queue; their dedupe key when they
+  ride the outbox is the existing stable X-Observe-Delivery id. Seed
+  path (IngestSync) derives synchronously via ProcessIDs. Single-process
+  claim (AUD-018 posture); multi-replica needs lease/CAS before the
+  webhook kind rides. New oracle: `internal/outbox/outbox_test.go` +
+  `internal/tracing/o01_outbox_test.go` + storage-free payload
+  round-trip pin; red-first (contract tests failed against the detached
+  code — at ack time zero durable record carried the derived work, and
+  the goroutine's best-effort writes visibly raced test teardown in the
+  red logs); mutations both ways (enqueue outside the tx fails the
+  atomicity pin; due-scan skipping fresh intents fails the resume pins).
+  `derived_outbox` added to `backup.Tables` (F44 gate caught it).
+  Residuals for later slices: alert-fire webhook origination (R22
+  durable half), replay heatmap origination (TO-020 replay half),
+  processed-intent + KV-marker retention (slice 5), per-kind dead-letter
+  alerting beyond the healthz counter. Gates: `go vet ./...` clean;
+  touched packages green incl. `-race`; full serial suite
+  (`OBSERVE_NUCLEUS_URL` fixture, `-p 1 -count=1 ./...`) green.
 
 Pass record (2026-09-17 audit, remediation session same day):
 
@@ -485,6 +534,11 @@ Round-3 deferrals (new):
   derived work (a producer retry is ledger-deduped away). The code
   documents the gap; the fix is a derived-work table + idempotent worker
   (migration + exactly-once contribution design), not a contained patch.
+  UPDATE 2026-09-22 (O01 slice 3): the derived-work table + idempotent
+  worker now EXIST (`derived_outbox`, migration 046) and the trace
+  signal rides them end to end; what remains open is wiring the REPLAY
+  heatmap origination through the same outbox (the `heatmap` kind is
+  reserved).
 - TO-021/TO-022 - P2 - Open (design): replay pagination + causal
   ordering. GetReplayEvents is unbounded and equal-timestamp events order
   by deterministic-but-not-causal (timestamp, event_id); the fix is the

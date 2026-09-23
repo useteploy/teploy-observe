@@ -43,6 +43,7 @@ now pinned under explicit lossy mode). New era-2 pins:
 `internal/ingest/o01_group_commit_test.go`. The §3 events row below is
 the era-2 reality; §1.1's hop table remains the era-1 record.
 
+
 **ERA 3 — 2026-09-22, implementation slice 2 landed (error inbox +
 durable error path, §5.6/§5.4).** The errors signal now rides the SAME
 generalized WAL machinery as its own queue instance ("errors" — one
@@ -84,6 +85,45 @@ conflicting_id / pending + queued/bytes + replayed_on_restart +
 flush_failing), `errors_wal` carries the queue stats, and degraded
 durability states cover errors-memory-only, error-wal-degraded, and
 error-flush-failing.
+
+**ERA 4 — 2026-09-22, implementation slice 3 landed (derived-work outbox,
+§5.7, trace signal end to end).** Migration 046 creates `derived_outbox`
+(ReplacingMergeTree keyed on the intent id, version-collapsed): trace ingest
+now commits the span batch AND its derived-work intents (one `rollup`
+intent, one `detector` intent) in ONE transaction — the detached
+post-response rollup goroutine is GONE for the trace signal. Intent payloads
+are the exact derived inputs frozen at ingest (the pure per-bucket rollup
+aggregates; the computed detector issues — NOT a span re-read, which would
+double-count an exporter retry's duplicate prefix), so the worker's derive
+is idempotent under at-least-once delivery. Worker: background drain
+(lifecycle-owned), immediate startup pass = crash resume, exponential
+backoff on failure, durable dead-letter sentinel (next_attempt_at = -1)
+after the attempt budget with last_error kept and per-kind counters at
+/healthz (`outbox.by_kind.{pending,processed,failed,dead_lettered}`).
+Idempotency inventory as shipped: trace rollups idempotent by construction
+(key-collapsed identical rows); detector persistence made idempotent per
+intent via KV completion markers (residual: a crash inside the
+write-then-mark window can double-count one fingerprint's severity count —
+over-counted diagnostics, never lost detections). Behavior change riding
+the same tx: a failing span chunk now rolls back the WHOLE export instead
+of leaving a committed prefix (an exporter retry reprocesses cleanly; the
+503-retry duplicate-prefix window for traces is closed). Webhook
+deliveries (alert-fire origin) and replay heatmaps do NOT ride the outbox
+yet — the kinds are reserved, wiring is the next slice (see §6). New
+oracle: `internal/outbox/outbox_test.go` (process+mark, retry → durable
+dead-letter with counter, startup resume, enqueue-rollback atomicity,
+unhandled-kind dead-letter, backoff schedule) and
+`internal/tracing/o01_outbox_test.go` (intents-in-span-tx, both rollback
+directions, crash-resume derive with VALUE-idempotence assertions, seed
+sync path, failing-derive dead-letter) + the storage-free payload
+round-trip pin (`internal/tracing/outbox_payload_test.go`). Red-first: the
+contract tests failed against the detached-goroutine code (zero intents at
+ack; the goroutine's best-effort writes visibly racing the test teardown);
+mutation-checked both ways (enqueue moved outside the tx fails the
+atomicity pin; due-scan skipping fresh intents fails the resume pins).
+`derived_outbox` joined `backup.Tables` (the F44 completeness gate caught
+it).
+
 
 ---
 
@@ -362,7 +402,7 @@ retry appends a duplicate row; DISTINCT-user analysis tolerates it.
 | events (single/batch) — ERA 2 (2026-09-22, slice 1) | group-commit fsync of the batch's WAL frame (default; lossy mode: memory admission only) | the ack's own fsync (≤ group-commit window + one fsync); lossy mode: periodic fsync (≤500 ms) | dedupe ≤24 h horizon (durable), 10 min cache; durability refusals are 503 + Retry-After | site-scoped event_id (v2) | durable: nothing on 200 — the disk high-water REFUSES (counted) instead of deleting; lossy: ≤1 sync interval of acked events (declared budget) |
 | errors — ERA 3 (2026-09-22, slice 2) | group-commit fsync of the record's WAL frame on the errors queue (default; lossy mode: memory admission only) | the ack's own fsync; lossy mode: periodic fsync (<=500 ms) | two layers: 10 min admission cache (duplicate -> deduped ack, conflict -> 409 + counter), durable `error_inbox` ledger in the apply tx (covers restarts/replay); identity-less producers: none (v1 posture) | site-scoped (site, producer_id, event_id) + payload digest, when the producer sends event_id | durable: nothing on 200 — storage failure leaves the record PENDING (retried), poison quarantined; lossy: <=1 sync interval of acked records |
 | logs | sync SQL commit | same moment | 503 retry duplicates committed prefix | none (O02) | nothing on 200; duplication on 503+retry |
-| traces | sync span commit | same moment | 503 retry duplicates committed prefix; rollups not retryable at all | none (O02) | spans safe on 200; derived rollups/detectors can be silently missing |
+| traces — ERA 4 (2026-09-22, slice 3) | one tx: sync span commit + derived-work intents (`derived_outbox`) | same moment | 503 retry reprocesses the whole export cleanly (all-or-nothing tx — the committed-prefix duplicate window is closed); derived rollups/detectors resume from durable intents after any crash | none (O02) | nothing on 200 — spans AND the derived-work guarantee commit together; a failing derive retries then dead-letters loudly |
 | metrics | sync SQL commit | same moment | 503 retry duplicates committed prefix | none (O02) | nothing on 200; duplication on 503+retry |
 | replays (v2) | SQL COMMIT (ledger+children+session, one tx) | same moment | ledger dedupe; digest conflict 409 | producer+batch+digest | nothing; heatmap derived work best-effort |
 | replays (v1) | SQL COMMIT | same moment | none | none | nothing, but retries duplicate |
@@ -507,13 +547,28 @@ Closes R14's durable half.
 
 ### 5.7 Derived-work outbox (rollups, detectors, heatmaps, webhooks)
 
-`derived_work` rows committed in the originating transaction (trace
-ingest, replay ingest, alert fire) with a work type + bounded payload
-reference; an idempotent worker drains with retry/backoff; a bounded
-dead-letter (quarantine) for work whose application keeps failing.
-Subsumes TO-020 (heatmap outbox), R22's durable half (webhook
-deliveries), and the trace rollup goroutine. The scheduled analytics
+**IMPLEMENTED 2026-09-22 (slice 3, era 4) for the trace signal; the table
+and worker are signal-agnostic and ready for the rest.** As shipped:
+`derived_outbox` (migration 046) rows are committed INSIDE the originating
+transaction — trace ingest's one tx carries the span chunks plus a `rollup`
+intent and a `detector` intent whose payloads are the exact derived inputs
+frozen at ingest (per-bucket aggregates; computed issues — not span ids to
+re-read, which an exporter's duplicate prefix would corrupt). The worker
+(`internal/outbox`) drains due intents idempotently with exponential
+backoff, marks processed via strictly-monotonic version rewrites, and
+dead-letters durably (sentinel next_attempt_at = -1, last_error kept,
+per-kind /healthz counters) after the attempt budget; startup runs an
+immediate resume pass. Idempotency: rollup writes are key-collapsed
+identical-row rewrites; detector persistence carries per-intent KV
+completion markers (residual ms-window documented in the era-4 record).
+Single-process claim (AUD-018 posture) — multi-replica needs a lease/CAS
+design before externally-visible kinds ride it. REMAINING ORIGINS (next
+slices): webhook deliveries (alert fire — receivers dedupe on R22's stable
+X-Observe-Delivery id, which becomes the intent payload's delivery id),
+replay heatmap rollups (TO-020's replay half). The scheduled analytics
 rollups stay periodic-recompute (self-healing) and are NOT outboxed.
+Retention: processed intents (and the KV perf markers) accumulate until
+slice 5 gives them an explicit policy.
 
 ### 5.8 Dedupe retention windows — finite, documented, no silent infinite exactly-once
 
@@ -589,8 +644,12 @@ implementation slices see it.
    rewritten to the durable/PENDING contract in the same change, with
    inbox crash-window pins added and both directions
    mutation-checked).
-3. **Derived-work outbox (5.7)** — closes TO-020's class + R22 durable
-   half; migration + worker; trace rollups move into it.
+3. **Derived-work outbox (5.7)** — LANDED 2026-09-22 (era 4 above) for
+   the trace signal end to end: migration 046 + `internal/outbox` worker,
+   trace rollups + detectors ride it, the detached-goroutine pattern is
+   gone. RESIDUAL origins for the same table (next slices): webhook
+   deliveries from alert fire (R22's durable half — in-memory queue until
+   then) and replay heatmap rollups (TO-020's replay half).
 4. **Quarantine + counters (5.9, 5.10)** — WAL fence-and-quarantine,
    SQL-layer diversion, healthz counter block.
 5. **Ledger retention policies (5.8)** — replay_batches (and the new

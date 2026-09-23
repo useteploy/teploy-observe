@@ -70,6 +70,9 @@ var replacingKeys = map[string][]string{
 	// 041_replay_batch_ledger — insert-once per (site, replay, batch);
 	// replacing so a cross-process double-submit collapses to one row.
 	"replay_batches": {"tenant_id", "site_id", "replay_id", "producer_id", "batch_id"},
+	// 046_derived_outbox — one logical intent per id; the outbox worker
+	// rewrites attempts/processed state as strictly-monotonic new versions.
+	"derived_outbox": {"tenant_id", "id"},
 }
 
 // Keys returns the registered ORDER BY key of a replacing table, or nil.

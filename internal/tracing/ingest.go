@@ -13,6 +13,7 @@ import (
 	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/outbox"
 	"github.com/useteploy/teploy-observe/internal/tracing/detectors"
 )
 
@@ -26,10 +27,33 @@ type IngestService struct {
 	db        *nucleus.Client
 	logger    *slog.Logger
 	detectors *detectors.Engine
+	outbox    intentPipeline
+}
+
+// intentPipeline is the derived-work seam: the production *outbox.Store plus
+// a stub the atomicity tests use to break the ingest transaction at a chosen
+// enqueue.
+type intentPipeline interface {
+	Enqueue(ctx context.Context, sql *nucleus.SQLModel, siteID, kind string, payload any) (string, error)
+	ProcessIDs(ctx context.Context, ids ...string) error
 }
 
 func NewIngestService(db *nucleus.Client) *IngestService {
-	return &IngestService{db: db, logger: slog.Default(), detectors: detectors.New(db)}
+	s := &IngestService{db: db, logger: slog.Default(), detectors: detectors.New(db)}
+	obx := outbox.New(db, s.logger)
+	obx.Register(outbox.KindTraceRollup, s.handleRollupIntent)
+	obx.Register(outbox.KindTraceDetect, s.handleDetectorIntent)
+	s.outbox = obx
+	return s
+}
+
+// Outbox exposes the derived-work store this service enqueues on, so main
+// wires one worker + healthz block for every kind.
+func (s *IngestService) Outbox() *outbox.Store {
+	if ob, ok := s.outbox.(*outbox.Store); ok {
+		return ob
+	}
+	return nil
 }
 
 // WithLogger lets callers thread their own logger (used by main + seed so
@@ -51,26 +75,57 @@ type IngestResponse struct {
 	Spans int  `json:"spans"`
 }
 
-// Ingest processes an OTLP ExportTraceServiceRequest. Spans are written
-// synchronously; the rollup tables (service_stats, service_dependencies)
-// are written in the background so a slow rollup never stalls ingest.
+// Ingest processes an OTLP ExportTraceServiceRequest. Spans AND their
+// derived-work intents (rollups + detector findings) commit in ONE
+// transaction (O01 section 5.7): a 200 means the spans and the intents that
+// guarantee their derived work are both durable. The outbox worker derives
+// from the intents after the response — a crash between commit and derive
+// resumes on the next startup instead of silently skipping the derived work.
 func (s *IngestService) Ingest(ctx context.Context, siteID string, req ExportTraceRequest) (IngestResponse, error) {
 	return s.ingest(ctx, siteID, req, false)
 }
 
-// IngestSync is identical to Ingest but blocks until the rollup writes
-// finish. Used by the seed path so a fresh dev stack shows data the
-// moment the HTTP server is ready.
+// IngestSync is identical to Ingest but derives the intents it just created
+// synchronously before returning. Used by the seed path so a fresh dev stack
+// shows data the moment the HTTP server is ready.
 func (s *IngestService) IngestSync(ctx context.Context, siteID string, req ExportTraceRequest) (IngestResponse, error) {
 	return s.ingest(ctx, siteID, req, true)
 }
 
-func (s *IngestService) ingest(ctx context.Context, siteID string, req ExportTraceRequest, syncRollup bool) (IngestResponse, error) {
-	sql := s.db.SQL()
-
+func (s *IngestService) ingest(ctx context.Context, siteID string, req ExportTraceRequest, syncDerive bool) (IngestResponse, error) {
 	// Flatten the OTLP envelope into a single slice — keeps the rollup
 	// aggregator pure and unit-testable without an OTLP request struct.
 	flat := flattenSpans(req)
+	if len(flat) == 0 {
+		return IngestResponse{OK: true}, nil
+	}
+
+	// Derive the intent payloads BEFORE the transaction: both the rollup
+	// aggregates and the detector findings are pure functions of the
+	// in-memory batch, so the payload is frozen at exactly the inputs the
+	// derived work consumes — a worker re-run (crash resume, duplicate
+	// delivery) derives identical output, and nothing needs to re-read the
+	// spans table (which would double-count a retried export's duplicate
+	// prefix).
+	services, deps := aggregateRollups(flat)
+	rollupPL := newRollupIntentPayload(services, deps)
+	var detIssues []detectors.Issue
+	if s.detectors != nil {
+		detIssues = s.detectors.RunAll(flatToDetectorSpans(req, flat))
+	}
+
+	// ONE transaction: span chunks + intent rows commit or roll back
+	// together (the replay_batches 041 boundary applied to derived work —
+	// an intent can never orphan ahead of its spans, and spans can never
+	// commit without the derived work they owe). A mid-request failure
+	// rolls the whole export back, so an exporter retry reprocesses
+	// cleanly instead of duplicating a committed prefix.
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return IngestResponse{}, fmt.Errorf("begin trace ingest tx: %w", err)
+	}
+	defer tx.Rollback(ctx) // no-op once Commit has succeeded
+	sqlc := tx.SQL()
 
 	// Batch-insert spans in chunked multi-row statements instead of one
 	// autocommit INSERT per span — an unbatched per-span loop was directly
@@ -79,34 +134,140 @@ func (s *IngestService) ingest(ctx context.Context, siteID string, req ExportTra
 	// trace export, which for a busy exporter can be hundreds of spans per
 	// request. Mirrors the chunking approach in internal/ingest/buffer.go's
 	// insertBatch (same chunk size, same placeholder-building shape).
-	total, err := insertSpans(ctx, sql, siteID, flat)
+	total, err := insertSpans(ctx, sqlc, siteID, flat)
 	if err != nil {
 		return IngestResponse{}, fmt.Errorf("insert span: %w", err)
 	}
 
-	services, deps := aggregateRollups(flat)
-	detSpans := flatToDetectorSpans(req, flat)
-
-	if syncRollup {
-		s.writeRollups(ctx, siteID, services, deps)
-		if s.detectors != nil {
-			s.detectors.Persist(ctx, siteID, detSpans)
+	intentIDs := make([]string, 0, 2)
+	id, err := s.outbox.Enqueue(ctx, sqlc, siteID, outbox.KindTraceRollup, rollupPL)
+	if err != nil {
+		return IngestResponse{}, fmt.Errorf("enqueue rollup intent: %w", err)
+	}
+	intentIDs = append(intentIDs, id)
+	if s.detectors != nil {
+		id, err := s.outbox.Enqueue(ctx, sqlc, siteID, outbox.KindTraceDetect, detIssues)
+		if err != nil {
+			return IngestResponse{}, fmt.Errorf("enqueue detector intent: %w", err)
 		}
-	} else {
-		// Detach from the request context so handler timeouts don't kill
-		// a half-finished rollup write. A 30s ceiling keeps a stuck DB
-		// from leaking goroutines.
-		go func() {
-			bg, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		intentIDs = append(intentIDs, id)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return IngestResponse{}, fmt.Errorf("commit trace ingest tx: %w", err)
+	}
+
+	if syncDerive {
+		if ob, ok := s.outbox.(*outbox.Store); ok {
+			// Same bounded ceiling the detached goroutine used to carry.
+			dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			s.writeRollups(bg, siteID, services, deps)
-			if s.detectors != nil {
-				s.detectors.Persist(bg, siteID, detSpans)
+			if err := ob.ProcessIDs(dctx, intentIDs...); err != nil {
+				s.logger.Warn("trace seed: synchronous derive failed — intents stay pending for the worker",
+					"err", err)
 			}
-		}()
+		}
 	}
 
 	return IngestResponse{OK: true, Spans: total}, nil
+}
+
+// handleRollupIntent derives service_stats / service_dependencies rows from
+// a frozen rollup payload. Idempotent by construction: the same payload
+// writes the same key rows, and the replacing-merge collapse keyed on
+// (service, operation, bucket) keeps one row with identical values.
+func (s *IngestService) handleRollupIntent(ctx context.Context, intentID, siteID string, payload []byte) error {
+	var p rollupIntentPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("decode rollup payload: %w", err)
+	}
+	services, edges := p.toMaps()
+	return s.writeRollups(ctx, siteID, services, edges)
+}
+
+// handleDetectorIntent persists frozen detector findings. Idempotent under
+// re-delivery via the per-intent KV completion markers inside
+// WriteIssues (the count accumulation itself is not naturally idempotent).
+func (s *IngestService) handleDetectorIntent(ctx context.Context, intentID, siteID string, payload []byte) error {
+	if s.detectors == nil {
+		return nil
+	}
+	var issues []detectors.Issue
+	if err := json.Unmarshal(payload, &issues); err != nil {
+		return fmt.Errorf("decode detector payload: %w", err)
+	}
+	return s.detectors.WriteIssues(ctx, intentID, siteID, issues)
+}
+
+// rollupIntentPayload is the frozen derived-input for the rollup worker: the
+// per-bucket aggregates exactly as computed at ingest. JSON-shaped (slices,
+// not struct-keyed maps) so the payload round-trips losslessly.
+type rollupIntentPayload struct {
+	Services []rollupServiceAgg `json:"services"`
+	Edges    []rollupEdgeAgg    `json:"edges"`
+}
+
+type rollupServiceAgg struct {
+	Service     string  `json:"service"`
+	Operation   string  `json:"operation"`
+	Bucket      int64   `json:"bucket"`
+	Count       int64   `json:"count"`
+	Errors      int64   `json:"errors"`
+	DurationSum int64   `json:"duration_sum"`
+	DurationMin int64   `json:"duration_min"`
+	DurationMax int64   `json:"duration_max"`
+	Durations   []int64 `json:"durations"`
+}
+
+type rollupEdgeAgg struct {
+	Src         string `json:"src"`
+	Dst         string `json:"dst"`
+	Bucket      int64  `json:"bucket"`
+	CallCount   int64  `json:"call_count"`
+	ErrorCount  int64  `json:"error_count"`
+	DurationSum int64  `json:"duration_sum"`
+}
+
+func newRollupIntentPayload(services map[ServiceBucket]*Aggregate, deps map[ServiceEdge]*EdgeAgg) rollupIntentPayload {
+	p := rollupIntentPayload{
+		Services: make([]rollupServiceAgg, 0, len(services)),
+		Edges:    make([]rollupEdgeAgg, 0, len(deps)),
+	}
+	for k, a := range services {
+		p.Services = append(p.Services, rollupServiceAgg{
+			Service: k.Service, Operation: k.Operation, Bucket: k.Bucket,
+			Count: a.Count, Errors: a.Errors,
+			DurationSum: a.DurationSum, DurationMin: a.DurationMin, DurationMax: a.DurationMax,
+			Durations: append([]int64(nil), a.Durations...),
+		})
+	}
+	for k, e := range deps {
+		p.Edges = append(p.Edges, rollupEdgeAgg{
+			Src: k.Src, Dst: k.Dst, Bucket: k.Bucket,
+			CallCount: e.CallCount, ErrorCount: e.ErrorCount, DurationSum: e.DurationSum,
+		})
+	}
+	return p
+}
+
+// toMaps rebuilds the aggregate maps the writeRollups consumer expects —
+// deterministically from the frozen payload.
+func (p rollupIntentPayload) toMaps() (map[ServiceBucket]*Aggregate, map[ServiceEdge]*EdgeAgg) {
+	services := make(map[ServiceBucket]*Aggregate, len(p.Services))
+	for _, s := range p.Services {
+		services[ServiceBucket{Service: s.Service, Operation: s.Operation, Bucket: s.Bucket}] = &Aggregate{
+			Count: s.Count, Errors: s.Errors,
+			DurationSum: s.DurationSum, DurationMin: s.DurationMin, DurationMax: s.DurationMax,
+			Durations: append([]int64(nil), s.Durations...),
+		}
+	}
+	deps := make(map[ServiceEdge]*EdgeAgg, len(p.Edges))
+	for _, e := range p.Edges {
+		deps[ServiceEdge{Src: e.Src, Dst: e.Dst, Bucket: e.Bucket}] = &EdgeAgg{
+			CallCount: e.CallCount, ErrorCount: e.ErrorCount, DurationSum: e.DurationSum,
+		}
+	}
+	return services, deps
 }
 
 // flatToDetectorSpans projects the internal flatSpan slice into the
@@ -384,11 +545,15 @@ func aggregateRollups(spans []flatSpan) (map[ServiceBucket]*Aggregate, map[Servi
 }
 
 // writeRollups flushes the aggregated services + dependency edges to the
-// rollup tables. Each insert is best-effort — a failure logs and moves
-// on so a single bad row never aborts the rollup batch.
-func (s *IngestService) writeRollups(ctx context.Context, siteID string, services map[ServiceBucket]*Aggregate, deps map[ServiceEdge]*EdgeAgg) {
+// rollup tables. Each insert is attempted even when an earlier one failed,
+// but the first error is returned so the outbox worker can retry the whole
+// intent — idempotently: the same aggregate payload rewrites the same key
+// rows, and the replacing-merge collapse keyed on (service, operation,
+// bucket) keeps one row with identical values.
+func (s *IngestService) writeRollups(ctx context.Context, siteID string, services map[ServiceBucket]*Aggregate, deps map[ServiceEdge]*EdgeAgg) error {
 	sql := s.db.SQL()
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+	var firstErr error
 
 	for key, agg := range services {
 		sort.Slice(agg.Durations, func(i, j int) bool { return agg.Durations[i] < agg.Durations[j] })
@@ -415,6 +580,9 @@ func (s *IngestService) writeRollups(ctx context.Context, siteID string, service
 			now,
 		)
 		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
 			s.logger.Warn("rollup: service_stats insert failed",
 				"service", key.Service, "operation", key.Operation,
 				"bucket", key.Bucket, "err", err)
@@ -439,11 +607,15 @@ func (s *IngestService) writeRollups(ctx context.Context, siteID string, service
 			now,
 		)
 		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
 			s.logger.Warn("rollup: service_dependencies insert failed",
 				"src", key.Src, "dst", key.Dst,
 				"bucket", key.Bucket, "err", err)
 		}
 	}
+	return firstErr
 }
 
 func percentile(sorted []int64, p float64) int64 {

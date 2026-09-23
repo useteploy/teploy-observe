@@ -608,6 +608,22 @@ func main() {
 				return nil
 			},
 		}),
+		// O01 slice 3: the derived-work outbox worker. Start drains an
+		// immediate pass (resuming the previous process's committed-but-
+		// underived intents) then a fixed cadence; Stop waits for the
+		// in-flight intent. Pending intents survive a stop and resume on
+		// the next start.
+		neutron.WithLifecycle(neutron.LifecycleHook{
+			Name: "derived-outbox",
+			OnStart: func(ctx context.Context) error {
+				traceIngest.Outbox().Start()
+				return nil
+			},
+			OnStop: func(ctx context.Context) error {
+				traceIngest.Outbox().Stop()
+				return nil
+			},
+		}),
 		neutron.WithLifecycle(neutron.LifecycleHook{
 			Name: "scheduler",
 			OnStart: func(ctx context.Context) error {
@@ -1594,6 +1610,12 @@ func main() {
 		if errorsQ != nil {
 			health["errors_wal"] = errorsQ.Stats()
 		}
+		// O01 (ADR section 5.10, slice 3): the derived-work outbox counters,
+		// per kind — pending / processed / failed attempts / dead-lettered.
+		// A non-zero dead_lettered is the operator's signal that derived
+		// work (rollups, detector findings) is being skipped loudly rather
+		// than silently.
+		health["outbox"] = traceIngest.Outbox().Stats(req.Context())
 		if degraded {
 			health["status"] = "degraded"
 			writeJSONError(w, http.StatusServiceUnavailable, "telemetry pipeline degraded: "+durability)
