@@ -179,6 +179,14 @@ type FunnelInput struct {
 	From   string       `json:"from"`
 	To     string       `json:"to"`
 	Steps  []FunnelStep `json:"steps"`
+	// Entity selects the grouped entity: "visit", "person", or
+	// "visitor-estimate" (O03 ADR vocabulary). Empty = visitor-estimate.
+	Entity string `json:"entity"`
+	// ConversionWindowMs bounds the traversal from the first step's event
+	// (edge inclusive). 0/absent = unbounded within the query range.
+	ConversionWindowMs int64 `json:"conversion_window_ms"`
+	// Exclusions are disqualifying steps (see FunnelOptions).
+	Exclusions []FunnelStep `json:"exclusions"`
 }
 
 // FunnelBreakdownInput augments FunnelInput with a breakdown dimension.
@@ -189,6 +197,7 @@ type FunnelBreakdownInput struct {
 	Steps       []FunnelStep `json:"steps"`
 	BreakdownBy string       `json:"breakdown_by"`
 	MinSize     int          `json:"min_size"`
+	Entity      string       `json:"entity"`
 }
 
 func (i FunnelBreakdownInput) TimeRange() (time.Time, time.Time) {
@@ -221,6 +230,14 @@ type RetentionInput struct {
 	From       string `query:"from"`
 	To         string `query:"to"`
 	PeriodDays int    `query:"period_days"`
+	// Entity selects the grouped entity (see FunnelInput.Entity).
+	Entity string `query:"entity"`
+	// CohortEvent restricts cohort entry to entities whose first matching
+	// event_type falls in the period (empty = first activity).
+	CohortEvent string `query:"cohort_event"`
+	// ReturnEvent restricts return-activity bucketing to an event_type
+	// (empty = any event).
+	ReturnEvent string `query:"return_event"`
 }
 
 func (i RetentionInput) TimeRange() (time.Time, time.Time) {
@@ -489,7 +506,11 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 	// Funnel analysis
 	neutron.Post(api, "/funnel", func(ctx context.Context, input FunnelInput) ([]FunnelResult, error) {
 		from, to := input.TimeRange()
-		return svc.Funnel(ctx, input.SiteID, from, to, input.Steps)
+		return svc.FunnelWithOptions(ctx, input.SiteID, from, to, input.Steps, FunnelOptions{
+			Entity:             input.Entity,
+			ConversionWindowMs: input.ConversionWindowMs,
+			Exclusions:         input.Exclusions,
+		})
 	}, neutron.WithTags("stats"))
 
 	// Funnel analysis with breakdown by a property (browser, country, device, os).
@@ -499,12 +520,18 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 		if min <= 0 {
 			min = 5
 		}
-		return svc.FunnelByBreakdown(ctx, input.SiteID, from, to, input.Steps, input.BreakdownBy, min)
+		return svc.FunnelByBreakdownWithOptions(ctx, input.SiteID, from, to, input.Steps, input.BreakdownBy, min, FunnelOptions{
+			Entity: input.Entity,
+		})
 	}, neutron.WithTags("stats"))
 
 	// Retention cohort analysis
 	neutron.Get(api, "/retention", func(ctx context.Context, input RetentionInput) ([]RetentionCohort, error) {
 		from, to := input.TimeRange()
-		return svc.Retention(ctx, input.SiteID, from, to, input.PeriodDays)
+		return svc.RetentionWithOptions(ctx, input.SiteID, from, to, input.PeriodDays, RetentionOptions{
+			Entity:      input.Entity,
+			CohortEvent: input.CohortEvent,
+			ReturnEvent: input.ReturnEvent,
+		})
 	}, neutron.WithTags("stats"))
 }

@@ -92,15 +92,15 @@ func distinctIDOf(raw, siteSalt string) string {
 // time the producer experienced; ingestedAt is when the server processed
 // it — era-1 uses ONLY ingestedAt (see scenario (e)).
 type scenarioRow struct {
-	name       string
-	site       string
-	ip         string
-	ua         string
-	ts         time.Time // event time as experienced client-side
-	ingestedAt time.Time // server processing time (era-1's only clock)
-	salt       string    // global OBSERVE_SESSION_SALT
+	name        string
+	site        string
+	ip          string
+	ua          string
+	ts          time.Time // event time as experienced client-side
+	ingestedAt  time.Time // server processing time (era-1's only clock)
+	salt        string    // global OBSERVE_SESSION_SALT
 	rawIdentity string    // raw identify() value, "" for anonymous
-	siteSalt   string    // per-site salt for the distinct_id HMAC
+	siteSalt    string    // per-site salt for the distinct_id HMAC
 
 	// computed by runScenario
 	sessionID  string
@@ -440,12 +440,12 @@ func TestReference_ScenarioE_DelayedDelivery(t *testing.T) {
 	)
 	sess := monthKeyedID(site, ip, ua, salt, "2026-07")
 
-	onTime := time.Date(2026, 7, 10, 9, 10, 0, 0, time.UTC)  // event at 09:10, delivered 09:10
-	eventAt := time.Date(2026, 7, 10, 9, 50, 0, 0, time.UTC) // event happened 09:50 ...
+	onTime := time.Date(2026, 7, 10, 9, 10, 0, 0, time.UTC)     // event at 09:10, delivered 09:10
+	eventAt := time.Date(2026, 7, 10, 9, 50, 0, 0, time.UTC)    // event happened 09:50 ...
 	delivered := time.Date(2026, 7, 10, 11, 40, 0, 0, time.UTC) // ... ingested 11:40
 
-	truthVisit := VisitID(sess, eventAt)      // where the event BELONGS
-	landingVisit := VisitID(sess, delivered)  // where era-1 PUTS it
+	truthVisit := VisitID(sess, eventAt)     // where the event BELONGS
+	landingVisit := VisitID(sess, delivered) // where era-1 PUTS it
 
 	if truthVisit == landingVisit {
 		t.Fatal("09:50 event delivered 11:40 must land outside its true hour bucket (era-1 pin)")
@@ -484,24 +484,390 @@ func TestReference_ScenarioE_DelayedDelivery(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
+// O04: funnel / retention expected-answer tables (entity semantics)
+// ----------------------------------------------------------------------------
+
+// Programme workstream O04 ("funnel + retention semantics") extends this
+// oracle from identity derivation to the query surfaces. The tables below
+// pin, per O03 scenario and per entity mode, the ENTITY PARTITION (which
+// events the query groups together) and HAND-COMPUTED funnel/retention
+// counts. The counts are literals written by hand here — they are the
+// spec, not the output of any implementation.
+//
+// The executable binding lives in internal/query: its storage-free walk
+// tests and its Nucleus-gated integration tests re-derive the SAME
+// scenario ids through these same public functions (session.ID /
+// monthKeyedID, session.VisitID, identity.HashDistinctID) and assert the
+// SAME literals against the real Funnel/Retention code. A mismatch on
+// either side means the implementation is wrong or the era is being
+// bumped — the O03 era rule applies unchanged.
+//
+// Entity modes (O03 ADR vocabulary, used verbatim):
+//
+//   visitor-estimate  events grouped on session_id (the monthly
+//                     fingerprint estimate — current/default behavior)
+//   visit             events grouped on visit_id (the clock-hour bucket)
+//   person            events grouped on distinct_id, IDENTIFIED events
+//                     only (distinct_id '' excluded — anonymous events
+//                     belong to no person in era-1)
+//
+// Funnel semantics pinned by these tables (full statement in
+// internal/query/funnel.go):
+//   - ordering: (timestamp, event_id) ascending — timestamp is the STORED
+//     column, which era-1 sets to INGESTION time (ADR D8: no event-time
+//     on the wire; see the late-delivery pin below)
+//   - progression: greedy earliest chain; each step consumes a distinct
+//     event strictly after the previous step's event in that total order
+//   - conversion window W: last step within W of the FIRST step's event,
+//     boundary ts == e0+W is IN, ts > e0+W is OUT; W<=0 = unbounded
+//   - exclusions: the first exclusion-matching event strictly after e0
+//     terminates progression (steps kept, nothing further)
+
+// o04Row is one seeded analytics event with the identity inputs the
+// ingest path would have seen. storedTS is the timestamp era-1 stores
+// (= ingestion time). identity inputs derive session/visit; rawIdentity
+// derives the person id.
+type o04Row struct {
+	name        string
+	eventType   string
+	pathname    string
+	storedTS    time.Time
+	rawIdentity string
+	eventID     string
+
+	sessionID  string
+	visitID    string
+	distinctID string
+}
+
+// o04Derive derives the era-1 ids for a scenario's rows under one fixed
+// fingerprint triple + site salt, exactly as ingest would: session.ID
+// (month = server clock, pinned to the current month), VisitID keyed on
+// the STORED (ingestion) timestamp, distinct_id = per-site-salt HMAC.
+func o04Derive(t *testing.T, site, ip, ua, salt, siteSalt string, rows []*o04Row) {
+	t.Helper()
+	month := currentMonthKey()
+	for _, r := range rows {
+		r.sessionID = monthKeyedID(site, ip, ua, salt, month)
+		r.visitID = VisitID(r.sessionID, r.storedTS)
+		r.distinctID = distinctIDOf(r.rawIdentity, siteSalt)
+	}
+	if month != currentMonthKey() {
+		t.Fatalf("UTC month rolled mid-scenario (%s); rerun the test", month)
+	}
+}
+
+// o04Partition groups rows by the selected entity mode's id and drops
+// anonymous rows in person mode (the persons-surface rule).
+func o04Partition(rows []*o04Row, mode string) map[string][]*o04Row {
+	groups := make(map[string][]*o04Row)
+	for _, r := range rows {
+		var key string
+		switch mode {
+		case "visit":
+			key = r.visitID
+		case "person":
+			if r.distinctID == "" {
+				continue
+			}
+			key = r.distinctID
+		default: // visitor-estimate
+			key = r.sessionID
+		}
+		groups[key] = append(groups[key], r)
+	}
+	return groups
+}
+
+func o04PartitionSizes(rows []*o04Row, mode string) map[int]int {
+	sizes := make(map[int]int)
+	for _, g := range o04Partition(rows, mode) {
+		sizes[len(g)]++
+	}
+	return sizes
+}
+
+// Scenario A (anon -> login -> logout, one browser), funnel tables.
+// Events: pageview 10:00 anon, signup 10:05 identified, purchase 11:30
+// identified, pageview 11:45 anon (post-logout). Same O03 scenario-a
+// fingerprint.
+//
+// HAND-COMPUTED (the spec):
+//
+//	funnel [pageview /, purchase]
+//	  visitor-estimate: [1,1]  one entity; pageview 10:00 -> purchase 11:30
+//	  visit:            [2,0]  10h visit has the pageview, 11h visit has
+//	                           the purchase — the sequence splits across
+//	                           clock-hour visits
+//	  person:           [0,0]  purchase is identified, but the step-1
+//	                           pageview is anonymous — no chain exists
+//	funnel [signup, purchase]
+//	  visitor-estimate: [1,1]
+//	  visit:            [1,0]  signup 10h, purchase 11h — split
+//	  person:           [1,1]  one person, signup 10:05 -> purchase 11:30
+func TestReference_O04_ScenarioA_FunnelEntityTables(t *testing.T) {
+	const (
+		site     = "site-a"
+		ip       = "203.0.113.7"
+		ua       = "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+		salt     = "global-salt-a"
+		siteSalt = "site-salt-a"
+	)
+	rows := []*o04Row{
+		{name: "pageview 10:00 anon", eventType: "pageview", pathname: "/", storedTS: time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC), eventID: "a-1"},
+		{name: "signup 10:05 identified", eventType: "signup", storedTS: time.Date(2026, 7, 10, 10, 5, 0, 0, time.UTC), rawIdentity: "user-1", eventID: "a-2"},
+		{name: "purchase 11:30 identified", eventType: "purchase", storedTS: time.Date(2026, 7, 10, 11, 30, 0, 0, time.UTC), rawIdentity: "user-1", eventID: "a-3"},
+		{name: "pageview 11:45 anon", eventType: "pageview", pathname: "/", storedTS: time.Date(2026, 7, 10, 11, 45, 0, 0, time.UTC), eventID: "a-4"},
+	}
+	o04Derive(t, site, ip, ua, salt, siteSalt, rows)
+
+	// Partition proof: one estimate, two visits (10h, 11h), one person
+	// carrying exactly the two identified rows.
+	if got := o04PartitionSizes(rows, "visitor-estimate"); !reflectDeepEqualIntMap(got, map[int]int{4: 1}) {
+		t.Errorf("visitor-estimate partition = %v, want one entity with all 4 events", got)
+	}
+	if got := o04PartitionSizes(rows, "visit"); !reflectDeepEqualIntMap(got, map[int]int{2: 2}) {
+		t.Errorf("visit partition = %v, want two entities with 2 events each", got)
+	}
+	if got := o04PartitionSizes(rows, "person"); !reflectDeepEqualIntMap(got, map[int]int{2: 1}) {
+		t.Errorf("person partition = %v, want one person with the 2 identified events", got)
+	}
+
+	// The count literals above are the spec; internal/query binds them
+	// (funnel_semantics_test.go + funnel_retention_nucleus_test.go).
+	wantFunnel := map[string][2][2]int{
+		// mode -> {funnel[pageview,purchase], funnel[signup,purchase]}
+		"visitor-estimate": {{1, 1}, {1, 1}},
+		"visit":            {{2, 0}, {1, 0}},
+		"person":           {{0, 0}, {1, 1}},
+	}
+	for mode, tables := range wantFunnel {
+		if len(o04Partition(rows, mode)) == 0 && (tables[0][0] != 0 || tables[1][0] != 0) {
+			t.Errorf("%s: partition is empty but step-0 count literal is nonzero", mode)
+		}
+	}
+	// Step-0 counts can never exceed the entity count per mode (the
+	// literals stay honest against the partition even without running
+	// the walk here).
+	for mode, tables := range wantFunnel {
+		n := len(o04Partition(rows, mode))
+		for _, table := range tables {
+			if table[0] > n {
+				t.Errorf("%s: step-0 literal %d exceeds entity count %d", mode, table[0], n)
+			}
+		}
+	}
+}
+
+// Scenario B (two people behind one NAT), funnel tables. Distinct UAs
+// split the estimate; IDENTICAL UAs merge (the pinned D2 limitation).
+//
+// HAND-COMPUTED (funnel [pageview /, purchase]; person A does both,
+// person B only the pageview):
+//
+//	distinct-UA NAT:
+//	  visitor-estimate: [2,1]   visit: [2,1]   person: [0,0] (no identified events)
+//	same-UA NAT (A does both, C only the pageview):
+//	  visitor-estimate: [1,1]   visit: [1,1]   person: [0,0]
+//	  — the [1,1] is the ESTIMATE answer; two real people did this (truth
+//	  [2,1]). Pinned as the documented limitation, not as people counts.
+func TestReference_O04_ScenarioB_FunnelEntityTables(t *testing.T) {
+	const (
+		site = "site-b"
+		ip   = "198.51.100.25"
+		salt = "global-salt-b"
+	)
+	chrome := "Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 Chrome/121 Safari/537.36"
+	firefox := "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0"
+
+	distinct := []*o04Row{
+		{eventType: "pageview", pathname: "/", storedTS: time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC), eventID: "b-1"},
+		{eventType: "purchase", storedTS: time.Date(2026, 7, 10, 10, 10, 0, 0, time.UTC), eventID: "b-2"},
+	}
+	o04Derive(t, site, ip, chrome, salt, "", distinct)
+	bOnly := []*o04Row{
+		{eventType: "pageview", pathname: "/", storedTS: time.Date(2026, 7, 10, 10, 2, 0, 0, time.UTC), eventID: "b-3"},
+	}
+	o04Derive(t, site, ip, firefox, salt, "", bOnly)
+
+	all := append(append([]*o04Row{}, distinct...), bOnly...)
+	if got := o04PartitionSizes(all, "visitor-estimate"); !reflectDeepEqualIntMap(got, map[int]int{2: 1, 1: 1}) {
+		t.Errorf("distinct-UA partition = %v, want entities of 2 and 1 events", got)
+	}
+	if got := o04PartitionSizes(all, "visit"); !reflectDeepEqualIntMap(got, map[int]int{2: 1, 1: 1}) {
+		t.Errorf("distinct-UA visit partition = %v, want 2+1", got)
+	}
+	if got := len(o04Partition(all, "person")); got != 0 {
+		t.Errorf("person partition = %d entities, want 0 (no identified events)", got)
+	}
+
+	sameA := []*o04Row{
+		{eventType: "pageview", pathname: "/", storedTS: time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC), eventID: "b-4"},
+		{eventType: "purchase", storedTS: time.Date(2026, 7, 10, 10, 10, 0, 0, time.UTC), eventID: "b-5"},
+	}
+	o04Derive(t, site, ip, chrome, salt, "", sameA)
+	sameC := []*o04Row{
+		{eventType: "pageview", pathname: "/", storedTS: time.Date(2026, 7, 10, 10, 5, 0, 0, time.UTC), eventID: "b-6"},
+	}
+	o04Derive(t, site, ip, chrome, salt, "", sameC)
+	merged := append(append([]*o04Row{}, sameA...), sameC...)
+	if got := len(o04Partition(merged, "visitor-estimate")); got != 1 {
+		t.Errorf("same-UA estimate partition = %d, want 1 (the merged-estimate pin)", got)
+	}
+	if got := len(o04Partition(merged, "visit")); got != 1 {
+		t.Errorf("same-UA visit partition = %d, want 1 (same clock hour)", got)
+	}
+}
+
+// Scenario C (one person, two devices), funnel + retention tables. The
+// laptop signs up 09:00; the phone purchases 20:00; both identified as
+// the same raw user under the same site salt.
+//
+// HAND-COMPUTED (funnel [signup, purchase]):
+//
+//	visitor-estimate: [1,0]  the laptop entity matches signup only; the
+//	                        purchase lives on the phone's entity, so the
+//	                        person never converts — split across two
+//	                        estimates
+//	visit:            [1,0]  same split
+//	person:           [1,1]  one person, signup (laptop) -> purchase
+//	                        (phone): the cross-device conversion
+//
+// HAND-COMPUTED retention (period = 1 day; range Jul 10 00:00 -> Jul 12
+// 00:00, both days complete, two grid columns Jul 10 + Jul 11):
+//
+//	visitor-estimate: cohort Jul 10 (laptop) size 1 [100, 0];
+//	                  cohort Jul 11 (phone)  size 1 [100]
+//	visit:            same shape — [100, 0] and [100]
+//	person:           cohort Jul 10 size 1 [100, 100]  — the day-2 return
+//	                                                 IS attributed
+//	(the estimate/visit grids can never show the return: the returning
+//	 device is a different estimate and a different visit)
+//
+// Incomplete-period pin (range ending Jul 11 12:00, phone purchase
+// delivered 09:00 that morning): the Jul 11 column is not complete, so
+// the person cohort Jul 10 reports [100] with one incomplete period
+// excluded, and the phone's Jul 11 estimate cohort reports no periods
+// at all.
+func TestReference_O04_ScenarioC_CrossDeviceTables(t *testing.T) {
+	const (
+		site     = "site-c"
+		salt     = "global-salt-c"
+		siteSalt = "site-salt-c"
+		raw      = "user-1"
+	)
+	laptop := []*o04Row{
+		{eventType: "signup", storedTS: time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC), rawIdentity: raw, eventID: "c-1"},
+	}
+	o04Derive(t, site, "203.0.113.9", "Mozilla/5.0 (Macintosh) Chrome/120", salt, siteSalt, laptop)
+	phone := []*o04Row{
+		{eventType: "purchase", storedTS: time.Date(2026, 7, 11, 20, 0, 0, 0, time.UTC), rawIdentity: raw, eventID: "c-2"},
+	}
+	o04Derive(t, site, "198.51.100.88", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) Safari/604.1", salt, siteSalt, phone)
+
+	all := append(append([]*o04Row{}, laptop...), phone...)
+	// Partition: two estimates, two visits, ONE person with both events.
+	if got := len(o04Partition(all, "visitor-estimate")); got != 2 {
+		t.Errorf("estimate partition = %d, want 2", got)
+	}
+	if got := len(o04Partition(all, "visit")); got != 2 {
+		t.Errorf("visit partition = %d, want 2", got)
+	}
+	if got := o04PartitionSizes(all, "person"); !reflectDeepEqualIntMap(got, map[int]int{2: 1}) {
+		t.Errorf("person partition = %v, want ONE person holding both devices' events", got)
+	}
+}
+
+// Timestamp-tie pin. One entity, two events at the SAME stored timestamp
+// with event ids ordered opposite to insertion ("ev-002" inserted first,
+// "ev-001" second). The pinned total order is (timestamp, event_id)
+// ascending, so signup ("ev-001") sequences BEFORE purchase ("ev-002")
+// regardless of ingestion order, and the funnel [signup, purchase]
+// converts. Flipping the tie-break breaks the conversion.
+func TestReference_O04_TimestampTieBreak(t *testing.T) {
+	const (
+		site = "site-tie"
+		ip   = "203.0.113.61"
+		ua   = "Mozilla/5.0 Chrome/121"
+		salt = "global-salt-tie"
+	)
+	rows := []*o04Row{
+		{name: "purchase, inserted FIRST", eventType: "purchase", storedTS: time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC), eventID: "ev-002"},
+		{name: "signup, inserted SECOND", eventType: "signup", storedTS: time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC), eventID: "ev-001"},
+	}
+	o04Derive(t, site, ip, ua, salt, "", rows)
+	// Same entity in every session-keyed mode (same fingerprint, same hour).
+	for _, mode := range []string{"visitor-estimate", "visit"} {
+		if got := len(o04Partition(rows, mode)); got != 1 {
+			t.Errorf("%s partition = %d entities, want 1", mode, got)
+		}
+	}
+	// HAND-COMPUTED: funnel [signup, purchase] = [1,1] under (ts, event_id)
+	// ascending; [1,0] under any flipped tie-break. Bound in
+	// internal/query/funnel_semantics_test.go.
+	if rows[0].eventID <= rows[1].eventID {
+		t.Fatal("fixture must have the later-id event inserted first for the tie pin to mean anything")
+	}
+}
+
+// Late-arrival pin (the D8 truth). True order: B 09:00 then A 09:05.
+// Ingestion: A stored 09:59, B stored 10:00 (B delivered late). The
+// queries order by the STORED timestamp (= ingestion time, era-1), so the
+// funnel [B, A] sees A before B and does NOT convert: [1,0]. Under event
+// time it WOULD convert ([1,1]) — that divergence is the O03-implementation
+// dependency (wire event-time, ADR D8), recorded in AUDIT_OPEN.md.
+func TestReference_O04_LateArrivalOrdersByIngestionTime(t *testing.T) {
+	const (
+		site = "site-late"
+		ip   = "203.0.113.62"
+		ua   = "Mozilla/5.0 Chrome/121"
+		salt = "global-salt-late"
+	)
+	rows := []*o04Row{
+		{name: "A, true 09:05, ingested 09:59", eventType: "A", storedTS: time.Date(2026, 7, 10, 9, 59, 0, 0, time.UTC), eventID: "l-1"},
+		{name: "B, true 09:00, ingested 10:00", eventType: "B", storedTS: time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC), eventID: "l-2"},
+	}
+	o04Derive(t, site, ip, ua, salt, "", rows)
+	if !rows[0].storedTS.Before(rows[1].storedTS) {
+		t.Fatal("fixture must store the late-delivered B after A")
+	}
+	// HAND-COMPUTED: funnel [B, A] = [1,0] on stored order (A precedes B,
+	// so B's match leaves no A after it). Event-time truth would be [1,1].
+}
+
+// reflectDeepEqualIntMap is a tiny map[int]int equality helper (kept
+// local so the oracle file needs no new imports beyond its existing set).
+func reflectDeepEqualIntMap(a, b map[int]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// ----------------------------------------------------------------------------
 // Salt persistence and rotation (era rules)
 // ----------------------------------------------------------------------------
 
 // Era-1 answers pinned here:
 //
-//   1. FIXED salt -> all derivations are pure functions of their inputs;
-//      nothing process-local enters them, so restart stability with a
-//      fixed salt is total (the only state is the env var itself).
-//   2. CHANGING the global salt -> every session_id and visit_id changes
-//      (new era), but distinct_id on a site-backed install does NOT
-//      (its HMAC key is the per-site salt from the sites table, not the
-//      global salt).
-//   3. FALLBACK branch (unknown site / unwired SiteService): the global
-//      salt IS the identity salt, so a rotation re-keys persons too.
-//   4. UNSET salt -> the server mints a random per-process salt
-//      (cmd/observe/main.go), so every restart silently starts a new era
-//      for sessions and visits. Pinned as fact, with the ADR's
-//      recommendation against running this way.
+//  1. FIXED salt -> all derivations are pure functions of their inputs;
+//     nothing process-local enters them, so restart stability with a
+//     fixed salt is total (the only state is the env var itself).
+//  2. CHANGING the global salt -> every session_id and visit_id changes
+//     (new era), but distinct_id on a site-backed install does NOT
+//     (its HMAC key is the per-site salt from the sites table, not the
+//     global salt).
+//  3. FALLBACK branch (unknown site / unwired SiteService): the global
+//     salt IS the identity salt, so a rotation re-keys persons too.
+//  4. UNSET salt -> the server mints a random per-process salt
+//     (cmd/observe/main.go), so every restart silently starts a new era
+//     for sessions and visits. Pinned as fact, with the ADR's
+//     recommendation against running this way.
 func TestReference_SaltEras(t *testing.T) {
 	const (
 		site     = "site-salt"

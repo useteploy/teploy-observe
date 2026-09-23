@@ -1689,3 +1689,120 @@ O08 residuals (recorded, out of this slice's scope):
   evaluation with no per-user dedupe window.
 - Local (client-side) evaluation: none exists; all evaluation is
   server-side through the public endpoint.
+
+## 2026-09-22 O04 slice 1 — funnel/retention entity + window/order semantics (pinned)
+
+Programme O04 (P0): "Funnels need selectable entity, sequence/order,
+conversion window, exclusions, repeated steps and property attribution;
+timestamp ties need deterministic handling. Retention must define
+first-seen history, cohort entry event, return event, period/timezone
+and incomplete periods." Working tree at `06ccf1e` + this change,
+uncommitted. Oracle-first per the O03 rule: the expected-answer tables
+were extended BEFORE the implementation, and the era was NOT bumped
+(no identity derivation changed — the queries label what they already
+grouped and add new grouping modes).
+
+Deliverables:
+
+- **Entity parameter** (funnel `/api/v1/stats/funnel` +
+  `/funnel/breakdown`, retention `/api/v1/stats/retention`):
+  `entity=visit|person|visitor-estimate` (O03 ADR vocabulary,
+  verbatim). Default "" = visitor-estimate = the pre-O04 grouping,
+  now honestly LABELED. Response surfaces name the entity additively
+  (per-row `entity` + `entity_limitation` fields on FunnelResult /
+  FunnelBreakdownResult / RetentionCohort — the arrays keep their
+  shape, so existing UI callers decode unchanged). Unknown values are
+  rejected (400 via neutron.ErrBadRequest), never silently degraded.
+  Person mode groups identified events only (distinct_id '' excluded);
+  visit mode groups the clock-hour bucket; visitor-estimate keeps
+  session_id.
+- **Pinned funnel semantics** (`internal/query/funnel.go` doc
+  comments + tests): ordering by (timestamp, event_id) ASC — a total
+  order, event_id unique per site — replacing the old unstable
+  sort-on-timestamp-only (tie order was engine-arrival order,
+  unspecified); greedy earliest-chain progression, each step a distinct
+  strictly-later event (repeated steps re-fire; conversion keyed on
+  first progression); bounded conversion window
+  (`conversion_window_ms`, measured from the FIRST step-0 event,
+  edge ts == e0+W INCLUSIVE, default 0 = query range only); exclusion
+  steps (`exclusions`) — the first exclusion-matching event strictly
+  after the step-0 event terminates progression, pre-entry events
+  never disqualify.
+- **Pinned retention semantics** (`internal/query/retention.go`):
+  cohort entry = sessions-rollup first_ts for the default
+  visitor-estimate path (unchanged — events never create cohorts
+  there), or the entity's FIRST matching event when
+  `cohort_event=event_type` is set / for visit+person modes
+  (raw-events-bounded first-seen history — documented limitation);
+  return activity = any event or `return_event=event_type`; period =
+  periodDays (default 1, 7 when range > 30d), buckets are absolute
+  UTC-epoch multiples (7-day buckets start THURSDAY — pinned in a
+  test), timezone UTC-only and documented; incomplete periods are
+  EXCLUDED from `periods` and flagged per row via `incomplete_periods`
+  (a column is complete once fully elapsed by `to`; the pre-O04 code
+  rendered the current period as a misleadingly-low value). Two grid
+  repairs landed as part of the pin: the dead trailing bucket
+  (starting exactly at `to`) is no longer a grid column, and the
+  legacy first_ts string-scan (CAST-parse via digits-only parseInt64)
+  was replaced by the native int64 scan the Sessions browser already
+  uses — the old path was never under test and parsed nothing when the
+  driver handed back a number.
+- **Oracle extension** (`internal/session/reference_test.go`, O04
+  section): HAND-COMPUTED tables for the O03 scenarios a/b/c under
+  each entity mode (entity partitions asserted against the real
+  derivation functions; funnel/retention count literals written as
+  spec), plus the timestamp-tie pin, window-edge pin, and the
+  late-arrival truth pin. Executable binding:
+  `internal/query/funnel_semantics_test.go` (storage-free — the walk,
+  entity dispatch, and grid math) +
+  `internal/query/funnel_retention_nucleus_test.go` (Nucleus-gated —
+  seeds the scenarios with production-derived ids, asserts the same
+  literals end to end, plus range edges, validation, and
+  default-path identity).
+
+**The late-event truth (what the queries ACTUALLY order by):** the
+stored `timestamp` column, which era-1 ingest sets to INGESTION time
+— the wire protocol has no client event-time field (O03 ADR D8).
+Funnels therefore sequence a late-delivered event at its ingestion
+position (pinned: funnel [B,A] over a late-delivered B does not
+convert even though B truly preceded A; under event time it would).
+Retention buckets return activity on ingestion time identically.
+This is recorded as the O03-implementation dependency it is: when
+event-time lands on the wire (O03 D8), funnels/retention must
+re-pin these tables in the same change and bump the era.
+
+TDD evidence: semantics tests written first, failed to compile
+against the pre-O04 code (walkFunnelEvents / entityKeyOf /
+buildRetentionCohorts did not exist); during bring-up three
+hand-computed literals were CORRECTED AGAINST the tests (scenario C
+step-0 count is 1 not 2 — only the laptop did signup; the trailing
+grid column is structurally dead; the incomplete-count definition
+narrowed to the cohort's current period) — each fix landed in the
+oracle comments and the tests together, which is the tables doing
+their job. Mutations both ways: entity dispatch hard-wired to
+session_id fails the person-mode tables across scenarios a/b/c
+(6+ assertions) AND the storage-free dispatch/grouping tests;
+tie-break flipped to event_id DESC fails the tie table exactly.
+Gates: `go vet ./...` clean; `internal/query` + `internal/session`
+green under `-race` against the fixture; full serial suite
+(`OBSERVE_NUCLEUS_URL`, `-p 1 -count=1 ./...`) green, 0 failures.
+
+O04 remainder (next slices):
+- **Property attribution** (funnel steps keyed on event properties,
+  not just event_type/pathname) — the biggest unpinned piece.
+- **Exclusions depth**: windowed/between-step exclusions (current
+  pin: first exclusion after entry ends progression globally);
+  exclusion scopes per step.
+- **Cohorts agreement**: the `cohort_id` filter (resolveFilters)
+  expands person ids into filters built on distinct_id while the
+  surrounding charts may group a different entity — entity-aware
+  cohort resolution needs a pass.
+- **Budgets/materialization**: funnels/retention fetch full-range raw
+  events per request (bounded only by the 186-day retention clamp +
+  12-column grid); no materialized per-entity step/cohort state. A
+  budget story is needed before these surfaces face large sites.
+- **UI entity labeling** (O03 D6/D11): the API names the entity; the
+  dashboard panels and the envelope-vs-array response shape ride that
+  slice.
+- **Retention timezone parameter** (UTC-only today, documented) and
+  pathname-scoped cohort/return events (event_type exact match today).
