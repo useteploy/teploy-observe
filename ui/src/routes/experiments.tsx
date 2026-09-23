@@ -52,6 +52,9 @@ function ResultsPanel({ experimentId }: { experimentId: string }) {
 
   const maxRate = Math.max(...results.variants.map(v => v.conversion_rate), 0.001);
   const totalExposures = results.variants.reduce((sum, v) => sum + v.exposures, 0);
+  const an = results.analysis;
+  const pct = (x: number) => `${(x * 100).toFixed(2)}%`;
+  const pStr = (p: number) => (p < 0.0001 ? "<0.0001" : p.toFixed(4));
 
   return (
     <div class="experiments-results">
@@ -65,6 +68,24 @@ function ResultsPanel({ experimentId }: { experimentId: string }) {
           </span>
         )}
       </div>
+
+      {/* O09 analysis: SRM diagnostic first (it invalidates trust), then the
+          gate state, test and winner-rule trace. Estimates always render;
+          the gates only decide the badge. */}
+      {an && (
+        <div style={{ padding: "10px 16px", borderBottom: "1px solid var(--obs-border-subtle)", fontSize: "12px", display: "flex", flexDirection: "column", gap: "4px" }}>
+          {an.srm?.detected && (
+            <div style={{ padding: "6px 10px", borderRadius: "var(--obs-radius)", background: "rgba(239, 68, 68, 0.12)", color: "var(--obs-danger, #ef4444)", fontWeight: 600 }}>
+              Sample ratio mismatch detected (p={pStr(an.srm.p_value)}) - {an.srm.note || "assignment is broken; do not trust these results"}
+            </div>
+          )}
+          <div style={{ display: "flex", gap: "14px", flexWrap: "wrap", color: "var(--obs-text-secondary)" }}>
+            <span>Horizon: {an.horizon_met ? "met" : `waiting (min arm ${an.min_arm_exposures}/${an.min_sample_per_arm})`}</span>
+            <span>Test: {an.test}{an.test !== "none" && an.p_value > 0 ? ` (p={pStr(an.p_value)}, df=${an.df})` : ""}</span>
+          </div>
+          {an.test_note && <div style={{ color: "var(--obs-text-secondary)" }}>{an.test_note}</div>}
+        </div>
+      )}
 
       {results.variants.map((v, idx) => {
         const barWidth = maxRate > 0 ? (v.conversion_rate / maxRate) * 100 : 0;
@@ -92,6 +113,11 @@ function ResultsPanel({ experimentId }: { experimentId: string }) {
               <span class="experiments-result-stat" style={{ fontWeight: 600, color: "var(--obs-text)" }}>
                 {(v.conversion_rate * 100).toFixed(2)}%
               </span>
+              {v.wilson_low !== undefined && v.wilson_high !== undefined && (
+                <span class="experiments-result-stat" title="Wilson score 95% interval" style={{ fontSize: "11px" }}>
+                  [{pct(v.wilson_low)} - {pct(v.wilson_high)}]
+                </span>
+              )}
               {!isControl && (
                 <span class={`experiments-prob ${probClass}`} title="Bayesian probability this variant beats control">
                   P(beats control) {probPct}%
@@ -115,11 +141,35 @@ function ResultsPanel({ experimentId }: { experimentId: string }) {
             {!isControl && (
               <div class="experiments-prob-bar" title={`${probPct}% probability variant beats control`}>
                 <div class={`experiments-prob-bar-fill ${probClass}`} style={{ width: `${Math.max(probPct, 2)}%` }} />
-              </div>
-            )}
+               </div>
+             )}
+           </div>
+         );
+       })}
+
+      {/* O09 pairwise vs control: absolute + relative lift, Newcombe CI,
+          Holm-adjusted p. The Bayesian bars above stay estimates; these are
+          the gates a winner claim actually passed. */}
+      {an?.pairwise_vs_control?.length > 0 && (
+        <div style={{ padding: "10px 16px", fontSize: "12px", borderTop: "1px solid var(--obs-border-subtle)" }}>
+          <div style={{ color: "var(--obs-text-secondary)", marginBottom: "6px", fontWeight: 600 }}>
+            vs control {an.winner_rule ? `- ${an.winner_rule}` : ""}
           </div>
-        );
-      })}
+          {an.pairwise_vs_control.map((pw) => (
+            <div key={pw.variant} style={{ display: "flex", gap: "14px", flexWrap: "wrap", padding: "3px 0", color: "var(--obs-text-secondary)" }}>
+              <span style={{ minWidth: "100px", color: "var(--obs-text)" }}>{pw.variant}</span>
+              <span>lift {pw.lift_absolute >= 0 ? "+" : ""}{pct(pw.lift_absolute)}</span>
+              <span>95% CI [{pct(pw.ci_low)} - {pct(pw.ci_high)}]</span>
+              <span title={pw.used_fisher ? "Fisher exact (small cells)" : "chi-square"}>
+                p={pStr(pw.holm_adjusted_p)} (Holm{pw.used_fisher ? ", Fisher" : ""})
+              </span>
+              {pw.significant && (
+                <span style={{ color: "var(--obs-success)", fontWeight: 600 }}>significant</span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

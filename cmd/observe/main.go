@@ -1317,6 +1317,8 @@ func main() {
 		neutron.WithTags("experiments"), neutron.WithSummary("Stop experiment"))
 	neutron.Get(expGroup, "/{experiment_id}/results", experimentResultsHandler(experimentSvc),
 		neutron.WithTags("experiments"), neutron.WithSummary("Get experiment results"))
+	neutron.Get(expGroup, "/sample-size", experimentSampleSizeHandler(),
+		neutron.WithTags("experiments"), neutron.WithSummary("MDE-based per-arm sample size recommendation (O09 design-time)"))
 
 	// --- Surveys (JWT auth + public endpoints; editor+ writes) ---
 	surveyGroup := r.Group("/api/v1/surveys", jwtMW)
@@ -3570,6 +3572,57 @@ func stopExperimentHandler(svc *experiments.ExperimentService) neutron.HandlerFu
 type experimentResultsInput struct {
 	ExperimentID string `path:"experiment_id"`
 	SiteID       string `query:"site_id"`
+}
+
+type experimentSampleSizeInput struct {
+	Baseline float64 `query:"p1"`
+	MDE      float64 `query:"mde"`
+	Alpha    float64 `query:"alpha"`
+	Power    float64 `query:"power"`
+}
+
+type experimentSampleSizeOutput struct {
+	NPerArm       int64   `json:"n_per_arm"`
+	Baseline      float64 `json:"baseline"`
+	MDE           float64 `json:"mde"`
+	Alpha         float64 `json:"alpha"`
+	Power         float64 `json:"power"`
+	AbsoluteDelta float64 `json:"absolute_delta"`
+}
+
+// experimentSampleSizeHandler surfaces the O09 design-time recommendation
+// (DELEGATED_DECISIONS section 4, decision 4): baseline rate + MDE at the
+// chosen alpha/power -> n per arm, the same calculation the fixtures
+// verified against scipy-derived goldens (measured power 0.790 vs design
+// 0.800 at the recommended n).
+func experimentSampleSizeHandler() neutron.HandlerFunc[experimentSampleSizeInput, experimentSampleSizeOutput] {
+	return func(ctx context.Context, in experimentSampleSizeInput) (experimentSampleSizeOutput, error) {
+		alpha := in.Alpha
+		if alpha == 0 {
+			alpha = 0.05
+		}
+		power := in.Power
+		if power == 0 {
+			power = 0.80
+		}
+		if in.Baseline <= 0 || in.Baseline >= 1 {
+			return experimentSampleSizeOutput{}, neutron.ErrBadRequest("p1 must be in (0, 1)")
+		}
+		if in.MDE <= 0 || in.Baseline+in.MDE >= 1 {
+			return experimentSampleSizeOutput{}, neutron.ErrBadRequest("mde must be positive with p1+mde < 1 (absolute lift)")
+		}
+		if alpha <= 0 || alpha >= 1 || power <= 0 || power < 0.5 || power >= 1 {
+			return experimentSampleSizeOutput{}, neutron.ErrBadRequest("alpha in (0,1), power in [0.5,1)")
+		}
+		n := experiments.SampleSizePerArm(in.Baseline, in.MDE, alpha, power)
+		if n <= 0 {
+			return experimentSampleSizeOutput{}, neutron.ErrBadRequest("no finite sample size for these inputs")
+		}
+		return experimentSampleSizeOutput{
+			NPerArm: n, Baseline: in.Baseline, MDE: in.MDE,
+			Alpha: alpha, Power: power, AbsoluteDelta: in.MDE,
+		}, nil
+	}
 }
 
 func experimentResultsHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[experimentResultsInput, experiments.ExperimentResults] {

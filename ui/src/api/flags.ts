@@ -39,6 +39,41 @@ export interface VariantResult {
   conversions: number;
   conversion_rate: number;
   prob_beat_control: number;
+  wilson_low: number;
+  wilson_high: number;
+}
+
+export interface SRMDiagnostic {
+  detected: boolean;
+  chi_square: number;
+  p_value: number;
+  note?: string;
+}
+
+export interface PairwiseResult {
+  variant: string;
+  lift_absolute: number;
+  lift_relative: number;
+  ci_low: number;
+  ci_high: number;
+  p_value: number;
+  holm_adjusted_p: number;
+  significant: boolean;
+  used_fisher: boolean;
+}
+
+export interface AnalysisResult {
+  horizon_met: boolean;
+  min_arm_exposures: number;
+  min_sample_per_arm: number;
+  test: string;
+  test_note?: string;
+  chi_square: number;
+  df: number;
+  p_value: number;
+  srm: SRMDiagnostic;
+  pairwise_vs_control: PairwiseResult[];
+  winner_rule: string;
 }
 
 export interface ExperimentResults {
@@ -46,6 +81,7 @@ export interface ExperimentResults {
   variants: VariantResult[];
   significant: boolean;
   winner: string;
+  analysis: AnalysisResult;
 }
 
 export interface FlagHistoryEntry {

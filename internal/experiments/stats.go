@@ -368,6 +368,13 @@ func srmGoodnessOfFit(counts []int64, weights []float64) (stat, p float64) {
 // absolute lift delta, two-sided alpha and the given power (normal
 // approximation to the two-proportion test). Returned n is ceil'ed and
 // floored at 2.
+// SampleSizePerArm is the exported design-time helper (the /api/v1/
+// experiments/sample-size endpoint); the fixtures pin it against
+// scipy-derived goldens.
+func SampleSizePerArm(p1, delta, alpha, power float64) int64 {
+	return sampleSizePerArm(p1, delta, alpha, power)
+}
+
 func sampleSizePerArm(p1, delta, alpha, power float64) int64 {
 	if p1 <= 0 || p1 >= 1 || delta <= 0 || p1+delta >= 1 {
 		return 0
