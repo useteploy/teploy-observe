@@ -115,3 +115,45 @@ func TestMigrationsApplyToFreshDatabase(t *testing.T) {
 		t.Fatalf("re-applying the migration chain failed: %v", err)
 	}
 }
+
+// TestApplyAdoptsLegacyHistory pins the M04 transition: a history recorded
+// by the pre-v2 runner (format marker missing) is refused by Migrate and
+// graduates through the SDK's explicit adoption, after which the chain
+// applies again. The format downgrade simulates exactly what the old
+// runner's rows look like to the new one — no other history shape changes.
+func TestApplyAdoptsLegacyHistory(t *testing.T) {
+	ctx := context.Background()
+	db, err := nucleus.Connect(ctx, nucleustest.DSN(t))
+	if err != nil {
+		t.Skipf("connect: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Pool().Exec(ctx, "UPDATE _neutron_migrations SET format = NULL"); err != nil {
+		t.Skipf("no migration history to downgrade (fixture already fresh): %v", err)
+	}
+
+	report, err := ApplyWithAdoption(ctx, db)
+	if err != nil {
+		t.Fatalf("apply over legacy history: %v", err)
+	}
+	if report == nil {
+		t.Fatalf("legacy history was not adopted — report is nil")
+	}
+	if len(report.Verified) == 0 {
+		t.Fatalf("adoption verified nothing: %+v", report)
+	}
+	// The adopted history must now be protocol v2 end to end.
+	var legacy int
+	if err := db.Pool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM _neutron_migrations WHERE format IS NULL OR format != 'v2'").Scan(&legacy); err != nil {
+		t.Fatalf("read back history format: %v", err)
+	}
+	if legacy != 0 {
+		t.Fatalf("%d history rows are still not protocol v2 after adoption", legacy)
+	}
+	// And the chain still applies (no-op) on the adopted history.
+	if err := Apply(ctx, db); err != nil {
+		t.Fatalf("re-apply after adoption failed: %v", err)
+	}
+}

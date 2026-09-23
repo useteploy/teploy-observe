@@ -155,9 +155,16 @@ func main() {
 
 	// Run migrations. The schema package owns them so tests can build the
 	// same tables production runs on.
-	if err := schema.Apply(ctx, db); err != nil {
+	adoption, err := schema.ApplyWithAdoption(ctx, db)
+	if err != nil {
 		logger.Error("failed to run migrations", "err", err)
 		os.Exit(1)
+	}
+	if adoption != nil {
+		logger.Warn("legacy migration history adopted into protocol v2",
+			"verified", len(adoption.Verified),
+			"unverified", len(adoption.Unverified),
+			"unverified_versions", fmt.Sprint(adoption.Unverified))
 	}
 	logger.Info("migrations complete")
 
