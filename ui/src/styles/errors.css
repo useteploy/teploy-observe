@@ -149,6 +149,18 @@
   color: var(--obs-text-muted);
 }
 
+.errors-issue-regressed {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: var(--obs-radius-sm);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--obs-warning);
+  border: 1px solid var(--obs-warning);
+}
+
 .errors-issue-list {
   border: 1px solid var(--obs-border);
   border-radius: var(--obs-radius-md);

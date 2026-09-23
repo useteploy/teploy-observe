@@ -15,20 +15,24 @@ import (
 )
 
 const issuesColumns = `(
-	issue_id       TEXT NOT NULL,
-	tenant_id      TEXT NOT NULL DEFAULT 'default',
-	site_id        TEXT NOT NULL,
-	group_hash     TEXT NOT NULL,
-	title          TEXT NOT NULL DEFAULT '',
-	culprit        TEXT NOT NULL DEFAULT '',
-	level          TEXT NOT NULL DEFAULT 'error',
-	status         TEXT NOT NULL DEFAULT 'open',
-	first_seen     TEXT NOT NULL,
-	last_seen      TEXT NOT NULL,
-	event_count    TEXT NOT NULL DEFAULT '1',
-	user_count     TEXT NOT NULL DEFAULT '0',
-	release_tag    TEXT NOT NULL DEFAULT '',
-	version        BIGINT NOT NULL DEFAULT 0
+	issue_id            TEXT NOT NULL,
+	tenant_id           TEXT NOT NULL DEFAULT 'default',
+	site_id             TEXT NOT NULL,
+	group_hash          TEXT NOT NULL,
+	title               TEXT NOT NULL DEFAULT '',
+	culprit             TEXT NOT NULL DEFAULT '',
+	level               TEXT NOT NULL DEFAULT 'error',
+	status              TEXT NOT NULL DEFAULT 'open',
+	first_seen          TEXT NOT NULL,
+	last_seen           TEXT NOT NULL,
+	event_count         TEXT NOT NULL DEFAULT '1',
+	user_count          TEXT NOT NULL DEFAULT '0',
+	release_tag         TEXT NOT NULL DEFAULT '',
+	fingerprint_version TEXT NOT NULL DEFAULT '1',
+	first_regression_at TEXT NOT NULL DEFAULT '',
+	regression_count    TEXT NOT NULL DEFAULT '0',
+	snooze_until        TEXT NOT NULL DEFAULT '',
+	version             BIGINT NOT NULL DEFAULT 0
 )`
 
 const issuesOrderBy = `(tenant_id, site_id, issue_id)`
@@ -129,7 +133,7 @@ func TestUpdateStatusWritesOneRowAndReadsBack(t *testing.T) {
 		}
 	}
 	before := rowCount(t, db, id)
-	if err := svc.UpdateStatus(ctx, id, site, "resolved"); err != nil {
+	if err := svc.UpdateStatus(ctx, id, site, "resolved", 0); err != nil {
 		t.Fatalf("update status: %v", err)
 	}
 	if got, want := rowCount(t, db, id), before+1; got != want {
@@ -219,7 +223,7 @@ func TestSameMillisecondBumpAndStatusChangeResolveNewest(t *testing.T) {
 		if _, err := svc.ResolveIssue(ctx, site, hash, "boom", "culprit", "error", "", time.Now().UnixMilli()); err != nil {
 			t.Fatalf("iter %d second resolve: %v", i, err)
 		}
-		if err := svc.UpdateStatus(ctx, issueID, site, "resolved"); err != nil {
+		if err := svc.UpdateStatus(ctx, issueID, site, "resolved", 0); err != nil {
 			t.Fatalf("iter %d update status: %v", i, err)
 		}
 		got, err := svc.GetIssue(ctx, issueID, site)

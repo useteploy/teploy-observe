@@ -17,6 +17,19 @@ export interface Issue {
   event_count: number;
   user_count: number;
   release_tag: string;
+  // O05 lifecycle fields (additive; absent on older payloads).
+  fingerprint_version?: number;
+  first_regression_at?: string;
+  regression_count?: number;
+  snooze_until?: string;
+  snooze_active?: boolean;
+  // Per-release event counts, detail reads only.
+  releases?: IssueRelease[];
+}
+
+export interface IssueRelease {
+  release_tag: string;
+  event_count: number;
 }
 
 export interface ErrorEvent {
@@ -92,8 +105,10 @@ export const errorsApi = {
     get<ErrorEvent[]>(`${BASE}/issues/${issueId}/events?site_id=${siteId}`),
   issueSession: (issueId: string, siteId: string) =>
     get<{ session_id: string; events: unknown[] }>(`${BASE}/issues/${issueId}/session?site_id=${siteId}`),
-  updateStatus: (issueId: string, siteId: string, status: string) =>
-    post<{ ok: boolean }>(`${BASE}/issues/${issueId}/status`, { site_id: siteId, status }),
+  updateStatus: (issueId: string, siteId: string, status: string, until?: string) =>
+    post<{ ok: boolean }>(`${BASE}/issues/${issueId}/status`, {
+      site_id: siteId, status, ...(until ? { until } : {}),
+    }),
   search: (siteId: string, query: string) =>
     get<Issue[]>(`${BASE}/issues/search?site_id=${siteId}&q=${encodeURIComponent(query)}`),
   releases: (siteId: string) =>

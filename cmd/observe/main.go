@@ -2683,6 +2683,11 @@ type updateStatusInput struct {
 	IssueID string `path:"issue_id"`
 	SiteID  string `json:"site_id"`
 	Status  string `json:"status"`
+	// Until (O05) marks a snooze: RFC3339, legal only with
+	// status=resolved, must lie in the future. The issue stays resolved
+	// but auto-hides until the deadline; new events during the window
+	// reopen it immediately.
+	Until string `json:"until,omitempty"`
 }
 
 func updateIssueStatusHandler(svc *obserrors.IssueService) neutron.HandlerFunc[updateStatusInput, neutron.Empty] {
@@ -2693,7 +2698,21 @@ func updateIssueStatusHandler(svc *obserrors.IssueService) neutron.HandlerFunc[u
 		if input.Status != "open" && input.Status != "resolved" && input.Status != "ignored" {
 			return neutron.Empty{}, neutron.ErrBadRequest("status must be open, resolved, or ignored")
 		}
-		if err := svc.UpdateStatus(ctx, input.IssueID, input.SiteID, input.Status); err != nil {
+		var snoozeUntilMs int64
+		if input.Until != "" {
+			if input.Status != "resolved" {
+				return neutron.Empty{}, neutron.ErrBadRequest("until is only valid with status=resolved (snooze)")
+			}
+			ts, err := time.Parse(time.RFC3339, input.Until)
+			if err != nil {
+				return neutron.Empty{}, neutron.ErrBadRequest("until must be RFC3339")
+			}
+			if !ts.After(time.Now().UTC()) {
+				return neutron.Empty{}, neutron.ErrBadRequest("until must be in the future")
+			}
+			snoozeUntilMs = ts.UnixMilli()
+		}
+		if err := svc.UpdateStatus(ctx, input.IssueID, input.SiteID, input.Status, snoozeUntilMs); err != nil {
 			return neutron.Empty{}, err
 		}
 		return neutron.Empty{}, nil

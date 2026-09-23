@@ -1806,3 +1806,113 @@ O04 remainder (next slices):
   slice.
 - **Retention timezone parameter** (UTC-only today, documented) and
   pathname-scoped cohort/return events (event_type exact match today).
+
+## 2026-09-23 O05 slice 1 — grouping versioning + honest issue lifecycle
+
+Programme O05 ("Error investigation worthy of replacing Sentry for
+supported stacks"): the first bounded slice covers fingerprint
+versioning, regression reopen, snooze, first/last seen, affected
+users, and release attribution. Working tree at `4bcdc00` + this
+change, uncommitted.
+
+**Semantics table (pinned by the oracle below):**
+
+| event arrives on issue in state | resulting state | regression markers | snooze |
+|---|---|---|---|
+| open | open (unchanged) | none (count stays, first stays) | n/a |
+| resolved (plain or snoozed) | OPEN (reopened) | count +1; first_regression_at set on FIRST regression only | cleared |
+| ignored | ignored (never auto-reopened — the operator said stop) | none | cleared |
+| resolved + snooze_until future, NO events, deadline passes | resolved (snooze lapses; `snooze_active` flips false) | none | lazily inactive |
+
+- Snooze = status `resolved` + `snooze_until` (unix-ms). Evaluation is
+  lazy at read time (`SnoozeActive` = resolved AND until in the
+  future); no background timer. New events during the window reopen
+  immediately with a regression (Sentry-like, stated precisely).
+- Timeline distinction: `regression_count = 0` + zero
+  `first_regression_at` = continuous (never reopened by an event, or
+  pre-047 history where regressions were not tracked — the honest
+  backfill, never fabricated); `> 0` = has been through at least one
+  resolve/reopen cycle, `first_regression_at` anchors the first.
+  Markers survive every status change, including manual reopen.
+- first_seen/last_seen: INGESTION-time ms (the pinned truth — the
+  error wire protocol carries no client event-time, O03 ADR D8; same
+  as the error_events.timestamp column). Every bump clamps:
+  first_seen LEAST, last_seen GREATEST — an out-of-order apply
+  (PENDING retry, WAL replay) can widen the seen window, never
+  regress it.
+- Affected users: on-read aggregation (JUSTIFICATION: a stored
+  versioned counter is a read-modify-write into the ReplacingMergeTree
+  that loses increments under concurrent flushes — the exact defect
+  the on-read event_count already documents; COUNT DISTINCT over
+  append-only error_events is exact and costs one bounded query per
+  listed issue). Unit: distinct `distinct_id` (the hashed identify()
+  id); anonymous rows are CASEd to NULL so '' never counts as a user;
+  only an issue with NO identified events falls back to the pre-O05
+  session proxy, documented as an estimate.
+- Release attribution: the event's own release field (SDKs verified to
+  send one: browser init({release}), sentry-shim release option,
+  tracker data-release). Absent = '' = unknown, never fabricated.
+  `issues.release_tag` stays the first-seen release; the detail read
+  adds `releases[]` (per-release event counts, LIMIT 10, ordered).
+- Fingerprint versioning: `fingerprint_version` recorded ON the issue
+  at create (migration 047 backfills '1' for all existing rows), never
+  rewritten by bumps or status changes. The derivation moved behind
+  `ComputeGroupHash(version, input)` (v1 = the exact prior selection
+  ladder: custom fingerprint -> RageClick special case -> stack;
+  unknown versions are errors, never silent v1 fallback). v1 outputs
+  pinned on golden MD5 fixtures. MIGRATION POLICY (documented in
+  grouping.go): a future v2 lands as a new case in the switch + a
+  constant bump; existing issues KEEP their recorded version and their
+  group_hash/history — the same real-world error then derives a new
+  hash and lands in a NEW issue (Sentry's re-grouping behaves the
+  same); the recorded version is the per-issue audit trail of that
+  boundary.
+
+Schema: migration 047 (`issues` + fingerprint_version,
+first_regression_at, regression_count, snooze_until — rename-aside +
+create + copy, ASCII comments only). API additive: Issue JSON carries
+the new fields (+ `snooze_active`, `releases`); POST status accepts
+`until` (RFC3339, resolved-only, must be future — 400s otherwise).
+UI: detail gains Regressed / Snoozed-until stats, a Snooze 7d action,
+release-impact breakdown, fingerprint version label; list rows show a
+regressed marker; export gains regression + fingerprint columns.
+
+Evidence (TDD red first — the grouping pins and handler-validation
+suite failed to compile against the pre-O05 code; the lifecycle suite
+asserted the absent Issue fields): `internal/errors/o05_grouping_test.go`
+(4 storage-free: version constant, golden fixtures, dispatch
+rejection, selection ladder), `internal/errors/o05_lifecycle_test.go`
+(7 Nucleus-gated via the self-migrating fixture: reopen+markers+open
+list, ignored-not-reopened, two-cycle count accumulation + first-anchor
++ continuous contrast, snooze-during-window reopen AND expired-snooze
+plain-resolved, clamped first/last seen incl. out-of-order, affected
+users by distinct_id incl. anonymous-session and mixed ''-exclusion
+cases, fingerprint version recorded-and-stable through churn),
+`cmd/observe/issue_status_o05_test.go` (until validation 400 boundary).
+Mutations, both reverted after the kill: reopen CASE removed from
+bumpIssue -> TestO05_NewEventReopensResolvedIssueWithRegression fails
+("status resolved") and TestO05_SnoozeWindowAndExpiry fails on the
+during-window reopen; last_seen GREATEST clamp removed (pre-O05
+unconditional overwrite) -> TestO05_FirstLastSeenClamped fails
+("last_seen regressed to 2000, want 5000"). Probe finding folded into
+the fix: COUNT(DISTINCT x) counts '' — anonymous rows must be CASEd to
+NULL or a mixed issue over-reports users. Gates: `go vet ./...` clean;
+`internal/errors` green under `-race` against the fixture; `cmd/observe`
+green; full serial suite (`OBSERVE_NUCLEUS_URL`, `-p 1 -count=1
+./...`) green, 45 packages ok, 0 failures. UI: production rebuild via
+scripts/ui-sync.sh (embedded dist rotated, Go binary builds), ui unit
+suite 47/47.
+
+O05 remainder (later slices):
+- **Source maps** as a first-class investigation surface (upload UX,
+  unresolved-frame reporting, coverage honesty).
+- **Ownership/assignment**: assign issues to principals, suspect
+  commits via release + VCS links.
+- **Notification routing**: per-issue/per-owner alert rules off the
+  regression + reopen events this slice made queryable.
+- **Sentry migration table**: docs/migrations/from-sentry.md gains the
+  lifecycle-field mapping (resolvedAfter/reentryCount ->
+  regression_count etc.).
+- **Mobile stacks** (symbolication-class work) and any grouping v2
+  proposals — none warranted yet; v1 is pinned and versioned for
+  exactly that day.

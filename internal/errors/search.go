@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
 )
@@ -160,13 +161,13 @@ func (s *SearchService) SearchIssues(ctx context.Context, siteID, query string, 
 	// Fetch full issue objects
 	var issues []Issue
 	for _, id := range issueIDs {
-		rows, err := nucleus.Query[Issue](ctx, s.db.SQL(),
+		rows, err := nucleus.Query[issueScan](ctx, s.db.SQL(),
 			`SELECT `+issueSelectCols+`
 			 FROM `+issuesLatest("issue_id = $1 AND site_id = $2"),
 			id, siteID,
 		)
 		if err == nil && len(rows) > 0 {
-			issues = append(issues, rows[0])
+			issues = append(issues, rows[0].toIssue(time.Now().UTC()))
 		}
 	}
 

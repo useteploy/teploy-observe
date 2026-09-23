@@ -39,6 +39,12 @@ function formatDate(iso: string): string {
   } catch { return iso; }
 }
 
+// isRealTime filters Go zero-value timestamps ("0001-01-01...") that the
+// API sends for never-set lifecycle fields.
+function isRealTime(iso?: string): boolean {
+  return !!iso && iso.startsWith("2");
+}
+
 function tryParseJson(raw: string): object | null {
   if (!raw || raw === "{}" || raw === "null") return null;
   try {
@@ -134,6 +140,7 @@ function IssueDetail({ issue, siteId, onBack }: { issue: Issue; siteId: string; 
   const [loadingEvents, setLoadingEvents] = useState(true);
   const [updatingStatus, setUpdatingStatus] = useState(false);
   const [currentStatus, setCurrentStatus] = useState(issue.status);
+  const [snoozedUntil, setSnoozedUntil] = useState<string>(issue.snooze_active ? issue.snooze_until ?? "" : "");
   const [selectedEvent, setSelectedEvent] = useState<ErrorEvent | null>(null);
   const [session, setSession] = useState<{ session_id: string; events: unknown[] } | null>(null);
   const [loadingSession, setLoadingSession] = useState(false);
@@ -146,13 +153,19 @@ function IssueDetail({ issue, siteId, onBack }: { issue: Issue; siteId: string; 
       .finally(() => setLoadingEvents(false));
   }, [issue.issue_id, siteId]);
 
-  const handleStatusChange = async (status: string) => {
+  const handleStatusChange = async (status: string, until?: string) => {
     setUpdatingStatus(true);
     try {
-      await errorsApi.updateStatus(issue.issue_id, siteId, status);
+      await errorsApi.updateStatus(issue.issue_id, siteId, status, until);
       setCurrentStatus(status);
+      setSnoozedUntil(status === "resolved" && until ? until : "");
     } catch (err) { console.error("Failed to update status:", err); }
     finally { setUpdatingStatus(false); }
+  };
+
+  const handleSnooze = async () => {
+    const until = new Date(Date.now() + 7 * 86400000).toISOString();
+    await handleStatusChange("resolved", until);
   };
 
   const handleViewSession = async () => {
@@ -189,6 +202,10 @@ function IssueDetail({ issue, siteId, onBack }: { issue: Issue; siteId: string; 
             <button class="obs-btn obs-btn--sm" disabled={updatingStatus}
               onClick={() => handleStatusChange("resolved")}>Resolve</button>
           )}
+          {currentStatus === "resolved" && !snoozedUntil && (
+            <button class="obs-btn obs-btn--sm" disabled={updatingStatus}
+              onClick={handleSnooze}>Snooze 7d</button>
+          )}
           {currentStatus !== "ignored" && (
             <button class="obs-btn obs-btn--sm" disabled={updatingStatus}
               onClick={() => handleStatusChange("ignored")}>Ignore</button>
@@ -217,10 +234,34 @@ function IssueDetail({ issue, siteId, onBack }: { issue: Issue; siteId: string; 
           <span class="errors-detail-stat-label">Last seen</span>
           <span class="errors-detail-stat-value">{formatDate(issue.last_seen)}</span>
         </div>
-        {issue.release_tag && (
+        {Number(issue.regression_count) > 0 && (
           <div class="errors-detail-stat">
-            <span class="errors-detail-stat-label">Release</span>
-            <span class="errors-detail-stat-value">{issue.release_tag}</span>
+            <span class="errors-detail-stat-label">Regressed</span>
+            <span class="errors-detail-stat-value">
+              {Number(issue.regression_count)} time{Number(issue.regression_count) === 1 ? "" : "s"}
+              {isRealTime(issue.first_regression_at)
+                ? `, first ${formatDate(issue.first_regression_at as string)}` : ""}
+            </span>
+          </div>
+        )}
+        {snoozedUntil && (
+          <div class="errors-detail-stat">
+            <span class="errors-detail-stat-label">Snoozed until</span>
+            <span class="errors-detail-stat-value">{formatDate(snoozedUntil)}</span>
+          </div>
+        )}
+        <div class="errors-detail-stat">
+          <span class="errors-detail-stat-label">Release</span>
+          <span class="errors-detail-stat-value">
+            {issue.releases?.length
+              ? issue.releases.map(r => `${r.release_tag} (${Number(r.event_count)})`).join(", ")
+              : issue.release_tag || "unknown"}
+          </span>
+        </div>
+        {issue.fingerprint_version != null && (
+          <div class="errors-detail-stat">
+            <span class="errors-detail-stat-label">Fingerprint</span>
+            <span class="errors-detail-stat-value">v{Number(issue.fingerprint_version)}</span>
           </div>
         )}
         <div class="errors-detail-stat">
@@ -449,6 +490,8 @@ export default function ErrorsPage() {
             { key: "first_seen", label: "first_seen" },
             { key: "last_seen", label: "last_seen" },
             { key: "release_tag", label: "release" },
+            { key: "regression_count", label: "regressions" },
+            { key: "fingerprint_version", label: "fingerprint_version" },
           ]}
         />
       </div>
@@ -514,7 +557,14 @@ export default function ErrorsPage() {
                   <StatusBadge status={issue.status} size="sm" />
                   <div class="errors-issue-info">
                     <div class="errors-issue-title">{issue.title}</div>
-                    <div class="errors-issue-culprit">{issue.culprit}</div>
+                    <div class="errors-issue-culprit">
+                      {issue.culprit}
+                      {Number(issue.regression_count) > 0 && (
+                        <span class="errors-issue-regressed" title="Reopened by a new event after resolution">
+                          regressed {Number(issue.regression_count)}x
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <div class="errors-issue-activity">
                     {Array.from({ length: 14 }).map((_, i) => {

@@ -10,6 +10,50 @@ import (
 	"unicode/utf8"
 )
 
+// FingerprintVersion is the CURRENT grouping-derivation version used to
+// fingerprint NEW error events (O05). The derivation each version
+// applies is pinned by golden-fixture tests (o05_grouping_test.go) and
+// is immutable once shipped.
+//
+// Migration policy for a future v2: add the v2 derivation to
+// ComputeGroupHash's switch, bump this constant, and record the cutover
+// here. Issues created before the cutover KEEP the version recorded in
+// issues.fingerprint_version — their group_hash and history are never
+// rewritten. Consequence, stated plainly: after a cutover the same
+// real-world error derives a NEW hash and lands in a NEW issue; the v1
+// issue stays as history (Sentry's re-grouping behaves the same way).
+// The recorded version is the audit trail that makes that boundary
+// visible per issue.
+const FingerprintVersion = 1
+
+// ComputeGroupHash derives the grouping fingerprint for an error input
+// under an explicit derivation version. Version 1 selection ladder:
+// explicit SDK fingerprint, else the RageClick special case, else the
+// stack-based derivation. Any other version is an error — never a
+// silent fallback to v1 (a fallback would group events under a
+// derivation the issue does not record).
+func ComputeGroupHash(version int, input ErrorInput) (string, error) {
+	switch version {
+	case 1:
+		return groupHashV1(input), nil
+	default:
+		return "", fmt.Errorf("errors: fingerprint version %d not supported", version)
+	}
+}
+
+// groupHashV1 is the version-1 derivation. Inputs are taken AFTER the
+// handler's canonicalization (URL sanitize, R28) so the digest sees the
+// same bytes that get persisted.
+func groupHashV1(input ErrorInput) string {
+	if len(input.Fingerprint) > 0 {
+		return customFingerprint(input.Fingerprint)
+	}
+	if input.ErrorType == "RageClick" {
+		return GroupHashRageClick(input.URL, input.Selector)
+	}
+	return GroupHash(input.ErrorType, input.ErrorValue, input.StackTrace)
+}
+
 // StackFrame represents a single frame in a stack trace.
 type StackFrame struct {
 	Filename string `json:"filename"`
@@ -19,7 +63,7 @@ type StackFrame struct {
 	InApp    bool   `json:"in_app"`
 }
 
-// GroupHash computes a fingerprint for an error event.
+// GroupHash computes the v1 stack-based fingerprint for an error event.
 // Priority:
 //  1. If there are in-app frames: MD5(error_type + sorted in-app frame filenames+functions)
 //  2. Fallback: MD5(error_type + parameterized message)

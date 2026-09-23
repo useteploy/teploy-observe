@@ -189,16 +189,13 @@ func (s *Service) insertErrorEvent(ctx context.Context, sqlc *nucleus.SQLModel, 
 	// the sanitized value consistently.
 	input.URL = ingest.CapturedURL(input.URL)
 
-	// Compute grouphash
-	var groupHash string
-	if len(input.Fingerprint) > 0 {
-		groupHash = customFingerprint(input.Fingerprint)
-	} else if input.ErrorType == "RageClick" {
-		// Rage clicks have no stack trace — group by (type + URL + selector)
-		// so repeated rage clicks on the same element merge into one issue.
-		groupHash = GroupHashRageClick(input.URL, input.Selector)
-	} else {
-		groupHash = GroupHash(input.ErrorType, input.ErrorValue, input.StackTrace)
+	// Compute the grouping fingerprint under the CURRENT versioned
+	// derivation (O05). The issue records the version at create; a
+	// future v2 cutover is a new case in ComputeGroupHash, documented in
+	// grouping.go — existing issues are never rewritten.
+	groupHash, err := ComputeGroupHash(FingerprintVersion, input)
+	if err != nil {
+		return "", "", fmt.Errorf("group fingerprint: %w", err)
 	}
 
 	title := IssueTitle(input.ErrorType, input.ErrorValue)
