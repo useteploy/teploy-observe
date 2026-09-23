@@ -54,6 +54,13 @@ func DSN(t *testing.T) string {
 	}
 	db, err := nucleus.Connect(context.Background(), dsn)
 	if err != nil {
+		// A green suite must never mask the store going away mid-run
+		// (found live by the 2026-09-22 verification audit: 88 tests
+		// silently skipped when the fixture blinked). CI integration jobs
+		// set OBSERVE_REQUIRE_NUCLEUS=1 so an unreachable fixture FAILS.
+		if os.Getenv("OBSERVE_REQUIRE_NUCLEUS") == "1" {
+			t.Fatalf("OBSERVE_REQUIRE_NUCLEUS=1: nucleus not reachable at %s — failing instead of skipping (%v)", dsn, err)
+		}
 		t.Skipf("nucleus not reachable at %s — skipping integration test (%v)", dsn, err)
 	}
 	defer db.Close()

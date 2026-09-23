@@ -256,6 +256,7 @@ jobs:
       - name: Full suite against live Nucleus v1.1.1
         env:
           OBSERVE_NUCLEUS_URL: postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable
+          OBSERVE_REQUIRE_NUCLEUS: "1"
         run: go test -p 1 ./...
 
   nucleus-integration:
@@ -303,6 +304,7 @@ jobs:
       - name: Full suite against live Nucleus
         env:
           OBSERVE_NUCLEUS_URL: postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable
+          OBSERVE_REQUIRE_NUCLEUS: "1"
         # Serial: concurrent packages racing schema.Apply trip the known
         # upstream Migrate ledger TOCTOU (documented in AUDIT_OPEN.md).
         run: go test -p 1 ./...
@@ -446,5 +448,6 @@ jobs:
       - name: Lease-required backup suite
         env:
           OBSERVE_NUCLEUS_URL: postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable
+          OBSERVE_REQUIRE_NUCLEUS: "1"
           OBSERVE_REQUIRE_SNAPSHOT_LEASE: "1"
         run: go test -p 1 -count=1 ./internal/backup/... ./internal/audit/... ./internal/replays/...

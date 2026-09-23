@@ -1486,9 +1486,9 @@ workspace. Upstream then renamed the module: at origin/main `e5c6e9fe`
 Resolution (uncommitted, this session):
 
 - Import path rewrite `github.com/neutron-dev/neutron-go` →
-  `github.com/neutron-build/neutron/go` across 173 `.go` files plus
+  `github.com/neutron-build/neutron/go` across 162 `.go` files plus
   `go.mod`, `.github/workflows/ci.yml`, `AGENTS.md`, `CLAUDE.md`
-  (177 files; `_internal/` audit history and the gitignored `observe`
+  (166 files total; `_internal/` audit history and the gitignored `observe`
   binary deliberately untouched).
 - vendor/ regenerated from the PIN TREE (`git worktree` of `e5c6e9fe`
   at `/tmp/neutron-pin-worktree`, replace pointed there for
