@@ -6,10 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"math"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
@@ -17,10 +21,39 @@ import (
 
 type FlagService struct {
 	db *nucleus.Client
+
+	// fetchFlag is the config-read seam Evaluate goes through. Production
+	// runs the flagsLatest query; tests inject read failures so an
+	// unavailable store is distinguishable from an absent flag (O08).
+	fetchFlag        func(ctx context.Context, siteID, flagKey string) ([]FeatureFlag, error)
+	unavailableTotal atomic.Int64
+	invalidTotal     atomic.Int64
+	quarantineSeen   sync.Map // flagID "|" part -> struct{}{} — log-once gate
 }
 
 func NewFlagService(db *nucleus.Client) *FlagService {
-	return &FlagService{db: db}
+	s := &FlagService{db: db}
+	s.fetchFlag = func(ctx context.Context, siteID, flagKey string) ([]FeatureFlag, error) {
+		return nucleus.Query[FeatureFlag](ctx, s.db.SQL(),
+			`SELECT flag_id, tenant_id, site_id, flag_key, name, description, flag_type, enabled, rollout_pct,
+			COALESCE(variants, '') AS variants, COALESCE(targeting, '') AS targeting, created_at, version
+		 FROM `+flagsLatest("site_id = $1 AND flag_key = $2"), siteID, flagKey)
+	}
+	return s
+}
+
+// Stats exposes the O08 condition counters: how many evaluations could not
+// read their config (unavailable) and how many were quarantined from
+// evaluation by invalid stored config (total plus distinct flag|part
+// signatures). Surfaced at /healthz under "flags".
+func (s *FlagService) Stats() map[string]int64 {
+	distinct := int64(0)
+	s.quarantineSeen.Range(func(_, _ any) bool { distinct++; return true })
+	return map[string]int64{
+		"config_unavailable_total": s.unavailableTotal.Load(),
+		"invalid_config_total":     s.invalidTotal.Load(),
+		"invalid_config_distinct":  distinct,
+	}
 }
 
 // FeatureFlag is the domain type with typed fields.
@@ -45,10 +78,19 @@ type Variant struct {
 	RolloutPct int    `json:"rollout_pct"`
 }
 
+// Evaluation condition, carried additively on every SDK response (O08).
+const (
+	ReasonEvaluated   = "evaluated"
+	ReasonUnavailable = "unavailable"
+	ReasonInvalid     = "invalid"
+)
+
 // EvaluationResult is what the SDK receives.
 type EvaluationResult struct {
 	Enabled bool   `json:"enabled"`
 	Variant string `json:"variant,omitempty"`
+	Reason  string `json:"reason"`
+	Detail  string `json:"detail,omitempty"`
 }
 
 func (s *FlagService) Create(ctx context.Context, siteID, flagKey, name, description, flagType, variants, targeting string, rolloutPct int) (*FeatureFlag, error) {
@@ -60,6 +102,19 @@ func (s *FlagService) Create(ctx context.Context, siteID, flagKey, name, descrip
 	}
 	if rolloutPct <= 0 {
 		rolloutPct = 100
+	}
+
+	// O08 write boundary: invalid rules must not be storable. The store's
+	// JSONB column already refuses syntactically broken JSON (as an opaque
+	// 500), but VALID JSON of the wrong shape — an unarrayed rule object —
+	// or a semantically invalid ruleset (unknown operator, missing value)
+	// stores fine and used to silently skip the targeting condition at
+	// evaluation. Reject here, naming the error.
+	if _, err := ValidateTargeting(targeting); err != nil {
+		return nil, &ValidationError{Err: err}
+	}
+	if _, err := ValidateVariants(variants); err != nil {
+		return nil, &ValidationError{Err: err}
 	}
 
 	_, err := s.db.SQL().Exec(ctx,
@@ -172,6 +227,92 @@ type TargetingRule struct {
 	Value     any    `json:"value"`
 }
 
+// ValidationError marks a config rejection at the write boundary so the
+// handler can answer 400 naming the error instead of storing it.
+type ValidationError struct{ Err error }
+
+func (e *ValidationError) Error() string { return e.Err.Error() }
+func (e *ValidationError) Unwrap() error { return e.Err }
+
+var targetingOperators = map[string]bool{
+	"eq": true, "neq": true, "in": true, "not_in": true, "contains": true,
+}
+
+// ValidateTargeting parses and sanity-checks a targeting ruleset. Empty,
+// "null" and "[]" mean "no restrictions" and are valid. Anything else must
+// be a JSON array of rules with a non-empty attribute, a known operator
+// and a present value — the same operators matchesTargeting enforces.
+func ValidateTargeting(raw string) ([]TargetingRule, error) {
+	if raw == "" || raw == "null" || raw == "[]" {
+		return nil, nil
+	}
+	var rules []TargetingRule
+	if err := json.Unmarshal([]byte(raw), &rules); err != nil {
+		return nil, fmt.Errorf("targeting: invalid JSON: %w", err)
+	}
+	for i, r := range rules {
+		if r.Attribute == "" {
+			return nil, fmt.Errorf("targeting: rule %d: attribute is required", i)
+		}
+		if !targetingOperators[r.Operator] {
+			return nil, fmt.Errorf("targeting: rule %d: unknown operator %q", i, r.Operator)
+		}
+		if r.Value == nil {
+			return nil, fmt.Errorf("targeting: rule %d: value is required", i)
+		}
+	}
+	return rules, nil
+}
+
+// ValidateVariants parses and sanity-checks a variant list. Empty means
+// "no variants" and is valid. Otherwise each entry needs a non-empty,
+// unique key and a rollout_pct within 0..100.
+func ValidateVariants(raw string) ([]Variant, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var variants []Variant
+	if err := json.Unmarshal([]byte(raw), &variants); err != nil {
+		return nil, fmt.Errorf("variants: invalid JSON: %w", err)
+	}
+	seen := map[string]bool{}
+	for i, v := range variants {
+		if v.Key == "" {
+			return nil, fmt.Errorf("variants: entry %d: key is required", i)
+		}
+		if seen[v.Key] {
+			return nil, fmt.Errorf("variants: duplicate key %q", v.Key)
+		}
+		seen[v.Key] = true
+		if v.RolloutPct < 0 || v.RolloutPct > 100 {
+			return nil, fmt.Errorf("variants: entry %d: rollout_pct %d out of range 0..100", i, v.RolloutPct)
+		}
+	}
+	return variants, nil
+}
+
+// clampDetail bounds the response detail so a pathological stored value
+// cannot balloon the evaluation response.
+func clampDetail(s string) string {
+	if len(s) > 200 {
+		return s[:200]
+	}
+	return s
+}
+
+// errorClass reduces a read failure to the class the response carries;
+// the full error goes to the server log, not the wire.
+func errorClass(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	default:
+		return "storage"
+	}
+}
+
 func matchesTargeting(rules []TargetingRule, userCtx map[string]string) bool {
 	for _, r := range rules {
 		actual, ok := userCtx[r.Attribute]
@@ -235,65 +376,122 @@ func toStringSlice(v any) []string {
 }
 
 // Evaluate checks a flag for a given user.
+//
+// O08 three-condition contract — availability, absence and validity are
+// distinct, and the response says which one answered:
+//
+//   - evaluated: a real decision from valid config. A false here is a
+//     valid answer (absent flag, disabled, rollout miss, targeting miss),
+//     never an error.
+//   - unavailable: the config read failed. The store error is logged and
+//     counted server-side; the response carries only its class.
+//   - invalid: the stored config failed validation. The flag is
+//     QUARANTINED from evaluation — never evaluated as unrestricted —
+//     the condition is counted, and the first occurrence per flag+part
+//     is logged.
+//
+// Fail-safe default (documented per-flag contract): unavailable and
+// invalid both answer Enabled=false. Flags gate feature exposure and the
+// create-path default is disabled, so neither an outage nor a corrupt
+// config may widen exposure. A per-flag fail-open override (the
+// kill-switch pattern) needs a stored default plus an SDK contract —
+// recorded as an O08 residual.
 func (s *FlagService) Evaluate(ctx context.Context, siteID, flagKey, userID string, userCtx map[string]string) (*EvaluationResult, error) {
-	rows, err := nucleus.Query[FeatureFlag](ctx, s.db.SQL(),
-		`SELECT flag_id, tenant_id, site_id, flag_key, name, description, flag_type, enabled, rollout_pct,
-			COALESCE(variants, '') AS variants, COALESCE(targeting, '') AS targeting, created_at, version
-		 FROM `+flagsLatest("site_id = $1 AND flag_key = $2"), siteID, flagKey)
-	if err != nil || len(rows) == 0 {
-		return &EvaluationResult{Enabled: false}, nil
+	rows, err := s.fetchFlag(ctx, siteID, flagKey)
+	if err != nil {
+		s.unavailableTotal.Add(1)
+		log.Printf("[flags] evaluate %s/%s: config unavailable (%v) — answering fail-safe default (disabled), not a decision", siteID, flagKey, err)
+		return &EvaluationResult{
+			Enabled: false,
+			Reason:  ReasonUnavailable,
+			Detail:  "flags config read failed: " + errorClass(err),
+		}, nil
+	}
+	if len(rows) == 0 {
+		return &EvaluationResult{Enabled: false, Reason: ReasonEvaluated, Detail: "flag not found"}, nil
 	}
 
 	flag := rows[0]
+
+	// Read boundary: validate BEFORE the enabled short-circuit so a corrupt
+	// config surfaces even while the flag is disabled (operators learn
+	// without enabling first), and so invalid rules can never be evaluated
+	// as "no restrictions".
+	rules, err := ValidateTargeting(flag.Targeting)
+	if err != nil {
+		return s.quarantine(flag, "targeting", err), nil
+	}
+	var variants []Variant
+	if flag.FlagType == "multivariate" && flag.Variants != "" {
+		variants, err = ValidateVariants(flag.Variants)
+		if err != nil {
+			return s.quarantine(flag, "variants", err), nil
+		}
+	}
+
 	if !flag.Enabled {
-		return &EvaluationResult{Enabled: false}, nil
+		return &EvaluationResult{Enabled: false, Reason: ReasonEvaluated, Detail: "flag disabled"}, nil
 	}
 
 	if flag.RolloutPct < 100 {
 		hash := hashUser(flagKey, userID)
 		if hash > flag.RolloutPct {
-			return &EvaluationResult{Enabled: false}, nil
+			return &EvaluationResult{Enabled: false, Reason: ReasonEvaluated, Detail: "rollout"}, nil
 		}
 	}
 
-	if flag.Targeting != "" && flag.Targeting != "[]" && flag.Targeting != "null" {
-		var rules []TargetingRule
-		if err := json.Unmarshal([]byte(flag.Targeting), &rules); err == nil && len(rules) > 0 {
-			if !matchesTargeting(rules, userCtx) {
-				return &EvaluationResult{Enabled: false}, nil
+	if len(rules) > 0 && !matchesTargeting(rules, userCtx) {
+		return &EvaluationResult{Enabled: false, Reason: ReasonEvaluated, Detail: "targeting"}, nil
+	}
+
+	result := &EvaluationResult{Enabled: true, Reason: ReasonEvaluated}
+
+	if flag.FlagType == "multivariate" && len(variants) > 0 {
+		hash := hashUser(flagKey+":variant", userID)
+		cumulative := 0
+		for _, v := range variants {
+			cumulative += v.RolloutPct
+			if hash <= cumulative {
+				result.Variant = v.Key
+				break
 			}
+		}
+		if result.Variant == "" {
+			result.Variant = variants[0].Key
 		}
 	}
 
-	result := &EvaluationResult{Enabled: true}
-
-	if flag.FlagType == "multivariate" && flag.Variants != "" {
-		var variants []Variant
-		json.Unmarshal([]byte(flag.Variants), &variants)
-		if len(variants) > 0 {
-			hash := hashUser(flagKey+":variant", userID)
-			cumulative := 0
-			for _, v := range variants {
-				cumulative += v.RolloutPct
-				if hash <= cumulative {
-					result.Variant = v.Key
-					break
-				}
-			}
-			if result.Variant == "" {
-				result.Variant = variants[0].Key
-			}
-		}
+	// Fire-and-forget: evaluation tracking is best-effort, must not block
+	// response. Reached only for real decisions (unavailable and invalid
+	// return above) — exposure recording semantics unchanged (O08 scope).
+	// The nil-db guard keeps the seam-injected unit path hermetic; the
+	// recording is already best-effort.
+	if s.db != nil {
+		evalID := genID()
+		_, _ = s.db.SQL().Exec(ctx,
+			`INSERT INTO flag_evaluations (eval_id, tenant_id, site_id, flag_key, user_id, variant, timestamp)
+			 VALUES ($1, 'default', $2, $3, $4, $5, $6)`,
+			evalID, siteID, flagKey, userID, result.Variant, time.Now().UTC().UnixMilli())
 	}
-
-	// Fire-and-forget: evaluation tracking is best-effort, must not block response.
-	evalID := genID()
-	_, _ = s.db.SQL().Exec(ctx,
-		`INSERT INTO flag_evaluations (eval_id, tenant_id, site_id, flag_key, user_id, variant, timestamp)
-		 VALUES ($1, 'default', $2, $3, $4, $5, $6)`,
-		evalID, siteID, flagKey, userID, result.Variant, time.Now().UTC().UnixMilli())
 
 	return result, nil
+}
+
+// quarantine refuses evaluation of a flag whose stored config failed
+// validation: counts the condition, logs the first occurrence per
+// flag+part (the public evaluate endpoint would otherwise flood the log),
+// and answers the documented fail-safe default with reason "invalid".
+func (s *FlagService) quarantine(flag FeatureFlag, part string, err error) *EvaluationResult {
+	s.invalidTotal.Add(1)
+	sig := flag.FlagID + "|" + part
+	if _, seen := s.quarantineSeen.LoadOrStore(sig, struct{}{}); !seen {
+		log.Printf("[flags] flag %q (%s) quarantined: %v — evaluation refused, answering fail-safe default (disabled)", flag.FlagKey, flag.FlagID, err)
+	}
+	return &EvaluationResult{
+		Enabled: false,
+		Reason:  ReasonInvalid,
+		Detail:  clampDetail(fmt.Sprintf("stored %s failed validation: %v", part, err)),
+	}
 }
 
 func hashUser(flagKey, userID string) int {

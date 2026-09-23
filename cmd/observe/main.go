@@ -1594,6 +1594,10 @@ func main() {
 		// conflicting-id / pending (plus the legacy queued/bytes backlog
 		// fields and replayed-on-restart).
 		health["errors"] = errorBuf.Stats()
+		// O08: flag-evaluation condition counters — how many evaluations
+		// could not read their config (unavailable) and how many flags
+		// were quarantined from evaluation by invalid stored config.
+		health["flags"] = flagSvc.Stats()
 		// O01 (ADR §5.10): per-signal admission counters for the events
 		// path — accepted vs durably-acked (the gap is lossy mode's live
 		// loss budget) and replayed-on-restart. The high-water refusal and
@@ -3359,6 +3363,12 @@ func createFlagHandler(svc *flags.FlagService) neutron.HandlerFunc[createFlagInp
 		}
 		f, err := svc.Create(ctx, input.SiteID, input.FlagKey, input.Name, input.Description, input.FlagType, input.Variants, input.Targeting, input.RolloutPct)
 		if err != nil {
+			// O08: a ruleset the write boundary rejected is a 400 naming
+			// the error, not a 500 — and never a silent store.
+			var ve *flags.ValidationError
+			if errors.As(err, &ve) {
+				return flags.FeatureFlag{}, neutron.ErrBadRequest(err.Error())
+			}
 			return flags.FeatureFlag{}, err
 		}
 		return *f, nil

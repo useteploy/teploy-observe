@@ -1601,3 +1601,91 @@ Residuals:
 - The regeneration procedure depends on a `git worktree` of the pin
   existing at a temp path; if the pin SHA is absent locally the
   submodule remote must be fetched first.
+
+## 2026-09-22 O08 correctness slice — flag evaluation: valid false vs unavailable vs invalid
+
+Programme O08 (P0): "Distinguish a valid false evaluation from
+unavailable configuration... Validate targeting/variants at write and
+read boundaries; invalid stored JSON must not silently remove targeting
+restrictions." Two source-confirmed defects, both fixed in this slice
+(working tree at `ef52aee` + this change, uncommitted):
+
+- Defect 1 (conflation): `internal/flags/flags.go` Evaluate read the
+  config with `if err != nil || len(rows) == 0 { return
+  &EvaluationResult{Enabled:false}, nil }` — a DATABASE READ FAILURE and
+  an absent flag produced the identical silent false. No log, no
+  response difference; the handler's 500 branch (cmd/observe) was dead
+  code for storage failures because Evaluate never returned an error.
+- Defect 2 (targeting hole): targeting JSON was parsed per evaluation
+  under `if err := json.Unmarshal(...); err == nil && len(rules) > 0` —
+  on parse failure the whole targeting block was SKIPPED, so invalid
+  stored rules made a flag evaluable by everyone. Same class on the
+  variants path (multivariate parse errors silently dropped variant
+  selection). Recon correction: the JSONB column already refuses
+  syntactically-broken JSON at the store level (opaque 500), so the real
+  storable hole is VALID JSON of the wrong shape (an unarrayed rule
+  object) and semantically invalid rulesets (unknown operator, missing
+  value) — exactly what the write boundary now rejects.
+
+Three-condition semantics (carried additively on every
+`POST /api/v1/flags/evaluate` response as `reason` + `detail`;
+`enabled`/`variant` unchanged, legacy decoders unaffected):
+
+| condition   | reason        | enabled | detail                    | server side                |
+|-------------|---------------|---------|---------------------------|----------------------------|
+| real decision from valid config | `evaluated` | the decision (false AND true both representable) | "flag disabled" / "rollout" / "targeting" / "flag not found" | eval recorded only on the true path (unchanged) |
+| config read failed | `unavailable` | false (fail-safe default) | "flags config read failed: {deadline\|canceled\|storage}" | full error LOGGED + `config_unavailable_total` counter |
+| stored config failed validation | `invalid` | false (fail-safe default, evaluation REFUSED — never unrestricted) | names the part + the validation error (bounded 200 chars) | quarantined: `invalid_config_total` + `invalid_config_distinct` counters, first occurrence per flag+part logged |
+
+Fail-safe default (documented per-flag contract, flags.go Evaluate doc):
+`unavailable` and `invalid` both answer Enabled=false. Flags gate
+feature exposure and the create-path default is disabled, so neither an
+outage nor corrupt config may widen exposure. A per-flag fail-OPEN
+override (kill-switch pattern) is an O08 residual below.
+
+Boundaries: WRITE — Create validates targeting (JSON array of rules;
+non-empty attribute; operator in eq/neq/in/not_in/contains; value
+present) and variants (array; non-empty unique keys; rollout_pct
+0..100) BEFORE storing; rejections return as `*flags.ValidationError`
+which createFlagHandler maps to 400 naming the error (previously shape
+errors stored silently and only syntactic breakage surfaced as a 500
+from the JSONB column). READ — Evaluate validates BEFORE the enabled
+short-circuit (operators learn their config is corrupt without
+enabling the flag first); invalid targeting or variants quarantine the
+flag. Toggle copies rules verbatim (introduces no new JSON) and is
+untouched. Quarantine counters surface at `/healthz` under `flags`
+(additive). Consumers: evaluate response additive only (ui
+flags.ts decodes `{enabled, variant?}` — extra fields ignored);
+dashboard List and MCP ListFlags shapes unchanged.
+
+Evidence (TDD red first, both defects demonstrated against original
+behavior with only a behavior-neutral fetch-seam extraction added):
+`internal/flags/o08_test.go` — red run showed ReadFailure tests failing
+(reason "" not "unavailable"; no error surfaced), Create storing the
+unarrayed ruleset, the corrupt-row fixture evaluating as a decision;
+post-fix 16/16 green incl. live Nucleus (absent/disabled/rollout/
+targeting-hit/miss all reason "evaluated" with both false and true
+asserted; corrupt-row repair resumes evaluation — quarantine is
+per-read, not sticky). Mutations both ways: restoring
+skip-on-parse-error fails TestO08_InvalidStoredTargeting...,
+TestO08_DisabledFlagWithInvalid... and TestO08_LegacyCorruptRow...;
+restoring error-as-absent fails both TestO08_ReadFailure tests.
+Gates: `go vet ./...` clean; `internal/flags` + `cmd/observe` green
+under `-race` against the fixture; full serial suite
+(`OBSERVE_NUCLEUS_URL`, `-p 1 -count=1 ./...`) 45 packages ok, 0
+failures.
+
+O08 residuals (recorded, out of this slice's scope):
+- Versioned rules: targeting/variants are rewritten as verbatim strings
+  on version-rewriting writes; no schema/version stamp for rule
+  changes themselves.
+- Bounded-version hashing / SDK-agreement: hashUser (sha256 first two
+  bytes mod 100) has no version negotiation with any client-side
+  evaluation; a future local-eval SDK must agree on bucketing.
+- Kill switch / per-flag fail-open default: unavailable+invalid answer
+  false platform-wide; a flag whose safe state is ON needs a stored
+  per-flag default plus an SDK contract to express it.
+- Exposure dedup: flag_evaluations rows are appended per enabled
+  evaluation with no per-user dedupe window.
+- Local (client-side) evaluation: none exists; all evaluation is
+  server-side through the public endpoint.
