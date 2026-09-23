@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>X05 Fixture App — Telemetry Instrumentation Target</title>
+<style>
+  :root { --ink:#1c2330; --muted:#5b6472; --line:#e3e7ee; --accent:#2f6fed; --bg:#f7f9fc; }
+  * { box-sizing: border-box; margin: 0; }
+  body { font: 15px/1.55 system-ui, sans-serif; color: var(--ink); background: var(--bg); }
+  header { display:flex; align-items:center; gap:16px; padding:14px 28px; background:#fff; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:10; }
+  header svg { width:34px; height:34px; }
+  header h1 { font-size:17px; font-weight:650; }
+  nav { display:flex; gap:4px; margin-left:auto; }
+  nav button { border:0; background:transparent; padding:8px 12px; border-radius:8px; cursor:pointer; font:inherit; color:var(--muted); }
+  nav button:hover { background:var(--bg); color:var(--ink); }
+  nav button[aria-current="true"] { background:var(--accent); color:#fff; }
+  main { max-width:1060px; margin:0 auto; padding:24px 28px 80px; }
+  .kpis { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:22px; }
+  .kpi { background:#fff; border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
+  .kpi .v { font-size:24px; font-weight:700; margin-top:2px; }
+  .kpi .l { color:var(--muted); font-size:12.5px; text-transform:uppercase; letter-spacing:.04em; }
+  .ticker { background:#fff; border:1px solid var(--line); border-radius:12px; padding:12px 16px; margin-bottom:22px; }
+  .ticker h2 { font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; margin-bottom:8px; }
+  #ticker-list { list-style:none; display:flex; flex-direction:column; gap:6px; }
+  #ticker-list li { display:flex; justify-content:space-between; font-variant-numeric:tabular-nums; }
+  #ticker-list li .up { color:#0a7d33; } #ticker-list li .down { color:#b3362c; }
+  .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:26px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:12px; padding:16px; cursor:pointer; transition:box-shadow .15s; }
+  .card:hover { box-shadow:0 4px 18px rgba(28,35,48,.09); }
+  .card .t { font-weight:600; margin-bottom:6px; }
+  .card .s { color:var(--muted); font-size:13px; }
+  .card .m { margin-top:10px; font-size:12.5px; color:var(--accent); }
+  form { background:#fff; border:1px solid var(--line); border-radius:12px; padding:18px; max-width:520px; }
+  form h2 { font-size:15px; margin-bottom:12px; }
+  label { display:block; font-size:13px; color:var(--muted); margin:10px 0 4px; }
+  input, textarea, select { width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:8px; font:inherit; background:#fff; }
+  .row { display:flex; gap:10px; margin-top:14px; }
+  .row button { border:0; border-radius:8px; padding:10px 16px; font:inherit; cursor:pointer; }
+  .row .primary { background:var(--accent); color:#fff; }
+  .row .ghost { background:transparent; color:var(--muted); }
+  #detail[hidden] { display:none; }
+  #detail { position:fixed; inset:0; background:rgba(28,35,48,.35); display:grid; place-items:center; }
+  #detail .sheet { background:#fff; border-radius:14px; padding:22px 24px; width:min(440px,90vw); }
+  #detail h3 { margin-bottom:8px; }
+  #detail p { color:var(--muted); font-size:14px; }
+  #detail .row { justify-content:flex-end; }
+  footer { text-align:center; color:var(--muted); font-size:12.5px; padding:26px 0 34px; }
+</style>
+</head>
+<body>
+<header>
+  <svg viewBox="0 0 40 40" aria-hidden="true">
+    <rect width="40" height="40" rx="9" fill="#2f6fed"/>
+    <path d="M12 28 L20 12 L28 28 Z" fill="#fff" fill-opacity=".92"/>
+    <circle cx="20" cy="23" r="3" fill="#2f6fed"/>
+  </svg>
+  <h1>X05 Fixture App</h1>
+  <nav id="nav">
+    <button data-tab="overview" aria-current="true">Overview</button>
+    <button data-tab="catalog">Catalog</button>
+    <button data-tab="orders">Orders</button>
+    <button data-tab="settings">Settings</button>
+  </nav>
+</header>
+<!--X05-RECORDER-->
+<main>
+  <section class="kpis">
+    <div class="kpi"><div class="l">Requests</div><div class="v" id="kpi-requests">14,208</div></div>
+    <div class="kpi"><div class="l">Visitors</div><div class="v" id="kpi-visitors">3,914</div></div>
+    <div class="kpi"><div class="l">Error rate</div><div class="v" id="kpi-errors">0.42%</div></div>
+    <div class="kpi"><div class="l">p95 latency</div><div class="v" id="kpi-latency">184 ms</div></div>
+  </section>
+
+  <section class="ticker" aria-label="Live updates">
+    <h2>Live updates — mutates every 2 s</h2>
+    <ul id="ticker-list"></ul>
+  </section>
+
+  <section class="grid" id="cards" aria-label="Catalog cards"></section>
+
+  <form id="signup" autocomplete="off">
+    <h2>Get deployment notifications</h2>
+    <label for="f-name">Name</label>
+    <input id="f-name" name="name" placeholder="Ada Lovelace">
+    <label for="f-email">Work email</label>
+    <input id="f-email" name="email" type="email" placeholder="ada@example.com">
+    <label for="f-channel">Channel</label>
+    <select id="f-channel" name="channel">
+      <option>Email</option><option>Webhook</option><option>SMS</option>
+    </select>
+    <label for="f-notes">Notes</label>
+    <textarea id="f-notes" rows="3" placeholder="Optional context"></textarea>
+    <div class="row">
+      <button class="primary" type="submit" id="f-submit">Subscribe</button>
+      <button class="ghost" type="button" id="f-reset">Reset</button>
+    </div>
+  </form>
+</main>
+
+<div id="detail" hidden>
+  <div class="sheet" role="dialog" aria-modal="true">
+    <h3 id="detail-title">Item</h3>
+    <p id="detail-body">Details for this catalog item, including stock and recent activity.</p>
+    <div class="row"><button class="primary" id="detail-close">Close</button></div>
+  </div>
+</div>
+
+<footer>X05 fixture — revision <span id="rev">x05-20260923.1</span> — dynamic DOM, forms, dialogs and navigation for replay instrumentation.</footer>
+
+<script>
+(function () {
+  // Dynamic DOM: the live ticker mutates every 2 s (text updates, node
+  // add/remove) — the churn that distinguishes snapshot-only replay from
+  // incremental mutation capture.
+  var items = [];
+  for (var i = 0; i < 8; i++) items.push(seed());
+  function seed() {
+    return {
+      sku: 'SKU-' + String(Math.floor(Math.random() * 9000) + 1000),
+      qty: Math.floor(Math.random() * 60) + 5,
+      price: (Math.random() * 90 + 10).toFixed(2),
+    };
+  }
+  var list = document.getElementById('ticker-list');
+  function render() {
+    while (list.firstChild) list.removeChild(list.firstChild);
+    items.slice(0, 6).forEach(function (it) {
+      var li = document.createElement('li');
+      var l = document.createElement('span'); l.textContent = it.sku;
+      var r = document.createElement('span');
+      var up = Math.random() > 0.5;
+      r.className = up ? 'up' : 'down';
+      r.textContent = (up ? '+' : '-') + (Math.random() * 4 + 0.1).toFixed(2) + ' (' + it.qty + ') $' + it.price;
+      li.appendChild(l); li.appendChild(r);
+      list.appendChild(li);
+    });
+  }
+  render();
+  setInterval(function () {
+    items.shift(); items.push(seed()); render();
+    var k = document.getElementById('kpi-requests');
+    k.textContent = (parseInt(k.textContent.replace(/,/g, ''), 10) + Math.floor(Math.random() * 9) + 1).toLocaleString();
+  }, 2000);
+
+  // Catalog cards.
+  var names = ['Analytic edge', 'Fast crawler', 'Ingest lane', 'Store front',
+    'Edge cache', 'Query fan', 'Schema tool', 'Ship deck', 'Panel kit',
+    'Signal room', 'Bloom store', 'Meter box'];
+  var cards = document.getElementById('cards');
+  names.forEach(function (n, i) {
+    var c = document.createElement('div');
+    c.className = 'card'; c.dataset.sku = 'SKU-' + (1000 + i * 137);
+    var t = document.createElement('div'); t.className = 't'; t.textContent = n;
+    var s = document.createElement('div'); s.className = 's';
+    s.textContent = 'Region ' + String.fromCharCode(65 + (i % 5)) + ' - stock ' + (i * 7 % 40 + 3);
+    var m = document.createElement('div'); m.className = 'm'; m.textContent = 'Open details';
+    c.appendChild(t); c.appendChild(s); c.appendChild(m);
+    c.addEventListener('click', function () {
+      document.getElementById('detail-title').textContent = n;
+      document.getElementById('detail-body').textContent =
+        c.dataset.sku + ' - ' + s.textContent + ' - updated ' + new Date().toISOString().slice(11, 19) + 'Z';
+      document.getElementById('detail').hidden = false;
+    });
+    cards.appendChild(c);
+  });
+  document.getElementById('detail-close').addEventListener('click', function () {
+    document.getElementById('detail').hidden = true;
+  });
+
+  // Tabs switch sections' visibility state (aria-current only; content
+  // panels are illustrative for the journey).
+  var nav = document.getElementById('nav');
+  nav.addEventListener('click', function (e) {
+    var b = e.target.closest('button');
+    if (!b) return;
+    nav.querySelectorAll('button').forEach(function (x) { x.removeAttribute('aria-current'); });
+    b.setAttribute('aria-current', 'true');
+  });
+
+  // Error fixture: the submit button throws 1-in-N (deterministic every 5th).
+  var subs = 0;
+  document.getElementById('f-submit').addEventListener('click', function (e) {
+    e.preventDefault();
+    if (++subs % 5 === 0) throw new Error('x05 fixture: simulated submit failure #' + subs);
+  });
+  document.getElementById('f-reset').addEventListener('click', function () {
+    document.getElementById('signup').reset();
+  });
+})();
+</script>
+</body>
+</html>

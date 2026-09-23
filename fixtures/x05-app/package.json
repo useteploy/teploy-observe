@@ -1,0 +1,18 @@
+{
+  "name": "x05-fixture-app",
+  "private": true,
+  "type": "module",
+  "description": "X05 maintained fixture application (O06 replay experiment + product evaluation fixtures)",
+  "scripts": {
+    "build:arm-b": "esbuild arm-b/recorder.mjs --bundle --minify --format=iife --outfile=arm-b/recorder.js",
+    "measure:lcp": "node harness/measure.mjs --phase lcp",
+    "measure:session": "node harness/measure.mjs --phase session"
+  },
+  "dependencies": {
+    "rrweb": "^2.0.0-alpha.4"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "playwright-core": "^1.50.0"
+  }
+}
