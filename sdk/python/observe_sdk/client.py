@@ -45,6 +45,12 @@ class Options:
     log_batch_size: int = 50
     log_flush_interval: float = 2.0
     timeout: float = 10.0
+    # O11 retry budget: retryable failures (429/5xx/network) retry with an
+    # immediate first attempt, then exponential backoff off retry_backoff
+    # (seconds, 30 s cap) up to max_send_attempts before the chunk is
+    # dropped and counted as a loss.
+    max_send_attempts: int = 6
+    retry_backoff: float = 1.0
 
 
 # Server-side /logs/batch cap; entries beyond it are a 400.
@@ -62,6 +68,25 @@ _MAX_BATCH_BYTES = 1024 * 1024
 _MAX_QUEUE_BYTES = 8 * 1024 * 1024
 
 
+class ObserveHTTPError(RuntimeError):
+    """A non-2xx response from the server. ``code`` carries the status so
+    callers can classify retryable (429/5xx) from permanent (other 4xx)
+    refusals (O11)."""
+
+    def __init__(self, path: str, code: int) -> None:
+        super().__init__(f"observe: {path} returned {code}")
+        self.code = code
+
+
+def _retryable(exc: BaseException) -> bool:
+    """O11 retry classification: HTTP 429/5xx and transport-level failures
+    (URLError, timeouts, resets) are retryable; every other 4xx is
+    permanent for that payload."""
+    if isinstance(exc, ObserveHTTPError):
+        return exc.code == 429 or exc.code >= 500
+    return True
+
+
 def _validate_options(opts: "Options") -> None:
     """AUD-037 (round 2): reject configuration that would spin the worker
     (zero/negative interval), hang requests (non-finite timeout), or break
@@ -73,10 +98,13 @@ def _validate_options(opts: "Options") -> None:
         # deployments pass 3600 to effectively disable the background loop.
         ("log_flush_interval", opts.log_flush_interval, 0.05, 3600.0),
         ("timeout", opts.timeout, 0.1, 60.0),
+        ("retry_backoff", opts.retry_backoff, 0.001, 60.0),
     ):
         if isinstance(value, bool) or not isinstance(value, (int, float)) \
                 or not math.isfinite(value) or not lower <= value <= upper:
             raise ValueError(f"{name} must be a finite number in [{lower}, {upper}]")
+    if type(opts.max_send_attempts) is not int or not 1 <= opts.max_send_attempts <= 100:
+        raise ValueError("max_send_attempts must be an integer in [1, 100]")
 
 
 class Client:
@@ -115,6 +143,19 @@ class Client:
         # Optional non-throwing diagnostics hook for background failures
         # (AUD-035): `_loop` used to swallow every exception.
         self.on_error: Optional[Any] = None
+        # O11: visible loss/delivery counters, surfaced via stats().
+        # dropped maps reason -> count: entry_invalid, entry_oversize,
+        # queue_full, retry_exhausted, non_retryable, server_rejected,
+        # shutdown_unflushed. delivered + sum(dropped) + len(queue)
+        # accounts for every admitted record.
+        self._stats_dropped: Dict[str, int] = {}
+        self._stats_delivered = 0
+        self._stats_retries = 0
+        # O11 retry state for the queue head: consecutive attempts and the
+        # backoff gate. The first retry is immediate; the gate engages
+        # from the second consecutive failure (same policy as the Go SDK).
+        self._send_attempts = 0
+        self._retry_not_before = 0.0
         # Context-local identity (audit F34): each thread/task sees its own
         # value; unset reads are anonymous. Capture it into a payload BEFORE
         # handing work to a background thread — ContextVar does not transfer.
@@ -130,6 +171,40 @@ class Client:
         self._thread.start()
 
     # ── public API ────────────────────────────────────────────────────────
+
+    def stats(self) -> Dict[str, Any]:
+        """O11 diagnostics snapshot: delivered / retries / dropped-by-reason
+        counters plus the live queue depth. Losses are never silent — every
+        drop also notifies ``on_error`` (when set)."""
+        with self._lock:
+            queued = len(self._buffer)
+        return {
+            "delivered": self._stats_delivered,
+            "retries": self._stats_retries,
+            "dropped": dict(self._stats_dropped),
+            "queued": queued,
+        }
+
+    def _count_loss(self, reason: str, count: int, detail: str = "") -> None:
+        """O11: increment the visible counter and notify the hook."""
+        self._stats_dropped[reason] = self._stats_dropped.get(reason, 0) + count
+        message = f"observe: lost {count} record(s) ({reason})"
+        if detail:
+            message += f" — {detail}"
+        self._last_error = RuntimeError(message)
+        if self.on_error is not None:
+            try:
+                self.on_error(self._last_error)
+            except Exception:  # noqa: BLE001 - hook must not break the SDK
+                pass
+
+    def _backoff_for(self, attempt: int) -> float:
+        delay = float(self.opts.retry_backoff)
+        for _ in range(1, attempt):
+            delay *= 2
+            if delay >= 30.0:
+                return 30.0
+        return delay
 
     @contextmanager
     def bind_identity(self, user_id: Optional[str]) -> Iterator[None]:
@@ -229,14 +304,21 @@ class Client:
         # AFTER the buffer was detached, so one unsupported attribute type
         # raised TypeError out of the loop and silently discarded every
         # valid entry behind it; worse, the original dict stayed mutable by
-        # the caller.
-        raw = encode_entry(entry)
+        # the caller. O11: the rejection is also counted (entry_invalid).
+        try:
+            raw = encode_entry(entry)
+        except ValueError as exc:
+            self._count_loss("entry_invalid", 1, str(exc))
+            raise
         with self._lock:
             if self._state != "open":
                 # AUD-037: no admission once closing starts — a queued
                 # entry with no consumer is a silent loss.
                 raise RuntimeError("observe_sdk: client is closing or closed")
             if self._buffer_bytes + len(raw) > _MAX_QUEUE_BYTES:
+                # O11: drop-newest overflow policy, counted visibly on top
+                # of the long-standing BufferError signal.
+                self._stats_dropped["queue_full"] = self._stats_dropped.get("queue_full", 0) + 1
                 raise BufferError("observe_sdk: log queue byte limit reached")
             self._buffer.append(raw)
             self._buffer_bytes += len(raw)
@@ -250,7 +332,7 @@ class Client:
     def error(self, msg: str, **fields: Any) -> None: self.log("error", msg, **fields)
     def fatal(self, msg: str, **fields: Any) -> None: self.log("fatal", msg, **fields)
 
-    def flush(self) -> None:
+    def flush(self, timeout: Optional[float] = None) -> None:
         """Drain the log buffer synchronously via the batch endpoint.
 
         AUD-035 (round 2): one flush owner; a batch is removed from the
@@ -258,11 +340,32 @@ class Client:
         entries queued, updates ``last_error``, notifies ``on_error``, and
         re-raises — a caller (or ``close``) can observe the failure instead
         of a silent loss.
+
+        O11 retry/loss contract: retryable failures (429/5xx/network, see
+        ``_retryable``) get an immediate first retry; further consecutive
+        failures hold off with exponential backoff, and once
+        ``max_send_attempts`` is exhausted the chunk is dropped and counted
+        (``retry_exhausted``). A non-retryable 4xx is dropped immediately
+        (``non_retryable``) — it can never succeed as-shaped, and blocking
+        the queue head on it starves every later entry. A 200 whose body
+        reports per-entry rejections counts them as ``server_rejected``
+        (the accepted neighbors are never resent). ``timeout`` bounds the
+        whole drain; on expiry a TimeoutError is raised with the queue
+        still intact and visible in ``stats()``. While the backoff gate is
+        engaged, flush() returns early — queued entries remain visible via
+        ``stats()["queued"]``.
         """
+        deadline = time.monotonic() + timeout if timeout is not None else None
         with self._flush_lock:
             with self._lock:
                 remaining = len(self._buffer)  # fixed watermark, not a live drain
             while remaining:
+                if self._send_attempts >= 2 and time.monotonic() < self._retry_not_before:
+                    return  # mid-backoff; the worker or a later flush retries
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "observe_sdk: flush deadline reached with entries queued"
+                    )
                 with self._lock:
                     chosen: List[bytes] = []
                     size = len(b'{"logs":[]}')
@@ -273,13 +376,47 @@ class Client:
                         chosen.append(raw)
                         size += extra
                 if not chosen:
-                    raise ValueError(
-                        "observe_sdk: single log entry exceeds the request byte budget"
-                    )
+                    # Belt-and-braces (admission caps entries at 64 KiB, so
+                    # this is unreachable in practice): drop the head entry
+                    # loudly instead of erroring forever on an undrainable
+                    # queue.
+                    with self._lock:
+                        oversize = self._buffer.pop(0)
+                        self._buffer_bytes -= len(oversize)
+                    remaining -= 1
+                    self._count_loss("entry_oversize", 1, "entry exceeds the request byte budget")
+                    continue
                 body = b'{"logs":[' + b",".join(chosen) + b']}'
+                per_request = self.opts.timeout
+                if deadline is not None:
+                    per_request = min(per_request, max(deadline - time.monotonic(), 0.05))
                 try:
-                    self._post_bytes("/api/v1/logs/batch", body)
-                except Exception as exc:  # noqa: BLE001 - surfaced + re-raised
+                    accepted, rejected = self._post_batch(body, timeout=per_request)
+                except Exception as exc:  # noqa: BLE001 - classified below
+                    if not _retryable(exc):
+                        with self._lock:
+                            del self._buffer[: len(chosen)]
+                            self._buffer_bytes -= sum(len(c) for c in chosen)
+                        remaining -= len(chosen)
+                        self._send_attempts = 0
+                        self._count_loss("non_retryable", len(chosen), str(exc))
+                        continue
+                    self._send_attempts += 1
+                    if self._send_attempts >= self.opts.max_send_attempts:
+                        with self._lock:
+                            del self._buffer[: len(chosen)]
+                            self._buffer_bytes -= sum(len(c) for c in chosen)
+                        remaining -= len(chosen)
+                        self._send_attempts = 0
+                        self._count_loss(
+                            "retry_exhausted", len(chosen),
+                            f"{self.opts.max_send_attempts} attempts, last error: {exc}",
+                        )
+                        continue
+                    self._stats_retries += 1
+                    self._retry_not_before = time.monotonic() + self._backoff_for(
+                        self._send_attempts
+                    )
                     self._last_error = exc
                     if self.on_error is not None:
                         try:
@@ -287,13 +424,22 @@ class Client:
                         except Exception:  # noqa: BLE001 - hook must not break flush
                             pass
                     raise
+                self._send_attempts = 0
+                if accepted is None and rejected is None:
+                    accepted, rejected = len(chosen), 0  # bodyless 200 (old servers)
+                if rejected:
+                    self._count_loss(
+                        "server_rejected", rejected,
+                        f"server accepted {accepted} of {len(chosen)}",
+                    )
+                self._stats_delivered += accepted or 0
                 with self._lock:
                     del self._buffer[: len(chosen)]
                     self._buffer_bytes -= sum(len(c) for c in chosen)
                 remaining -= len(chosen)
             self._last_error = None
 
-    def close(self) -> None:
+    def close(self, timeout: Optional[float] = None) -> None:
         """Stop the background flusher and drain pending logs.
 
         AUD-037 (round 2): open -> closing -> closed with an explicit
@@ -301,6 +447,12 @@ class Client:
         incomplete, retryable) instead of returning success; a failed drain
         raises and leaves the client in ``closing`` so a later close can
         retry; ``log()`` refuses admission once closing starts.
+
+        O11: ``timeout`` bounds BOTH the worker join and the final drain
+        (default: the configured flush interval + request timeout + 1 s).
+        Entries still queued when close gives up are counted as
+        ``shutdown_unflushed`` losses and reported through ``on_error`` —
+        never swallowed.
         """
         with self._close_lock:
             with self._lock:
@@ -308,14 +460,33 @@ class Client:
                     return
                 self._state = "closing"
             self._stop.set()
-            self._thread.join(
-                timeout=self.opts.log_flush_interval + self.opts.timeout + 1.0
+            join_timeout = (
+                timeout if timeout is not None
+                else self.opts.log_flush_interval + self.opts.timeout + 1.0
             )
+            self._thread.join(timeout=join_timeout)
             if self._thread.is_alive():
                 raise TimeoutError(
                     "observe_sdk: flush worker has not stopped; close is incomplete"
                 )
-            self.flush()  # may raise; state stays "closing" for a retry
+            drain_timeout = timeout if timeout is not None else self.opts.timeout
+            drain_error: Optional[BaseException] = None
+            try:
+                self.flush(timeout=drain_timeout)
+            except Exception as exc:  # noqa: BLE001 - surfaced via the raise below
+                drain_error = exc
+            with self._lock:
+                leftover = len(self._buffer)
+            if leftover:
+                self._count_loss(
+                    "shutdown_unflushed", leftover,
+                    "close deadline reached with entries queued",
+                )
+            if drain_error is not None or leftover:
+                raise TimeoutError(
+                    f"observe_sdk: close incomplete ({leftover} entries queued"
+                    f"{f'; last error: {drain_error}' if drain_error else ''})"
+                )
             with self._lock:
                 self._state = "closed"
 
@@ -341,6 +512,35 @@ class Client:
         data = json.dumps(body).encode("utf-8")
         self._post_bytes(path, data, url=url, silent=silent)
 
+    def _post_batch(
+        self, body: bytes, *, timeout: Optional[float] = None
+    ) -> tuple[Optional[int], Optional[int]]:
+        """POST one packed /logs/batch body and return the per-entry ack
+        (accepted, rejected) from the response (O11 partial-error
+        handling). Raises ObserveHTTPError on non-2xx."""
+        url = self.opts.endpoint.rstrip("/") + "/api/v1/logs/batch"
+        headers = {"Content-Type": "application/json"}
+        if self.opts.api_key:
+            headers["X-API-Key"] = self.opts.api_key
+        req = urlrequest.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with self._opener.open(req, timeout=timeout or self.opts.timeout) as resp:
+                raw = resp.read(64 * 1024)
+        except urlrequest.HTTPError as exc:
+            raise ObserveHTTPError("/api/v1/logs/batch", exc.code) from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(f"observe: post /api/v1/logs/batch failed: {exc}") from exc
+        if not 200 <= resp.status < 300:
+            raise ObserveHTTPError("/api/v1/logs/batch", resp.status)
+        try:
+            ack = json.loads(raw.decode("utf-8")) if raw else {}
+        except ValueError:
+            return None, None
+        return (
+            ack.get("accepted") if isinstance(ack.get("accepted"), int) else None,
+            ack.get("rejected") if isinstance(ack.get("rejected"), int) else None,
+        )
+
     def _post_bytes(self, path: str, data: bytes, *, url: Optional[str] = None, silent: bool = False) -> None:
         if url is None:
             url = self.opts.endpoint.rstrip("/") + path
@@ -353,11 +553,11 @@ class Client:
                 # TO-037: only 2xx is success (a refused 3xx reaches here
                 # as an HTTPError, which is a URLError subclass).
                 if not 200 <= resp.status < 300 and not silent:
-                    raise RuntimeError(f"observe: {path} returned {resp.status}")
+                    raise ObserveHTTPError(path, resp.status)
         except urlrequest.HTTPError as exc:
             if silent:
                 return
-            raise RuntimeError(f"observe: {path} returned {exc.code}") from exc
+            raise ObserveHTTPError(path, exc.code) from exc
         except (URLError, TimeoutError) as exc:
             if not silent:
                 raise RuntimeError(f"observe: post {path} failed: {exc}") from exc
@@ -437,6 +637,11 @@ def close() -> None:
 
 def flush() -> None:
     _require().flush()
+
+
+def stats() -> Dict[str, Any]:
+    """O11 diagnostics of the default client (see Client.stats)."""
+    return _require().stats()
 
 
 def identify(user_id: str, traits: Optional[Dict[str, Any]] = None) -> None:

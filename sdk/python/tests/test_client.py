@@ -166,14 +166,14 @@ def test_failed_flush_retains_queue(server):
     client.on_error = lambda exc: errors.append(exc)
     # Point the client at a dead port by closing the real server first.
     client.info("doomed")
-    # Simulate failure by monkeypatching _post_bytes.
-    def boom(path, data, **kw):
+    # Simulate failure by monkeypatching _post_batch (the O11 flush seam).
+    def boom(body, **kw):
         raise RuntimeError("observe: post failed: connection refused")
-    orig = client._post_bytes
-    client._post_bytes = boom
+    orig = client._post_batch
+    client._post_batch = boom
     with pytest.raises(RuntimeError):
         client.flush()
-    client._post_bytes = orig
+    client._post_batch = orig
     assert len(client._buffer) == 1, "failed batch must remain queued"
     client.flush()
     assert len(client._buffer) == 0
