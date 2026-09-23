@@ -15,7 +15,7 @@ spec). Runtimes below are what the test suites exercise.
 | SDK | runtime deps | dev deps | types | bundle raw / gz(-9) | runtimes tested |
 |---|---|---|---|---|---|
 | `@teploy/observe-browser` 0.1.0 | **0** | typescript 5.4, tsx 4.19, @types/node 22 | `dist/index.d.ts` (11,199 B) shipped | **33,730 B / 11,002 B** | Node 22 (`node --test`, stubbed browser globals + real-loopback transport tests) |
-| `@teploy/observe-sentry-shim` 0.1.0 | **0** | typescript 5.4, tsx 4.19 | `dist/index.d.ts` (8,912 B) shipped | **14,840 B / 4,738 B** | Node >= 18 (`node --test`) |
+| `@teploy/observe-sentry-shim` 0.1.0 | **0** | typescript 5.4, tsx 4.19, @types/node 22 | `dist/index.d.ts` (10,659 B) shipped | **20,397 B / 6,502 B** | Node >= 18 (`node --test`) |
 | `sdk/go` (module `github.com/useteploy/teploy-observe/sdk/go`) | **0** (Go stdlib only) | — | godoc comments | compiled in (Go) | Go 1.22 (`go test`) |
 | `sdk/python` (`teploy-observe` 0.1.0) | **0** (stdlib only: urllib/json/threading/contextvars) | — | inline type hints | n/a | CPython 3.8+ (`unittest`) |
 

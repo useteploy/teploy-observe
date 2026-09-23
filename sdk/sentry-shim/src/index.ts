@@ -32,6 +32,8 @@
  * lightweight scope-bound stub so existing call sites do not break.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
+
 export type SeverityLevel =
   | "fatal"
   | "error"
@@ -64,7 +66,8 @@ export interface InitOptions {
   endpoint?: string;
   /** Site identifier. Defaults to `"default"` (or DSN-extracted value). */
   siteId?: string;
-  /** API key sent as the `X-API-Key` header. Optional during the grace period. */
+  /** API key sent as the `X-API-Key` header. Required in practice: Observe
+   * ingest rejects keyless requests with 401. */
   apiKey?: string;
   /** Release tag attached to every event. */
   release?: string;
@@ -72,13 +75,17 @@ export interface InitOptions {
   environment?: string;
   /** Maximum breadcrumbs retained per scope. Default: 100. */
   maxBreadcrumbs?: number;
-  /** If true, skip outgoing network calls (useful for tests). */
+  /** If true, skip outgoing network calls and all no-op diagnostics
+   * (useful for tests). */
   debug?: boolean;
   /** Custom fetch implementation. Defaults to global `fetch`. */
   fetch?: typeof fetch;
   /** Skip auto-collection of stack frames if you need a smaller payload. Default: true. */
   attachStacktrace?: boolean;
-  // Accepted for Sentry compat; intentionally not honored:
+  /** O11: called with every delivery failure or counted loss (the shim
+   * never throws out of capture* calls — this is the drop signal). */
+  onError?: (err: Error) => void;
+  // Accepted for Sentry compat; intentionally not honored (warn once):
   tracesSampleRate?: number;
   profilesSampleRate?: number;
   integrations?: unknown[];
@@ -139,6 +146,7 @@ interface ResolvedConfig {
   attachStacktrace: boolean;
   fetchImpl: typeof fetch;
   beforeSend?: InitOptions["beforeSend"];
+  onError?: (err: Error) => void;
 }
 
 class Scope {
@@ -191,8 +199,87 @@ let config: ResolvedConfig | null = null;
 let rootScope: Scope = new Scope();
 let scopeStack: Scope[] = [];
 
+// O11 request-local scope (spec: "a Node SDK/shim needs request-local
+// scope rather than sharing user context across concurrent requests").
+// withRequestScope forks the active scope into an AsyncLocalStorage
+// context; concurrent requests mutate isolated forks. Without it, setUser
+// in one request leaked into every other request's captures.
+const requestScope = new AsyncLocalStorage<Scope>();
+
 function activeScope(): Scope {
+  const scoped = requestScope.getStore();
+  if (scoped) return scoped;
   return scopeStack.length > 0 ? scopeStack[scopeStack.length - 1] : rootScope;
+}
+
+/**
+ * Run `fn` (and everything it awaits) against a FORKED scope so
+ * per-request state (setUser, tags, extras, breadcrumbs) cannot leak
+ * across concurrent requests. Use as request middleware:
+ *
+ * ```ts
+ * app.use((req, res, next) => Sentry.withRequestScope(() => next()));
+ * ```
+ *
+ * The fork snapshots the GLOBAL scope at entry; mutations inside apply
+ * only to this async context.
+ */
+export function withRequestScope<T>(fn: () => T): T {
+  const fork = activeScope().clone();
+  return requestScope.run(fork, fn);
+}
+
+// ── O11 honest no-ops ────────────────────────────────────────────────────
+// Accepted-for-compat APIs that do nothing warn ONCE per class (reset by
+// init) with a pointer to the compatibility table, replacing silent
+// no-ops. Suppressed entirely in debug/dry-run mode.
+const warnedNoOps = new Set<string>();
+
+function warnOnce(noOpClass: string, message: string): void {
+  if (!config || config.debug) return;
+  if (warnedNoOps.has(noOpClass)) return;
+  warnedNoOps.add(noOpClass);
+  try {
+    console.warn(
+      `[observe-sentry-shim] ${message} — intentional no-op; see docs/sdk/COMPATIBILITY.md#sentry-intentional-no-ops`,
+    );
+  } catch {
+    /* a broken console must not break the SDK */
+  }
+}
+
+// ── O11 visible loss counters ────────────────────────────────────────────
+export interface ShimStats {
+  /** Envelopes the server accepted (2xx). */
+  delivered: number;
+  /** Lost envelopes by reason: send_failed (network), http_<status>,
+   * non_2xx (unknown status), serialize_failed. No retry exists — each
+   * capture is one attempt (see the compatibility table). */
+  lost: Record<string, number>;
+  /** Envelopes still unconfirmed when flush(timeout) gave up — the honest
+   * upper bound; some may still deliver after process exit. */
+  unconfirmedAtFlush: number;
+  /** Sends currently in flight. */
+  inFlight: number;
+}
+
+let stats: ShimStats = { delivered: 0, lost: {}, unconfirmedAtFlush: 0, inFlight: 0 };
+const inFlightSends = new Set<Promise<void>>();
+
+function countLoss(reason: string, detail?: string): void {
+  stats.lost[reason] = (stats.lost[reason] ?? 0) + 1;
+  if (!config || config.debug) return;
+  const err = new Error(`observe-sentry-shim: lost 1 envelope (${reason})${detail ? ` — ${detail}` : ""}`);
+  try {
+    config.onError?.(err);
+  } catch {
+    /* an onError hook that throws must not break the SDK */
+  }
+}
+
+/** O11 diagnostics: delivery and loss counters since the last init(). */
+export function getStats(): ShimStats {
+  return { ...stats, lost: { ...stats.lost } };
 }
 
 function parseDsn(dsn: string): { endpoint: string; siteId: string } | null {
@@ -247,9 +334,26 @@ export function init(options: InitOptions): void {
     attachStacktrace: options.attachStacktrace ?? true,
     fetchImpl,
     beforeSend: options.beforeSend,
+    onError: options.onError,
   };
   rootScope = new Scope();
   scopeStack = [];
+  warnedNoOps.clear();
+  stats = { delivered: 0, lost: {}, unconfirmedAtFlush: 0, inFlight: 0 };
+  // O11: accepted-but-ignored Sentry options tell the truth once, with a
+  // pointer to the compatibility table.
+  if (options.tracesSampleRate !== undefined) {
+    warnOnce("tracesSampleRate", "tracesSampleRate is not a sampling knob here; spans are always recorded when created");
+  }
+  if (options.profilesSampleRate !== undefined) {
+    warnOnce("profilesSampleRate", "profilesSampleRate is ignored; the shim ships no profiler");
+  }
+  if (options.integrations !== undefined) {
+    warnOnce("integrations", "integrations is accepted for import compatibility and ignored");
+  }
+  if (options.autoSessionTracking !== undefined) {
+    warnOnce("autoSessionTracking", "autoSessionTracking is a no-op; release health is computed server-side from release tags");
+  }
 }
 
 /** Returns the active configuration (mostly for tests). */
@@ -262,14 +366,32 @@ async function postJSON(path: string, body: unknown): Promise<void> {
   if (config.debug) return; // dry-run mode
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (config.apiKey) headers["X-API-Key"] = config.apiKey;
+  // O11: failures are counted and reported through onError — the shim
+  // still never throws out of capture* calls (Sentry compat), but a lost
+  // envelope is no longer indistinguishable from a delivered one.
+  const send = (async () => {
+    try {
+      const res = await config.fetchImpl(config.endpoint + path, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        countLoss(`http_${res.status}`, `POST ${path} returned ${res.status}`);
+        return;
+      }
+      stats.delivered++;
+    } catch (err) {
+      countLoss("send_failed", err instanceof Error ? err.message : String(err));
+    }
+  })();
+  stats.inFlight++;
+  inFlightSends.add(send);
   try {
-    await config.fetchImpl(config.endpoint + path, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    });
-  } catch {
-    // Mirror Sentry's behavior: never throw out of capture* calls.
+    await send;
+  } finally {
+    inFlightSends.delete(send);
+    stats.inFlight--;
   }
 }
 
@@ -484,11 +606,12 @@ export function configureScope(fn: (scope: Scope) => void): void {
 export function startSession(): void {
   // Release health is computed server-side from `release` + event volume;
   // the shim has nothing to track on the client.
+  warnOnce("startSession", "startSession() is a no-op; sessions are inferred server-side");
 }
 
-/** Sentry: end the implicit session. No-op on the shim. */
+/** Sentry: endSession noop on the shim. */
 export function endSession(): void {
-  // See startSession.
+  warnOnce("endSession", "endSession() is a no-op; sessions are inferred server-side");
 }
 
 /** Sentry: lightweight transaction stub. Returns a span-like object. */
@@ -565,13 +688,41 @@ export class Span {
   }
 }
 
-/** Force-flush any in-flight requests. The shim sends synchronously, so this is a no-op shim. */
-export async function flush(_timeout?: number): Promise<boolean> {
-  return true;
+/**
+ * Sentry compat: await in-flight sends, bounded by `timeout` (default
+ * 2 s). O11 semantics: sends still unconfirmed when the timeout hits are
+ * snapshotted into getStats().unconfirmedAtFlush and reported through
+ * onError — the honest upper bound, because Node process exit may still
+ * complete some of them. Returns false when anything was unconfirmed.
+ */
+export async function flush(timeout: number = 2000): Promise<boolean> {
+  const sends = [...inFlightSends];
+  if (sends.length === 0) return Object.keys(stats.lost).length === 0;
+  const all = Promise.all(sends);
+  const bounded = await Promise.race([
+    all.then(() => "done" as const),
+    new Promise<"timeout">((r) => setTimeout(() => r("timeout"), timeout)),
+  ]);
+  if (bounded === "timeout") {
+    // Sends still in flight when the budget expired: the honest upper
+    // bound — some may complete after the caller stops waiting.
+    stats.unconfirmedAtFlush = [...inFlightSends].length;
+    if (stats.unconfirmedAtFlush > 0 && config && !config.debug) {
+      try {
+        config.onError?.(new Error(
+          `observe-sentry-shim: flush gave up with ${stats.unconfirmedAtFlush} send(s) unconfirmed`));
+      } catch {
+        /* hook must not break the SDK */
+      }
+    }
+    return false;
+  }
+  return Object.keys(stats.lost).length === 0;
 }
 
-/** Sentry compat: close the client. */
-export async function close(_timeout?: number): Promise<boolean> {
+/** Sentry compat: close the client (awaits in-flight like flush). */
+export async function close(timeout: number = 2000): Promise<boolean> {
+  await flush(timeout);
   config = null;
   rootScope = new Scope();
   scopeStack = [];
