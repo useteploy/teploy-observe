@@ -201,36 +201,49 @@ func TestParseGroupBy(t *testing.T) {
 	}
 }
 
-// rateReduce: counter resets and per-second slope.
+// rateReduce (O07 pin update): counter resets and per-second slope.
+// Reset convention is restart-at-zero (Prometheus rate()); bucket values
+// are time-weighted (increase/span). Full reference tables live in
+// o07_reference_test.go — these are the Phase-2 pins, updated to the
+// aggregateSeries seam.
 func TestRateReduce_BasicAndReset(t *testing.T) {
 	// Synthetic cumulative counter: 0 → 10 → 30 (rate=10/s, 20/s) then RESET
 	// to 5 → 15 (rate=10/s).
 	rows := []pointRow{
-		{TsNs: 0, Value: 0, Kind: "sum"},
-		{TsNs: 1_000_000_000, Value: 10, Kind: "sum"},  // +10 over 1s
-		{TsNs: 2_000_000_000, Value: 30, Kind: "sum"},  // +20 over 1s
-		{TsNs: 3_000_000_000, Value: 5, Kind: "sum"},   // RESET, drop slope
-		{TsNs: 4_000_000_000, Value: 15, Kind: "sum"},  // +10 over 1s
+		{TsNs: 0, Value: 0, Kind: "sum", Temporality: "cumulative"},
+		{TsNs: 1_000_000_000, Value: 10, Kind: "sum", Temporality: "cumulative"},
+		{TsNs: 2_000_000_000, Value: 30, Kind: "sum", Temporality: "cumulative"},
+		{TsNs: 3_000_000_000, Value: 5, Kind: "sum", Temporality: "cumulative"},
+		{TsNs: 4_000_000_000, Value: 15, Kind: "sum", Temporality: "cumulative"},
 	}
-	// Use 10s step so all valid pairs land in the same bucket → average.
-	pts := rateReduce(rows, 10_000)
+	// Use 10s step so all pairs land in the same bucket.
+	pts := aggregateSeries(rows, AggRate, 10_000)
 	if len(pts) != 1 {
 		t.Fatalf("expected 1 bucket, got %d", len(pts))
 	}
-	// Slopes 10, 20, (skipped), 10 → mean 13.333…
-	if math.Abs(pts[0].Value-(10+20+10)/3.0) > 1e-9 {
-		t.Errorf("rate = %v, want 13.333", pts[0].Value)
+	// Increases +10, +20, reset contributes curr=5 (restart-at-zero), +10
+	// = 45 total over the 4s covered span → 11.25/s. The bucket invoked
+	// the reset assumption → estimate, named method. (Pre-O07 this pinned
+	// the mean-of-slopes 13.33 with the reset interval dropped.)
+	if math.Abs(pts[0].Value-11.25) > 1e-9 {
+		t.Errorf("rate = %v, want 11.25", pts[0].Value)
+	}
+	if pts[0].Estimate == nil || !*pts[0].Estimate {
+		t.Errorf("reset bucket must be labeled estimate, got %+v", pts[0].Estimate)
+	}
+	if pts[0].Method != "rate/per-series+reset-assumed" {
+		t.Errorf("method = %q", pts[0].Method)
 	}
 }
 
 func TestRateReduce_PerSecondAcrossBuckets(t *testing.T) {
 	// One slope per 1s bucket so we exercise step boundaries too.
 	rows := []pointRow{
-		{TsNs: 0, Value: 0, Kind: "sum"},
-		{TsNs: 1_000_000_000, Value: 5, Kind: "sum"},
-		{TsNs: 2_000_000_000, Value: 15, Kind: "sum"},
+		{TsNs: 0, Value: 0, Kind: "sum", Temporality: "cumulative"},
+		{TsNs: 1_000_000_000, Value: 5, Kind: "sum", Temporality: "cumulative"},
+		{TsNs: 2_000_000_000, Value: 15, Kind: "sum", Temporality: "cumulative"},
 	}
-	pts := rateReduce(rows, 1_000) // 1s buckets
+	pts := aggregateSeries(rows, AggRate, 1_000) // 1s buckets
 	if len(pts) != 2 {
 		t.Fatalf("expected 2 buckets, got %d (%+v)", len(pts), pts)
 	}
@@ -240,10 +253,10 @@ func TestRateReduce_PerSecondAcrossBuckets(t *testing.T) {
 }
 
 func TestRateReduce_TooShortReturnsEmpty(t *testing.T) {
-	if got := rateReduce([]pointRow{{TsNs: 0, Value: 1}}, 60_000); len(got) != 0 {
+	if got := aggregateSeries([]pointRow{{TsNs: 0, Value: 1, Kind: "sum", Temporality: "cumulative"}}, AggRate, 60_000); len(got) != 0 {
 		t.Errorf("single point should yield no rate, got %v", got)
 	}
-	if got := rateReduce(nil, 60_000); len(got) != 0 {
+	if got := aggregateSeries(nil, AggRate, 60_000); len(got) != 0 {
 		t.Errorf("empty rows should yield no rate, got %v", got)
 	}
 }
@@ -298,8 +311,9 @@ func TestHistogramQuantile_Edges(t *testing.T) {
 }
 
 func TestQuantileReduce_AggregatesPerBucket(t *testing.T) {
-	// Two histogram observations in the same 60s bucket should sum their
-	// counts before solving the quantile.
+	// Two DELTA histogram observations in the same 60s bucket sum their
+	// counts before solving the quantile (O07 pin update: temporality is
+	// explicit — cumulative observations would be differenced instead).
 	histA := MarshalHistogram(HistogramDataPoint{
 		Count: "10", BucketCounts: []jsonInt{"5", "5", "0"}, ExplicitBounds: []float64{10, 50},
 	})
@@ -307,10 +321,10 @@ func TestQuantileReduce_AggregatesPerBucket(t *testing.T) {
 		Count: "10", BucketCounts: []jsonInt{"0", "0", "10"}, ExplicitBounds: []float64{10, 50},
 	})
 	rows := []pointRow{
-		{TsNs: 1_000_000_000, Histogram: histA, Kind: "histogram"},
-		{TsNs: 2_000_000_000, Histogram: histB, Kind: "histogram"},
+		{TsNs: 1_000_000_000, Histogram: histA, Kind: "histogram", Temporality: "delta"},
+		{TsNs: 2_000_000_000, Histogram: histB, Kind: "histogram", Temporality: "delta"},
 	}
-	pts := quantileReduce(rows, 0.99, 60_000)
+	pts := aggregateSeries(rows, AggP99, 60_000)
 	if len(pts) != 1 {
 		t.Fatalf("expected 1 bucket, got %d", len(pts))
 	}
@@ -324,10 +338,10 @@ func TestQuantileReduce_AggregatesPerBucket(t *testing.T) {
 // scalarReduce step boundary rounding.
 func TestScalarReduce_StepBoundaryRounding(t *testing.T) {
 	rows := []pointRow{
-		{TsNs: 1_000 * 1_000_000, Value: 1, Kind: "gauge"},   // bucket 0
-		{TsNs: 14_999 * 1_000_000, Value: 2, Kind: "gauge"},  // bucket 0
-		{TsNs: 15_000 * 1_000_000, Value: 3, Kind: "gauge"},  // bucket 15s
-		{TsNs: 29_999 * 1_000_000, Value: 4, Kind: "gauge"},  // bucket 15s
+		{TsNs: 1_000 * 1_000_000, Value: 1, Kind: "gauge"},  // bucket 0
+		{TsNs: 14_999 * 1_000_000, Value: 2, Kind: "gauge"}, // bucket 0
+		{TsNs: 15_000 * 1_000_000, Value: 3, Kind: "gauge"}, // bucket 15s
+		{TsNs: 29_999 * 1_000_000, Value: 4, Kind: "gauge"}, // bucket 15s
 	}
 	pts := scalarReduce(rows, AggSum, 15_000)
 	if len(pts) != 2 {

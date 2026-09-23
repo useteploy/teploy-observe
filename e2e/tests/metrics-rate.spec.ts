@@ -70,7 +70,9 @@ test.describe("Metrics rate() + group_by (W3.A Phase 2)", () => {
     expect(q.ok(), `rate query ${q.status()}: ${await q.text()}`).toBeTruthy();
     const body = await q.json();
     expect(Array.isArray(body)).toBeTruthy();
-    // Slopes 10, 20, (skipped reset), 10 → mean 13.33…
+    // O07 reference math: increases +10, +20, reset contributes curr=5
+    // (restart-at-zero), +10 = 45 over the 4s covered span → 11.25/s,
+    // labeled estimate:true (reset assumption invoked).
     expect(body.length).toBeGreaterThanOrEqual(1);
     const total = body.reduce((acc: number, p: any) => acc + p.value, 0);
     expect(total).toBeGreaterThan(0);

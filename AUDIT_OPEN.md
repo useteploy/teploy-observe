@@ -1916,3 +1916,141 @@ O05 remainder (later slices):
 - **Mobile stacks** (symbolication-class work) and any grouping v2
   proposals — none warranted yet; v1 is pinned and versioned for
   exactly that day.
+
+## 2026-09-23 O07 slice 1 — reference-calculated metric math (rate, resets, temporality, histogram quantiles, estimate labeling)
+
+Programme O07 ("incorrect math P0"): "Validate counter resets,
+cumulative/delta temporality, per-series rate-before-aggregation,
+histogram boundaries/quantiles and units against reference calculations.
+Differentiate sampled estimates from exact counts." First bounded slice,
+oracle-first. PromQL is REJECTED per the delegated decision
+2026-09-23 (#19) — no PromQL surface added; the metrics.go comment that
+promised "PromQL-style rate() handling" is rewritten and README gains the
+compatibility statement + the pinned semantics section.
+
+**RECON (what the ingest stores / the query computes, verified):**
+`metric_points` stores gauge (temporality always cumulative), sum
+(is_monotonic + delta|cumulative temporality as sent), histogram (JSON
+per-bucket counts + explicit bounds + sum/count, temporality as sent;
+our SDKs send DELTA per TO-040, OTLP defaults are CUMULATIVE). The math
+lived in internal/metrics/query.go: scalarReduce (last/avg/sum/min/max,
+histogram→mean fallback), rateReduce (cumulative consecutive-pair
+slopes, reset = drop interval), deltaRateReduce (bucket-sum /
+bucket-seconds), quantileReduce (per-bucket SUMMED raw counts) →
+histogramQuantile (linear interpolation within the crossing bucket).
+
+**Defects the reference tables proved wrong (all fixed):**
+
+1. **Rate-after-aggregation (the programme's explicit ordering rule).**
+   Without group_by — or when series collide on group-key values — all
+   rows merged into ONE differencing pass: values from different
+   counters subtracted into garbage, silently (tie order at equal
+   timestamps decided which garbage). Fix: rate (and cumulative-histogram
+   differencing) now split by FULL label fingerprint first; the
+   collapsed view returns the SUM of per-series rates (sum(rate(...))
+   posture). Delta increments remain additive (collapse is correct for
+   them — differencing is not involved).
+2. **Reset convention.** A reset dropped the whole interval (and the
+   code comment falsely claimed Prometheus parity). Reference (Prometheus
+   rate()): the reset pair contributes curr under the restart-at-zero
+   assumption — a new epoch, never negative rate. Such buckets are
+   labeled estimate:true naming the assumption.
+3. **Bucket weighting.** Mean-of-pair-slopes gave equal weight to every
+   pair regardless of duration: a 1s-dense pair outweighed a 99s gap
+   pair ~5x (reference table R3: 5.5/s where the time-weighted answer is
+   1.1/s; R4: 50.0/s vs 1.71/s). Fix: per-bucket increase / covered
+   time-span (pairs attributed to the bucket of their end timestamp).
+4. **Cumulative-histogram snapshots summed raw.** Two cumulative
+   snapshots [1,1,1]+[2,3,4] were added to [3,4,5] and answered p50=40;
+   the window's real distribution is the difference [1,2,3] → p50=50.
+   Fix: consecutive snapshots are differenced PER SERIES (decreasing
+   total or bounds change = reset epoch → last snapshot alone; first
+   in-range snapshot is baseline-only — its pre-range observations are
+   not re-attributed, same posture as counter rate).
+5. **No estimate differentiation.** Every Point now carries additive
+   `estimate` (pointer-bool, explicit false serializes) + `method`:
+   quantiles always estimate:true ("histogram-quantile/
+   linear-interpolation"[+reset-assumed][+mixed-bounds]); rate buckets
+   estimate only when the restart-at-zero assumption was invoked; scalar
+   aggregations are labeled exact. Additive on /api/v1/metrics/query,
+   /api/v1/metrics/series, and metric_series dashboard panels (UI
+   decoders are structural; surfacing the labels in charts rides O13's
+   chart-states work).
+
+**Pinned as already correct (reference tables assert):** the
+interpolation convention — linear inside the crossing bucket between
+explicit boundaries, first bucket from 0, rank-on-boundary returns the
+bound exactly, +Inf saturates to the last bound; delta rate =
+bucket-sum/bucket-seconds (delta points carry no start timestamp in
+this store, so the bucket length is the only well-defined denominator);
+scalar display reducers. Naive behaviors recorded as wrong in the suite
+header: mean-of-slopes, drop-the-reset-interval, cross-series
+differencing, snapshot-summing, midpoint/center interpolation.
+
+**Evidence:** `internal/metrics/o07_reference_test.go` — 19 storage-free
+tests, hand-computed literal tables (R1-R7 cumulative rate incl. reset,
+gap, mixed steps, duplicate timestamps, ordering rule under collapse AND
+group-key collision; D1-D3 delta direct/additive/across buckets; Q1-Q5
+quantile interpolation incl. boundary-exactness, delta summing,
+cumulative differencing, reset epoch, per-series-then-merge; S1 exact
+labeling; dispatch wiring). TDD red first: compile red at the new seam,
+then behavioral red with the old reducer bodies wired into the new
+dispatch — 18 failures with the predicted value mismatches (13.33 vs
+11.25, 5.505 vs 1.1, 50.0086 vs 1.7119, 7.5 vs 15, 40 vs 50) plus
+missing labels; green after the implementation. Executable binding:
+`internal/metrics/o07_nucleus_test.go` (Nucleus-gated, self-migrating) —
+the same literals end to end through Ingest → storage → QuerySeries
+(collapsed + group_by fan-out, estimate/method on the wire shape).
+Deliberate pin updates in metrics_test.go: TestRateReduce_BasicAndReset
+(13.33 → 11.25 restart-at-zero + time-weighting), TestRateReduce_* moved
+to the aggregateSeries seam, TestQuantileReduce_AggregatesPerBucket now
+explicit delta temporality. e2e/tests/metrics-rate.spec.ts comment
+updated to the reference math (bounds unchanged).
+
+**Mutation discipline (all reverted after the kill):** (A) rate merged
+back to after-aggregation differencing → R5/R5b + the gated rate e2e
+fail; the FIRST R5 table (equal timestamps, zero starts) did NOT kill
+it — the duplicate-timestamp skip rule absorbed the cross-series pairs
+— so the table was strengthened to offset timestamps (real instances do
+not share nanoseconds), after which the kill is deterministic (10/s
+spurious-reset vs 15/s). Recorded: a mutation that survives means the
+TABLE is weak, not the implementation right. (B) drop-the-reset-interval
+→ R2/R6/dispatch + gated e2e. (C) mean-of-slopes → 8 tests incl. R3/R4.
+(D) raw-snapshot summing → Q3/Q4/Q5 + gated histogram e2e. (E) midpoint
+interpolation (no boundaries) → Q1 + every quantile table.
+
+Gates: `go vet ./...` clean; `internal/metrics` + `internal/query`
+green under `-race` against the shared fixture
+(OBSERVE_NUCLEUS_URL=postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable);
+full serial suite (`-p 1 -count=1 ./...`) green. gofmt note:
+internal/metrics/types.go is unformatted at HEAD — pre-existing,
+untouched by this slice.
+
+O07 remainder (next slices):
+- **Units**: the OTLP `unit` field is decoded but NOT persisted (no
+  column) — query responses cannot label units; needs a migration +
+  response fields before "units against reference calculations" is
+  closable.
+- **Service overview / trace waterfall UI depth** (programme's
+  reliable-service-overview line): service map, root-vs-child error
+  attribution, log/trace correlation — not started.
+- **Logs indexing budgets**: indexed search, filter consistency,
+  live/historical behavior, bounded cardinality — current logs search
+  posture needs the budget audit.
+- **Collector recipes**: OpenTelemetry Collector configurations for
+  infrastructure/database sources + redaction guidance.
+- **Mixed-bounds histogram merge**: observations/series with different
+  explicit-bound sets in one bucket are SKIPPED and flagged
+  (+mixed-bounds in method) — an alignment merge (union bounds with
+  cumulative redistribution) is the correct fix.
+- **Scalar reducers on cumulative inputs**: last/avg/sum/min/max over
+  cumulative sums/histograms are display aggregations of observed
+  values, not temporality-aware derived quantities (documented in
+  scalarReduce) — acceptable as display, but a "window value" reducer
+  would need the same per-series differencing rate got.
+- **UI estimate surfacing**: the fields are on the wire; chart rendering
+  of estimate/exact states rides O13's chart-state work.
+- **Per-series lookback**: cumulative queries use the in-range scan, so
+  each series' first in-range sample is baseline-only (its pre-range
+  increase is not attributed); a one-row-per-series lookback before
+  `from` would recover it.

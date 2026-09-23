@@ -1,9 +1,13 @@
 // Package metrics implements OTLP metrics ingest + query for Observe.
 //
-// Phase 1 (W3.A) ships the schema, the HTTP ingest endpoint, a small list /
-// query API for the dashboard, and the SDK helpers that emit OTLP JSON.
-// Phase 2 will layer rich UI (heatmap, dashboard widget) and PromQL-style
-// rate() handling on top.
+// Phase 1 (W3.A) shipped the schema, the HTTP ingest endpoint, a small
+// list / query API for the dashboard, and the SDK helpers that emit OTLP
+// JSON. Phase 2 layered the per-series fan-out with rate and histogram
+// quantile reducers; O07 pinned their reference semantics (counter-reset
+// restart-at-zero, per-series rate before aggregation, cumulative-histogram
+// differencing, boundary interpolation, estimate labeling) in
+// o07_reference_test.go. Observe deliberately does not implement PromQL —
+// see README "Metrics query semantics".
 package metrics
 
 import (

@@ -399,6 +399,36 @@ so the direct role claim is available here and takes precedence over groups.
 | PUT | `/api/v1/sites/{id}/ratelimit` | admin | Set per-site events/sec cap. |
 | POST | `/api/v1/platform/*` | admin | Users, alert rules, webhooks. |
 
+## Metrics query semantics
+
+Observe does not implement PromQL. Metrics are queried via Observe's
+structured query API (`GET /api/v1/metrics/query` and
+`GET /api/v1/metrics/series`: metric name, exact-match label filters,
+group-by, step, and the reducers `last|avg|sum|min|max|rate|p50|p95|p99`).
+PromQL support is an explicit future decision, not an implied
+compatibility; if it ever lands it will wrap the upstream Prometheus
+engine, never a hand-rolled subset.
+
+Reducer semantics are pinned by hand-computed reference tables
+(`internal/metrics/o07_reference_test.go`):
+
+- `rate` is computed **per series before any cross-series aggregation**;
+  a collapsed query returns the sum of per-series rates. On cumulative
+  counters a value decrease is a counter reset — a new epoch counted
+  under the restart-at-zero assumption (the Prometheus `rate()`
+  convention), never a negative rate. Bucket values are time-weighted
+  (increase / covered span), so mixed scrape intervals and gaps weigh
+  samples by duration. Delta-temporality counters are direct: the bucket
+  sum divided by the bucket length.
+- `p50/p95/p99` interpolate inside the crossing histogram bucket between
+  its explicit boundaries (the official cumulative-histogram
+  convention); cumulative histograms are differenced per series first.
+- Every point carries `estimate` + `method`: histogram quantiles are
+  always `estimate: true` (interpolated from bucketed data); rate
+  buckets that invoked the restart-at-zero assumption are labeled
+  estimates naming the assumption; everything else is labeled
+  `estimate: false, method: "exact"`.
+
 ## Architecture
 
 ```

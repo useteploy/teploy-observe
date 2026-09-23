@@ -22,10 +22,22 @@ type MetricInfo struct {
 // Point is a single value emitted by Query for a (timestamp, labels)
 // combination. Histograms collapse to their sum / count via the Aggregation
 // field on Query — Phase 2 will expose the underlying buckets.
+//
+// Estimate/Method differentiate sampled estimates from exact values
+// (programme O07): Estimate is true whenever the value depends on an
+// interpolation or a modeling assumption (histogram quantiles; counter
+// buckets where a reset invoked the restart-at-zero assumption), false for
+// exact aggregations of observed values; Method names how the value was
+// produced ("exact", "rate/per-series[+reset-assumed]",
+// "rate/delta-window-sum", "histogram-quantile/linear-interpolation[...]").
 type Point struct {
 	TsMs   int64             `json:"ts_ms"`
 	Value  float64           `json:"value"`
 	Labels map[string]string `json:"labels,omitempty"`
+	// Estimate is a pointer so the explicit false (exact) is serialized,
+	// not dropped by omitempty.
+	Estimate *bool  `json:"estimate,omitempty"`
+	Method   string `json:"method,omitempty"`
 }
 
 // Series is one labelled time-series — Phase 2 fans the per-bucket
@@ -303,25 +315,364 @@ func groupKey(have map[string]string, groupBy []string) (string, map[string]stri
 	return b.String(), out
 }
 
-// aggregateSeries runs the chosen reducer over a single label-fingerprinted
-// row slice. Histograms / counters get specialised paths — everything else
-// falls back to the bucketed reduce() helper from Phase 1.
+// aggregateSeries runs the chosen reducer over one output group's rows.
+// Rate and histogram quantiles FIRST split the rows into per-series
+// slices by full label fingerprint (the O07 ordering rule: rate and
+// cumulative-histogram differencing are per-series operations, computed
+// BEFORE any cross-series aggregation); scalar reducers keep the
+// Phase-1 value-level collapse.
 func aggregateSeries(rows []pointRow, agg Aggregation, stepMs int64) []Point {
 	switch agg {
 	case AggRate:
-		return rateReduce(rows, stepMs)
+		return rateGroupReduce(splitSeries(rows), stepMs)
 	case AggP50:
-		return quantileReduce(rows, 0.50, stepMs)
+		return quantileGroupReduce(splitSeries(rows), 0.50, stepMs)
 	case AggP95:
-		return quantileReduce(rows, 0.95, stepMs)
+		return quantileGroupReduce(splitSeries(rows), 0.95, stepMs)
 	case AggP99:
-		return quantileReduce(rows, 0.99, stepMs)
+		return quantileGroupReduce(splitSeries(rows), 0.99, stepMs)
 	}
 	return scalarReduce(rows, agg, stepMs)
 }
 
+// sortedLabelKeys returns m's keys sorted (groupKey requires sorted keys
+// for a stable fingerprint).
+func sortedLabelKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// splitSeries partitions one output group's rows into per-series row
+// slices keyed by the FULL label fingerprint (every attribute key). Rows
+// arrive time-ordered with arbitrary tie order across series, which is
+// fine: each slice keeps its own rows in scan order.
+func splitSeries(rows []pointRow) [][]pointRow {
+	groups := map[string][]pointRow{}
+	keys := []string{}
+	for _, r := range rows {
+		m := UnmarshalAttrs(r.Attributes)
+		k, _ := groupKey(m, sortedLabelKeys(m))
+		if _, ok := groups[k]; !ok {
+			keys = append(keys, k)
+		}
+		groups[k] = append(groups[k], r)
+	}
+	sort.Strings(keys)
+	out := make([][]pointRow, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, groups[k])
+	}
+	return out
+}
+
+// rateGroupReduce computes the rate reducer for one output group built
+// from one or more full-fingerprint series. The O07 reference semantics:
+//
+//   - Cumulative series: consecutive-pair differencing PER SERIES. A
+//     reset (value decrease) is a new epoch counted under the
+//     restart-at-zero assumption — the reset pair contributes curr, never
+//     a negative slope (the Prometheus rate() convention). Each step
+//     bucket's per-series value is increase / covered-time-span (the pair
+//     is attributed to the bucket containing its END timestamp), which
+//     time-weights pairs so mixed step sizes and gaps weigh by duration.
+//     Duplicate / out-of-order timestamps advance the baseline and
+//     contribute nothing.
+//   - Delta series: the point value IS the interval increase; bucket
+//     value = sum(deltas) / bucket-seconds (delta points carry no start
+//     timestamp in this store, so the bucket length is the only
+//     well-defined denominator).
+//   - Cross-series collapse = SUM of per-series bucket rates
+//     (sum(rate(...)) posture).
+//
+// A bucket whose computation invoked the restart-at-zero assumption is
+// labeled estimate:true with the assumption named in Method; pure
+// differencing is exact.
+func rateGroupReduce(series [][]pointRow, stepMs int64) []Point {
+	bucketSecs := float64(stepMs) / 1000.0
+	type acc struct {
+		perSec     float64
+		resets     int
+		deltaCnt   int
+		cumCnt     int
+		anyContrib bool
+	}
+	buckets := map[int64]*acc{}
+	keys := []int64{}
+	add := func(key int64) *acc {
+		b, ok := buckets[key]
+		if !ok {
+			b = &acc{}
+			buckets[key] = b
+			keys = append(keys, key)
+		}
+		return b
+	}
+
+	for _, rows := range series {
+		if len(rows) == 0 {
+			continue
+		}
+		if rows[0].Temporality == "delta" {
+			for _, r := range rows {
+				key := bucketKeyMs(r.TsNs, stepMs)
+				b := add(key)
+				b.perSec += r.Value / bucketSecs
+				b.deltaCnt++
+				b.anyContrib = true
+			}
+			continue
+		}
+		// Cumulative: per-series differencing with reset epochs.
+		type spanAcc struct {
+			firstPrevNs int64
+			lastCurrNs  int64
+			inc         float64
+			reset       bool
+		}
+		spans := map[int64]*spanAcc{}
+		prev := rows[0]
+		for i := 1; i < len(rows); i++ {
+			curr := rows[i]
+			if curr.TsNs <= prev.TsNs {
+				// duplicate / out-of-order — baseline advances, no contribution
+				prev = curr
+				continue
+			}
+			inc := curr.Value - prev.Value
+			reset := false
+			if inc < 0 {
+				// Counter reset: new epoch, restart-at-zero assumption.
+				inc, reset = curr.Value, true
+			}
+			key := bucketKeyMs(curr.TsNs, stepMs)
+			s, ok := spans[key]
+			if !ok {
+				s = &spanAcc{firstPrevNs: prev.TsNs}
+				spans[key] = s
+			}
+			s.inc += inc
+			s.reset = s.reset || reset
+			s.lastCurrNs = curr.TsNs
+			prev = curr
+		}
+		for k, s := range spans {
+			b := add(k)
+			b.perSec += s.inc / (float64(s.lastCurrNs-s.firstPrevNs) / 1_000_000_000)
+			b.cumCnt++
+			if s.reset {
+				b.resets++
+			}
+			b.anyContrib = true
+		}
+	}
+
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	out := make([]Point, 0, len(keys))
+	for _, k := range keys {
+		b := buckets[k]
+		if !b.anyContrib {
+			continue
+		}
+		method := refMethodRatePerSeries
+		switch {
+		case b.resets > 0:
+			method = refMethodRatePerSeriesReset
+		case b.deltaCnt > 0 && b.cumCnt == 0:
+			method = refMethodRateDelta
+		}
+		est := b.resets > 0
+		out = append(out, Point{TsMs: k, Value: b.perSec, Estimate: &est, Method: method})
+	}
+	return out
+}
+
+// bucketKeyMs maps a nanosecond timestamp to its stepMs bucket start (ms).
+func bucketKeyMs(tsNs int64, stepMs int64) int64 {
+	tsMs := tsNs / 1_000_000
+	return (tsMs / stepMs) * stepMs
+}
+
+// quantileGroupReduce computes a histogram quantile for one output group.
+// Window histograms are built PER SERIES first (temporality-aware), then
+// merged across series by adding bucket counts, then the quantile is
+// interpolated once over the merged distribution (quantile-of-sums, not
+// sum-of-quantiles — the Prometheus histogram_quantile over sum()
+// posture):
+//
+//   - Delta histograms: each observation's counts land in its bucket as-is.
+//   - Cumulative histograms: consecutive snapshots are differenced per
+//     series (the first in-range snapshot serves only as the baseline —
+//     its pre-range observations are not re-attributed). A decreasing
+//     total or a bounds change is a reset: a new epoch whose window is
+//     the last snapshot alone.
+//   - Observations or series with mismatched bounds in the same bucket
+//     are skipped and flagged in Method (+mixed-bounds) — index-wise
+//     addition across different boundary sets would silently corrupt the
+//     distribution.
+//
+// Every quantile point is an estimate (bucketed interpolation).
+func quantileGroupReduce(series [][]pointRow, q float64, stepMs int64) []Point {
+	type histAcc struct {
+		bounds      []float64
+		counts      []float64
+		reset       bool
+		mixedBounds bool
+	}
+	buckets := map[int64]*histAcc{}
+	keys := []int64{}
+	ensure := func(key int64, bounds []float64) *histAcc {
+		b, ok := buckets[key]
+		if !ok {
+			b = &histAcc{bounds: append([]float64(nil), bounds...)}
+			buckets[key] = b
+			keys = append(keys, key)
+		}
+		return b
+	}
+	contribute := func(key int64, bounds []float64, counts []float64, reset bool) {
+		b := ensure(key, bounds)
+		if !boundsEqual(b.bounds, bounds) {
+			b.mixedBounds = true
+			return
+		}
+		if len(b.counts) < len(counts) {
+			grown := make([]float64, len(counts))
+			copy(grown, b.counts)
+			b.counts = grown
+		}
+		for i, c := range counts {
+			if i < len(b.counts) {
+				b.counts[i] += c
+			}
+		}
+		b.reset = b.reset || reset
+	}
+
+	for _, rows := range series {
+		delta := len(rows) > 0 && rows[0].Temporality == "delta"
+		if delta {
+			for _, r := range rows {
+				if r.Kind != "histogram" {
+					continue
+				}
+				h := UnmarshalHistogram(r.Histogram)
+				if len(h.Counts) == 0 {
+					continue
+				}
+				contribute(bucketKeyMs(r.TsNs, stepMs), h.Bounds, intsToFloats(h.Counts), false)
+			}
+			continue
+		}
+		// Cumulative: difference consecutive snapshots per series.
+		var prev HistogramShape
+		havePrev := false
+		for _, r := range rows {
+			if r.Kind != "histogram" {
+				continue
+			}
+			h := UnmarshalHistogram(r.Histogram)
+			if len(h.Counts) == 0 {
+				continue
+			}
+			key := bucketKeyMs(r.TsNs, stepMs)
+			if !havePrev {
+				// Baseline only: its own window is unobservable without
+				// the preceding snapshot.
+				prev, havePrev = h, true
+				continue
+			}
+			if !boundsEqual(prev.Bounds, h.Bounds) || histTotal(h) < histTotal(prev) {
+				// Reset (or exporter bounds change): new epoch — the last
+				// snapshot alone is the window.
+				contribute(key, h.Bounds, intsToFloats(h.Counts), true)
+				prev, havePrev = h, true
+				continue
+			}
+			inc := make([]float64, len(h.Counts))
+			for i, c := range h.Counts {
+				d := float64(c) - float64(prev.Counts[i])
+				if d < 0 {
+					d = 0
+				}
+				inc[i] = d
+			}
+			contribute(key, h.Bounds, inc, false)
+			prev, havePrev = h, true
+		}
+	}
+
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	out := make([]Point, 0, len(keys))
+	for _, k := range keys {
+		b := buckets[k]
+		total := 0.0
+		for _, c := range b.counts {
+			total += c
+		}
+		method := refMethodHistQuantile
+		if b.reset {
+			method = refMethodHistQuantileReset
+		}
+		if b.mixedBounds {
+			method += "+mixed-bounds"
+		}
+		est := true
+		out = append(out, Point{
+			TsMs: k, Value: histogramQuantile(b.bounds, b.counts, total, q),
+			Estimate: &est, Method: method,
+		})
+	}
+	return out
+}
+
+// Method-string constants for the O07 estimate labeling (mirrored as
+// literals in the reference test suite).
+const (
+	refMethodExact              = "exact"
+	refMethodRatePerSeries      = "rate/per-series"
+	refMethodRatePerSeriesReset = "rate/per-series+reset-assumed"
+	refMethodRateDelta          = "rate/delta-window-sum"
+	refMethodHistQuantile       = "histogram-quantile/linear-interpolation"
+	refMethodHistQuantileReset  = "histogram-quantile/linear-interpolation+reset-assumed"
+)
+
+func boundsEqual(a, b []float64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func intsToFloats(xs []int64) []float64 {
+	out := make([]float64, len(xs))
+	for i, x := range xs {
+		out[i] = float64(x)
+	}
+	return out
+}
+
+func histTotal(h HistogramShape) float64 {
+	t := 0.0
+	for _, c := range h.Counts {
+		t += float64(c)
+	}
+	return t
+}
+
 // scalarReduce buckets rows by stepMs and applies the gauge / sum reducer.
-// For histograms it falls back to mean (sum/count) per Phase-1 behaviour.
+// For histograms it falls back to mean (sum/count) per Phase-1 behaviour —
+// a display reduction of observed values, not a temporality-aware derived
+// quantity (use p50/p95/p99 for that). Every scalar point aggregates exact
+// observed values, so it is labeled exact.
 func scalarReduce(rows []pointRow, agg Aggregation, stepMs int64) []Point {
 	type bucket struct {
 		points []float64
@@ -354,174 +705,21 @@ func scalarReduce(rows []pointRow, agg Aggregation, stepMs int64) []Point {
 	out := make([]Point, 0, len(keys))
 	for _, k := range keys {
 		b := buckets[k]
-		out = append(out, Point{TsMs: k, Value: reduce(b.points, b.last, agg)})
-	}
-	return out
-}
-
-// rateReduce converts a cumulative counter into a per-second slope.
-//
-// Algorithm: walk the time-sorted slice, take consecutive (prev, curr)
-// pairs, and emit slope = (curr.value - prev.value) / Δt. Counter resets
-// (curr.value < prev.value) skip the negative slope and use curr as the
-// new baseline — Prometheus does the same.
-//
-// Output is bucketed by stepMs: when multiple consecutive pairs land in
-// the same bucket we average their slopes. Buckets with no pair-data
-// are simply omitted (rather than emitting a zero-rate sentinel that
-// would distort downstream alerting).
-func rateReduce(rows []pointRow, stepMs int64) []Point {
-	if len(rows) == 0 {
-		return []Point{}
-	}
-	// Delta-temporality counters carry the per-interval increment in each point,
-	// so consecutive-differencing them is wrong — bucket and sum instead, then
-	// divide by the bucket length. Reset detection doesn't apply (deltas are
-	// non-negative). Temporality is uniform within a series, so read row 0.
-	if rows[0].Temporality == "delta" {
-		return deltaRateReduce(rows, stepMs)
-	}
-	if len(rows) < 2 {
-		return []Point{}
-	}
-	type acc struct {
-		sum  float64
-		n    int
-		tsMs int64
-	}
-	buckets := map[int64]*acc{}
-	keys := []int64{}
-
-	prev := rows[0]
-	for i := 1; i < len(rows); i++ {
-		curr := rows[i]
-		dtNs := curr.TsNs - prev.TsNs
-		if dtNs <= 0 {
-			// duplicate / out-of-order — treat curr as the new baseline.
-			prev = curr
-			continue
-		}
-		if curr.Value < prev.Value {
-			// counter reset — drop the negative slope, advance baseline.
-			prev = curr
-			continue
-		}
-		slope := (curr.Value - prev.Value) / float64(dtNs) * 1_000_000_000
-		tsMs := curr.TsNs / 1_000_000
-		key := (tsMs / stepMs) * stepMs
-		b, ok := buckets[key]
-		if !ok {
-			b = &acc{tsMs: key}
-			buckets[key] = b
-			keys = append(keys, key)
-		}
-		b.sum += slope
-		b.n++
-		prev = curr
-	}
-
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	out := make([]Point, 0, len(keys))
-	for _, k := range keys {
-		b := buckets[k]
-		if b.n == 0 {
-			continue
-		}
-		out = append(out, Point{TsMs: b.tsMs, Value: b.sum / float64(b.n)})
-	}
-	return out
-}
-
-// deltaRateReduce computes per-bucket rate for delta-temporality counters:
-// rate = sum(deltas in bucket) / bucket_seconds.
-func deltaRateReduce(rows []pointRow, stepMs int64) []Point {
-	bucketSecs := float64(stepMs) / 1000.0
-	if bucketSecs <= 0 {
-		bucketSecs = 60
-	}
-	sums := map[int64]float64{}
-	keys := []int64{}
-	for _, r := range rows {
-		tsMs := r.TsNs / 1_000_000
-		key := (tsMs / stepMs) * stepMs
-		if _, ok := sums[key]; !ok {
-			keys = append(keys, key)
-		}
-		sums[key] += r.Value
-	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	out := make([]Point, 0, len(keys))
-	for _, k := range keys {
-		out = append(out, Point{TsMs: k, Value: sums[k] / bucketSecs})
-	}
-	return out
-}
-
-// quantileReduce computes a quantile estimate per stepMs bucket from
-// histogram rows. When a bucket holds multiple histogram observations the
-// counts are summed across observations before the quantile is solved —
-// matches Prometheus's histogram_quantile() over a sum() group.
-//
-// Linear interpolation across the bucket the cumulative count first
-// crosses (q × total). Returns 0 for empty buckets.
-func quantileReduce(rows []pointRow, q float64, stepMs int64) []Point {
-	type acc struct {
-		bounds []float64
-		counts []float64
-		total  float64
-		tsMs   int64
-	}
-	buckets := map[int64]*acc{}
-	keys := []int64{}
-
-	for _, r := range rows {
-		if r.Kind != "histogram" {
-			continue
-		}
-		h := UnmarshalHistogram(r.Histogram)
-		if len(h.Counts) == 0 {
-			continue
-		}
-		tsMs := r.TsNs / 1_000_000
-		key := (tsMs / stepMs) * stepMs
-		b, ok := buckets[key]
-		if !ok {
-			b = &acc{tsMs: key, bounds: append([]float64(nil), h.Bounds...)}
-			buckets[key] = b
-			keys = append(keys, key)
-		}
-		// Initialise / resize the per-bucket counter slice on the first
-		// row; later rows in the same bucket must share the same bounds
-		// or we ignore the mismatch (histograms with shifting bounds in
-		// the same window are user error).
-		if len(b.counts) < len(h.Counts) {
-			grown := make([]float64, len(h.Counts))
-			copy(grown, b.counts)
-			b.counts = grown
-		}
-		for i, c := range h.Counts {
-			if i < len(b.counts) {
-				b.counts[i] += float64(c)
-				b.total += float64(c)
-			}
-		}
-	}
-
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	out := make([]Point, 0, len(keys))
-	for _, k := range keys {
-		b := buckets[k]
-		out = append(out, Point{TsMs: b.tsMs, Value: histogramQuantile(b.bounds, b.counts, b.total, q)})
+		exact := false
+		out = append(out, Point{TsMs: k, Value: reduce(b.points, b.last, agg), Estimate: &exact, Method: refMethodExact})
 	}
 	return out
 }
 
 // histogramQuantile returns the estimate of the q-quantile of a bucketed
-// histogram. bounds are the upper inclusive boundaries; counts is the
-// per-bucket population (last bucket is the +Inf overflow). Implements
-// linear interpolation inside the crossing bucket — within the lower
-// boundary and the bucket's upper bound. The very first bucket is
-// interpolated from 0 since we have no lower bound for it.
+// histogram, using the official cumulative-histogram convention: bounds
+// are the upper inclusive boundaries; counts is the per-bucket population
+// (last bucket is the +Inf overflow). Linear interpolation runs inside the
+// crossing bucket between its boundaries (previous explicit bound as the
+// lower, 0 for the first bucket); a rank landing exactly on a cumulative
+// boundary returns that boundary; the +Inf bucket saturates to the last
+// explicit bound. Pinned against hand-computed reference values in
+// o07_reference_test.go.
 func histogramQuantile(bounds []float64, counts []float64, total float64, q float64) float64 {
 	if total <= 0 || len(counts) == 0 {
 		return 0
