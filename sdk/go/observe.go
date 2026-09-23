@@ -23,8 +23,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -59,6 +62,17 @@ type Options struct {
 	// LogFlushInterval is the cadence for flushing buffered logs.
 	// Default: 2 seconds.
 	LogFlushInterval time.Duration
+
+	// MaxSendAttempts bounds the retry budget per queued chunk before it
+	// is dropped and counted as a loss (O11). The first retry after a
+	// retryable failure (429/5xx/network) fires immediately; further
+	// consecutive failures back off exponentially from RetryBackoff.
+	// Default: 6.
+	MaxSendAttempts int
+
+	// RetryBackoff is the base delay for the exponential send backoff;
+	// doubles per consecutive failure up to 30 s. Default: 1 s.
+	RetryBackoff time.Duration
 
 	// OnError, when set, receives transport/admission failures (dropped
 	// oversized entries, failed background flushes). Never called from
@@ -106,6 +120,126 @@ type Client struct {
 	// default path and the second close panicked).
 	closeOnce sync.Once
 	closeErr  error
+	// O11 retry/loss state. Per-signal attempt counters and backoff gates
+	// (a retryable failure holds that signal's flush until notBefore);
+	// statsMtx guards the Stats snapshot counters.
+	statsMtx         sync.Mutex
+	stats            Stats
+	logAttempts      int
+	spanAttempts     int
+	metricAttempts   int
+	logNotBefore     time.Time
+	spanNotBefore    time.Time
+	metricNotBefore  time.Time
+	maxSendAttempts  int
+	retryBackoffBase time.Duration
+}
+
+// Stats is the O11 diagnostics snapshot: delivery and loss counters for
+// everything this Client admitted. Dropped is keyed by reason:
+//
+//	logs_queue_full, logs_entry_oversize, logs_retry_exhausted,
+//	logs_non_retryable, logs_server_rejected, logs_shutdown_unflushed,
+//	spans_queue_full, spans_non_retryable, spans_retry_exhausted,
+//	spans_shutdown_unflushed, metrics_non_retryable,
+//	metrics_retry_exhausted, metric_series_budget, gauge_point_budget.
+//
+// Accounting: Delivered + sum(Dropped) + Queued + shutdown_unflushed
+// (a point-in-time count taken when Shutdown gave up with work queued)
+// covers every admitted record. Queues are in-memory; kill -9 loses the
+// queue and these counters with the process.
+type Stats struct {
+	DeliveredLogs         int64          `json:"delivered_logs"`
+	DeliveredSpans        int64          `json:"delivered_spans"`
+	DeliveredMetricPoints int64          `json:"delivered_metric_points"`
+	Retries               int64          `json:"retries"`
+	Dropped               map[string]int64 `json:"dropped"`
+	QueuedLogs            int            `json:"queued_logs"`
+	QueuedSpans           int            `json:"queued_spans"`
+}
+
+// Stats returns a deep copy of the current diagnostics counters (O11).
+func (c *Client) Stats() Stats {
+	c.statsMtx.Lock()
+	defer c.statsMtx.Unlock()
+	out := c.stats
+	out.Dropped = make(map[string]int64, len(c.stats.Dropped))
+	for k, v := range c.stats.Dropped {
+		out.Dropped[k] = v
+	}
+	c.mu.Lock()
+	out.QueuedLogs = c.logsN
+	out.QueuedSpans = c.spansN
+	c.mu.Unlock()
+	return out
+}
+
+// countLoss increments a visible loss counter AND reports through OnError
+// (O11: a loss is never silent even when no hook is configured, because
+// Stats() always exposes it).
+func (c *Client) countLoss(reason string, n int64, detail string) {
+	c.statsMtx.Lock()
+	if c.stats.Dropped == nil {
+		c.stats.Dropped = map[string]int64{}
+	}
+	c.stats.Dropped[reason] += n
+	c.statsMtx.Unlock()
+	msg := fmt.Sprintf("observe: lost %d record(s) (%s)", n, reason)
+	if detail != "" {
+		msg += " — " + detail
+	}
+	c.reportError(errors.New(msg))
+}
+
+// countDelivered books successful deliveries per signal.
+func (c *Client) countDelivered(fn func(*Stats)) {
+	c.statsMtx.Lock()
+	fn(&c.stats)
+	c.statsMtx.Unlock()
+}
+
+// httpError carries the HTTP status of a refused send so callers can
+// classify retryable (429/5xx) from permanent (other 4xx) failures.
+type httpError struct {
+	status int
+	url    string
+}
+
+func (e *httpError) Error() string {
+	return fmt.Sprintf("observe: %s returned %d", e.url, e.status)
+}
+
+// retryableSendErr classifies a send failure: HTTP 429 and 5xx (and any
+// non-HTTP transport error — network, timeout, deadline) are retryable;
+// every other 4xx is permanent for that payload (O11).
+func retryableSendErr(err error) bool {
+	var he *httpError
+	if errors.As(err, &he) {
+		return he.status == 429 || he.status >= 500
+	}
+	return true
+}
+
+// backoffFor returns the exponential send backoff after attempt n
+// (1-based), capped at 30 s.
+func (c *Client) backoffFor(attempt int) time.Duration {
+	d := c.retryBackoffBase
+	for i := 1; i < attempt && d < 30*time.Second; i++ {
+		d *= 2
+	}
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	return d
+}
+
+// backoffGated reports whether a signal's flush is currently held off by
+// its retry backoff. The FIRST retry is always allowed immediately (a
+// transient blip recovers with no delay, and signal-path Flush callers
+// get a real attempt); the gate engages from the second consecutive
+// failure onward (O11).
+func backoffGated(attempts int, notBefore time.Time) bool {
+	return attempts >= 2 && time.Now().Before(notBefore)
 }
 
 // Field represents a single key/value attribute on a log entry.
@@ -202,38 +336,98 @@ func New(opts Options) (*Client, error) {
 	if opts.LogFlushInterval <= 0 {
 		opts.LogFlushInterval = 2 * time.Second
 	}
+	if opts.MaxSendAttempts <= 0 {
+		opts.MaxSendAttempts = 6
+	}
+	if opts.RetryBackoff <= 0 {
+		opts.RetryBackoff = time.Second
+	}
 	c := &Client{
-		opts:      opts,
-		http:      &owned,
-		closed:    make(chan struct{}),
-		done:      make(chan struct{}),
-		flushWake: make(chan struct{}, 1),
+		opts:             opts,
+		http:             &owned,
+		closed:           make(chan struct{}),
+		done:             make(chan struct{}),
+		flushWake:        make(chan struct{}, 1),
+		stats:            Stats{Dropped: map[string]int64{}},
+		maxSendAttempts:  opts.MaxSendAttempts,
+		retryBackoffBase: opts.RetryBackoff,
 	}
 	go c.loop()
 	return c, nil
 }
 
-// Close flushes any buffered telemetry and stops the background goroutine.
-// Safe to call multiple times and from multiple goroutines: every caller
-// waits for the same single finalization and receives the same result
-// (audit F35 — the old select/default + close raced a double close panic,
-// and untracked flush goroutines could outlive Close's return).
+// Close flushes any buffered telemetry and stops the background goroutine,
+// with a 10 s shutdown budget. Safe to call multiple times and from
+// multiple goroutines: every caller waits for the same single finalization
+// and receives the same result (audit F35 — the old select/default +
+// close raced a double close panic, and untracked flush goroutines could
+// outlive Close's return).
+//
+// For a caller-controlled shutdown deadline use Shutdown (O11). On an
+// expired deadline Shutdown reports still-queued records as counted
+// losses (stats key "<signal>_shutdown_unflushed") instead of swallowing
+// them.
 func (c *Client) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return c.Shutdown(ctx)
+}
+
+// Shutdown is Close with the caller's deadline (O11 shutdown semantics:
+// flush(timeout)). The context bounds the final drain; when it expires
+// with work still queued, the leftovers are counted per signal as
+// "<signal>_shutdown_unflushed" losses and reported through OnError, and
+// the context error is returned joined with any flush failure.
+func (c *Client) Shutdown(ctx context.Context) error {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
 		c.closing = true // new admissions rejected from here on
 		c.mu.Unlock()
 		close(c.closed)
 		<-c.done // includes ALL owned flush work, not only the ticker
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
 		c.closeErr = errors.Join(
 			c.flushSpans(ctx),
 			c.FlushMetrics(ctx),
 			c.flushLogs(ctx),
 		)
+		if ctx.Err() != nil {
+			c.closeErr = errors.Join(c.closeErr, ctx.Err())
+		}
+		// O11: honest shutdown accounting. Anything still queued when the
+		// deadline hit is lost with the process — count and report it
+		// rather than returning a clean-looking result.
+		c.mu.Lock()
+		leftLogs, leftSpans := c.logsN, c.spansN
+		c.mu.Unlock()
+		if leftLogs > 0 {
+			c.countLoss("logs_shutdown_unflushed", int64(leftLogs), "shutdown deadline reached with logs queued")
+		}
+		if leftSpans > 0 {
+			c.countLoss("spans_shutdown_unflushed", int64(leftSpans), "shutdown deadline reached with spans queued")
+		}
+		if s := c.lossSummary(); s != "" {
+			c.reportError(errors.New(s))
+		}
 	})
 	return c.closeErr
+}
+
+// lossSummary renders a one-line shutdown summary of all counted losses,
+// or "" when nothing was lost.
+func (c *Client) lossSummary() string {
+	c.statsMtx.Lock()
+	defer c.statsMtx.Unlock()
+	if len(c.stats.Dropped) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(c.stats.Dropped))
+	total := int64(0)
+	for k, v := range c.stats.Dropped {
+		keys = append(keys, fmt.Sprintf("%s=%d", k, v))
+		total += v
+	}
+	sort.Strings(keys)
+	return fmt.Sprintf("observe: shutdown loss summary — %d record(s) lost: %s", total, strings.Join(keys, ", "))
 }
 
 func (c *Client) loop() {
@@ -334,7 +528,7 @@ func (c *Client) admitLog(entry LogEntry) {
 		if err == nil {
 			err = fmt.Errorf("log entry exceeds %d bytes", maxLogEntryBytes)
 		}
-		c.reportError(fmt.Errorf("observe: dropping unserializable log entry: %w", err))
+		c.countLoss("logs_entry_oversize", 1, err.Error())
 		return
 	}
 	c.mu.Lock()
@@ -345,10 +539,11 @@ func (c *Client) admitLog(entry LogEntry) {
 		return
 	}
 	// AUD-038: bounded admission — a stalled endpoint must not turn the
-	// queue into unbounded memory.
+	// queue into unbounded memory. Overflow drops the NEW entry (O11
+	// documented drop-newest policy) and says so.
 	if c.pendingLogBytes+int64(len(raw)) > maxPendingLogBytes {
 		c.mu.Unlock()
-		c.reportError(errors.New("observe: log queue byte limit reached — entry dropped"))
+		c.countLoss("logs_queue_full", 1, "queue byte limit reached — newest entry dropped")
 		return
 	}
 	c.logs = append(c.logs, raw)
@@ -402,6 +597,17 @@ const maxLogRequestBytes = 1 << 20
 // chunks on the floor, so a 503 lost the batch while a later Close saw an
 // empty queue and reported success. Serialized by logFlushMu so public
 // Flush and the worker cannot double-send.
+//
+// O11 retry/loss contract: retryable failures (429/5xx/network, see
+// retryableSendErr) consume the bounded attempt budget with exponential
+// backoff (logNotBefore gate); when the budget is exhausted the chunk is
+// dropped and counted (logs_retry_exhausted). A NON-retryable 4xx can
+// never succeed as-shaped and is dropped immediately with a counted loss
+// (logs_non_retryable) — the previous behavior blocked the queue head
+// forever while admission drops silently piled up behind it. A 200 whose
+// body reports per-entry rejections counts them as logs_server_rejected
+// (the server already skipped those rows; resending would only duplicate
+// the accepted neighbors).
 func (c *Client) flushLogs(ctx context.Context) error {
 	c.logFlushMu.Lock()
 	defer c.logFlushMu.Unlock()
@@ -412,6 +618,9 @@ func (c *Client) flushLogs(ctx context.Context) error {
 	for remaining > 0 {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if backoffGated(c.logAttempts, c.logNotBefore) {
+			return nil // mid-backoff; the ticker or a later Flush retries
 		}
 		c.mu.Lock()
 		n, size := 0, len(`{"logs":[]}`)
@@ -426,14 +635,59 @@ func (c *Client) flushLogs(ctx context.Context) error {
 			size += extra
 			n++
 		}
+		if n == 0 {
+			// Belt-and-braces: admission caps entries at 64 KiB, so a
+			// chunk that cannot fit even alone is unreachable — if it
+			// ever happens, drop the head entry loudly instead of
+			// erroring forever on a queue that can never drain.
+			oversize := c.logs[0]
+			c.logs = c.logs[1:]
+			c.logsN--
+			c.pendingLogBytes -= int64(len(oversize))
+			if c.pendingLogBytes < 0 {
+				c.pendingLogBytes = 0
+			}
+			remaining--
+			c.mu.Unlock()
+			c.countLoss("logs_entry_oversize", 1, "entry exceeds the request byte budget")
+			continue
+		}
 		batch := c.logs[:n]
 		c.mu.Unlock()
-		if n == 0 {
-			return errors.New("observe: single log entry exceeds the request byte budget")
+		var ack struct {
+			Accepted int `json:"accepted"`
+			Rejected int `json:"rejected"`
 		}
-		if err := c.post(ctx, "/api/v1/logs/batch", logBatchWire{Logs: batch}); err != nil {
+		err := c.postJSON(ctx, "/api/v1/logs/batch", logBatchWire{Logs: batch}, &ack)
+		if err != nil {
+			if !retryableSendErr(err) {
+				c.dropLogPrefix(n, "logs_non_retryable", err.Error())
+				remaining -= n
+				c.logAttempts = 0
+				continue
+			}
+			c.logAttempts++
+			if c.logAttempts >= c.maxSendAttempts {
+				c.dropLogPrefix(n, "logs_retry_exhausted",
+					fmt.Sprintf("%d attempts, last error: %v", c.maxSendAttempts, err))
+				remaining -= n
+				c.logAttempts = 0
+				continue
+			}
+			c.countDelivered(func(s *Stats) { s.Retries++ })
+			c.logNotBefore = time.Now().Add(c.backoffFor(c.logAttempts))
 			return err // the same queue prefix stays queued for the next attempt
 		}
+		if ack.Accepted == 0 && ack.Rejected == 0 {
+			// Older servers answered 200 without a body — count the chunk.
+			ack.Accepted = n
+		}
+		if ack.Rejected > 0 {
+			c.countLoss("logs_server_rejected", int64(ack.Rejected),
+				fmt.Sprintf("server accepted %d of %d", ack.Accepted, n))
+		}
+		delivered := int64(ack.Accepted)
+		c.countDelivered(func(s *Stats) { s.DeliveredLogs += delivered })
 		c.mu.Lock()
 		var sent int64
 		for _, raw := range c.logs[:n] {
@@ -447,8 +701,27 @@ func (c *Client) flushLogs(ctx context.Context) error {
 		c.logsN -= n
 		remaining -= n
 		c.mu.Unlock()
+		c.logAttempts = 0
 	}
 	return nil
+}
+
+// dropLogPrefix removes n entries from the queue head, releasing their
+// byte reservation, and books them as a counted loss (O11).
+func (c *Client) dropLogPrefix(n int, reason, detail string) {
+	c.mu.Lock()
+	var dropped int64
+	for _, raw := range c.logs[:n] {
+		dropped += int64(len(raw))
+	}
+	c.pendingLogBytes -= dropped
+	if c.pendingLogBytes < 0 {
+		c.pendingLogBytes = 0
+	}
+	c.logs = c.logs[n:]
+	c.logsN -= n
+	c.mu.Unlock()
+	c.countLoss(reason, int64(n), detail)
 }
 
 // logBatchWire is the /logs/batch request shape. Logs holds pre-encoded
@@ -464,6 +737,51 @@ func (c *Client) post(ctx context.Context, path string, body any) error {
 	}
 	url += path
 	return c.postRaw(ctx, url, body, nil)
+}
+
+// postJSON sends body and decodes the 2xx response into out (O11: the
+// logs batch endpoint reports per-entry outcomes in its response body —
+// {accepted, rejected} — which the caller books as loss counters).
+func (c *Client) postJSON(ctx context.Context, path string, body any, out any) error {
+	url := c.opts.Endpoint
+	for len(url) > 0 && url[len(url)-1] == '/' {
+		url = url[:len(url)-1]
+	}
+	url += path
+	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("observe: marshal: %w", err)
+	}
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, url, bytes.NewReader(raw))
+	if err != nil {
+		return fmt.Errorf("observe: new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.opts.APIKey != "" {
+		req.Header.Set("X-API-Key", c.opts.APIKey)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("observe: post: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return &httpError{status: resp.StatusCode, url: url}
+	}
+	if out != nil {
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		if err != nil {
+			return fmt.Errorf("observe: read ack: %w", err)
+		}
+		if len(data) > 0 {
+			if err := json.Unmarshal(data, out); err != nil {
+				return fmt.Errorf("observe: decode ack: %w", err)
+			}
+		}
+	}
+	return nil
 }
 
 // postRaw is the underlying HTTP call, used by post() and the OTLP trace path.
@@ -496,9 +814,11 @@ func (c *Client) postRaw(ctx context.Context, url string, body any, extraHeaders
 	defer resp.Body.Close()
 	// TO-037: only 2xx is success. Redirects are already refused by the
 	// owned client (they would forward the credential); a 3xx reaching
-	// this check means the caller's transport forced one through.
+	// this check means the caller's transport forced one through. The
+	// typed status lets flush callers classify retryable vs permanent
+	// (O11, see retryableSendErr).
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("observe: %s returned %d", url, resp.StatusCode)
+		return &httpError{status: resp.StatusCode, url: url}
 	}
 	return nil
 }
