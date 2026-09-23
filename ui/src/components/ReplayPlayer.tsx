@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "preact/hooks"
 import type { ReplayEvent } from "../api/replays.js";
 import { heatmapsApi, type Click } from "../api/heatmaps.js";
 import { streamTicketQuery } from "../api/helpers.js";
+import { detectRrwebEvents, isRrwebSession } from "../lib/replayRrweb.js";
 import HeatmapOverlay from "./HeatmapOverlay.js";
 
 type SerializedNode =
@@ -153,6 +154,125 @@ function nodeToHTML(node: SerializedNode, baseURL: string, ticket: string): stri
   return renderSnapshotBody(node, baseURL, ticket);
 }
 
+// ── O06: rrweb delta playback ──
+//
+// Sessions recorded by observe-replay-delta.js carry wrapped rrweb events
+// ({type:'rrweb', data:<rrweb event>}). When they are present the rrweb
+// Replayer CLASS (never the rrweb-player svelte UI) drives playback from
+// two static bundles under /rrweb/ — same-origin assets shipped in
+// ui/public, no new ui package dependencies. The trusted envelope is
+// unchanged: rrweb itself creates its iframe with sandbox="allow-same-
+// origin" (no allow-scripts — it drives the document from parent
+// context), the player injects the REPLAY_CSP meta into every rebuilt
+// document, and recorded images load exclusively through the
+// /api/v1/replay-assets proxy. Events are re-sanitized at play time with
+// the same pure fold the recorder ran — the second, independent layer of
+// the F38 posture. Sessions without rrweb shape keep the keyframe player
+// below exactly as it was.
+
+interface RrwebReplayer {
+  play(timeOffset?: number): void;
+  pause(timeOffset?: number): void;
+  setSpeed(speed: number): void;
+  getCurrentTime(): number;
+  getMetaData(): { startTime: number; endTime: number; totalTime: number };
+  on(event: string, cb: (payload?: unknown) => void): void;
+  destroy(): void;
+  iframe?: HTMLIFrameElement | null;
+}
+
+interface RrwebRuntime {
+  Replayer: new (events: unknown[], config: Record<string, unknown>) => RrwebReplayer;
+  createEventSanitizer: (opts?: { baseURL?: string }) => { sanitize: (event: unknown) => unknown | null };
+}
+
+// Module-level SCRIPT cache (content, not credentials — TO-024's rule is
+// about per-player tickets, which stay local below).
+let rrwebRuntimePromise: Promise<RrwebRuntime> | null = null;
+
+function loadRrwebScript(src: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[data-observe-replay-runtime="${src}"]`)) {
+      resolve();
+      return;
+    }
+    const el = document.createElement("script");
+    el.src = src;
+    el.async = true;
+    el.setAttribute("data-observe-replay-runtime", src);
+    el.onload = () => resolve();
+    el.onerror = () => reject(new Error(`failed to load ${src}`));
+    document.head.appendChild(el);
+  });
+}
+
+function loadRrwebRuntime(): Promise<RrwebRuntime> {
+  if (!rrwebRuntimePromise) {
+    rrwebRuntimePromise = Promise.all([
+      loadRrwebScript("/rrweb/replayer.js"),
+      loadRrwebScript("/rrweb/sanitize.js"),
+    ]).then(() => {
+      const rt = (window as unknown as { __observeReplayRuntime?: RrwebRuntime }).__observeReplayRuntime;
+      if (!rt || typeof rt.Replayer !== "function" || typeof rt.createEventSanitizer !== "function") {
+        throw new Error("rrweb runtime did not expose Replayer/sanitizer");
+      }
+      return rt;
+    });
+    rrwebRuntimePromise.catch(() => { rrwebRuntimePromise = null; });
+  }
+  return rrwebRuntimePromise;
+}
+
+// Inject the trusted CSP into a rebuilt replay document. rrweb rebuilds
+// the document from (sanitized) recorded events on every full snapshot;
+// the meta is re-inserted at byte-zero of the head each time. The
+// sanitizer replaces the recorded head subtree with a placeholder (head
+// is a private tag — meta CSRF tokens, style URLs), so the rebuilt
+// document has NO head element and one is created to host the CSP.
+function injectReplayCSP(replayer: RrwebReplayer | null): void {
+  try {
+    const doc = replayer?.iframe?.contentDocument;
+    if (!doc || !doc.documentElement) return;
+    if (doc.querySelector('meta[http-equiv="Content-Security-Policy"]')) return;
+    let head = doc.head;
+    if (!head) {
+      head = doc.createElement("head");
+      doc.documentElement.insertBefore(head, doc.documentElement.firstChild);
+    }
+    const meta = doc.createElement("meta");
+    meta.setAttribute("http-equiv", "Content-Security-Policy");
+    meta.setAttribute("content", REPLAY_CSP);
+    head.insertBefore(meta, head.firstChild);
+  } catch { /* destroyed or cross-origin */ }
+}
+
+// Rewrite recorded img srcs to the same-origin asset proxy at play time
+// (full-snapshot trees and mutation addedNodes; attribute-mutation srcs
+// never survive sanitization, which drops src without tag context).
+function rewriteRrwebAssetSrcs(events: any[], baseURL: string, ticket: string): void {
+  const rewriteNode = (node: unknown) => {
+    if (!node || typeof node !== "object") return;
+    const n = node as Record<string, any>;
+    if (n.type === 2) {
+      const tag = String(n.tagName || "").toLowerCase();
+      const attrs = n.attributes;
+      if (tag === "img" && attrs && typeof attrs.src === "string") {
+        const value = rewriteAssetSrc(attrs.src, baseURL, ticket);
+        if (value) attrs.src = value;
+        else delete attrs.src;
+      }
+    }
+    if (Array.isArray(n.childNodes)) n.childNodes.forEach(rewriteNode);
+  };
+  for (const ev of events) {
+    if (!ev || typeof ev !== "object") continue;
+    if (ev.type === 2 && ev.data?.node) rewriteNode(ev.data.node);
+    if (ev.type === 3 && ev.data?.source === 0 && Array.isArray(ev.data.adds)) {
+      for (const add of ev.data.adds) rewriteNode(add?.node);
+    }
+  }
+}
+
 function escapeText(s: string): string {
   return s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c] as string));
 }
@@ -196,8 +316,10 @@ export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerPro
   const cursorRef = useRef<HTMLDivElement>(null);
   const rippleRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef<number | null>(null);
+  const rrwebRootRef = useRef<HTMLDivElement>(null);
+  const replayerRef = useRef<RrwebReplayer | null>(null);
 
-  // AUD-032 (round 2): parsed input is DERIVED from the events prop
+  // AUD-032: parsed input is DERIVED from the events prop
   // (useMemo) — the one-time useState kept the previous dataset when the
   // prop changed without a remount.
   const parsed = useMemo(() => parseEvents(events), [events]);
@@ -208,10 +330,22 @@ export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerPro
   const [heatmapOn, setHeatmapOn] = useState(false);
   const [heatmapClicks, setHeatmapClicks] = useState<Click[]>([]);
   const [stageSize, setStageSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+  const [rrwebReady, setRrwebReady] = useState(false);
+  const [rrwebDuration, setRrwebDuration] = useState(0);
+  const [rrwebError, setRrwebError] = useState<string | null>(null);
+
+  // rrweb delta sessions: wrapped rrweb events with a full snapshot and
+  // at least two events (the Replayer's floor). Everything else keeps the
+  // keyframe player. Detection lives in lib/replayRrweb.ts (pinned there
+  // by unit tests).
+  const rrwebRaw = useMemo(() => detectRrwebEvents(parsed), [parsed]);
+  const rrwebMode = isRrwebSession(rrwebRaw);
 
   const startTs = parsed.length ? parsed[0].timestamp : 0;
   const endTs = parsed.length ? parsed[parsed.length - 1].timestamp : 0;
-  const duration = Math.max(1, endTs - startTs);
+  const duration = rrwebMode
+    ? Math.max(1, rrwebDuration || endTs - startTs)
+    : Math.max(1, endTs - startTs);
 
   // AUD-032: the active snapshot is the most recent keyframe at or before
   // the playhead — a session with multiple snapshots used to render the
@@ -255,8 +389,10 @@ export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerPro
 
   // TO-024: the snapshot load is its own effect (the keyboard listener no
   // longer re-registers on every keyframe change); cleanup invalidates any
-  // in-flight load for this player.
+  // in-flight load for this player. Keyframe mode only — the rrweb
+  // replayer owns its document in delta mode.
   useEffect(() => {
+    if (rrwebMode) return;
     void loadSnapshot().catch(() => {
       // A failed ticket mint leaves srcs unproxied (the documented F38
       // behavior); an unexpected failure must not become an unhandled
@@ -264,7 +400,7 @@ export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerPro
       setSnapshotReady(false);
     });
     return () => { ++loadGeneration.current; };
-  }, [loadSnapshot]);
+  }, [loadSnapshot, rrwebMode]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -275,9 +411,88 @@ export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerPro
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  // Apply events up to the current elapsed offset.
+  // ── rrweb replayer lifecycle ──
   useEffect(() => {
-    if (!snapshotReady) return;
+    if (!rrwebMode) return;
+    let destroyed = false;
+    let replayer: RrwebReplayer | null = null;
+    setRrwebReady(false);
+    setRrwebError(null);
+    setElapsed(0);
+    (async () => {
+      try {
+        const rt = await loadRrwebRuntime();
+        if (destroyed) return;
+        // Second sanitizer layer: the same pure fold the recorder ran,
+        // re-applied to stored (untrusted) events before replay.
+        const sanitizer = rt.createEventSanitizer(url ? { baseURL: url } : undefined);
+        const ticket = await streamTicketQuery("/api/v1/replay-assets");
+        if (destroyed) return;
+        const sanitized: unknown[] = [];
+        for (const e of rrwebRaw) {
+          const s = sanitizer.sanitize({ type: e.type, data: e.data, timestamp: e.timestamp });
+          if (s) sanitized.push(s);
+        }
+        rewriteRrwebAssetSrcs(sanitized as any[], url || "", ticket);
+        const root = rrwebRootRef.current;
+        if (!root) return;
+        replayer = new rt.Replayer(sanitized, {
+          root,
+          triggerFocus: false,
+          mouseTail: false,
+          showWarning: false,
+          insertStyleRules: [],
+        });
+        replayerRef.current = replayer;
+        replayer.on("fullsnapshot-rebuilded", () => injectReplayCSP(replayer));
+        replayer.on("finish", () => setPlaying(false));
+        const meta = replayer.getMetaData();
+        setRrwebDuration(Math.max(1, meta.totalTime));
+        setRrwebReady(true);
+      } catch (err) {
+        if (!destroyed) setRrwebError(err instanceof Error ? err.message : String(err));
+      }
+    })();
+    return () => {
+      destroyed = true;
+      try { replayer?.destroy(); } catch { /* already gone */ }
+      if (replayerRef.current === replayer) replayerRef.current = null;
+      setRrwebReady(false);
+    };
+  }, [rrwebMode, rrwebRaw, url]);
+
+  // Play/pause and speed map straight onto the replayer.
+  useEffect(() => {
+    if (!rrwebMode || !rrwebReady) return;
+    const r = replayerRef.current;
+    if (!r) return;
+    if (playing) r.play();
+    else r.pause();
+  }, [playing, rrwebReady, rrwebMode]);
+
+  useEffect(() => {
+    if (!rrwebMode || !rrwebReady) return;
+    replayerRef.current?.setSpeed(speed);
+  }, [speed, rrwebReady, rrwebMode]);
+
+  // Elapsed tracking reads the replayer's clock while playing (the
+  // replayer owns seek/ff state; re-render cost matches the keyframe
+  // player's per-frame updates).
+  useEffect(() => {
+    if (!rrwebMode || !rrwebReady || !playing) return;
+    let raf = 0;
+    const tick = () => {
+      const r = replayerRef.current;
+      if (r) setElapsed(r.getCurrentTime());
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [rrwebMode, rrwebReady, playing]);
+
+  // Apply events up to the current elapsed offset. Keyframe mode only.
+  useEffect(() => {
+    if (rrwebMode || !snapshotReady) return;
     const deadline = startTs + elapsed;
     let lastMouse: { x: number; y: number } | null = null;
     let lastClick: { x: number; y: number; ts: number } | null = null;
@@ -324,10 +539,12 @@ export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerPro
     if (iframeRef.current?.contentWindow) {
       try { iframeRef.current.contentWindow.scrollTo(lastScroll?.x ?? 0, lastScroll?.y ?? 0); } catch { /* sandboxed */ }
     }
-  }, [parsed, elapsed, snapshotReady, startTs]);
+  }, [parsed, elapsed, snapshotReady, startTs, rrwebMode]);
 
-  // Playback tick.
+  // Playback tick. Keyframe mode only — the rrweb replayer runs its own
+  // timer in delta mode.
   useEffect(() => {
+    if (rrwebMode) return;
     if (!playing) {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       return;
@@ -348,7 +565,7 @@ export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerPro
     };
     rafRef.current = requestAnimationFrame(tick);
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
-  }, [playing, speed, duration]);
+  }, [playing, speed, duration, rrwebMode]);
 
   // Track replay-stage size so the heatmap canvas matches the iframe area
   // exactly. Re-measures on layout changes (resize, modal open, etc.).
@@ -426,8 +643,11 @@ export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerPro
 
   const onScrub = (e: Event) => {
     const target = e.target as HTMLInputElement;
-    setElapsed(Number(target.value));
+    const value = Number(target.value);
+    setElapsed(value);
     setPlaying(false);
+    // rrweb: pause(offset) seeks and holds the frame at the offset.
+    if (rrwebMode && replayerRef.current) replayerRef.current.pause(value);
   };
 
   const fmt = (ms: number) => {
@@ -441,24 +661,38 @@ export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerPro
     <div class="replay-overlay" role="dialog" aria-label="Session replay">
       <div class="replay-modal">
         <div class="replay-header">
-          <div class="replay-title">Session replay</div>
+          <div class="replay-title">
+            Session replay
+            <span class={`replay-mode-badge${rrwebMode ? " replay-mode-badge--delta" : ""}`}>
+              {rrwebMode ? "delta recording (rrweb)" : "keyframes (structural snapshots)"}
+            </span>
+          </div>
           <button class="replay-close" onClick={onClose} aria-label="Close player">×</button>
         </div>
 
         <div class="replay-stage" ref={stageRef}>
-          <iframe
-            ref={iframeRef}
-            class="replay-iframe"
-            sandbox="allow-same-origin"
-            title="Session replay"
-          />
-          <div ref={cursorRef} class="replay-cursor" aria-hidden="true" />
-          <div ref={rippleRef} class="replay-ripple" aria-hidden="true" />
+          {rrwebMode ? (
+            <div ref={rrwebRootRef} class="replay-rrweb-root" title="Session replay" />
+          ) : (
+            <>
+              <iframe
+                ref={iframeRef}
+                class="replay-iframe"
+                sandbox="allow-same-origin"
+                title="Session replay"
+              />
+              <div ref={cursorRef} class="replay-cursor" aria-hidden="true" />
+              <div ref={rippleRef} class="replay-ripple" aria-hidden="true" />
+            </>
+          )}
           {heatmapOn && (
             <HeatmapOverlay clicks={heatmapClicks} width={stageSize.w} height={stageSize.h} />
           )}
           {!parsed.length && (
             <div class="replay-empty">No replay events recorded.</div>
+          )}
+          {rrwebMode && rrwebError && (
+            <div class="replay-empty">Replayer failed to load: {rrwebError}</div>
           )}
         </div>
 

@@ -135,12 +135,27 @@ the exact image and version.
 - Pipelines (JSON parse, regex extract, rename, mask, sample).
 
 ### Session replay
-- Limited mode: bounded structural DOM snapshots (5,000 nodes, depth 32)
-  plus mouse / click / scroll interactions, re-snapshotted periodically.
-  DOM changes between snapshots are counted, not captured — playback shows
-  keyframe structure with interaction overlay. Full delta recording is the
-  adopted rrweb integration (O06, in progress).
-- Playback with timeline scrubbing and error correlation.
+- Two recorders, one ingest and player. The structural recorder
+  (`observe-replay.js`) ships bounded full-DOM snapshots (5,000 nodes,
+  depth 32) plus mouse / click / scroll interactions, re-snapshotted
+  periodically — mutations are counted, not captured. The delta recorder
+  (`observe-replay-delta.js`, rrweb 2.1.6 bundled and wrapped in
+  Observe's sanitizer) records full snapshots plus incremental DOM
+  mutations (characterData included), so playback shows DOM changes
+  between keyframes. Both ride the same v2 batch transport; sessions are
+  indistinguishable server-side.
+- Privacy boundary (both recorders, audited allowlist policy): attribute
+  allowlist on every node, form controls / scripts / head subtrees /
+  `contenteditable` / `data-observe-block` regions replaced by opaque
+  placeholders, input text never recorded, image srcs sanitized to
+  origin+path and re-loaded through the replay asset proxy. The player
+  re-sanitizes at play time (second independent layer) inside a
+  `sandbox="allow-same-origin"` iframe with a strict CSP — replayed
+  script tags stay inert.
+- Playback with timeline scrubbing, click heatmaps, and error
+  correlation. Sessions recorded by either tracker replay through the
+  appropriate player automatically (delta sessions via the rrweb
+  Replayer class; keyframe sessions via the structural renderer).
 
 ### Monitoring
 - Uptime HTTP monitors with response-time tracking.
@@ -214,8 +229,13 @@ the exact image and version.
 <script defer src="https://your-observe.com/t/observe-errors.js"
   data-site-id="YOUR_SITE_ID"></script>
 
-<!-- Session replay -->
+<!-- Session replay (structural keyframes) -->
 <script defer src="https://your-observe.com/t/observe-replay.js"
+  data-site-id="YOUR_SITE_ID"></script>
+
+<!-- Session replay (delta recording via rrweb — DOM mutations captured;
+     same attributes, 30 s keyframes via data-checkout-interval) -->
+<script defer src="https://your-observe.com/t/observe-replay-delta.js"
   data-site-id="YOUR_SITE_ID"></script>
 
 <!-- Feedback widget -->

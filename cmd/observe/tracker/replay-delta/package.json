@@ -7,7 +7,8 @@
     "build": "esbuild src/recorder.mjs --bundle --minify --format=iife --outfile=../observe-replay-delta.js",
     "build:player": "esbuild src/player-replayer.mjs --bundle --minify --format=iife --loader:.css=text --outfile=../../../../ui/public/rrweb/replayer.js && esbuild src/player-sanitize.mjs --bundle --minify --format=iife --outfile=../../../../ui/public/rrweb/sanitize.js",
     "test": "node --test test/",
-    "smoke": "node test/smoke.mjs"
+    "smoke": "node test/smoke.mjs",
+    "smoke:player": "node test/player-smoke.mjs"
   },
   "dependencies": {
     "rrweb": "2.1.6"
