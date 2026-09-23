@@ -15,6 +15,7 @@ import "github.com/useteploy/teploy-observe/internal/query"
 var experimentCols = []string{
 	"name", "flag_key", "goal_metric", "goal_value", "status", "min_sample",
 	"variants", "started_at", "ended_at", "created_at", "version",
+	"conversion_window_hours",
 }
 
 // experimentsLatest renders the collapsed derived table, aliased `experiments`

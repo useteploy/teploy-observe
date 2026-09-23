@@ -53,6 +53,12 @@ func expTestDB(t *testing.T) (*nucleus.Client, func()) {
 		cancel()
 		t.Fatalf("ensure variants column: %v", err)
 	}
+	// 048 (O09): the declared conversion window.
+	if _, err := db.SQL().Exec(ctx, `ALTER TABLE experiments ADD COLUMN IF NOT EXISTS conversion_window_hours BIGINT NOT NULL DEFAULT 72`); err != nil {
+		db.Close()
+		cancel()
+		t.Fatalf("ensure conversion_window_hours column: %v", err)
+	}
 	return db, func() { db.Close(); cancel() }
 }
 

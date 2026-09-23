@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math"
 	"strconv"
 	"time"
 
@@ -35,6 +34,9 @@ type Experiment struct {
 	StartedAt    time.Time `json:"started_at"`
 	EndedAt      time.Time `json:"ended_at"`
 	CreatedAt    time.Time `json:"created_at"`
+	// ConversionWindowHours bounds how long after an exposure a conversion
+	// still attributes (O09 input semantics; 048, default 72).
+	ConversionWindowHours int `json:"conversion_window_hours"`
 }
 
 type ExperimentResults struct {
@@ -42,6 +44,13 @@ type ExperimentResults struct {
 	Variants    []VariantResult `json:"variants"`
 	Significant bool            `json:"significant"`
 	Winner      string          `json:"winner"`
+	// Analysis is the O09 honest reporting layer: the horizon gate, SRM
+	// diagnostic, omnibus test, Holm-corrected pairwise comparisons, and the
+	// winner-rule trace. Significant/Winner above remain as the compact
+	// summary: Significant = horizon met AND no SRM AND omnibus p < 0.05;
+	// Winner additionally requires the winning arm's pairwise comparison to
+	// survive Holm.
+	Analysis AnalysisResult `json:"analysis"`
 }
 
 type VariantResult struct {
@@ -52,6 +61,10 @@ type VariantResult struct {
 	// ProbBeatControl is the Bayesian probability that this variant has a higher
 	// true conversion rate than the control variant. Zero for the control itself.
 	ProbBeatControl float64 `json:"prob_beat_control"`
+	// WilsonLow/WilsonHigh are the 95% Wilson score interval bounds on the
+	// arm's conversion rate (O09: estimates always carry uncertainty).
+	WilsonLow  float64 `json:"wilson_low"`
+	WilsonHigh float64 `json:"wilson_high"`
 }
 
 func (s *ExperimentService) Create(ctx context.Context, siteID, name, flagKey, goalMetric, goalValue, variants string, minSample int) (*Experiment, error) {
@@ -81,7 +94,8 @@ func (s *ExperimentService) List(ctx context.Context, siteID string) ([]Experime
 	return nucleus.Query[Experiment](ctx, s.db.SQL(),
 		`SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample,
 			COALESCE(variants, '') AS variants,
-			started_at, ended_at, created_at, version
+			started_at, ended_at, created_at, version,
+			COALESCE(CAST(conversion_window_hours AS TEXT), '72') AS conversion_window_hours
 		 FROM `+experimentsLatest("site_id = $1")+` ORDER BY created_at DESC`, siteID)
 }
 
@@ -151,15 +165,39 @@ func (s *ExperimentService) RecordConversion(ctx context.Context, experimentID, 
 	return err
 }
 
-// Results computes experiment results with statistical significance.
+// Results computes experiment results with the O09 decided analysis
+// (2026-09-23): input semantics restrict exposures to the running interval
+// and conversions to the declared conversion window after an exposure,
+// deduped by user; reporting carries Wilson/Newcombe uncertainty, the
+// per-arm horizon gate, SRM detection, the omnibus test with Fisher
+// fallback, and Holm-corrected pairwise winner claims.
+//
+// Late-arrival policy: a conversion recorded after the experiment stopped
+// still counts when it falls inside the conversion window of an
+// in-interval exposure (the window is anchored at exposure time).
 func (s *ExperimentService) Results(ctx context.Context, experimentID, siteID string) (*ExperimentResults, error) {
 	exps, err := nucleus.Query[Experiment](ctx, s.db.SQL(),
 		`SELECT experiment_id, tenant_id, site_id, name, flag_key, goal_metric, goal_value, status, min_sample,
 			COALESCE(variants, '') AS variants,
-			started_at, ended_at, created_at, version
+			started_at, ended_at, created_at, version,
+			COALESCE(CAST(conversion_window_hours AS TEXT), '72') AS conversion_window_hours
 		 FROM `+experimentsLatest("experiment_id = $1 AND site_id = $2"), experimentID, siteID)
 	if err != nil || len(exps) == 0 {
 		return nil, fmt.Errorf("experiment not found")
+	}
+	exp := exps[0]
+
+	// Input semantics bounds: exposures count only inside the running
+	// interval. started_at = 0 (draft, never started) keeps historical
+	// pre-start rows; the upper bound is ended_at when completed, else now.
+	lower := timeMsOrZero(exp.StartedAt)
+	upper := timeMsOrZero(exp.EndedAt)
+	if upper <= 0 {
+		upper = time.Now().UTC().UnixMilli()
+	}
+	windowMs := int64(defaultConversionWindowHours) * 3600 * 1000
+	if exp.ConversionWindowHours > 0 {
+		windowMs = int64(exp.ConversionWindowHours) * 3600 * 1000
 	}
 
 	type cntRow struct {
@@ -167,25 +205,32 @@ func (s *ExperimentService) Results(ctx context.Context, experimentID, siteID st
 		Count   string `db:"count"`
 	}
 
-	// Exposures: distinct users per variant. ORDER BY variant gives a stable
-	// slice so the Bayesian control selection below is deterministic.
+	// Exposures: distinct users per variant, restricted to the running
+	// interval. ORDER BY variant gives a stable slice so the Bayesian
+	// control selection below is deterministic.
 	expRows, err := nucleus.Query[cntRow](ctx, s.db.SQL(),
 		`SELECT variant, CAST(COUNT(DISTINCT user_id) AS TEXT) AS count
 		 FROM experiment_exposures
-		 WHERE experiment_id = $1 AND site_id = $2
+		 WHERE experiment_id = $1 AND site_id = $2 AND timestamp >= $3 AND timestamp <= $4
 		 GROUP BY variant ORDER BY variant`,
-		experimentID, siteID)
+		experimentID, siteID, lower, upper)
 	if err != nil {
 		return nil, err
 	}
 
-	// Conversions: distinct converting users per variant.
+	// Conversions: distinct converting users per variant, counted only when
+	// the conversion falls within the conversion window after an
+	// in-interval exposure of that user (any of them - the attributed
+	// variant is the exposure whose window contains it).
 	convRows, err := nucleus.Query[cntRow](ctx, s.db.SQL(),
-		`SELECT variant, CAST(COUNT(DISTINCT user_id) AS TEXT) AS count
-		 FROM experiment_conversions
-		 WHERE experiment_id = $1 AND site_id = $2
-		 GROUP BY variant ORDER BY variant`,
-		experimentID, siteID)
+		`SELECT e.variant AS variant, CAST(COUNT(DISTINCT e.user_id) AS TEXT) AS count
+		 FROM experiment_exposures e
+		 INNER JOIN experiment_conversions c
+		   ON c.experiment_id = e.experiment_id AND c.site_id = e.site_id AND c.user_id = e.user_id
+		 WHERE e.experiment_id = $1 AND e.site_id = $2 AND e.timestamp >= $3 AND e.timestamp <= $4
+		   AND c.timestamp >= e.timestamp AND c.timestamp <= e.timestamp + CAST($5 AS BIGINT)
+		 GROUP BY e.variant ORDER BY e.variant`,
+		experimentID, siteID, lower, upper, windowMs)
 	if err != nil {
 		return nil, err
 	}
@@ -203,54 +248,80 @@ func (s *ExperimentService) Results(ctx context.Context, experimentID, siteID st
 		if total > 0 {
 			rate = float64(conv) / float64(total)
 		}
-		variants = append(variants, VariantResult{Variant: r.Variant, Exposures: total, Conversions: conv, ConversionRate: rate})
+		lo, hi := wilsonInterval(conv, total, zAlphaTwoSided005)
+		variants = append(variants, VariantResult{
+			Variant: r.Variant, Exposures: total, Conversions: conv,
+			ConversionRate: rate, WilsonLow: lo, WilsonHigh: hi,
+		})
 	}
 
 	// Put the declared control variant (first entry in the experiment's variants
 	// JSON, or one keyed "control") at index 0 so the Bayesian comparison is
 	// against the true control rather than whatever sorted first.
-	orderControlFirst(variants, controlKey(exps[0].Variants))
+	orderControlFirst(variants, controlKey(exp.Variants))
 
 	// Bayesian: compute probability each variant beats the control (index 0).
 	// Uses Beta(1+conv, 1+nonconv) conjugate prior with a 4000-sample Monte Carlo.
+	// Displayed as a labeled estimate; it never gates the winner (2026-09-23
+	// decision: the fixed-horizon frequentist gates do).
 	if len(variants) >= 2 {
 		computeBayesianProbabilities(variants)
 	}
 
-	// Significance/winner are gated on the configured minimum sample so a tiny
-	// sample cannot falsely report a winner.
-	significant := false
-	winner := ""
-	if len(variants) >= 2 {
-		var totalExposures int64
-		minArm := int64(1<<62 - 1)
-		for _, v := range variants {
-			totalExposures += v.Exposures
-			if v.Exposures < minArm {
-				minArm = v.Exposures
-			}
-		}
-		minSample := int64(exps[0].MinSample)
-		if totalExposures >= minSample && minArm > 0 {
-			significant = chiSquaredSignificant(variants)
-			if significant {
-				best := variants[0]
-				for _, v := range variants[1:] {
-					if v.ConversionRate > best.ConversionRate {
-						best = v
-					}
-				}
-				winner = best.Variant
-			}
-		}
+	// O09 analysis: per-arm horizon, SRM, omnibus + Fisher fallback, Holm
+	// pairwise. MinSample is per-arm (a 9,900/100 split must not declare).
+	minSample := exp.MinSample
+	if minSample <= 0 {
+		minSample = 100
 	}
+	analysis := analyze(variants, allocationWeights(exp.Variants, len(variants)), minSample)
+	winner := winnerFrom(analysis, variants)
+	significant := analysis.HorizonMet && !analysis.SRM.Detected &&
+		analysis.Test != "none" && analysis.PValue < alphaOmnibus
 
 	return &ExperimentResults{
-		Experiment:  exps[0],
+		Experiment:  exp,
 		Variants:    variants,
 		Significant: significant,
 		Winner:      winner,
+		Analysis:    analysis,
 	}, nil
+}
+
+// timeMsOrZero maps the TEXT epoch-ms columns ('0' for unset) through their
+// time.Time representation, treating pre-epoch/zero stamps as unset.
+func timeMsOrZero(t time.Time) int64 {
+	if t.IsZero() || t.Before(time.Unix(0, 0)) {
+		return 0
+	}
+	return t.UnixMilli()
+}
+
+// allocationWeights extracts the declared arm allocation from the variants
+// JSON ("rollout_pct" or "weight" per entry, normalized by the caller's GoF)
+// and returns a slice matching the arms' order when every arm is covered;
+// nil when the JSON does not declare weights for all arms (uniform assumed).
+func allocationWeights(variantsJSON string, armCount int) []float64 {
+	if variantsJSON == "" || armCount == 0 {
+		return nil
+	}
+	var vs []struct {
+		Key        string  `json:"key"`
+		RolloutPct float64 `json:"rollout_pct"`
+		Weight     float64 `json:"weight"`
+	}
+	if err := json.Unmarshal([]byte(variantsJSON), &vs); err != nil || len(vs) != armCount {
+		return nil
+	}
+	weights := make([]float64, len(vs))
+	for i, v := range vs {
+		if v.Weight > 0 {
+			weights[i] = v.Weight
+		} else {
+			weights[i] = v.RolloutPct
+		}
+	}
+	return weights
 }
 
 // controlKey returns the key of the control variant: the one keyed "control"
@@ -290,56 +361,6 @@ func orderControlFirst(variants []VariantResult, key string) {
 			return
 		}
 	}
-}
-
-// chiSquaredSignificant performs a simplified chi-squared test for 2+ variants.
-func chiSquaredSignificant(variants []VariantResult) bool {
-	if len(variants) < 2 {
-		return false
-	}
-	totalExposures := int64(0)
-	totalConversions := int64(0)
-	for _, v := range variants {
-		totalExposures += v.Exposures
-		totalConversions += v.Conversions
-	}
-	if totalExposures == 0 {
-		return false
-	}
-
-	overallRate := float64(totalConversions) / float64(totalExposures)
-	df := len(variants) - 1
-	// Yates continuity correction for the 2x2 (df=1) case reduces small-sample
-	// over-rejection. Only applied for two variants where it is well-defined.
-	yates := df == 1
-	chiSq := 0.0
-	for _, v := range variants {
-		if v.Exposures == 0 {
-			continue
-		}
-		expected := float64(v.Exposures) * overallRate
-		notExpected := float64(v.Exposures) * (1 - overallRate)
-		if expected > 0 {
-			d := math.Abs(float64(v.Conversions) - expected)
-			if yates {
-				d = math.Max(0, d-0.5)
-			}
-			chiSq += d * d / expected
-		}
-		if notExpected > 0 {
-			d := math.Abs(float64(v.Exposures-v.Conversions) - notExpected)
-			if yates {
-				d = math.Max(0, d-0.5)
-			}
-			chiSq += d * d / notExpected
-		}
-	}
-
-	criticals := []float64{0, 3.84, 5.99, 7.81, 9.49, 11.07}
-	if df < len(criticals) {
-		return chiSq > criticals[df]
-	}
-	return chiSq > 3.84
 }
 
 func genID() string {
