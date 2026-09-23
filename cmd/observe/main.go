@@ -1532,6 +1532,10 @@ func main() {
 	r.HandleFunc("GET /t/observe.js", serveTracker)
 	r.HandleFunc("GET /t/observe-errors.js", serveErrorTracker)
 	r.HandleFunc("GET /t/observe-replay.js", serveReplayTracker)
+	// O06: the rrweb-based delta recorder. Additive — the structural
+	// recorder above keeps its route untouched; sites opt in by pointing
+	// their script tag here. Ingest is unchanged (same v2 batch envelope).
+	r.HandleFunc("GET /t/observe-replay-delta.js", serveReplayDeltaTracker)
 	r.HandleFunc("GET /t/observe-feedback.js", serveFeedbackWidget)
 
 	// Dashboard UI (embedded static files)
@@ -2516,6 +2520,15 @@ func serveReplayTracker(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.Write(replayTrackerScript)
+}
+
+//go:embed tracker/observe-replay-delta.js
+var replayDeltaTrackerScript []byte
+
+func serveReplayDeltaTracker(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Write(replayDeltaTrackerScript)
 }
 
 //go:embed tracker/observe-feedback.js

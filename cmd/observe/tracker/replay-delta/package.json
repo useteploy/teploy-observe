@@ -1,0 +1,19 @@
+{
+  "name": "observe-replay-delta-build",
+  "private": true,
+  "type": "module",
+  "description": "Build sources for the O06 rrweb-based replay recorder (cmd/observe/tracker/observe-replay-delta.js) and the player-side static bundles (ui/public/rrweb/). rrweb is bundled here on purpose - the ui package's dependencies are not touched.",
+  "scripts": {
+    "build": "esbuild src/recorder.mjs --bundle --minify --format=iife --outfile=../observe-replay-delta.js",
+    "build:player": "esbuild src/player-replayer.mjs --bundle --minify --format=iife --loader:.css=text --outfile=../../../../ui/public/rrweb/replayer.js && esbuild src/player-sanitize.mjs --bundle --minify --format=iife --outfile=../../../../ui/public/rrweb/sanitize.js",
+    "test": "node --test test/",
+    "smoke": "node test/smoke.mjs"
+  },
+  "dependencies": {
+    "rrweb": "2.1.6"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "playwright-core": "1.50.0"
+  }
+}
