@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"time"
-
-	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // JourneyStep represents a page-to-page transition with its count.
@@ -35,7 +33,13 @@ type journeyEvent struct {
 	Timestamp int64  `db:"timestamp"`
 }
 
-// Journeys computes page-to-page transitions and top paths for the given time range.
+// Journeys computes page-to-page transitions and top paths for the given
+// time range.
+//
+// O12: the read is admission-gated and bounded — the SQL carries a LIMIT
+// of budget+1 rows and reading past the declared row budget converts to a
+// labeled refusal instead of an unbounded slice (guard.go
+// boundedRangeQuery). Below the ceiling the result set is unchanged.
 func (s *StatsService) Journeys(ctx context.Context, siteID string, from, to time.Time, limit int) (*JourneyResult, error) {
 	if limit <= 0 {
 		limit = 10
@@ -43,7 +47,13 @@ func (s *StatsService) Journeys(ctx context.Context, siteID string, from, to tim
 	fromMs := from.UnixMilli()
 	toMs := to.UnixMilli()
 
-	rows, err := nucleus.Query[journeyEvent](ctx, s.db.SQL(),
+	qctx, finish, err := s.beginQuery(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+
+	rows, err := boundedRangeQuery[journeyEvent](qctx, s,
 		`SELECT session_id, COALESCE(pathname, '/') AS pathname, timestamp
 		 FROM events
 		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3

@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/queryguard"
 )
 
 // CohortResolver returns the list of distinct_ids for a cohort. It's
@@ -27,10 +29,16 @@ type StatsService struct {
 	// earliest memoises the per-site earliest-data instant the coverage note
 	// is decided against, so the dashboard's load-time call is not a scan.
 	earliest earliestCache
+	// O12 query admission: guard is the optional per-site/global
+	// concurrency limiter (nil = concurrency admission disabled, e.g. in
+	// tests); budgets are always in force on the heavy read paths. See
+	// guard.go.
+	guard   *queryguard.Limiter
+	budgets queryguard.Budgets
 }
 
 func NewStatsService(db *nucleus.Client) *StatsService {
-	return &StatsService{db: db, retention: DefaultRetentionWindows()}
+	return &StatsService{db: db, retention: DefaultRetentionWindows(), budgets: queryguard.DefaultBudgets()}
 }
 
 // WithCohortResolver attaches a cohort lookup so the api layer can apply
