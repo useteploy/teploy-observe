@@ -11,8 +11,8 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/neutron-dev/neutron-go/neutronauth"
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/neutronauth"
+	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/principals"
 )
@@ -24,10 +24,10 @@ import (
 // managed users, and issuer-namespaced OIDC subjects - lives in the single
 // principals store; this service mints and validates tokens against it.
 type AuthService struct {
-	db        *nucleus.Client
-	store     *principals.Store
-	jwtSecret string
-	logger    *slog.Logger
+	db          *nucleus.Client
+	store       *principals.Store
+	jwtSecret   string
+	logger      *slog.Logger
 	oidcEnabled bool
 	// credentialMu serializes credential mutations (bootstrap, password
 	// change, administrative reset). AUD-005 (round 2): the read-verify-write

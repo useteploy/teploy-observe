@@ -159,8 +159,13 @@ func (c Config) Validate() error {
 	// Unset still means "generate per process" (logged at startup); a value
 	// an operator DID set must carry real entropy. Length floors, not
 	// composition rules — these are operator-chosen machine secrets.
-	if c.JWTSecret != "" && len(c.JWTSecret) < 16 {
-		return fmt.Errorf("OBSERVE_JWT_SECRET must be at least 16 characters when set (unset generates a random per-process secret)")
+	// JWT floor is 32: the pinned neutronauth enforces a 32-byte minimum
+	// at MINT time (upstream GO-14..GO-23), so accepting 16-31 bytes here
+	// would pass boot and then break at the first token mint — fail early
+	// with a rotation instruction instead. Existing installs with 16-31
+	// byte secrets must rotate before upgrading past this point.
+	if c.JWTSecret != "" && len(c.JWTSecret) < 32 {
+		return fmt.Errorf("OBSERVE_JWT_SECRET must be at least 32 characters when set (unset generates a random per-process secret; shorter configured secrets are rejected because the auth layer refuses to mint with them — rotate to 32+ characters)")
 	}
 	if c.AuditKey != "" && len(c.AuditKey) < 32 {
 		return fmt.Errorf("OBSERVE_AUDIT_KEY must be at least 32 characters when set (unset falls back with a startup warning)")

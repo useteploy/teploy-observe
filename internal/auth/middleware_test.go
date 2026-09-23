@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/neutron-dev/neutron-go/neutronauth"
+	"github.com/neutron-build/neutron/go/neutronauth"
 
 	"github.com/useteploy/teploy-observe/internal/ingest"
 )

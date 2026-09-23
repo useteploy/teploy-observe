@@ -4,11 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
-	"github.com/neutron-dev/neutron-go/neutron"
-	"github.com/neutron-dev/neutron-go/neutronauth"
+	"github.com/neutron-build/neutron/go/neutron"
+	"github.com/neutron-build/neutron/go/neutronauth"
 
 	"github.com/useteploy/teploy-observe/internal/ingest"
 )
@@ -181,13 +182,21 @@ func JWTAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 			// revoked (AUD-008).
 			sub, _ := claims["sub"].(string)
 			if sub != "" {
-				tokenTV, _ := claims["tv"].(float64)
+				// The pinned neutronauth parses claims with UseNumber
+				// semantics, so numeric claims arrive as json.Number —
+				// a bare float64 assertion reads 0 and would revoke every
+				// freshly minted token.
+				tokenTV, err := claimAsInt64(claims["tv"])
+				if err != nil {
+					neutron.WriteError(w, r, neutron.ErrUnauthorized("session invalid"))
+					return
+				}
 				currentTV, err := authSvc.CurrentTokenVersion(r.Context(), sub)
 				if err != nil {
 					neutron.WriteError(w, r, neutron.ErrUnauthorized("session invalid"))
 					return
 				}
-				if int64(tokenTV) != currentTV {
+				if tokenTV != currentTV {
 					neutron.WriteError(w, r, neutron.ErrUnauthorized("session revoked — please sign in again"))
 					return
 				}
@@ -262,5 +271,21 @@ func APIKeyAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 			ctx := ingest.WithSiteID(r.Context(), validated.SiteID)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
+	}
+}
+
+// claimAsInt64 reads a numeric JWT claim under either numeric decoding
+// regime: the pinned neutronauth parses with UseNumber (json.Number);
+// older tokens and some test paths may hold float64.
+func claimAsInt64(v any) (int64, error) {
+	switch n := v.(type) {
+	case json.Number:
+		return n.Int64()
+	case float64:
+		return int64(n), nil
+	case int64:
+		return n, nil
+	default:
+		return 0, fmt.Errorf("claim is not numeric (%T)", v)
 	}
 }

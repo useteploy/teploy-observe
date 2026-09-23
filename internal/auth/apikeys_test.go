@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/neutron-dev/neutron-go/nucleus"
+	"github.com/neutron-build/neutron/go/nucleus"
 	"github.com/useteploy/teploy-observe/internal/schema"
 
 	"github.com/useteploy/teploy-observe/internal/nucleustest"
@@ -52,7 +52,10 @@ func connect(t *testing.T) (context.Context, *nucleus.Client, func()) {
 }
 
 func testService(db *nucleus.Client) *AuthService {
-	return NewAuthService(db, "test-secret", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// 32+ bytes: the pinned neutronauth enforces a 32-byte minimum at
+	// mint time (upstream GO-14..GO-23 hardening) — a shorter test secret
+	// would fail inside Mint, not at the boundary under test.
+	return NewAuthService(db, "test-secret-test-secret-test-secret!", slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func uniqueSite(prefix string) string {

@@ -1469,3 +1469,81 @@ shared Nucleus v1.1.1 fixture (`OBSERVE_NUCLEUS_URL`), tests
 without the fixture). Full suite deliberately NOT run (shared-fixture
 constraint); `gofmt` note: `internal/ingest/queue.go` is unformatted at
 HEAD — pre-existing, untouched by this slice.
+
+## 2026-09-22 vendor-vs-pin drift resolution — renamed neutron module, pin-parity vendor, required parity gate
+
+Finding (orchestrator-verified, resolved this session at `231fa1f`):
+`go.mod` replaced `github.com/neutron-dev/neutron-go` with the live
+workspace `../../Neutron/go` (then UNPUSHED `75819324`, dirty tree), while
+`vendor/github.com/neutron-dev/neutron-go` was generated from a
+pre-rename workspace snapshot — 7 files differed from the submodule pin
+(`5b5d0a3`) and `nucleus/retry.go` was vendored but absent from it. The
+shipped build compiled code that matched neither the pin nor the reviewed
+workspace. Upstream then renamed the module: at origin/main `e5c6e9fe`
+(PUSHED, ancestor of workspace HEAD, contains `retry.go`) the module is
+`github.com/neutron-build/neutron/go`.
+
+Resolution (uncommitted, this session):
+
+- Import path rewrite `github.com/neutron-dev/neutron-go` →
+  `github.com/neutron-build/neutron/go` across 173 `.go` files plus
+  `go.mod`, `.github/workflows/ci.yml`, `AGENTS.md`, `CLAUDE.md`
+  (177 files; `_internal/` audit history and the gitignored `observe`
+  binary deliberately untouched).
+- vendor/ regenerated from the PIN TREE (`git worktree` of `e5c6e9fe`
+  at `/tmp/neutron-pin-worktree`, replace pointed there for
+  `go mod vendor` only), then the standing replace restored to
+  `../../Neutron/go`. Regeneration procedure documented as a comment in
+  `go.mod` (worktree the pin → replace → vendor → restore replace →
+  align the two `# ... =>` annotation lines in `vendor/modules.txt`,
+  which record the generation-time replace target and otherwise break
+  `-mod=vendor` consistency → re-pin the submodule). Old
+  `vendor/github.com/neutron-dev/` removed.
+- Submodule `Neutron/` re-pinned `5b5d0a3` → `e5c6e9fe` (records the
+  pin without touching upstream; workspace at `75819324` left alone).
+- CI `vendor-pin-parity` job rewritten: was a WRONG whole-tree
+  `diff -r` (the pin legitimately contains packages vendor/ doesn't
+  import — README, examples, cmd — which would false-fail). Now enforces
+  the correct invariant: every file under
+  `vendor/github.com/neutron-build/neutron/go` byte-identical to the
+  same path under the `Neutron/` submodule, vendored files absent from
+  the pin are drift (VENDOR-ONLY/CONTENT-DIFF), LICENSE exempt. REQUIRED
+  (no continue-on-error) because local parity passes with 0 diffs.
+
+Gates: `go build ./...` green with the new vendor; `go vet ./...` clean;
+parity 0 diffs; old vendor path gone. Full serial suite
+(`OBSERVE_NUCLEUS_URL` fixture, `-p 1 -count=1`): 43 packages ok,
+`internal/auth` FAIL — see the behavior-difference finding below; NOT
+adapted, awaiting an owner decision.
+
+Behavior difference, old vendored snapshot vs pin (REPORTED, not papered
+over): upstream `086e0253` (audit GO-14..GO-23, between the old pin and
+`e5c6e9fe`) added a strict HS256 policy — `neutronauth.GenerateToken`/
+`ParseToken` now refuse secrets shorter than 32 bytes
+(`jwtMinSecretLen`). Six `internal/auth` tests
+(TestJWTAuthMiddleware_RevokedTokenRejected,
+TestJWTAuthMiddleware_StreamTicketContract,
+TestF03Gate_CreateLoginPromoteOldTokenInvalid,
+TestF05OIDCSessionsRevocableAndIssuerScoped,
+TestF05Pre040OIDCTokenShapeRejected,
+TestTO003_OIDCRoleDowngradeRetiresOldJWT) mint through the shared helper
+`newTestService` (`internal/auth/apikeys_test.go:55`) which passes the
+11-byte `"test-secret"` — they passed against the old vendored snapshot
+only because that snapshot predates the hardening. Production exposure
+of the same policy shift: `internal/config/config.go:162` still
+validates `OBSERVE_JWT_SECRET` at >=16 bytes, so a configured 16–31-byte
+secret that passes config validation will now fail at mint time. The
+Observe-side decisions (lengthen the test secret vs raise the config
+floor to 32) are deliberately left open here per the stop-and-report
+rule; the CI integration jobs that run this suite against the fixture
+will fail on these six tests until it is decided.
+
+Residuals:
+
+- Workspace Neutron commits after `e5c6e9fe` (through `75819324`) are
+  NOT included in vendor/ or the pin until a future re-pin; the
+  standing replace pointing at the workspace remains build-inert while
+  vendor/ is present (it only matters for regeneration).
+- The regeneration procedure depends on a `git worktree` of the pin
+  existing at a temp path; if the pin SHA is absent locally the
+  submodule remote must be fetched first.
