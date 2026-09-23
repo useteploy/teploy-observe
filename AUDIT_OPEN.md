@@ -202,10 +202,10 @@ Round-4 deferrals (new):
   open, see the slice record below).
 - R14 durable half, R22 durable half: R14's durable half LANDED
   2026-09-22 (O01 slice 2); R22's durable half (across-restart webhook
-  delivery) remains deferred — the `derived_outbox` table + `webhook`
-  kind now exist (O01 slice 3, migration 046) but alert fire still
-  enqueues to the in-memory queue; wiring the alert-fire origin through
-  the outbox is the next slice.
+  delivery) LANDED 2026-09-23 for the alert path (O10 — the
+  `notification_outbox`, migrations 049-051; see the O10 record at the
+  end of this file). Alert evaluation no longer rides the in-memory
+  queue; other `Fire` callers (if any appear) still do.
 - R45 digest-pinning residual: needs real reviewed digests; the permissions
   /concurrency/timeout hardening landed.
 
@@ -2071,3 +2071,81 @@ S7) — the identity-layer legs of the programme's acceptance line. Evidence
 
 Vacuous-match guard included. Re-run and paste fresh output here on any
 contract change.
+
+## O10 alerts-and-incidents slice — 2026-09-23
+
+Closes the alerting residual named in the programme's O10 line for this
+slice (and the R22 durable-half deferral above): rule evaluation state,
+incident identity and the durable notification outbox.
+
+Landed:
+
+- Migrations 049-051 (ASCII, per the 038 rule): `alert_evaluations`
+  (append-only transition-edge ledger, one row per rule evaluation:
+  from_state/to_state/value/samples/detail/incident_id; current state =
+  latest row, restart-honest with no in-memory cache);
+  `notification_outbox` (the 046 derived-outbox shape applied to
+  externally-visible deliveries: replacing-mergetree, argMax collapse,
+  exponential backoff, attempt budget, `next_attempt_at = -1` dead-letter
+  sentinel with last_error kept, never auto-pruned);
+  `maintenance_windows`; `incident_events` (the incident timeline);
+  `incidents.acknowledged_at/by`; `alert_rules.min_samples/severity`.
+- Evaluation states: healthy / firing are DECISIONS; `no_data` (fewer
+  data points than the rule minimum, zero included) and `unavailable`
+  (metric query failed) are NOT decisions — labeled, recorded, never
+  silently treated as passing, and unable to open or recover anything.
+  This removes the error_rate empty-window silent 0% (it read healthy).
+- One opening notification per incident: hysteresis via state edges
+  (re-armed only after a recovery decision) AND the EnsureOpen created
+  gate. Repeat policy (say-so): a still-firing rule repeats only past
+  its cooldown (minutes, default 5) counted from the last notification.
+  Recovery sweep self-heals missed edges and failed closes.
+- Delivery: webhook POST with the stable `X-Observe-Delivery` id (the
+  intent id), R22 HMAC signing, frozen target+payload per intent,
+  bounded attempts (5), doubling backoff (1s base, 5m cap), dead letters
+  kept and counted at `/healthz` (`notifications` block:
+  pending/delivered/suppressed/dead_lettered per kind + process-local
+  failed attempts). At-least-once drain + receiver-side dedupe on the
+  delivery id = the exactly-once posture of the replay ledger; the
+  restart oracle pins 2 POSTs / 1 unique id across a simulated
+  kill-mid-drain.
+- Maintenance windows suppress DELIVERY only (visible on the row, in the
+  timeline, and at healthz); evaluation and incident lifecycle continue.
+- Ack: idempotent column state on the incident + one timeline event;
+  survives Close (the 051 column-carry). Timeline events: opened /
+  recovered / notified / suppressed / ack. Routes: incident ack +
+  timeline, maintenance-window CRUD.
+- Retention: `alert_evaluations` 14d (DefaultPolicies);
+  `notification_outbox` delivered-or-suppressed 7d, pending/dead never
+  (DefaultLedgerPolicies, pinned by TestDefaultLedgerPolicies).
+- All four tables added to `backup.Tables` (the F44 gate caught them).
+
+New oracles: `internal/platform/o10_alerts_engine_test.go` (sustained
+fault -> exactly one opening notification + no storm inside cooldown;
+recovery + ack recorded and surviving close; no-data distinct from
+healthy incl. the error_rate case; min-samples gate; cooldown repeat
+policy; restart state survival; maintenance suppresses delivery not
+evaluation), `internal/platform/o10_notify_outbox_test.go` (visible
+doubling backoff, bounded attempts -> durable dead letter, no storm,
+success-after-retries, kill-mid-drain restart exactly-once by delivery
+marker, site-scoped + global maintenance windows),
+`internal/incidents/ack_test.go` (idempotent ack, timeline, survives
+close, unknown incident refused). All at the real engine (fake counting
+webhook receiver), Nucleus-gated, fail-not-skip under
+OBSERVE_REQUIRE_NUCLEUS=1. Gates: `go build ./...`, `go vet ./...`
+clean; full serial suite green (`-p 1 -count=1 ./...`).
+
+Open items this slice deliberately leaves (programme O10 tails):
+
+- Routing by service/site/environment/severity: severity now exists on
+  rules/incidents/payloads but no per-severity or per-environment
+  routing rules; environment is not yet an alerting dimension.
+- Release/investigation/owner linkage on incident records (triggering
+  query, release, recovery proof fields beyond the timeline).
+- Uptime/cron-specific semantics (monitor replacement, scheduler
+  restarts) — the cron incident path predates this slice and still
+  notifies through EnsureOpen only, with no outbox delivery.
+- Multi-replica drain (lease/CAS before external side effects — the
+  standing AUD-018 posture, same boundary as the derived outbox).
+- Deleting a rule while firing leaves its incident open (no sweep for
+  tombstoned rules) — noted for the tails slice.

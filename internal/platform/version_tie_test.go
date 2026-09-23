@@ -9,7 +9,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
-// alert_rules and webhooks as 004_platform declares them.
+// alert_rules and webhooks as 004_platform + 049 declare them.
 const alertRuleColumns = `(
 	rule_id        TEXT NOT NULL,
 	tenant_id      TEXT NOT NULL DEFAULT 'default',
@@ -21,6 +21,8 @@ const alertRuleColumns = `(
 	window_minutes TEXT NOT NULL DEFAULT '5',
 	check_interval TEXT NOT NULL DEFAULT '60',
 	cooldown       TEXT NOT NULL DEFAULT '300',
+	min_samples    TEXT NOT NULL DEFAULT '1',
+	severity       TEXT NOT NULL DEFAULT 'warning',
 	enabled        TEXT NOT NULL DEFAULT 'true',
 	created_by     TEXT NOT NULL DEFAULT '',
 	created_at     TEXT NOT NULL,
@@ -60,7 +62,7 @@ func TestSameMillisecondCreateDeleteTombstoneWins(t *testing.T) {
 	nucleustest.AsPlainMergeTree(t, db, "webhooks", webhookColumns,
 		"(tenant_id, site_id, webhook_id)", "version")
 
-	alerts := NewAlertService(db, nil, nil)
+	alerts := NewAlertService(db, nil, nil, nil, nil)
 	hooks := NewWebhookService(db, nil)
 	const site = "platform-tie-site"
 

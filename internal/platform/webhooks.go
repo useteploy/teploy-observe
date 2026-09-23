@@ -31,8 +31,9 @@ type WebhookService struct {
 	// burst can no longer spawn unbounded goroutines, and Shutdown drains
 	// what is queued. Each firing keeps ONE stable delivery id across its
 	// attempts (and gets a bounded retry), so a receiver can dedupe a resent
-	// alert. Durable across-restart delivery remains deferred (needs the
-	// derived-work outbox design, same class as the R14/R26 durable work).
+	// alert. Durable across-restart delivery landed for alerts in O10 (the
+	// notification_outbox, notify_outbox.go); this in-memory path remains
+	// for immediate fire-and-forget sends that opt out of durability.
 	deliverMu  sync.Mutex
 	deliverQ   []deliveryJob
 	deliverWg  sync.WaitGroup

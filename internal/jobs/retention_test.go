@@ -81,13 +81,14 @@ func TestRetentionDeletesOldKeepsRecent(t *testing.T) {
 
 // TestDefaultLedgerPolicies pins the decided ledger windows (2026-09-23):
 // error_inbox/replay_batches 14d default, derived_outbox processed-only
-// pruning. The outbox policy MUST carry the processed_at > 0 guard —
-// without it the plain column comparison would also delete pending and
+// pruning, notification_outbox delivered-or-suppressed-only pruning (O10,
+// same decided posture). The outbox policies MUST carry their guards —
+// without them the plain column comparison would also delete pending and
 // dead-lettered intents (processed_at = 0 < any cutoff).
 func TestDefaultLedgerPolicies(t *testing.T) {
 	p := DefaultLedgerPolicies(14, 14, 7)
-	if len(p) != 3 {
-		t.Fatalf("want 3 ledger policies, got %d", len(p))
+	if len(p) != 4 {
+		t.Fatalf("want 4 ledger policies, got %d", len(p))
 	}
 	byTable := map[string]RetentionPolicy{}
 	for _, x := range p {
@@ -102,6 +103,9 @@ func TestDefaultLedgerPolicies(t *testing.T) {
 	x := byTable["derived_outbox"]
 	if x.Column != "processed_at" || x.Days != 7 || x.ExtraWhere != "processed_at > 0" {
 		t.Errorf("derived_outbox policy wrong: %+v", x)
+	}
+	if x := byTable["notification_outbox"]; x.Column != "created_at" || x.Days != 7 || x.ExtraWhere != "(delivered_at > 0 OR suppressed_at > 0)" {
+		t.Errorf("notification_outbox policy wrong: %+v", x)
 	}
 }
 

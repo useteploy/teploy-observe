@@ -14,7 +14,8 @@ import "github.com/useteploy/teploy-observe/internal/query"
 
 var alertRuleCols = []string{
 	"name", "metric", "operator", "threshold", "window_minutes",
-	"check_interval", "cooldown", "enabled", "created_by", "created_at", "version",
+	"check_interval", "cooldown", "min_samples", "severity",
+	"enabled", "created_by", "created_at", "version",
 }
 
 func alertRulesLatest(where string) string {
