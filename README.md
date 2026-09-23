@@ -135,7 +135,11 @@ the exact image and version.
 - Pipelines (JSON parse, regex extract, rename, mask, sample).
 
 ### Session replay
-- DOM snapshot + mouse / click / scroll / mutation recording.
+- Limited mode: bounded structural DOM snapshots (5,000 nodes, depth 32)
+  plus mouse / click / scroll interactions, re-snapshotted periodically.
+  DOM changes between snapshots are counted, not captured — playback shows
+  keyframe structure with interaction overlay. Full delta recording is the
+  adopted rrweb integration (O06, in progress).
 - Playback with timeline scrubbing and error correlation.
 
 ### Monitoring

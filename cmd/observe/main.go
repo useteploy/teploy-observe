@@ -369,8 +369,11 @@ func main() {
 	// Retention policies are the single source for both the cleanup job and
 	// the analytics read path: a unique count can only be answered by a table
 	// that still holds the rows, so the query layer tiers its source off the
-	// same numbers rather than a constant of its own.
-	retentionPolicies := jobs.DefaultPolicies(cfg.RawRetentionDays, cfg.HourlyRetentionDays)
+	// same numbers rather than a constant of its own. The ledger policies
+	// (O01 slice 5) ride the same job: dedupe ledgers expire with the data
+	// they dedupe, processed outbox intents prune, dead letters never do.
+	retentionPolicies := append(jobs.DefaultPolicies(cfg.RawRetentionDays, cfg.HourlyRetentionDays),
+		jobs.DefaultLedgerPolicies(cfg.ErrorInboxRetentionDays, cfg.ReplayBatchesRetentionDays, cfg.DerivedOutboxRetentionDays)...)
 
 	// Stats service
 	statsSvc := query.NewStatsService(db).WithRetention(query.RetentionWindows{

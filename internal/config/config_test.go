@@ -33,6 +33,7 @@ func TestValidateRejectsBrokenNumericConfig(t *testing.T) {
 		c := Config{
 			BufferSize: 1000, FlushSize: 100, FlushInterval: time.Second,
 			RateLimit: 100, RawRetentionDays: 30, HourlyRetentionDays: 365,
+			ErrorInboxRetentionDays: 14, ReplayBatchesRetentionDays: 14, DerivedOutboxRetentionDays: 7,
 		}
 		tc.mut(&c)
 		err := c.Validate()
@@ -46,6 +47,7 @@ func TestValidateAcceptsDefaults(t *testing.T) {
 	c := Config{
 		BufferSize: 100_000, FlushSize: 500, FlushInterval: 2 * time.Second,
 		RateLimit: 1000, RawRetentionDays: 30, HourlyRetentionDays: 365,
+		ErrorInboxRetentionDays: 14, ReplayBatchesRetentionDays: 14, DerivedOutboxRetentionDays: 7,
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("default-shaped config must validate: %v", err)

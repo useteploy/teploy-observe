@@ -33,6 +33,12 @@ type Config struct {
 	// Retention
 	RawRetentionDays    int
 	HourlyRetentionDays int
+	// Ledger retention (O01 ADR 5.8, decided 2026-09-23). Expiry means a
+	// retried record is processed as new — no silent infinite exactly-once
+	// promise beyond the window.
+	ErrorInboxRetentionDays    int
+	ReplayBatchesRetentionDays int
+	DerivedOutboxRetentionDays int
 
 	// Rate limiting
 	RateLimit int
@@ -89,6 +95,13 @@ func Load() Config {
 	set("OBSERVE_FLUSH_SIZE", 500, &c.FlushSize)
 	set("OBSERVE_RAW_RETENTION_DAYS", 30, &c.RawRetentionDays)
 	set("OBSERVE_HOURLY_RETENTION_DAYS", 365, &c.HourlyRetentionDays)
+	// O01 slice 5 ledger retention (decided defaults 2026-09-23): the
+	// error_inbox and replay_batches ledgers must not outlive the data they
+	// dedupe (error_events 180d, replay_sessions 14d); derived_outbox
+	// prunes processed intents only — dead letters are never auto-deleted.
+	set("OBSERVE_ERROR_INBOX_RETENTION_DAYS", 14, &c.ErrorInboxRetentionDays)
+	set("OBSERVE_REPLAY_BATCHES_RETENTION_DAYS", 14, &c.ReplayBatchesRetentionDays)
+	set("OBSERVE_DERIVED_OUTBOX_RETENTION_DAYS", 7, &c.DerivedOutboxRetentionDays)
 	set("OBSERVE_RATE_LIMIT", 1000, &c.RateLimit)
 	flushMs := 2000
 	set("OBSERVE_FLUSH_INTERVAL_MS", 2000, &flushMs)
@@ -154,6 +167,15 @@ func (c Config) Validate() error {
 	}
 	if c.HourlyRetentionDays < 1 {
 		return fmt.Errorf("OBSERVE_HOURLY_RETENTION_DAYS must be >= 1, got %d", c.HourlyRetentionDays)
+	}
+	if c.ErrorInboxRetentionDays < 1 {
+		return fmt.Errorf("OBSERVE_ERROR_INBOX_RETENTION_DAYS must be >= 1, got %d", c.ErrorInboxRetentionDays)
+	}
+	if c.ReplayBatchesRetentionDays < 1 {
+		return fmt.Errorf("OBSERVE_REPLAY_BATCHES_RETENTION_DAYS must be >= 1, got %d", c.ReplayBatchesRetentionDays)
+	}
+	if c.DerivedOutboxRetentionDays < 1 {
+		return fmt.Errorf("OBSERVE_DERIVED_OUTBOX_RETENTION_DAYS must be >= 1, got %d", c.DerivedOutboxRetentionDays)
 	}
 	// AUD-009: weak explicitly-configured secrets were accepted silently.
 	// Unset still means "generate per process" (logged at startup); a value

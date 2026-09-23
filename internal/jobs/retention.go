@@ -24,6 +24,20 @@ type RetentionPolicy struct {
 	Table  string
 	Column string // BIGINT epoch-ms column, typically "timestamp", "start_time", or "ts_bucket"
 	Days   int
+	// ExtraWhere is an optional additional predicate ANDed into the
+	// chunk-boundary SELECT and the DELETE (e.g. "processed_at > 0" so the
+	// derived_outbox policy prunes processed intents but never dead
+	// letters). Callers construct policies in code — this is never bound
+	// from user input, so it is raw SQL by design.
+	ExtraWhere string
+}
+
+// and returns the policy's predicate conjoined with any extra WHERE term.
+func (p RetentionPolicy) and() string {
+	if p.ExtraWhere == "" {
+		return ""
+	}
+	return " AND " + p.ExtraWhere
 }
 
 // RetentionService cleans up old data according to configured retention periods.
@@ -38,15 +52,37 @@ type RetentionService struct {
 // deployments keep their behavior.
 func DefaultPolicies(rawDays, hourlyDays int) []RetentionPolicy {
 	return []RetentionPolicy{
-		{"events", "timestamp", rawDays},
-		{"events_recent", "timestamp", 7},
-		{"stats_hourly", "ts_bucket", hourlyDays},
-		{"sessions", "last_ts", 90},
-		{"error_events", "timestamp", 180},
-		{"logs", "timestamp", 30},
-		{"spans", "start_time", 14},
-		{"service_stats", "ts_bucket", 30},
-		{"replay_sessions", "start_time", 14},
+		{Table: "events", Column: "timestamp", Days: rawDays},
+		{Table: "events_recent", Column: "timestamp", Days: 7},
+		{Table: "stats_hourly", Column: "ts_bucket", Days: hourlyDays},
+		{Table: "sessions", Column: "last_ts", Days: 90},
+		{Table: "error_events", Column: "timestamp", Days: 180},
+		{Table: "logs", Column: "timestamp", Days: 30},
+		{Table: "spans", Column: "start_time", Days: 14},
+		{Table: "service_stats", Column: "ts_bucket", Days: 30},
+		{Table: "replay_sessions", Column: "start_time", Days: 14},
+	}
+}
+
+// DefaultLedgerPolicies returns the O01 ADR section 5.8 retention for the
+// durability ledgers. Each window is the decided 2026-09-23 default
+// (DELEGATED_DECISIONS section 5) and is env-tunable by the caller.
+//
+// Expiry semantics (the ADR's honest statement, pinned here so it travels
+// with the policy): a ledger row that expires is gone from the dedupe set —
+// a producer retrying that same record after expiry is processed as NEW.
+// The ledgers dedupe data whose own retention is at least as long
+// (error_events 180d vs the inbox 14d; replay_sessions 14d matching its
+// ledger exactly), so the ordering never re-inserts orphaned children.
+//
+// derived_outbox prunes PROCESSED intents only (processed_at > 0): rows
+// still pending, retrying, or dead-lettered are never auto-deleted — the
+// dead letters are the operator's queue, surfaced at /healthz counters.
+func DefaultLedgerPolicies(errorInboxDays, replayBatchesDays, outboxDays int) []RetentionPolicy {
+	return []RetentionPolicy{
+		{Table: "error_inbox", Column: "applied_at", Days: errorInboxDays},
+		{Table: "replay_batches", Column: "first_seen", Days: replayBatchesDays},
+		{Table: "derived_outbox", Column: "processed_at", Days: outboxDays, ExtraWhere: "processed_at > 0"},
 	}
 }
 
@@ -126,14 +162,14 @@ func (r *RetentionService) RunCleanup(ctx context.Context) error {
 func (r *RetentionService) cleanupTable(ctx context.Context, sql *nucleus.SQLModel, p RetentionPolicy, cutoff int64) (int64, error) {
 	var total int64
 	for {
-		boundary, ok, err := chunkBoundary(ctx, sql, p.Table, p.Column, cutoff, retentionChunkSize)
+		boundary, ok, err := chunkBoundary(ctx, sql, p.Table, p.Column, p.and(), cutoff, retentionChunkSize)
 		if err != nil {
 			return total, err
 		}
 		if !ok {
 			// Fewer than a full chunk remain below cutoff — clear the rest
 			// in one final (bounded) statement and stop.
-			query := fmt.Sprintf(`DELETE FROM %s WHERE %s < $1`, p.Table, p.Column)
+			query := fmt.Sprintf(`DELETE FROM %s WHERE %s < $1%s`, p.Table, p.Column, p.and())
 			affected, err := sql.Exec(ctx, query, cutoff)
 			if err != nil {
 				return total, err
@@ -145,7 +181,7 @@ func (r *RetentionService) cleanupTable(ctx context.Context, sql *nucleus.SQLMod
 		// a 60s ts_bucket) mean this DELETE can remove somewhat more than
 		// chunkSize rows — still bounded to "one bucket's worth", nowhere
 		// near the size of an unbounded whole-policy DELETE.
-		query := fmt.Sprintf(`DELETE FROM %s WHERE %s <= $1`, p.Table, p.Column)
+		query := fmt.Sprintf(`DELETE FROM %s WHERE %s <= $1%s`, p.Table, p.Column, p.and())
 		affected, err := sql.Exec(ctx, query, boundary)
 		if err != nil {
 			return total, err
@@ -169,10 +205,10 @@ type boundaryRow struct {
 // boundary as one bounded batch. ok=false means fewer than chunkSize rows
 // remain below cutoff — the caller should do one final, already-small
 // DELETE instead.
-func chunkBoundary(ctx context.Context, sql *nucleus.SQLModel, table, column string, cutoff int64, chunkSize int) (int64, bool, error) {
+func chunkBoundary(ctx context.Context, sql *nucleus.SQLModel, table, column, extraWhere string, cutoff int64, chunkSize int) (int64, bool, error) {
 	query := fmt.Sprintf(
-		`SELECT %s AS c FROM %s WHERE %s < $1 ORDER BY %s ASC LIMIT 1 OFFSET %d`,
-		column, table, column, column, chunkSize-1)
+		`SELECT %s AS c FROM %s WHERE %s < $1%s ORDER BY %s ASC LIMIT 1 OFFSET %d`,
+		column, table, column, extraWhere, column, chunkSize-1)
 	rows, err := nucleus.Query[boundaryRow](ctx, sql, query, cutoff)
 	if err != nil {
 		return 0, false, err

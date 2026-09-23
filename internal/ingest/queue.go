@@ -114,6 +114,15 @@ type walSegment struct {
 
 // DefaultWALMaxTotalBytes is the default disk high-water across all WAL
 // segments (F16). 512 MiB = eight default-sized (64 MiB) segments.
+//
+// Per-queue semantics (O01 slice 5, decided 2026-09-23): the cap applies
+// PER QUEUE and the process runs TWO queues — events and errors — so the
+// worst-case WAL disk footprint is 2x this value (1 GiB at the default).
+// The cap is a buffer bound, not retention: at the declared load of
+// 100 events/s at 1 KiB (~100 KiB/s), a 512 MiB queue holds ~87 minutes
+// of durable buffering runway before admission is refused (503, never
+// deletion) while the database is unreachable. Raise the env var for more
+// stall runway; there is deliberately no time-based WAL retention.
 const DefaultWALMaxTotalBytes = 512 << 20
 
 // DefaultGroupCommitDelay bounds the durable-mode commit window (O01 §5.1,
