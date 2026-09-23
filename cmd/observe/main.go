@@ -1651,6 +1651,13 @@ func main() {
 	// shows no icon. Public: the browser fetches it before anyone signs in.
 	r.Handle("GET /favicon.svg", http.FileServer(http.FS(uiSub)))
 
+	// O06: the replay player's runtime bundles (rrweb Replayer class +
+	// the play-time sanitizer) are committed static files under
+	// dist/rrweb/ — outside /assets/, so like the favicon they need an
+	// explicit route or the SPA fallback answers with index.html. Public
+	// same-origin scripts; inert tooling, no credentials.
+	r.Handle("GET /rrweb/", http.FileServer(http.FS(uiSub)))
+
 	// --- Public share dashboard ---
 	r.HandleFunc("GET /share/{token}", shareViewHandler(shareSvc, uiSub))
 
