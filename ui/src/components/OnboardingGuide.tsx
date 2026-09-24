@@ -17,11 +17,16 @@ export default function OnboardingGuide({ siteId }: Props) {
 
   if (hasData === null || hasData) return null;
 
+  // The tracker needs the site-scoped ingest key (data-api-key) — keyless
+  // batches are rejected on any instance with keys provisioned, so a
+  // snippet without it cannot capture.
   const trackerSnippet = `<script defer src="${typeof window !== "undefined" ? window.location.origin : ""}/t/observe.js"
-  data-site-id="${siteId}"></script>`;
+  data-site-id="${siteId}"
+  data-api-key="YOUR_API_KEY"></script>`;
 
   const errorSnippet = `<script defer src="${typeof window !== "undefined" ? window.location.origin : ""}/t/observe-errors.js"
-  data-site-id="${siteId}"></script>`;
+  data-site-id="${siteId}"
+  data-api-key="YOUR_API_KEY"></script>`;
 
   const curlSnippet = `curl -X POST ${typeof window !== "undefined" ? window.location.origin : ""}/api/v1/events \\
   -H "Content-Type: application/json" \\
@@ -62,8 +67,8 @@ export default function OnboardingGuide({ siteId }: Props) {
       </div>
 
       <p style={{ fontSize: "11px", color: "var(--obs-text-muted)", margin: "16px 0 0" }}>
-        Generate an API key in Settings &gt; Sites to use the ingestion API.
-        Data will appear here within seconds after the first event arrives.
+        Generate an API key in Settings &gt; Sites and replace YOUR_API_KEY above —
+        ingest rejects keyless requests. Data will appear here within seconds after the first event arrives.
       </p>
     </div>
   );

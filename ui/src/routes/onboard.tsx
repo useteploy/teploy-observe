@@ -3,11 +3,18 @@ import { settingsApi } from "../api/settings.js";
 import type { Site } from "../api/settings.js";
 import { analyticsApi } from "../api/analytics.js";
 import { copyToClipboard } from "../lib/clipboard.js";
+import { captureState, trackerSnippet } from "../lib/onboardCapture.js";
+import type { CaptureState } from "../lib/onboardCapture.js";
 import "../styles/onboard.css";
 
 export const config = { mode: "app" };
 
 type Step = 1 | 2 | 3;
+
+// How long step 3 waits before saying "nothing is arriving" instead of
+// "waiting for first event" — the remedy state needs a real grace period
+// so a slow first pageview isn't misreported as a broken install.
+const NO_CAPTURE_GRACE_MS = 30_000;
 
 export default function OnboardPage() {
   const [step, setStep] = useState<Step>(1);
@@ -17,13 +24,21 @@ export default function OnboardPage() {
   const [newDomain, setNewDomain] = useState("");
   const [creating, setCreating] = useState(false);
   const [apiKey, setApiKey] = useState<string>("");
+  // Which site the shown key belongs to — switching sites invalidates the
+  // snippet's key, so a fresh one is minted rather than showing a mismatch.
+  const [keySiteId, setKeySiteId] = useState<string>("");
   const [keyLoading, setKeyLoading] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [detected, setDetected] = useState(false);
+  const [capture, setCapture] = useState<CaptureState>({ kind: "checking" });
   const pollRef = useRef<number | null>(null);
-  const baselineRef = useRef<number>(-1);
+  const baselineRef = useRef<number | null>(null);
+  const currentRef = useRef<number>(0);
+  const startedAtRef = useRef<number>(0);
+  // public_url is where browsers must load the tracker from (the dashboard
+  // origin can be a private address); fall back to this origin.
+  const [publicUrl, setPublicUrl] = useState("");
 
-  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const origin = publicUrl || (typeof window !== "undefined" ? window.location.origin : "");
 
   // Load sites on mount.
   useEffect(() => {
@@ -31,29 +46,40 @@ export default function OnboardPage() {
       setSites(s || []);
       if (s && s.length > 0) setSiteId(s[0].site_id);
     }).catch(() => setSites([]));
+    fetch("/api/v1/config")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((r) => setPublicUrl(typeof r?.public_url === "string" && r.public_url ? r.public_url : ""))
+      .catch(() => {});
   }, []);
 
-  // Step 3: poll overview for a pageview-count increase.
+  // Step 3: poll the overview for the recent window. Two confirmations are
+  // possible — the site already had events (tracker already working) or an
+  // event arrived since setup started. Zero traffic past the grace period
+  // switches to the remedy state instead of an endless "waiting".
   useEffect(() => {
     if (step !== 3) {
       if (pollRef.current) window.clearInterval(pollRef.current);
       return;
     }
-    analyticsApi.overview(siteId, new Date(Date.now() - 10 * 60 * 1000).toISOString(), new Date().toISOString())
-      .then((r) => {
-        baselineRef.current = r.current?.pageviews ?? 0;
-      })
-      .catch(() => { baselineRef.current = 0; });
+    startedAtRef.current = Date.now();
+    baselineRef.current = null;
+    currentRef.current = 0;
+    setCapture({ kind: "checking" });
 
-    pollRef.current = window.setInterval(async () => {
+    const read = async () => {
       try {
         const r = await analyticsApi.overview(siteId, new Date(Date.now() - 10 * 60 * 1000).toISOString(), new Date().toISOString());
         const pv = r.current?.pageviews ?? 0;
-        if (baselineRef.current >= 0 && pv > baselineRef.current) {
-          setDetected(true);
-        }
-      } catch { /* keep polling */ }
-    }, 3000);
+        if (baselineRef.current === null) baselineRef.current = pv;
+        currentRef.current = pv;
+        setCapture(captureState(baselineRef.current, pv, Date.now() - startedAtRef.current, NO_CAPTURE_GRACE_MS));
+      } catch {
+        // The overview failing is not evidence about capture; keep the
+        // previous state and try again on the next tick.
+      }
+    };
+    read();
+    pollRef.current = window.setInterval(read, 3000);
 
     return () => {
       if (pollRef.current) window.clearInterval(pollRef.current);
@@ -77,15 +103,21 @@ export default function OnboardPage() {
     try {
       const r = await settingsApi.createAPIKey(siteId);
       setApiKey(r.key);
+      setKeySiteId(siteId);
     } catch (err) { console.error("create key failed", err); }
     finally { setKeyLoading(false); }
   };
 
-  const snippet = `<script
-  src="${origin}/observe.js"
-  data-site-id="${siteId}"
-  data-endpoint="${origin}/api/v1/events"
-  defer></script>`;
+  // Entering step 2 with no key shown for the chosen site mints one
+  // automatically: the snippet is useless without it (ingest rejects
+  // keyless batches on any instance with keys provisioned).
+  useEffect(() => {
+    if (step === 2 && (!apiKey || keySiteId !== siteId) && !keyLoading) void generateKey();
+  }, [step, siteId, apiKey, keySiteId]);
+
+  const snippet = apiKey
+    ? trackerSnippet(origin, siteId, apiKey)
+    : `<script defer src="${origin}/t/observe.js"\n  data-site-id="${siteId}"\n  data-api-key="GENERATING..."></script>`;
 
   const copy = async (text: string) => {
     if (await copyToClipboard(text)) {
@@ -187,6 +219,8 @@ export default function OnboardPage() {
             <p class="onboard-help">
               Paste this snippet into your HTML, ideally just before <code>&lt;/head&gt;</code>.
               It captures pageviews, outbound clicks, and session info. ~2 KB gzipped.
+              The <code>data-api-key</code> is this site's ingest key — the snippet
+              does not work without it.
             </p>
 
             <div class="onboard-snippet-wrap">
@@ -199,7 +233,7 @@ export default function OnboardPage() {
             <div class="onboard-api-key">
               <div class="onboard-api-key-head">
                 <strong>Server-side ingest?</strong>
-                <span class="onboard-help-inline">You'll need an API key for log/error/trace ingestion from backends.</span>
+                <span class="onboard-help-inline">The same API key above authorizes log/error/trace ingestion from backends (send it as the X-API-Key header).</span>
               </div>
               {apiKey ? (
                 <div class="onboard-api-key-shown">
@@ -229,14 +263,39 @@ export default function OnboardPage() {
 
         {step === 3 && (
           <div class="onboard-body">
-            {detected ? (
+            {capture.kind === "confirmed" ? (
               <div class="onboard-done">
                 <div class="onboard-check">✓</div>
-                <h2>First event received</h2>
-                <p class="onboard-help">Your tracker is working. Head to the dashboard to watch pageviews arrive in real-time.</p>
+                <h2>{capture.sinceSetup ? "First event received" : "Capture confirmed"}</h2>
+                <p class="onboard-help" role="status">
+                  {capture.sinceSetup
+                    ? "An event arrived while you watched — the tracker is working."
+                    : "This site already received events in the last 10 minutes, so the tracker is already capturing. Head to the dashboard to watch pageviews arrive in real-time."}
+                </p>
                 <div class="onboard-actions">
                   <a class="obs-btn obs-btn--primary" href={`/?site_id=${encodeURIComponent(siteId)}`}>
                     Open dashboard →
+                  </a>
+                </div>
+              </div>
+            ) : capture.kind === "no-capture" ? (
+              <div class="onboard-waiting">
+                <h2>No events received</h2>
+                <p class="onboard-help" role="status">
+                  Nothing has arrived from this site in the last 10 minutes. Check, in order:
+                </p>
+                <ol class="onboard-help" style={{ textAlign: "left", paddingLeft: "20px", margin: "8px 0" }}>
+                  <li>The snippet is on a live page of <strong>this</strong> site ({siteId}) — a snippet pointed at another site's id reports there.</li>
+                  <li>It loads <code>/t/observe.js</code> from {origin || "your observe instance"} with a <code>data-api-key</code> — keyless or wrongly-keyed batches are rejected with 401.</li>
+                  <li>Your browser's devtools console: a failed request to <code>/api/v1/events/batch</code> means the key or site id is wrong; no request at all means the snippet did not load.</li>
+                </ol>
+                <div class="onboard-actions onboard-actions--split">
+                  <button class="obs-btn" onClick={() => setStep(2)}>← Show snippet again</button>
+                  <button class="obs-btn" onClick={generateKey} disabled={keyLoading}>
+                    {keyLoading ? "Generating..." : "Generate a fresh key"}
+                  </button>
+                  <a class="obs-btn" href={`/?site_id=${encodeURIComponent(siteId)}`}>
+                    Skip to dashboard
                   </a>
                 </div>
               </div>
@@ -245,7 +304,7 @@ export default function OnboardPage() {
                 <div class="onboard-pulse" aria-hidden="true" />
                 <h2>Waiting for first event…</h2>
                 <p class="onboard-help">
-                  Visit a page on your site to trigger a pageview. Polling every 3 seconds.
+                  Visit a page on your site to trigger a pageview. Checking every 3 seconds.
                   If nothing arrives, check the browser console for errors loading <code>observe.js</code>.
                 </p>
                 <div class="onboard-actions onboard-actions--split">
