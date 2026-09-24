@@ -1,8 +1,8 @@
 # Teploy Observe
 
 Self-hosted observability in one binary. Analytics, error tracking, APM,
-logs, session replay, monitoring, feature flags, experiments — and three
-things no competitor bundles:
+logs, session replay, monitoring, feature flags, experiments — with three
+of those surfaces working together in one install:
 
 1. **AI query assistant** on the SQL explorer. English in, SQL out (your
    LLM key, your cost). Every call logged back to the LLM-tracing table.
@@ -10,7 +10,8 @@ things no competitor bundles:
    chart overlays a translucent vertical band for the window.
 3. **Scheduled SQL exports** to any S3-compatible bucket (S3, R2, MinIO).
 
-Two processes. ~100MB idle. Runs on a $5 VPS.
+Two processes (Observe + Nucleus). 91 MB idle measured on the reference
+4-core host — see [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Install
 
@@ -104,6 +105,88 @@ go build ./cmd/observe        # neutron-go is vendored; no network setup
 You also need a Nucleus database binary — see the Docker compose file for
 the exact image and version.
 
+## First success
+
+The tested path from a fresh clone to a query-visible first event is the
+script `sdk/e2e/first_event_test.sh` (needs `podman`; uses its own
+fixtures on ports 55446/38080 and cleans up after itself):
+
+```bash
+git clone https://github.com/useteploy/teploy-observe.git
+cd teploy-observe
+bash sdk/e2e/first_event_test.sh
+```
+
+It boots a Nucleus fixture, builds and starts Observe, creates a
+site-scoped API key, proves keyless ingest is refused with 401, sends a
+first event from each SDK (browser, sentry-shim, Go, Python), and polls
+the stats API until those records are query-visible. Every step above is
+exercised by that script (verified passing on this branch); it is not
+part of the normal test suites because it needs podman and exclusive
+ports.
+
+The manual equivalent, condensed from the script:
+
+1. **Run**: start Nucleus, then `OBSERVE_NUCLEUS_URL=... OBSERVE_ADMIN_PASSWORD=...
+   observe`. Sign in, or drive the API: `POST /api/v1/auth/login` with the
+   admin credentials.
+2. **API key**: `POST /api/v1/sites/default/keys` with the admin JWT
+   (Settings > API keys in the UI) — a site-scoped telemetry key (`obs_...`,
+   shown once).
+3. **First event**: send one with any SDK or a plain POST to
+   `/api/v1/events/batch` with the `X-API-Key` header.
+4. **See it**: `GET /api/v1/stats/events?site_id=default` (JWT auth) lists
+   the event once it has flushed.
+
+Failure modes: a 401 on ingest means the key is missing/wrong (keys are
+site-scoped; browser keys are telemetry-only by design); `/healthz` 503
+with `nucleus: ...` means the engine connection failed — check
+`OBSERVE_NUCLEUS_URL` first. Durable-ingest posture and all counters are
+on `/healthz` (see the WAL notes under Platform below).
+
+## Migrating from Sentry or PostHog
+
+Tested paths (installation → credential → first event → verification, per
+SDK) and dual-write recipes are in [docs/sdk/MIGRATION.md](docs/sdk/MIGRATION.md).
+The per-API compatibility tables — supported, changed semantics,
+intentional no-op, unsupported — are the authority:
+[docs/sdk/COMPATIBILITY.md](docs/sdk/COMPATIBILITY.md). The rule for every
+recipe: run both integrations side by side, compare, and only remove the
+old one after the Observe data has proven itself.
+
+## Operational limits
+
+Declared limits, fixture-tested scale points, and where to read them live:
+
+- **Measured throughput** (reference host, Intel N5000 4-core/4GB —
+  [BENCHMARKS.md](BENCHMARKS.md)): 75 req/s analytics pageviews at 45 ms
+  p95; 58 req/s OTLP traces (2 spans/request) at 66 ms p95; error events
+  are rate-limited per site (default 1000 events/s,
+  `OBSERVE_RATE_LIMIT`). Memory 91 MB idle / 124 MB after the full bench.
+  The CI-enforced ingest budget (weekly, GitHub-hosted runner) is
+  10,000 events/s sustained with p95 < 50 ms —
+  [docs/operations/perf-budget.md](docs/operations/perf-budget.md).
+- **Query admission** (refusals are labeled 429/504, never truncated
+  answers): per-query row budget 1M, wall-time 30 s, 8 global / 4
+  per-site concurrent expensive queries, funnel/retention window clamp
+  186 days — knobs and refusal codes in
+  [docs/operations/capacity.md](docs/operations/capacity.md).
+- **Metrics ingest cardinality**: 20k distinct series per site, 20k data
+  points per request (413 past — exporters must split), label truncation
+  with counters; the series registry is bounded and in-memory.
+- **Ingest durability**: WAL-backed group commit (durable mode by
+  default; a 200 means fsynced). The disk high-water (512 MB across WAL
+  segments by default) refuses new events with a retryable 503 in durable
+  mode; `OBSERVE_WAL_LOSSY=true` opts into the declared loss budget
+  instead. Counters on `/healthz`.
+- **Single install**: two processes, one binary each. There is no
+  clustering, no multi-node storage; scale is a single instance plus the
+  budgets above. Ingest can be exposed separately from the dashboard via
+  `OBSERVE_INGEST_ADDR`.
+- **No PromQL**: metrics are queried via the structured query API;
+  PromQL is an explicit future decision (see "Metrics query semantics"
+  below).
+
 ## Features
 
 ### Analytics
@@ -113,7 +196,9 @@ the exact image and version.
 - Custom events with property drill-down.
 - Funnels, retention cohorts, user journeys, goals.
 - Real-time active visitors.
-- Cookie-free, GDPR-compliant.
+- Cookie-free (no cookies are set; visitor identity is derived, and all
+  data stays on your server). Whether that satisfies your jurisdiction's
+  obligations is your compliance review to make, not a claim of ours.
 
 ### Error tracking
 - Automatic grouping (MD5 of type + in-app frames).
