@@ -56,7 +56,11 @@ test("login lands on a rendered dashboard with stats cards", async ({ page }) =>
 });
 
 test("replay opens, pauses, and seeks", async ({ page }) => {
-  await open(page, "/sessions");
+  // Explicit site: without it the sessions route falls back to "first
+  // non-default site", which a concurrently-running spec can create mid-run
+  // and steer this test onto its rrweb session instead of the demo-seeded
+  // keyframe one.
+  await open(page, "/sessions?site_id=default");
   const firstCard = page.locator(".sessions-card").first();
   await expect(firstCard).toBeVisible({ timeout: 15000 });
   await firstCard.click();
@@ -90,8 +94,9 @@ test("audit view renders the trail", async ({ page }) => {
   await open(page, "/audit");
   await expect(page.locator("h1", { hasText: "Audit log" })).toBeVisible({ timeout: 15000 });
   // The login this suite performed is itself audited (auth.login), so a
-  // working instance always has at least one row.
-  const row = page.locator("table tbody tr").first();
+  // working instance always has at least one matching row — but parallel
+  // spec files also write audit actions (site.create, ...), which can sort
+  // ahead of it, so the match is order-independent.
+  const row = page.locator("table tbody tr").filter({ hasText: /auth\.login|user\.|audit\./ }).first();
   await expect(row).toBeVisible({ timeout: 15000 });
-  await expect(row).toContainText(/auth\.login|user\.|audit\./);
 });

@@ -30,7 +30,11 @@ test("login lands on a rendered dashboard", async ({ page }) => {
 
 test("one seeded replay opens and plays", async ({ page }) => {
   await login(page);
-  await page.goto("/sessions");
+  // Explicit site: without it the sessions route falls back to "first
+  // non-default site", which a concurrently-running spec (e.g. the
+  // dashboard-replay journey) can create mid-run and steer this test onto
+  // its rrweb session instead of the demo-seeded keyframe one.
+  await page.goto("/sessions?site_id=default");
   const firstCard = page.locator(".sessions-card").first();
   await expect(firstCard).toBeVisible({ timeout: 15000 });
   await firstCard.click();

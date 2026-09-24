@@ -373,7 +373,7 @@ jobs:
         run: |
           npm ci
           npx playwright install --with-deps chromium
-          npx playwright test tests/smoke.spec.ts tests/core.spec.ts
+          npx playwright test tests/smoke.spec.ts tests/core.spec.ts tests/dashboard-replay-journey.spec.ts
         env:
           OBSERVE_URL: http://127.0.0.1:3000
 
