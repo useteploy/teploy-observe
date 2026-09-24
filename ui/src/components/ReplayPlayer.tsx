@@ -472,7 +472,12 @@ export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerPro
 
   useEffect(() => {
     if (!rrwebMode || !rrwebReady) return;
-    replayerRef.current?.setSpeed(speed);
+    const r = replayerRef.current;
+    // The bundled runtime (ui/public/rrweb/replayer.js) drives speed through
+    // its internal speedService and does not expose setSpeed — calling it
+    // unconditionally threw and took the whole route down with it. Feature-
+    // detect: when absent, the selector is a no-op for this session.
+    if (r && typeof r.setSpeed === "function") r.setSpeed(speed);
   }, [speed, rrwebReady, rrwebMode]);
 
   // Elapsed tracking reads the replayer's clock while playing (the
