@@ -19,8 +19,8 @@ func diskView(path string) map[string]any {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(path, &st); err != nil {
 		return map[string]any{
-			"path": path,
-			"ok":   false,
+			"path":  path,
+			"ok":    false,
 			"error": err.Error(),
 		}
 	}

@@ -50,10 +50,10 @@ type CardinalityLimits struct {
 // 512 MiB engine through per-series rows.
 func DefaultCardinalityLimits() CardinalityLimits {
 	return CardinalityLimits{
-		MaxAttrsPerPoint:   32,
-		MaxAttrValueBytes:  200,
+		MaxAttrsPerPoint:    32,
+		MaxAttrValueBytes:   200,
 		MaxPointsPerRequest: 20000,
-		MaxSeriesPerSite:   20000,
+		MaxSeriesPerSite:    20000,
 	}
 }
 

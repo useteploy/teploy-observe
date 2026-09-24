@@ -12,8 +12,8 @@ import (
 	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/nucleustest"
-	"github.com/useteploy/teploy-observe/internal/schema"
 	"github.com/useteploy/teploy-observe/internal/queryguard"
+	"github.com/useteploy/teploy-observe/internal/schema"
 )
 
 // o12Connect mirrors o04Connect: DSN, 60s budget, unique per-run site id.

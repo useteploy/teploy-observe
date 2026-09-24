@@ -255,13 +255,13 @@ type SiteSnapshot struct {
 // Snapshot is the /healthz query-admission view: slot gauges, refusal
 // counters by code, and the declared budgets that produced them.
 type Snapshot struct {
-	GlobalRunning int                      `json:"global_running"`
-	GlobalLimit   int                      `json:"global_limit"`
-	SiteLimit     int                      `json:"site_limit"`
-	Sites         map[string]SiteSnapshot  `json:"sites"`
-	Refused       map[string]int64         `json:"refused_total"`
-	AcquiredTotal int64                    `json:"acquired_total"`
-	Budgets       map[string]any           `json:"budgets"`
+	GlobalRunning int                     `json:"global_running"`
+	GlobalLimit   int                     `json:"global_limit"`
+	SiteLimit     int                     `json:"site_limit"`
+	Sites         map[string]SiteSnapshot `json:"sites"`
+	Refused       map[string]int64        `json:"refused_total"`
+	AcquiredTotal int64                   `json:"acquired_total"`
+	Budgets       map[string]any          `json:"budgets"`
 }
 
 func (l *Limiter) Snapshot(b Budgets) Snapshot {
@@ -283,9 +283,9 @@ func (l *Limiter) Snapshot(b Budgets) Snapshot {
 		Refused:       refused,
 		AcquiredTotal: l.acquired,
 		Budgets: map[string]any{
-			"timeout_ms":       b.Timeout.Milliseconds(),
-			"max_scan_rows":    b.MaxScanRows,
-			"max_window_days":  int64(b.MaxWindow / (24 * time.Hour)),
+			"timeout_ms":      b.Timeout.Milliseconds(),
+			"max_scan_rows":   b.MaxScanRows,
+			"max_window_days": int64(b.MaxWindow / (24 * time.Hour)),
 		},
 	}
 }
