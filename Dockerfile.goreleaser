@@ -3,7 +3,8 @@
 # sidesteps the vendor-in-build-context problem that deferred Docker in v0.1.0.
 # The from-source Dockerfile (used by docker-compose for dev) is kept separately.
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates tzdata
+# tini is PID 1: it reaps orphaned healthcheck processes (see Dockerfile).
+RUN apk add --no-cache ca-certificates tzdata tini
 ARG TARGETPLATFORM
 COPY $TARGETPLATFORM/observe /usr/local/bin/observe
 
@@ -23,7 +24,10 @@ VOLUME ["/var/lib/observe"]
 
 USER 10001:10001
 
-HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
-    CMD wget -q --spider http://localhost:3000/healthz || exit 1
+# Same probe as the from-source Dockerfile, whose comment carries the reasons:
+# 12s covers a cold Nucleus connect (3s flapped to unhealthy), and wget's own
+# -T 10 exits before Docker's timeout so no orphaned wget is left behind.
+HEALTHCHECK --interval=15s --timeout=12s --start-period=30s --retries=3 \
+    CMD wget -q -T 10 --spider http://localhost:3000/healthz || exit 1
 
-ENTRYPOINT ["observe"]
+ENTRYPOINT ["/sbin/tini", "--", "observe"]

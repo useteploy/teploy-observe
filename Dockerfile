@@ -21,7 +21,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
         ./cmd/observe
 
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates tzdata
+# tini is PID 1 (see ENTRYPOINT): it reaps orphaned processes, which observe
+# itself never does.
+RUN apk add --no-cache ca-certificates tzdata tini
 COPY --from=builder /observe /usr/local/bin/observe
 
 # Audit F50: run as a dedicated unprivileged identity instead of the image's
@@ -54,7 +56,14 @@ USER 10001:10001
 # The timeout is sized for the cold-connect case rather than the warm one; it
 # stays under the interval, and retries=3 still requires three consecutive
 # failures before the container is called unhealthy.
+#
+# wget carries its own -T 10, under Docker's 12s. When Docker's timeout fires
+# it kills the probe's shell, not wget; the orphaned wget is re-parented to
+# PID 1, and with observe as PID 1 nothing ever reaps it. A live container
+# accumulated 1,108 zombie wget processes that way (one per probe that
+# outlived the timeout) on its way to PID exhaustion. -T makes wget exit on
+# its own first; tini as PID 1 reaps anything that still slips through.
 HEALTHCHECK --interval=15s --timeout=12s --start-period=30s --retries=3 \
-    CMD wget -q --spider http://localhost:3000/healthz || exit 1
+    CMD wget -q -T 10 --spider http://localhost:3000/healthz || exit 1
 
-ENTRYPOINT ["observe"]
+ENTRYPOINT ["/sbin/tini", "--", "observe"]
