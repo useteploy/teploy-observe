@@ -72,6 +72,7 @@ var Tables = []string{
 	"service_dependencies",
 	"derived_outbox",
 	"llm_traces",
+	"llm_model_prices",
 	"metric_points",
 	"host_metrics",
 	"replay_sessions",

@@ -1170,6 +1170,13 @@ func main() {
 		neutron.WithTags("llm"), neutron.WithSummary("LLM model breakdown"))
 	neutron.Get(llmGroup, "/traces", llmTracesHandler(llmSvc),
 		neutron.WithTags("llm"), neutron.WithSummary("Recent LLM traces"))
+	// O14: the versioned model/cost catalog (admin maintains; estimation
+	// reads it at ingest).
+	llmAdmin := llmGroup.Group("", requireAdmin)
+	neutron.Get(llmAdmin, "/prices", llmPricesListHandler(llmSvc),
+		neutron.WithTags("llm"), neutron.WithSummary("List effective model prices"))
+	neutron.Post(llmAdmin, "/prices", llmPricesSetHandler(llmSvc),
+		neutron.WithTags("llm"), neutron.WithSummary("Set a model price (versioned by valid_from)"))
 
 	// --- Infrastructure monitoring (API-key agent reports, JWT for queries) ---
 	// OBS-014: this was keyless — it validated that the caller-supplied
@@ -2921,6 +2928,18 @@ type llmTracesInput struct {
 func llmTracesHandler(svc *llm.LLMService) neutron.HandlerFunc[llmTracesInput, []llm.LLMTrace] {
 	return func(ctx context.Context, input llmTracesInput) ([]llm.LLMTrace, error) {
 		return emptyOnNil(svc.RecentTraces(ctx, input.SiteID, input.Limit))
+	}
+}
+
+func llmPricesListHandler(svc *llm.LLMService) neutron.HandlerFunc[neutron.Empty, []llm.CatalogEntry] {
+	return func(ctx context.Context, _ neutron.Empty) ([]llm.CatalogEntry, error) {
+		return emptyOnNil(svc.ListPrices(ctx))
+	}
+}
+
+func llmPricesSetHandler(svc *llm.LLMService) neutron.HandlerFunc[llm.CatalogEntry, neutron.Empty] {
+	return func(ctx context.Context, input llm.CatalogEntry) (neutron.Empty, error) {
+		return neutron.Empty{}, svc.SetPrice(ctx, input)
 	}
 }
 

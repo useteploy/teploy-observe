@@ -6,9 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
@@ -17,12 +17,24 @@ import (
 )
 
 type LLMService struct {
-	db *nucleus.Client
+	db     *nucleus.Client
+	logger *slog.Logger
+	cat    catalogCache
 }
 
 func NewLLMService(db *nucleus.Client) *LLMService {
-	return &LLMService{db: db}
+	return &LLMService{db: db, logger: slog.Default()}
 }
+
+// Token/cost provenance values (O14: an estimated number must say
+// estimated everywhere it renders).
+const (
+	TokenSourceReported  = "reported"
+	TokenSourceEstimated = "estimated"
+
+	CostSourceReported  = "reported"
+	CostSourceEstimated = "estimated"
+)
 
 // LLMTrace represents a single AI model call.
 type LLMTrace struct {
@@ -38,7 +50,9 @@ type LLMTrace struct {
 	PromptTokens     string `json:"prompt_tokens" db:"prompt_tokens"`
 	CompletionTokens string `json:"completion_tokens" db:"completion_tokens"`
 	TotalTokens      string `json:"total_tokens" db:"total_tokens"`
+	TokenSource      string `json:"token_source" db:"token_source"`
 	CostUSD          string `json:"cost_usd" db:"cost_usd"`
+	CostSource       string `json:"cost_source" db:"cost_source"`
 	LatencyMs        string `json:"latency_ms" db:"latency_ms"`
 	Status           string `json:"status" db:"status"`
 	ErrorMessage     string `json:"error_message" db:"error_message"`
@@ -57,6 +71,7 @@ type LLMInput struct {
 	Operation        string         `json:"operation"`
 	PromptTokens     int            `json:"prompt_tokens"`
 	CompletionTokens int            `json:"completion_tokens"`
+	TokenSource      string         `json:"token_source"`
 	CostUSD          float64        `json:"cost_usd"`
 	LatencyMs        int            `json:"latency_ms"`
 	Status           string         `json:"status"`
@@ -93,6 +108,11 @@ func validateInput(input *LLMInput) error {
 	if input.CostUSD < 0 || input.CostUSD > maxCostUSD || math.IsNaN(input.CostUSD) || math.IsInf(input.CostUSD, 0) {
 		return fmt.Errorf("invalid cost_usd (must be a finite number in [0, %d])", maxCostUSD)
 	}
+	switch input.TokenSource {
+	case "", TokenSourceReported, TokenSourceEstimated:
+	default:
+		return fmt.Errorf("invalid token_source (must be 'reported' or 'estimated')")
+	}
 	return nil
 }
 
@@ -118,21 +138,36 @@ func (s *LLMService) Ingest(ctx context.Context, input LLMInput) (LLMResponse, e
 		}
 	}
 
-	// Auto-calculate cost if not provided
+	// Token provenance (O14): counts arriving in the payload are REPORTED
+	// by construction; 'estimated' is the producer's own declaration (it
+	// derived the counts, e.g. chars/4). The server never invents counts.
+	tokenSource := input.TokenSource
+	if tokenSource == "" && totalTokens > 0 {
+		tokenSource = TokenSourceReported
+	}
+
+	// Cost provenance: a caller-supplied cost is reported; an auto-derived
+	// cost is ESTIMATED from the versioned catalog and labeled so - the
+	// number is a catalog computation, never an invoice.
 	cost := input.CostUSD
-	if cost == 0 && totalTokens > 0 {
-		cost = estimateCost(input.Model, input.PromptTokens, input.CompletionTokens)
+	costSource := ""
+	if cost > 0 {
+		costSource = CostSourceReported
+	} else if totalTokens > 0 {
+		in, out, _ := resolveCatalog(s.catalog(ctx), input.Provider, input.Model)
+		cost = (float64(input.PromptTokens)/1000)*in + (float64(input.CompletionTokens)/1000)*out
+		costSource = CostSourceEstimated
 	}
 
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO llm_traces (trace_id, tenant_id, site_id, session_id, span_id, timestamp,
 			model, provider, operation, prompt_tokens, completion_tokens, total_tokens,
-			cost_usd, latency_ms, status, error_message, prompt, completion, metadata)
-		 VALUES ($1,'default',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+			token_source, cost_usd, cost_source, latency_ms, status, error_message, prompt, completion, metadata)
+		 VALUES ($1,'default',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
 		id, input.SiteID, input.SessionID, input.SpanID, now,
 		input.Model, input.Provider, input.Operation,
 		strconv.Itoa(input.PromptTokens), strconv.Itoa(input.CompletionTokens), strconv.Itoa(totalTokens),
-		fmt.Sprintf("%.6f", cost), strconv.Itoa(input.LatencyMs),
+		tokenSource, fmt.Sprintf("%.6f", cost), costSource, strconv.Itoa(input.LatencyMs),
 		input.Status, input.ErrorMessage, input.Prompt, input.Completion, metaJSON,
 	)
 	if err != nil {
@@ -141,13 +176,22 @@ func (s *LLMService) Ingest(ctx context.Context, input LLMInput) (LLMResponse, e
 	return LLMResponse{OK: true, TraceID: id}, nil
 }
 
-// LLMStats returns aggregate LLM usage statistics.
+// LLMStats returns aggregate LLM usage statistics. The cost fields are
+// split by provenance (O14): total is everything, estimated is the subset
+// derived from the catalog - an estimated number must be labelable
+// everywhere it renders, so the split rides every surface that sums cost.
 type LLMStats struct {
 	TotalCalls   string `json:"total_calls" db:"total_calls"`
 	TotalTokens  string `json:"total_tokens" db:"total_tokens"`
 	TotalCostUSD string `json:"total_cost_usd" db:"total_cost_usd"`
-	AvgLatencyMs string `json:"avg_latency_ms" db:"avg_latency_ms"`
-	ErrorCount   string `json:"error_count" db:"error_count"`
+	// EstimatedCostUSD: the catalog-derived subset of TotalCostUSD.
+	EstimatedCostUSD string `json:"estimated_cost_usd" db:"estimated_cost_usd"`
+	// ReportedCostUSD: the caller-supplied subset.
+	ReportedCostUSD string `json:"reported_cost_usd" db:"reported_cost_usd"`
+	// CostUnattributed: rows whose cost_source is '' (legacy, pre-054).
+	CostUnattributed string `json:"cost_unattributed" db:"cost_unattributed"`
+	AvgLatencyMs     string `json:"avg_latency_ms" db:"avg_latency_ms"`
+	ErrorCount       string `json:"error_count" db:"error_count"`
 }
 
 type ModelStats struct {
@@ -156,7 +200,9 @@ type ModelStats struct {
 	CallCount    string `json:"call_count" db:"call_count"`
 	TotalTokens  string `json:"total_tokens" db:"total_tokens"`
 	TotalCostUSD string `json:"total_cost_usd" db:"total_cost_usd"`
-	AvgLatencyMs string `json:"avg_latency_ms" db:"avg_latency_ms"`
+	// EstimatedCostUSD: the catalog-derived subset of TotalCostUSD.
+	EstimatedCostUSD string `json:"estimated_cost_usd" db:"estimated_cost_usd"`
+	AvgLatencyMs     string `json:"avg_latency_ms" db:"avg_latency_ms"`
 }
 
 func (s *LLMService) Stats(ctx context.Context, siteID string, from, to time.Time) (*LLMStats, error) {
@@ -176,17 +222,23 @@ func (s *LLMService) Stats(ctx context.Context, siteID string, from, to time.Tim
 	// Empty result sets fall through to the zero-value LLMStats below
 	// with explicit "0" strings.
 	type rawRow struct {
-		Calls   int64   `db:"calls"`
-		Tokens  int64   `db:"tokens"`
-		Cost    float64 `db:"cost"`
-		Latency float64 `db:"latency"`
-		Errors  int64   `db:"errors"`
+		Calls        int64   `db:"calls"`
+		Tokens       int64   `db:"tokens"`
+		Cost         float64 `db:"cost"`
+		Estimated    float64 `db:"estimated"`
+		Reported     float64 `db:"reported"`
+		Unattributed int64   `db:"unattributed"`
+		Latency      float64 `db:"latency"`
+		Errors       int64   `db:"errors"`
 	}
 
 	rows, err := nucleus.Query[rawRow](ctx, s.db.SQL(),
 		`SELECT COUNT(*) AS calls,
 			COALESCE(SUM(CAST(total_tokens AS BIGINT)), 0) AS tokens,
 			COALESCE(SUM(CAST(cost_usd AS DOUBLE)), 0) AS cost,
+			COALESCE(SUM(CASE WHEN cost_source = 'estimated' THEN CAST(cost_usd AS DOUBLE) ELSE 0 END), 0) AS estimated,
+			COALESCE(SUM(CASE WHEN cost_source = 'reported' THEN CAST(cost_usd AS DOUBLE) ELSE 0 END), 0) AS reported,
+			COALESCE(SUM(CASE WHEN cost_source = '' THEN 1 ELSE 0 END), 0) AS unattributed,
 			COALESCE(AVG(CAST(latency_ms AS BIGINT)), 0) AS latency,
 			COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) AS errors
 		 FROM llm_traces WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
@@ -202,17 +254,21 @@ func (s *LLMService) Stats(ctx context.Context, siteID string, from, to time.Tim
 	if len(rows) == 0 {
 		return &LLMStats{
 			TotalCalls: "0", TotalTokens: "0",
-			TotalCostUSD: "0", AvgLatencyMs: "0", ErrorCount: "0",
+			TotalCostUSD: "0", EstimatedCostUSD: "0", ReportedCostUSD: "0", CostUnattributed: "0",
+			AvgLatencyMs: "0", ErrorCount: "0",
 		}, nil
 	}
 
 	r := rows[0]
 	return &LLMStats{
-		TotalCalls:   strconv.FormatInt(r.Calls, 10),
-		TotalTokens:  strconv.FormatInt(r.Tokens, 10),
-		TotalCostUSD: strconv.FormatFloat(r.Cost, 'f', -1, 64),
-		AvgLatencyMs: strconv.FormatFloat(r.Latency, 'f', -1, 64),
-		ErrorCount:   strconv.FormatInt(r.Errors, 10),
+		TotalCalls:       strconv.FormatInt(r.Calls, 10),
+		TotalTokens:      strconv.FormatInt(r.Tokens, 10),
+		TotalCostUSD:     strconv.FormatFloat(r.Cost, 'f', -1, 64),
+		EstimatedCostUSD: strconv.FormatFloat(r.Estimated, 'f', -1, 64),
+		ReportedCostUSD:  strconv.FormatFloat(r.Reported, 'f', -1, 64),
+		CostUnattributed: strconv.FormatInt(r.Unattributed, 10),
+		AvgLatencyMs:     strconv.FormatFloat(r.Latency, 'f', -1, 64),
+		ErrorCount:       strconv.FormatInt(r.Errors, 10),
 	}, nil
 }
 
@@ -228,6 +284,7 @@ func (s *LLMService) ModelBreakdown(ctx context.Context, siteID string, from, to
 		CallCount    int64   `db:"call_count"`
 		TotalTokens  int64   `db:"total_tokens"`
 		TotalCostUSD float64 `db:"total_cost_usd"`
+		Estimated    float64 `db:"estimated_cost_usd"`
 		AvgLatencyMs float64 `db:"avg_latency_ms"`
 	}
 	rows, err := nucleus.Query[rawRow](ctx, s.db.SQL(),
@@ -235,6 +292,7 @@ func (s *LLMService) ModelBreakdown(ctx context.Context, siteID string, from, to
 			COUNT(*) AS call_count,
 			COALESCE(SUM(CAST(total_tokens AS BIGINT)), 0) AS total_tokens,
 			COALESCE(SUM(CAST(cost_usd AS DOUBLE)), 0) AS total_cost_usd,
+			COALESCE(SUM(CASE WHEN cost_source = 'estimated' THEN CAST(cost_usd AS DOUBLE) ELSE 0 END), 0) AS estimated_cost_usd,
 			COALESCE(AVG(CAST(latency_ms AS BIGINT)), 0) AS avg_latency_ms
 		 FROM llm_traces WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		 GROUP BY model, provider
@@ -247,12 +305,13 @@ func (s *LLMService) ModelBreakdown(ctx context.Context, siteID string, from, to
 	out := make([]ModelStats, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, ModelStats{
-			Model:        r.Model,
-			Provider:     r.Provider,
-			CallCount:    strconv.FormatInt(r.CallCount, 10),
-			TotalTokens:  strconv.FormatInt(r.TotalTokens, 10),
-			TotalCostUSD: strconv.FormatFloat(r.TotalCostUSD, 'f', -1, 64),
-			AvgLatencyMs: strconv.FormatFloat(r.AvgLatencyMs, 'f', -1, 64),
+			Model:            r.Model,
+			Provider:         r.Provider,
+			CallCount:        strconv.FormatInt(r.CallCount, 10),
+			TotalTokens:      strconv.FormatInt(r.TotalTokens, 10),
+			TotalCostUSD:     strconv.FormatFloat(r.TotalCostUSD, 'f', -1, 64),
+			EstimatedCostUSD: strconv.FormatFloat(r.Estimated, 'f', -1, 64),
+			AvgLatencyMs:     strconv.FormatFloat(r.AvgLatencyMs, 'f', -1, 64),
 		})
 	}
 	return out, nil
@@ -265,51 +324,16 @@ func (s *LLMService) RecentTraces(ctx context.Context, siteID string, limit int)
 	return nucleus.Query[LLMTrace](ctx, s.db.SQL(),
 		fmt.Sprintf(`SELECT trace_id, tenant_id, site_id, session_id, span_id, timestamp,
 			model, provider, operation, prompt_tokens, completion_tokens, total_tokens,
-			cost_usd, latency_ms, status, error_message,
+			COALESCE(token_source, '') AS token_source,
+			cost_usd,
+			COALESCE(cost_source, '') AS cost_source,
+			latency_ms, status, error_message,
 			COALESCE(prompt, '') AS prompt, COALESCE(completion, '') AS completion,
 			COALESCE(metadata, '') AS metadata
 		 FROM llm_traces WHERE site_id = $1
 		 ORDER BY timestamp DESC LIMIT %d`, limit),
 		siteID,
 	)
-}
-
-// estimateCost provides rough cost estimates for common models.
-// modelPrice is USD per 1K tokens; modelPrices is ordered longest-prefix-first
-// so prefix matching resolves the most specific family first ("gpt-4o-mini"
-// before "gpt-4o", "gpt-4-turbo" before "gpt-4"). Real-world model strings are
-// dated/versioned ("gpt-4o-2024-08-06", "claude-3-5-sonnet-20241022"), so the
-// old exact-match-only table charged almost everything the wrong default.
-type modelPrice struct {
-	prefix        string
-	input, output float64
-}
-
-var modelPrices = []modelPrice{
-	{"gpt-4o-mini", 0.00015, 0.0006},
-	{"gpt-4o", 0.005, 0.015},
-	{"gpt-4-turbo", 0.01, 0.03},
-	{"gpt-4", 0.03, 0.06},
-	{"gpt-3.5-turbo", 0.0005, 0.0015},
-	{"o3-mini", 0.0011, 0.0044},
-	{"o1-mini", 0.0011, 0.0044},
-	{"o1", 0.015, 0.06},
-	{"claude-3-5-sonnet", 0.003, 0.015},
-	{"claude-3-5-haiku", 0.0008, 0.004},
-	{"claude-3-opus", 0.015, 0.075},
-	{"claude-3-sonnet", 0.003, 0.015},
-	{"claude-3-haiku", 0.00025, 0.00125},
-}
-
-func estimateCost(model string, promptTokens, completionTokens int) float64 {
-	in, out := 0.001, 0.002 // conservative default for unknown models
-	for _, mp := range modelPrices {
-		if model == mp.prefix || strings.HasPrefix(model, mp.prefix) {
-			in, out = mp.input, mp.output
-			break
-		}
-	}
-	return (float64(promptTokens)/1000)*in + (float64(completionTokens)/1000)*out
 }
 
 func genID() string {
