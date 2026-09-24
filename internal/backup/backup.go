@@ -85,6 +85,7 @@ var Tables = []string{
 	"experiment_conversions",
 	"surveys",
 	"survey_responses",
+	"survey_exposures",
 	"cohorts",
 	"feedback",
 	"alert_rules",

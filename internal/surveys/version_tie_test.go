@@ -30,7 +30,7 @@ func TestSameMillisecondCreateActivateResolvesActive(t *testing.T) {
 	nucleustest.AsPlainMergeTree(t, db, "surveys", surveyColumns,
 		"(tenant_id, site_id, survey_id)", "version")
 
-	svc := NewSurveyService(db)
+	svc := NewSurveyService(db, "", nil)
 	ctx := context.Background()
 	const site = "survey-tie-site"
 
@@ -91,7 +91,7 @@ func TestActivateBumpsPastAFutureVersion(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	svc := NewSurveyService(db)
+	svc := NewSurveyService(db, "", nil)
 	ctx := context.Background()
 	if err := svc.Activate(ctx, "fut"); err != nil {
 		t.Fatalf("activate: %v", err)

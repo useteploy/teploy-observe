@@ -445,7 +445,7 @@ func main() {
 	ssoSvc := sso.NewSSOService(db)
 	flagSvc := flags.NewFlagService(db)
 	experimentSvc := experiments.NewExperimentService(db)
-	surveySvc := surveys.NewSurveyService(db)
+	surveySvc := surveys.NewSurveyService(db, cfg.SessionSalt, siteSvc)
 	logSvc := logs.NewLogService(db)
 	logSvc.SetPipelines(pipelineSvc)
 	uptimeSvc := monitoring.NewUptimeService(db, logger)
@@ -1362,10 +1362,15 @@ func main() {
 		neutron.WithTags("surveys"), neutron.WithSummary("Create survey"))
 	neutron.Post(surveyEditor, "/{survey_id}/activate", activateSurveyHandler(surveySvc),
 		neutron.WithTags("surveys"), neutron.WithSummary("Activate survey"))
+	neutron.Post(surveyEditor, "/{survey_id}/close", closeSurveyHandler(surveySvc),
+		neutron.WithTags("surveys"), neutron.WithSummary("Close survey (stops exposure and response recording)"))
 	neutron.Get(surveyGroup, "/{survey_id}/responses", surveyResponsesHandler(surveySvc),
 		neutron.WithTags("surveys"), neutron.WithSummary("List survey responses"))
-	// Public: get active surveys + submit response
+	neutron.Get(surveyGroup, "/{survey_id}/stats", surveyStatsHandler(surveySvc),
+		neutron.WithTags("surveys"), neutron.WithSummary("Survey exposure/response stats"))
+	// Public: get active surveys, record exposure, submit response
 	r.HandleFunc("GET /api/v1/surveys/active", activeSurveysPublicHandler(surveySvc))
+	r.HandleFunc("POST /api/v1/surveys/expose", surveyExposeHandler(surveySvc))
 	r.HandleFunc("POST /api/v1/surveys/respond", surveyRespondHandler(surveySvc))
 
 	// --- Release health (JWT auth) ---
@@ -3840,11 +3845,60 @@ func createSurveyHandler(svc *surveys.SurveyService) neutron.HandlerFunc[createS
 
 type surveyIDInput struct {
 	SurveyID string `path:"survey_id"`
+	SiteID   string `query:"site_id"`
 }
 
 func activateSurveyHandler(svc *surveys.SurveyService) neutron.HandlerFunc[surveyIDInput, neutron.Empty] {
 	return func(ctx context.Context, input surveyIDInput) (neutron.Empty, error) {
 		return neutron.Empty{}, svc.Activate(ctx, input.SurveyID)
+	}
+}
+
+func closeSurveyHandler(svc *surveys.SurveyService) neutron.HandlerFunc[surveyIDInput, neutron.Empty] {
+	return func(ctx context.Context, input surveyIDInput) (neutron.Empty, error) {
+		return neutron.Empty{}, svc.Close(ctx, input.SurveyID)
+	}
+}
+
+func surveyStatsHandler(svc *surveys.SurveyService) neutron.HandlerFunc[surveyIDInput, *surveys.Stats] {
+	return func(ctx context.Context, input surveyIDInput) (*surveys.Stats, error) {
+		return svc.Stats(ctx, input.SurveyID, input.SiteID)
+	}
+}
+
+// surveyExposeHandler is the public exposure ping: the SDK reports that an
+// active survey was shown to a reader. The entity is derived SERVER-side
+// from the request IP/UA (or the hashed identify value when user_id is
+// sent) - the caller never names its own identity, matching the analytics
+// posture. Same bounds as respond (bounded body, strict decode).
+func surveyExposeHandler(svc *surveys.SurveyService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		r.Body = http.MaxBytesReader(w, r.Body, publicFormMaxBodyBytes)
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		var input surveyRespondInput
+		if err := dec.Decode(&input); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid request body"})
+			return
+		}
+		if input.SurveyID == "" || input.SiteID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "survey_id and site_id required"})
+			return
+		}
+		if err := svc.RecordExposure(r.Context(), input.SurveyID, input.SiteID, input.UserID,
+			ingest.ClientIPFromContext(r.Context()), ingest.UserAgentFromContext(r.Context())); err != nil {
+			// Same shape as respond: a gated refusal (unknown/inactive/cross-
+			// site survey) is a 400 the SDK can drop quietly.
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	}
 }
 
@@ -3886,10 +3940,11 @@ func activeSurveysPublicHandler(svc *surveys.SurveyService) http.HandlerFunc {
 }
 
 type surveyRespondInput struct {
-	SurveyID string         `json:"survey_id"`
-	SiteID   string         `json:"site_id"`
-	UserID   string         `json:"user_id"`
-	Answers  map[string]any `json:"answers"`
+	SurveyID   string         `json:"survey_id"`
+	SiteID     string         `json:"site_id"`
+	UserID     string         `json:"user_id"`
+	ResponseID string         `json:"response_id"`
+	Answers    map[string]any `json:"answers"`
 }
 
 // OBS-001/002/003: the decode error was ignored (malformed/truncated/wrongly
@@ -3923,13 +3978,15 @@ func surveyRespondHandler(svc *surveys.SurveyService) http.HandlerFunc {
 			return
 		}
 
-		id, err := svc.SubmitResponse(r.Context(), input.SurveyID, input.SiteID, input.UserID, input.Answers)
+		res, err := svc.SubmitResponse(r.Context(), input.SurveyID, input.SiteID, input.UserID,
+			input.ResponseID, input.Answers,
+			ingest.ClientIPFromContext(r.Context()), ingest.UserAgentFromContext(r.Context()))
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{"ok": true, "response_id": id})
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "response_id": res.ResponseID, "deduped": res.Deduped})
 	}
 }
 
