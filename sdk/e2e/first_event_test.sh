@@ -10,16 +10,9 @@
 #
 # Own fixture only (never 55432/55433): nucleus on :55446, observe on :38080.
 #
-# BLOCKED UPSTREAM (2026-09-23): the vendored Neutron lifecycle has a
-# success-path rollback bug — go/neutron/lifecycle.go's deferred
-# stopLimited runs even when every hook started cleanly, so app.Run()
-# boots Observe with its own hooks already stopped (ingest buffer,
-# scheduler, nucleus pool; /healthz answers 503 "nucleus: exec: closed
-# pool"). This script FAILS at the healthz gate until that one-line
-# framework fix lands in the Neutron repo (guard the defer with the
-# start error); the failure is the pin working, not a broken test. See
-# the O11 slice entry in AUDIT_OPEN.md for the probe that isolated it.
-set -euo pipefail
+# UPSTREAM FIXED (2026-09-23): the Neutron lifecycle success-path
+# rollback bug was fixed (eb19df63) and the pin carries it — this script
+# PASSES end to end (verified 2026-09-24; see the O11 receipt).
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WORK="$(mktemp -d /tmp/observe-o11-e2e.XXXXXX)"
