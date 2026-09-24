@@ -2,6 +2,7 @@ import { useEffect, useState } from "preact/hooks";
 import { useFilters } from "../hooks/useFilters.js";
 import { formatNumber } from "../utils/format.js";
 import { sortRows, metricLabel } from "../utils/sortRows.js";
+import LoadError from "./shared/LoadError.js";
 
 interface Props {
   fetchFn: (siteId: string, from: string, to: string, limit?: number, filters?: Record<string, string>) => Promise<Record<string, any>[]>;
@@ -30,16 +31,24 @@ function BreakdownTable({ fetchFn, labelKey, valueKey, filterKey, limit: initial
 
   const [data, setData] = useState<Record<string, any>[]>([]);
   const [loading, setLoading] = useState(true);
+  // O13 chart states: a failed breakdown renders an error, never the
+  // "No data for this period" empty state.
+  const [error, setError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const [limit, setLimit] = useState(initialLimit);
   const [sortAsc, setSortAsc] = useState(false);
 
   useEffect(() => {
     setLoading(true);
+    setError(null);
     fetchFn(siteId, from, to, limit, filters).then((d) => {
       setData(d || []);
       setLoading(false);
-    }).catch(() => setLoading(false));
-  }, [siteId, from, to, limit, JSON.stringify(filters)]);
+    }).catch((err) => {
+      setError(err instanceof Error ? err.message : String(err));
+      setLoading(false);
+    });
+  }, [siteId, from, to, limit, JSON.stringify(filters), reloadKey]);
 
   const sorted = sortRows(data, valueKey, labelKey, sortAsc);
   const total = data.reduce((sum, r) => sum + (Number(r[valueKey]) || 0), 0);
@@ -58,6 +67,16 @@ function BreakdownTable({ fetchFn, labelKey, valueKey, filterKey, limit: initial
 
   if (loading) {
     return <SkeletonRows />;
+  }
+
+  if (error !== null) {
+    return (
+      <LoadError
+        what={`${metricLabel(valueKey).toLowerCase()} by ${filterKey}`}
+        detail={error}
+        onRetry={() => setReloadKey((k) => k + 1)}
+      />
+    );
   }
 
   if (data.length === 0) {
