@@ -42,6 +42,26 @@ try {
 | `captureException(err, ctx?)` | Send an error with stack trace. |
 | `log(entry)` | Send a log line. |
 | `flush()` | Force-flush buffered events. |
+| `getStats()` | O11 diagnostics: delivered/retry/loss counters by reason, live queue depth, and the undelivered snapshot taken at pagehide. Null before init. |
+
+## Delivery, loss, and shutdown semantics
+
+- **Bounded queue, explicit overflow policy.** The queue is capped in both
+  event count (200) and bytes (8 MiB) across buffered + pending. At
+  admission overflow the **newest** event is dropped; at the pending
+  retention cap (200 frozen requests) the **oldest** requests are dropped.
+  Every drop is reported through `onError` and counted in `getStats()`.
+- **Retry.** Failed batches retry with doubling backoff (default 5
+  attempts, 1 s base, 60 s cap) and then count as `retry_exhausted` losses.
+  Per-record rejections inside an accepted batch (`rejected` in the server
+  ack) are counted as `server_rejected` and not retried — the accepted
+  neighbors must not be resent.
+- **Shutdown.** `visibilitychange(hidden)` and `pagehide` trigger a
+  keepalive flush. At pagehide, still-queued events are snapshotted into
+  `getStats().undeliveredAtUnload` and reported via `onError` — the honest
+  upper bound, because the page may die before delivery confirmation.
+- `kill`-class crashes lose the in-memory queue and its counters with the
+  page; no durable spool is claimed.
 
 ## Options
 
@@ -55,6 +75,7 @@ try {
 | `flushIntervalMs` | `2000` | Time-based flush interval. |
 | `maxRetryAttempts` | `5` | Automatic retries per failed batch before it is dropped and reported via `onError`. |
 | `retryBackoffMs` | `1000` | Base delay for the retry backoff; doubles per attempt up to 60 s. |
+| `requestTimeoutMs` | `10000` | Per-request deadline for every flush send (clamped 250 ms–10 min). A slow endpoint aborts and retries rather than pinning the flush owner. |
 | `onError` | — | Called with every delivery failure or drop (the SDK never throws). |
 | `onRetry` | — | Called each time a failed batch is scheduled for an automatic retry. |
 

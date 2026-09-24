@@ -56,6 +56,10 @@ export interface InitOptions {
    * each time a failed batch is scheduled for a retry, before the backoff
    * sleep. Never throws into application code. */
   onRetry?: (info: { attempt: number; delayMs: number; batchSize: number; error: Error }) => void;
+  /** Per-request deadline for flush sends (TO-034 made the deadline
+   * exist; O11 makes it configurable so slow-endpoint behavior is
+   * testable and tunable). Default: 10000 ms; clamped to [250, 600000]. */
+  requestTimeoutMs?: number;
 }
 
 export interface EventPayload {
@@ -130,7 +134,7 @@ export interface LogPayload {
 }
 
 interface Client {
-  opts: Required<Pick<InitOptions, "endpoint" | "siteId" | "disableAutoPageview" | "batchSize" | "flushIntervalMs" | "maxRetryAttempts" | "retryBackoffMs">> & {
+  opts: Required<Pick<InitOptions, "endpoint" | "siteId" | "disableAutoPageview" | "batchSize" | "flushIntervalMs" | "maxRetryAttempts" | "retryBackoffMs" | "requestTimeoutMs">> & {
     apiKey?: string;
     release?: string;
     environment?: string;
@@ -161,8 +165,59 @@ interface Client {
   /** F32: earliest wall-clock time (ms) at which a flush may send again —
    * the retry backoff gate. Set after each failed attempt. */
   retryAfter: number;
+  /** O11: visible loss/delivery counters for THIS client, surfaced via
+   * getStats(). Drops are never silent: every counter increment also
+   * reports through onError. */
+  stats: Stats;
   /** Removes this client's interval and DOM listeners (audit F31). */
   dispose: () => void;
+}
+
+/**
+ * O11 diagnostics snapshot. `dropped` counts LOST events by reason; the
+ * sum of its values plus `deliveredEvents` plus whatever is still queued
+ * (see `queued`) accounts for every event this SDK admitted. `undeliveredAtUnload`
+ * is a point-in-time snapshot taken when the page started unloading.
+ */
+export interface Stats {
+  /** Batches the server acknowledged (accepted >= 0 events). */
+  deliveredBatches: number;
+  /** Events the server accepted. */
+  deliveredEvents: number;
+  /** Retry attempts made (a batch may be retried several times). */
+  retries: number;
+  /** Lost events by reason: admission_unserializable, admission_oversize,
+   * queue_full (drop-newest), pack_oversize, retry_exhausted,
+   * server_rejected, retention_cap, reinit_drain_failed. */
+  dropped: Record<string, number>;
+  /** Events reported undelivered at the moment the page began unloading
+   * (pagehide/hidden). The keepalive flush may still deliver some; this
+  * snapshot is the honest upper bound visible before the page died. */
+  undeliveredAtUnload: number;
+  /** Events currently waiting in the live buffer + frozen pending requests. */
+  queued: number;
+  /** This client instance's producer id (correlates with server-side logs). */
+  producerId: string;
+}
+
+function newStats(producerId: string): Stats {
+  return {
+    deliveredBatches: 0,
+    deliveredEvents: 0,
+    retries: 0,
+    dropped: {},
+    undeliveredAtUnload: 0,
+    queued: 0,
+    producerId,
+  };
+}
+
+/** O11: count a loss (never silent) — increments the visible counter and
+ * reports through onError so an unset hook cannot hide the drop either. */
+function countDrop(target: Client, reason: string, events: number, detail?: string): void {
+  target.stats.dropped[reason] = (target.stats.dropped[reason] ?? 0) + events;
+  reportError(target, new Error(
+    `observe: lost ${events} event(s) (${reason})${detail ? ` — ${detail}` : ""}`));
 }
 
 /**
@@ -224,7 +279,8 @@ const MAX_PENDING_REQUESTS = 200;
 const MAX_RETRY_DELAY_MS = 60_000;
 
 // TO-034: every flush-network request carries a deadline; a hanging fetch
-// must not pin the single flush owner forever while the buffer grows.
+// must not pin the single flush owner forever while the buffer grows. The
+// default is 10 s; init({ requestTimeoutMs }) overrides (O11, clamped).
 const FETCH_DEADLINE_MS = 10_000;
 
 const textEncoder = new TextEncoder();
@@ -292,7 +348,7 @@ function packEventRequests(
     const rawBytes = textEncoder.encode(raw).byteLength;
     const solo = textEncoder.encode(batchEnvelopeJSON(producerId, "probe", [raw])).byteLength;
     if (solo > MAX_REQUEST_BYTES) {
-      onDrop("dropped an event exceeding the request byte budget");
+      onDrop(`dropped an event exceeding the request byte budget (${solo} > ${MAX_REQUEST_BYTES})`);
       continue;
     }
     const envelopeOverhead = solo - rawBytes;
@@ -311,9 +367,9 @@ function packEventRequests(
 
 /** fetch with a hard deadline (TO-034) and redirect refusal (TO-037: a
  * redirect would forward the X-API-Key credential to another origin). */
-async function fetchWithDeadline(url: string, init: RequestInit): Promise<Response> {
+async function fetchWithDeadline(url: string, init: RequestInit, deadlineMs: number = FETCH_DEADLINE_MS): Promise<Response> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_DEADLINE_MS);
+  const timer = setTimeout(() => controller.abort(), deadlineMs);
   try {
     return await fetch(url, { ...init, redirect: "error", signal: controller.signal });
   } finally {
@@ -341,7 +397,7 @@ function sendRawJSON(target: Client, path: string, raw: string, unloading = fals
     body: raw,
     credentials: "omit",
     keepalive: unloading && bytes <= MAX_KEEPALIVE_BYTES,
-  }).then((res) => {
+  }, target.opts.requestTimeoutMs).then((res) => {
     if (!res.ok) throw new Error(`observe: ingest returned ${res.status}`);
   });
 }
@@ -392,6 +448,19 @@ function reportRetry(target: Client, info: { attempt: number; delayMs: number; b
   }
 }
 
+/** O11: the honest unload accounting. At pagehide the still-queued events
+ * are the worst-case loss; record the snapshot visibly (onError + stats)
+ * before the best-effort keepalive flush, because the page may die before
+ * any delivery confirmation arrives. */
+function recordUnloadSnapshot(target: Client): void {
+  const queuedEvents = target.buffer.length + target.pending.reduce((n, r) => n + r.eventCount, 0);
+  if (queuedEvents > 0) {
+    target.stats.undeliveredAtUnload = queuedEvents;
+    reportError(target, new Error(
+      `observe: page unloading with ${queuedEvents} undelivered event(s) — attempting keepalive flush; this count is the loss upper bound`));
+  }
+}
+
 /** Initialize the SDK. Re-init disposes the previous client's timer and
  * listeners and drains its queued work under the OLD configuration (audit
  * F31); previously each init() leaked one interval plus three listeners
@@ -429,6 +498,7 @@ export function init(options: InitOptions): void {
       onRetry: options.onRetry,
       maxRetryAttempts: clamp(options.maxRetryAttempts, 5, 0, 50),
       retryBackoffMs: clamp(options.retryBackoffMs, 1000, 1, 60_000),
+      requestTimeoutMs: clamp(options.requestTimeoutMs, 10_000, 250, 600_000),
     },
     buffer: [],
     queuedBytes: 0,
@@ -440,8 +510,10 @@ export function init(options: InitOptions): void {
     flushing: null,
     retryCounts: new Map(),
     retryAfter: 0,
+    stats: null as unknown as Stats,
     dispose: () => {},
   };
+  instance.stats = newStats(instance.producerId);
   client = instance;
 
   if (typeof window !== "undefined") {
@@ -449,7 +521,9 @@ export function init(options: InitOptions): void {
     // via an AbortController (audit F31).
     const controller = new AbortController();
     instance.dispose = () => {
-      if (instance.timer !== null) window.clearInterval(instance.timer);
+      // The window global can vanish between init and dispose in tests and
+      // embedded runtimes — teardown must not throw there.
+      if (typeof window !== "undefined" && instance.timer !== null) window.clearInterval(instance.timer);
       instance.timer = null;
       controller.abort();
     };
@@ -464,6 +538,19 @@ export function init(options: InitOptions): void {
       "visibilitychange",
       () => {
         if (document.visibilityState === "hidden") void flushClient(instance, true);
+      },
+      { signal: controller.signal },
+    );
+
+    // O11: pagehide is the last moment sync work is guaranteed to run —
+    // snapshot the undelivered count (visible through onError + getStats)
+    // and fire the keepalive flush. Anything still queued after this is
+    // honestly reported as the unload loss, never swallowed.
+    window.addEventListener(
+      "pagehide",
+      () => {
+        recordUnloadSnapshot(instance);
+        void flushClient(instance, true);
       },
       { signal: controller.signal },
     );
@@ -580,12 +667,12 @@ export function track(eventType: string, props: Record<string, unknown> = {}): v
   try {
     raw = JSON.stringify(payload);
   } catch (err) {
-    reportError(target, new Error(`observe: event is not JSON-serializable (${err instanceof Error ? err.message : String(err)})`));
+    countDrop(target, "admission_unserializable", 1, err instanceof Error ? err.message : String(err));
     return;
   }
   const bytes = textEncoder.encode(raw).byteLength;
   if (bytes > MAX_EVENT_BYTES) {
-    reportError(target, new Error(`observe: event exceeds ${MAX_EVENT_BYTES} bytes and was dropped`));
+    countDrop(target, "admission_oversize", 1, `${bytes} > ${MAX_EVENT_BYTES}`);
     return;
   }
   // TO-034: admission-time count+byte budget across queued and pending —
@@ -593,7 +680,7 @@ export function track(eventType: string, props: Record<string, unknown> = {}): v
   // grow without limit. Overflow drops the NEWEST record (the oldest data
   // is closest to delivery) and says so.
   if (target.buffer.length >= MAX_QUEUED_EVENTS || target.queuedBytes + bytes > MAX_QUEUED_BYTES) {
-    reportError(target, new Error("observe: queue budget reached — newest event dropped"));
+    countDrop(target, "queue_full", 1, "drop-newest overflow policy");
     return;
   }
   target.buffer.push(raw);
@@ -746,24 +833,27 @@ function trimPending(target: Client): void {
     droppedEvents += oldest.eventCount;
   }
   if (droppedRequests > 0) {
-    reportError(target, new Error(
-      `observe: dropped ${droppedRequests} oldest pending request(s) (${droppedEvents} event(s)) — retention cap reached`));
+    countDrop(target, "retention_cap", droppedEvents, `${droppedRequests} oldest pending request(s), drop-oldest policy`);
   }
 }
 
 /** Send one frozen request and consume its acknowledgment. Returns the
- * ack on acceptance (including partial rejections, which are reported but
- * NOT retried — the rejected events are gone server-side and the accepted
- * neighbors must not be resent). */
+ * ack on acceptance (including partial rejections, which are counted and
+ * reported but NOT retried — the rejected events are gone server-side and
+ * the accepted neighbors must not be resent). */
 async function deliverRequest(target: Client, req: PendingEventRequest, unloading: boolean): Promise<{ ok: boolean; accepted?: number; rejected?: number; deduped?: boolean }> {
   const res = await fetchWithDeadline(
     target.opts.endpoint.replace(/\/+$/, "") + "/api/v1/events/batch",
     requestInitFor(target, req.body, unloading),
+    target.opts.requestTimeoutMs,
   );
   const ack = await readEventBatchAck(res);
-  if ((ack.rejected ?? 0) > 0) {
-    reportError(target, new Error(
-      `observe: server rejected ${ack.rejected} of ${req.eventCount} event(s) (accepted ${ack.accepted ?? 0}) — rejected events were dropped`));
+  target.stats.deliveredBatches++;
+  const rejected = ack.rejected ?? 0;
+  target.stats.deliveredEvents += Math.max(req.eventCount - rejected, 0);
+  if (rejected > 0) {
+    countDrop(target, "server_rejected", rejected,
+      `server accepted ${ack.accepted ?? req.eventCount - rejected} of ${req.eventCount}`);
   }
   return ack;
 }
@@ -783,22 +873,26 @@ function requestInitFor(target: Client, body: string, unloading: boolean): Reque
 
 /** Best-effort final drain of a replaced client's work (TO-036): pending
  * requests resend their exact bytes under their own producer identity;
- * buffered records are frozen into fresh requests. Failures are reported,
- * never retried (the replacement owns the timer from here on). */
+ * buffered records are frozen into fresh requests. Failures are counted
+ * as visible losses and reported, never retried (the replacement owns the
+ * timer from here on). */
 function drainClient(target: Client): void {
   const requests = [...target.pending];
   target.pending = [];
   if (target.buffer.length > 0) {
     const entries = target.buffer.splice(0);
     requests.push(...packEventRequests(target.producerId, entries, (why) => {
-      reportError(target, new Error(`observe: ${why} on re-init`));
+      countDrop(target, "pack_oversize", 1, `${why} on re-init`);
     }));
   }
   for (const req of requests) {
-    deliverRequest(target, req, true).catch((err) => {
-      reportError(target, err instanceof Error ? err : new Error(String(err)));
-    });
-    releaseRequest(target, req);
+    deliverRequest(target, req, true)
+      .then(() => releaseRequest(target, req))
+      .catch((err) => {
+        releaseRequest(target, req);
+        countDrop(target, "reinit_drain_failed", req.eventCount,
+          err instanceof Error ? err.message : String(err));
+      });
   }
 }
 
@@ -831,7 +925,7 @@ function flushClient(target: Client, unloading = false): Promise<void> {
         target.queuedBytes -= entries.reduce((n, raw) => n + textEncoder.encode(raw).byteLength, 0);
         if (target.queuedBytes < 0) target.queuedBytes = 0;
         const fresh = packEventRequests(target.producerId, entries, (why) => {
-          reportError(target, new Error(`observe: ${why}`));
+          countDrop(target, "pack_oversize", 1, why);
         });
         target.pending.push(...fresh);
         trimPending(target);
@@ -848,10 +942,11 @@ function flushClient(target: Client, unloading = false): Promise<void> {
           // Retry budget exhausted: give up on THIS request only. Its
           // reservation is released; later requests keep their turn.
           releaseRequest(target, req);
-          reportError(target, new Error(
-            `observe: gave up on a batch after ${target.opts.maxRetryAttempts} attempts — dropped ${req.eventCount} event(s)`));
+          countDrop(target, "retry_exhausted", req.eventCount,
+            `${target.opts.maxRetryAttempts} attempts, last error: ${sendErr.message}`);
         } else {
           target.retryCounts.set(req.batchId, attempts);
+          target.stats.retries++;
           const delayMs = Math.min(target.opts.retryBackoffMs * 2 ** (attempts - 1), MAX_RETRY_DELAY_MS);
           target.retryAfter = Date.now() + delayMs;
           // Delivery failed: the frozen request keeps its bytes and its
@@ -878,6 +973,26 @@ function flushClient(target: Client, unloading = false): Promise<void> {
 export function flush(): Promise<void> {
   if (!client || (client.buffer.length === 0 && client.pending.length === 0)) return Promise.resolve();
   return flushClient(client);
+}
+
+/**
+ * O11 diagnostics: delivery and loss counters for the active client
+ * (null before init()). Every dropped event is counted here by reason AND
+ * reported through onError — the SDK never loses events silently.
+ * `queued` is live; the rest are monotone counters.
+ */
+export function getStats(): Stats | null {
+  if (!client) return null;
+  const snapshot: Stats = {
+    deliveredBatches: client.stats.deliveredBatches,
+    deliveredEvents: client.stats.deliveredEvents,
+    retries: client.stats.retries,
+    dropped: { ...client.stats.dropped },
+    undeliveredAtUnload: client.stats.undeliveredAtUnload,
+    queued: client.buffer.length + client.pending.reduce((n, r) => n + r.eventCount, 0),
+    producerId: client.producerId,
+  };
+  return snapshot;
 }
 
 
@@ -925,4 +1040,4 @@ function parseStack(stack?: string): ErrorPayload["stack_trace"] {
 }
 
 // Default export for convenience with older bundlers.
-export default { init, pageview, track, identify, reset, captureException, log, flush };
+export default { init, pageview, track, identify, reset, captureException, log, flush, getStats };

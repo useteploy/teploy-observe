@@ -368,6 +368,9 @@ type frozenMetrics struct {
 // and it is retried by the next flush; an ambiguous outcome (timeout
 // after server acceptance) can duplicate points at a receiver without
 // dedupe — at-least-once, the same contract the log queue documents.
+// O11: the retry budget is bounded — after MaxSendAttempts the envelope
+// is dropped and counted (metrics_retry_exhausted); a permanent 4xx is
+// dropped immediately (metrics_non_retryable).
 func (c *Client) FlushMetrics(ctx context.Context) error {
 	c.mu.Lock()
 	closing := c.closing
@@ -381,13 +384,31 @@ func (c *Client) FlushMetrics(ctx context.Context) error {
 	c.metricFlushMu.Lock()
 	defer c.metricFlushMu.Unlock()
 
+	if backoffGated(c.metricAttempts, c.metricNotBefore) {
+		return nil // mid-backoff (O11)
+	}
+
 	// Retry the retained envelope first; only when it clears may a new
 	// snapshot be taken (order is preserved).
 	if len(pending) > 0 {
 		req := pending[0]
 		if err := c.postMetricsBody(ctx, req.body); err != nil {
+			if !retryableSendErr(err) {
+				c.dropPendingMetric(req, "metrics_non_retryable", err.Error())
+			} else {
+				c.metricAttempts++
+				if c.metricAttempts >= c.maxSendAttempts {
+					c.dropPendingMetric(req, "metrics_retry_exhausted",
+						fmt.Sprintf("%d attempts, last error: %v", c.maxSendAttempts, err))
+				} else {
+					c.countDelivered(func(s *Stats) { s.Retries++ })
+					c.metricNotBefore = time.Now().Add(c.backoffFor(c.metricAttempts))
+				}
+			}
 			return err
 		}
+		c.metricAttempts = 0
+		c.countDelivered(func(s *Stats) { s.DeliveredMetricPoints += int64(req.points) })
 		c.mu.Lock()
 		c.pendingMetrics = c.pendingMetrics[1:]
 		c.mu.Unlock()
@@ -405,13 +426,32 @@ func (c *Client) FlushMetrics(ctx context.Context) error {
 		return nil
 	}
 	if err := c.postMetricsBody(ctx, envelope.body); err != nil {
-		// Retain the exact body for the next attempt (TO-039).
+		if !retryableSendErr(err) {
+			c.dropPendingMetric(envelope, "metrics_non_retryable", err.Error())
+			return err
+		}
+		// Retain the exact body for the next attempt (TO-039); the
+		// bounded budget above disposes of it when exhausted (O11).
 		c.mu.Lock()
 		c.pendingMetrics = append(c.pendingMetrics, envelope)
 		c.mu.Unlock()
 		return err
 	}
+	c.countDelivered(func(s *Stats) { s.DeliveredMetricPoints += int64(envelope.points) })
 	return nil
+}
+
+// dropPendingMetric removes the head retained envelope (the one whose send
+// just failed) and books its points as a counted loss (O11). Called with
+// metricFlushMu held.
+func (c *Client) dropPendingMetric(req *frozenMetrics, reason, detail string) {
+	c.mu.Lock()
+	if len(c.pendingMetrics) > 0 && c.pendingMetrics[0] == req {
+		c.pendingMetrics = c.pendingMetrics[1:]
+	}
+	c.mu.Unlock()
+	c.metricAttempts = 0
+	c.countLoss(reason, int64(req.points), detail)
 }
 
 // snapshotMetrics detaches the current state under one lock hold and

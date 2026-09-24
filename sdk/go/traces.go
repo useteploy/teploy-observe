@@ -242,12 +242,12 @@ func (c *Client) queueSpan(ps pendingSpan) {
 	c.mu.Lock()
 	if c.closing {
 		c.mu.Unlock()
-		c.reportError(errors.New("observe: span rejected after close began"))
+		c.countLoss("spans_queue_full", 1, "span rejected after close began")
 		return
 	}
 	if c.pendingSpanBytes+cost > maxPendingSpanBytes || c.spansN >= maxPendingSpans {
 		c.mu.Unlock()
-		c.reportError(errors.New("observe: span queue limit reached — span dropped"))
+		c.countLoss("spans_queue_full", 1, "span queue limit reached — span dropped")
 		return
 	}
 	c.spans = append(c.spans, ps)
@@ -286,6 +286,9 @@ func (c *Client) flushSpans(ctx context.Context) error {
 	c.logFlushMu.Lock()
 	defer c.logFlushMu.Unlock()
 
+	if backoffGated(c.spanAttempts, c.spanNotBefore) {
+		return nil // mid-backoff (O11); the ticker or a later flush retries
+	}
 	c.mu.Lock()
 	if len(c.spans) == 0 {
 		c.mu.Unlock()
@@ -309,10 +312,25 @@ func (c *Client) flushSpans(ctx context.Context) error {
 	// OTLP endpoint /v1/traces so SDK consumers can also point this Client
 	// at a non-Observe OTLP collector if needed.
 	otlp := buildOTLPRequest(c.opts.ServiceName, c.opts.Environment, batch)
-	if err := c.postOTLP(ctx, otlp); err != nil {
-		// TO-038: a failed export requeues the WHOLE detached batch —
-		// spans are admitted with at-least-once delivery semantics, and
-		// a transient endpoint failure must not silently discard them.
+	err := c.postOTLP(ctx, otlp)
+	if err != nil {
+		// O11: retryable failures requeue the whole detached batch
+		// (at-least-once) inside a bounded attempt budget with backoff;
+		// when the budget is exhausted — or the refusal is permanent
+		// (non-retryable 4xx, see retryableSendErr) — the batch is
+		// dropped and counted instead of blocking the queue forever.
+		if !retryableSendErr(err) {
+			c.countLoss("spans_non_retryable", int64(len(batch)), err.Error())
+			return err
+		}
+		c.spanAttempts++
+		if c.spanAttempts >= c.maxSendAttempts {
+			c.countLoss("spans_retry_exhausted", int64(len(batch)),
+				fmt.Sprintf("%d attempts, last error: %v", c.maxSendAttempts, err))
+			return err
+		}
+		c.countDelivered(func(s *Stats) { s.Retries++ })
+		c.spanNotBefore = time.Now().Add(c.backoffFor(c.spanAttempts))
 		c.mu.Lock()
 		c.spans = append(batch, c.spans...)
 		c.spansN += len(batch)
@@ -320,6 +338,8 @@ func (c *Client) flushSpans(ctx context.Context) error {
 		c.mu.Unlock()
 		return err
 	}
+	c.spanAttempts = 0
+	c.countDelivered(func(s *Stats) { s.DeliveredSpans += int64(len(batch)) })
 	return nil
 }
 

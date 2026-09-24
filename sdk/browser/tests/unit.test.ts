@@ -288,7 +288,7 @@ test("oversized events are dropped individually, valid neighbors delivered", asy
   assert.ok(delivered.includes("small-neighbor") && delivered.includes("after"), "valid events must survive");
   assert.ok(!delivered.includes("monster"), "the oversized event must be dropped");
   // TO-033: the monster is now rejected at admission (per-event byte cap).
-  assert.ok(errs.some((m) => m.includes("bytes and was dropped")), "the drop must be reported");
+  assert.ok(errs.some((m) => m.includes("admission_oversize")), "the drop must be reported");
 });
 
 // F12 (protocol v2): every event carries a producer-assigned stable
@@ -415,7 +415,7 @@ test("retry budget exhausts, drops the batch, and recovers", async () => {
   await flush(); // attempt 2, delay 10
   await new Promise((r) => setTimeout(r, 15));
   await flush(); // attempt 3 > budget: give up and drop
-  assert.ok(errors.some((m) => m.includes("gave up on a batch after 2 attempts")), `expected the give-up report, got ${JSON.stringify(errors)}`);
+  assert.ok(errors.some((m) => m.includes("retry_exhausted")), `expected the give-up report, got ${JSON.stringify(errors)}`);
 
   // The dropped batch must not poison the client: a new event goes through.
   (globalThis as any).fetch = (url: string, opts: any) => {
@@ -447,7 +447,7 @@ test("sustained failure bounds the queue at admission", async () => {
   for (let i = 0; i < 230; i++) track(`flood-${i}`);
   await new Promise((r) => setTimeout(r, 10)); // past the backoff gate
   await flush();
-  assert.ok(errors.some((m) => m.includes("queue budget reached")), `expected the queue-budget report, got ${JSON.stringify(errors.slice(0, 3))}`);
+  assert.ok(errors.some((m) => m.includes("queue_full")), `expected the queue-budget report, got ${JSON.stringify(errors.slice(0, 3))}`);
 });
 
 // F41 URL contract: the raw query string never leaves the browser — only
@@ -547,7 +547,7 @@ test("unserializable and identity-overriding records are isolated (TO-033)", asy
   const delivered = sent.flatMap((s) => s.body.events.map((e: any) => e.event_type));
   assert.ok(delivered.includes("good-before") && delivered.includes("good-after"), "valid neighbors deliver");
   assert.ok(!delivered.includes("poison"), "the unserializable record is dropped, not the flush");
-  assert.ok(errors.some((m) => m.includes("not JSON-serializable")), "the poison is reported");
+  assert.ok(errors.some((m) => m.includes("admission_unserializable")), "the poison is reported");
   const sneaky = sent.flatMap((s) => s.body.events).find((e: any) => e.event_type === "sneaky");
   assert.ok(sneaky, "the sneaky record itself delivers");
   assert.equal(sneaky.site_id, "s1", "site_id cannot be overridden");
@@ -571,7 +571,7 @@ test("partial rejection is reported and not retried (TO-035)", async () => {
   await new Promise((r) => setTimeout(r, 10));
   await flush();
   assert.equal(calls, 1, "a partially rejected batch must not be resent");
-  assert.ok(errors.some((m) => m.includes("rejected 1 of 2")), `expected the partial-rejection report, got ${JSON.stringify(errors)}`);
+  assert.ok(errors.some((m) => m.includes("server_rejected")), `expected the partial-rejection report, got ${JSON.stringify(errors)}`);
 });
 
 // TO-036: an old client's in-flight drain keeps ITS producer identity and

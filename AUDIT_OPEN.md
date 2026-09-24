@@ -2268,3 +2268,75 @@ Open items this slice deliberately leaves (programme O12 tails):
 - Spans/logs attribute JSONB cardinality at ingest (metrics + event
   properties are guarded; span/log attributes are not) — next slice
   candidate, same pattern applies.
+||||||| 00b141f
+## O11 SDK-trust slice — 2026-09-23
+
+Branch `o11-sdk-trust`. Closes the programme's O11 line ("SDK and
+migration experience people can trust") for the four shipped SDKs:
+browser, sentry-shim, Go, Python.
+
+Landed (five commits, `46becdf..1e156e8`):
+
+- docs/sdk/COMPATIBILITY.md — per-API Sentry/PostHog compatibility
+  tables with the four O11 statuses (supported / changed semantics /
+  intentional no-op / unsupported), including the Node request-local
+  scope contract and URL/privacy deltas versus posthog-js.
+- docs/sdk/MIGRATION.md — credential -> first event -> query-visible
+  recipes per SDK, dual-write recipes that never delete the old
+  integration, shutdown discipline, honest kill -9 statement.
+- docs/sdk/MANIFEST.md — runtime/dev dependency declarations, shipped
+  types, measured bundle sizes, queue-bounds/loss posture summary.
+  Bundle numbers re-measured and re-verified this session: browser
+  33,730 B raw / 11,002 B gz(-9); sentry-shim 20,397 B / 6,502 B.
+- Per-SDK hardening (spec items 1-5): bounded queues with VISIBLE loss
+  counters (getStats()/Stats()/stats() — an unset error hook can no
+  longer make a drop invisible), bounded retry with exponential backoff
+  on retryable statuses (429/5xx/network), immediate counted drop of
+  non-retryable 4xx poison heads, partial-ack per-record loss booking
+  with no resend of accepted neighbors, deadline-carrying
+  flush/close/Shutdown, browser pagehide snapshot +
+  undeliveredAtUnload, request-local scope via withRequestScope in the
+  sentry shim, honest once-per-class warnings on accepted-but-ignored
+  Sentry options, sentry-shim postJSON now observes res.ok (a 500 was
+  previously indistinguishable from delivery).
+
+Pins (all green this session): browser `npm test` 36/36 (adverse
+transport matrix over the shared sdk/testing faultserver); sentry-shim
+`npm test` 26 pass + 1 pre-existing stack-dependent integration skip
+(localhost:3000 not up); Go `go test ./...` in sdk/go incl.
+o11_transport_test.go (race clean); Python `pytest` 22/22 incl.
+test_o11_transport.py; root `go build ./...` + `go vet ./...` clean.
+
+E2E disposition — BUILT, PINNED, BLOCKED UPSTREAM (not a silent gap):
+
+- sdk/e2e/first_event_test.sh is the real-server acceptance: own
+  nucleus fixture on :55446 (container nucleus-o11b, never 55432/55433),
+  fresh observe binary on :38080, admin login -> site-scoped key via
+  POST /api/v1/sites/default/keys, the keyless-ingest 401 proof, then
+  all four SDK fixtures, then query-visibility polled through
+  /api/v1/stats/events and /api/v1/logs/search. Fixtures assert
+  delivered==1 with zero losses from each SDK's diagnostics API.
+- Running it surfaced a NEUTRON FRAMEWORK DEFECT, not an SDK defect:
+  go/neutron/lifecycle.go's lifecycle.start() defer runs its rollback
+  (stopLimited) unconditionally — including on the success path — so
+  app.Run() boots observe with every lifecycle hook already stopped
+  (nucleus pool closed, ingest buffers and scheduler down; /healthz
+  503 "nucleus: exec: closed pool" while HTTP still serves). Isolated
+  with a scratch probe against the vendored package: OnStop fires while
+  Run is still serving. Same code in the live ../../Neutron tree;
+  introduced with the GO-11 rollback work; every main-tip observe
+  binary is affected (the Go test suites dodge it because they drive
+  app.Handler() directly, never Run()). Fix belongs upstream per the
+  layer-ownership rule: guard the deferred rollback with the start
+  error. Reported in the committing session's record; NOT fixed from
+  this repo per that same rule. The e2e fails at the healthz gate by
+  design (fail-not-skip) until the framework fix lands; rerun
+  `bash sdk/e2e/first_event_test.sh` after it does.
+
+Open items this slice deliberately leaves (programme O11 tails):
+
+- The green e2e run, pending the upstream Neutron lifecycle fix above
+  (one line upstream + rerun; the harness needs no changes).
+- Package publication prep is owner-controlled per the O11 spec: npm
+  tarball dry-runs (browser, sentry-shim), PyPI sdist/wheel build,
+  Go module tagging — none attempted from the lane.
