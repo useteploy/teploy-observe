@@ -3,6 +3,7 @@ import type { TimeSeriesPoint } from "../api.js";
 import { api } from "../api.js";
 import { useFilters } from "../hooks/useFilters.js";
 import { formatNumber } from "../utils/format.js";
+import LoadError from "./shared/LoadError.js";
 import { prepareMarkers, markerSummary } from "../utils/incidentMarkers.js";
 import type { IncidentMarker } from "../utils/incidentMarkers.js";
 
@@ -31,6 +32,10 @@ function TimeSeriesChart() {
   const [markers, setMarkers] = useState<IncidentMarker[]>([]);
   const [markerNote, setMarkerNote] = useState("");
   const [loading, setLoading] = useState(true);
+  // A failed request must not render as "No data for this period" — the
+  // empty state is reserved for a successful empty answer (O13 chart states).
+  const [error, setError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const [tooltip, setTooltip] = useState<{
     x: number; y: number; date: string; pageviews: number; visitors: number;
   } | null>(null);
@@ -40,6 +45,7 @@ function TimeSeriesChart() {
 
   useEffect(() => {
     setLoading(true);
+    setError(null);
     const fetchCurrent = api.timeseries(siteId, from, to, interval, filters);
     if (!compare) {
       fetchCurrent.then((d) => {
@@ -48,7 +54,10 @@ function TimeSeriesChart() {
         setPrevData([]);
         dataRef.current = result;
         setLoading(false);
-      }).catch(() => setLoading(false));
+      }).catch((err) => {
+        setError(err instanceof Error ? err.message : String(err));
+        setLoading(false);
+      });
       return;
     }
     // Compare mode: fetch the previous-period window too.
@@ -68,8 +77,11 @@ function TimeSeriesChart() {
       setPrevData(prevList.map((p) => ({ ...p, bucket: p.bucket + duration })));
       dataRef.current = curList;
       setLoading(false);
-    }).catch(() => setLoading(false));
-  }, [siteId, from, to, interval, compare, JSON.stringify(filters)]);
+    }).catch((err) => {
+      setError(err instanceof Error ? err.message : String(err));
+      setLoading(false);
+    });
+  }, [siteId, from, to, interval, compare, JSON.stringify(filters), reloadKey]);
 
   // Fetch incidents overlapping the current window. Best-effort — 404 / error
   // means "no markers," not a chart failure.
@@ -367,6 +379,15 @@ function TimeSeriesChart() {
           <div class="obs-skeleton-bar" style="width:100%;height:200px;border-radius:8px;" />
         </div>
       </div>
+    );
+  }
+  if (error !== null) {
+    return (
+      <LoadError
+        what="the timeseries"
+        detail={error}
+        onRetry={() => setReloadKey((k) => k + 1)}
+      />
     );
   }
   if (data.length === 0) {

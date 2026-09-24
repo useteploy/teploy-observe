@@ -90,7 +90,8 @@ Add this one line to your HTML:
 
 \`\`\`html
 <script defer src="https://observe.example.com/t/observe.js"
-  data-site-id="YOUR_SITE_ID"></script>
+  data-site-id="YOUR_SITE_ID"
+  data-api-key="YOUR_API_KEY"></script>
 \`\`\`
 
 That's it. Open your site, visit a few pages, check the **Dashboard**. Data appears within seconds.`,
@@ -139,7 +140,7 @@ On commodity hardware (8GB VPS):
 ## Install
 
 \`\`\`html
-<script defer src="/t/observe.js" data-site-id="SITE_ID"></script>
+<script defer src="/t/observe.js" data-site-id="SITE_ID" data-api-key="YOUR_API_KEY"></script>
 \`\`\`
 
 ## Auto-tracked events

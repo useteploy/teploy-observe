@@ -3,6 +3,7 @@ import type { CustomEventStat, PropertyStat } from "../api.js";
 import { api } from "../api.js";
 import { useFilters } from "../hooks/useFilters.js";
 import { formatNumber } from "../utils/format.js";
+import LoadError from "./shared/LoadError.js";
 
 function PropertyDrilldown({ eventType, siteId, from, to }: {
   eventType: string; siteId: string; from: string; to: string;
@@ -52,15 +53,23 @@ function CustomEventsPanel() {
 
   const [data, setData] = useState<CustomEventStat[]>([]);
   const [loading, setLoading] = useState(true);
+  // O13 chart states: a failed request renders an error, not the
+  // "No events recorded" empty state.
+  const [error, setError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const [expandedEvent, setExpandedEvent] = useState<string | null>(null);
 
   useEffect(() => {
     setLoading(true);
+    setError(null);
     api.customEvents(siteId, from, to, 20, filters).then((d) => {
       setData(d || []);
       setLoading(false);
-    }).catch(() => setLoading(false));
-  }, [siteId, from, to, JSON.stringify(filters)]);
+    }).catch((err) => {
+      setError(err instanceof Error ? err.message : String(err));
+      setLoading(false);
+    });
+  }, [siteId, from, to, JSON.stringify(filters), reloadKey]);
 
   return (
     <div class="obs-card-static">
@@ -75,6 +84,8 @@ function CustomEventsPanel() {
             </div>
           ))}
         </div>
+      ) : error !== null ? (
+        <LoadError what="custom events" detail={error} onRetry={() => setReloadKey((k) => k + 1)} />
       ) : data.length === 0 ? (
         <div class="obs-empty">
           <div class="obs-empty-icon">--</div>

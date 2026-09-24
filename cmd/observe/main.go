@@ -10,7 +10,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -2384,6 +2383,28 @@ type streamTicketResponse struct {
 	ExpiresIn int    `json:"expires_in"`
 }
 
+// claimTV reads the "tv" claim under either numeric decoding regime: the
+// pinned neutronauth parses claims with UseNumber, so a bare float64
+// assertion fails (json.Number) and stream-ticket minting rejected every
+// real token with "invalid token version" — the same trap internal/auth's
+// claimAsInt64 exists for. That 401 then hit the shared client helper's
+// session-dead path, kicking the operator off the dashboard the moment a
+// replay player opened.
+func claimTV(v any) (int64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int64(n), true
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return i, true
+	default:
+		return 0, false
+	}
+}
+
 func streamTicketHandler(authSvc *auth.AuthService) neutron.HandlerFunc[streamTicketInput, streamTicketResponse] {
 	return func(ctx context.Context, input streamTicketInput) (streamTicketResponse, error) {
 		if !auth.StreamTicketRouteValid(input.Route) {
@@ -2405,11 +2426,10 @@ func streamTicketHandler(authSvc *auth.AuthService) neutron.HandlerFunc[streamTi
 		// what changes is that a revocation racing AFTER this check leaves
 		// the ticket carrying the OLD, now-invalid version, which the
 		// middleware's unconditional check retires at its next use.
-		parent, okTV := claims["tv"].(float64)
-		if !okTV || parent < 0 || parent > 9007199254740991 || math.Trunc(parent) != parent {
+		parentTV, okTV := claimTV(claims["tv"])
+		if !okTV || parentTV < 0 || parentTV > 9007199254740991 {
 			return streamTicketResponse{}, neutron.ErrUnauthorized("invalid token version")
 		}
-		parentTV := int64(parent)
 		currentTV, err := authSvc.CurrentTokenVersion(ctx, sub)
 		if err != nil || currentTV != parentTV {
 			return streamTicketResponse{}, neutron.ErrUnauthorized("session revoked")
@@ -4619,8 +4639,10 @@ func logStreamHandler(svc *logs.LogService, authSvc *auth.AuthService) http.Hand
 			if s, ok := claims["sub"].(string); ok {
 				sub = s
 			}
-			if tv, ok := claims["tv"].(float64); ok {
-				expectedTV = int64(tv)
+			// claimTV: same UseNumber trap as stream-ticket — the bare
+			// float64 assertion never fired, so the tv label was always -1.
+			if tv, ok := claimTV(claims["tv"]); ok {
+				expectedTV = tv
 			}
 		}
 
