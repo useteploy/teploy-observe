@@ -516,11 +516,46 @@ func main() {
 		})
 	})
 
-	// A cron check-in resolves any open missed-cron incident for that monitor.
-	cronSvc.OnCheckin = func(ctx context.Context, c monitoring.CronMonitor) {
-		if err := incidentSvc.CloseByRule(ctx, "cron:"+c.CronID); err != nil {
-			logger.Warn("cron incident auto-resolve failed", "cron", c.CronID, "err", err)
+	// A cron check-in resolves any open missed-cron incident for that
+	// monitor - and (O10 tail) notifies through the durable outbox when it
+	// actually closed something, so a recovered cron reaches the same
+	// channels its missing did.
+	// notifyCronIncident enqueues one durable notification intent per
+	// severity-matched webhook (cron severity is warning) - the same
+	// outbox, delivery contract and dead-letter posture as alerts.
+	notifyCronIncident := func(ctx context.Context, kind string, cron platform.CronMonitorRef, incidentID string, graceSecs int) {
+		hooks, err := webhookSvc.List(ctx, cron.SiteID)
+		if err != nil {
+			logger.Warn("cron notification: webhook listing failed", "cron", cron.CronID, "err", err)
+			return
 		}
+		payload := platform.BuildCronPayload(kind, cron, incidentID, graceSecs, time.Now())
+		for _, hook := range hooks {
+			if !platform.MatchesSeverity(hook.Severities, "warning") {
+				continue
+			}
+			if _, err := notifier.Enqueue(ctx, platform.NotificationIntent{
+				Kind: kind, RuleID: "cron:" + cron.CronID, IncidentID: incidentID,
+				SiteID: cron.SiteID, WebhookID: hook.WebhookID,
+				TargetType: hook.WebhookType, TargetURL: hook.URL, Secret: hook.Secret,
+				Payload: payload,
+			}); err != nil {
+				logger.Warn("cron notification enqueue failed", "cron", cron.CronID, "err", err)
+			}
+		}
+	}
+	cronSvc.OnCheckin = func(ctx context.Context, c monitoring.CronMonitor) {
+		closed, err := incidentSvc.CloseByRule(ctx, "cron:"+c.CronID)
+		if err != nil {
+			logger.Warn("cron incident auto-resolve failed", "cron", c.CronID, "err", err)
+			return
+		}
+		if closed == 0 {
+			return
+		}
+		notifyCronIncident(ctx, platform.NotifyCronRecovered, platform.CronMonitorRef{
+			CronID: c.CronID, SiteID: c.SiteID, Name: c.Name, Slug: c.Slug,
+		}, "", 0)
 	}
 
 	// W2.B: cross-site board summary. SiteLookup adapts the SiteService
@@ -703,7 +738,7 @@ func main() {
 						// old `if active, _ := ActiveByRule(...)` read a failed
 						// query as "nothing open" and opened another incident
 						// every tick.
-						_, _, err := incidentSvc.EnsureOpen(ctx, incidents.CreateInput{
+						inc, created, err := incidentSvc.EnsureOpen(ctx, incidents.CreateInput{
 							SiteID:      c.SiteID,
 							Title:       fmt.Sprintf("Cron missed: %s", c.Name),
 							Description: fmt.Sprintf("cron %q (slug %q) has not checked in within its %ds grace period", c.Name, c.Slug, c.GracePeriod),
@@ -713,6 +748,17 @@ func main() {
 						}, "cron")
 						if err != nil {
 							logger.Warn("cron incident auto-create failed", "cron", c.CronID, "err", err)
+							continue
+						}
+						// O10 tail: the missed-cron notification rides the
+						// DURABLE outbox (it was EnsureOpen-only - the
+						// incident existed, nothing was delivered). Gated on
+						// created so a still-missing cron does not re-notify
+						// every tick; the check-in hook sends the recovery.
+						if created {
+							notifyCronIncident(ctx, platform.NotifyCronMissed, platform.CronMonitorRef{
+								CronID: c.CronID, SiteID: c.SiteID, Name: c.Name, Slug: c.Slug,
+							}, inc.IncidentID, c.GracePeriod)
 						}
 					}
 					return nil
@@ -5648,6 +5694,9 @@ type createWebhookInput struct {
 	Name        string `json:"name"`
 	WebhookType string `json:"webhook_type"`
 	URL         string `json:"url"`
+	// Severities (O10): optional comma-delivered routing filter
+	// (info,warning,critical,error); empty receives everything.
+	Severities string `json:"severities"`
 }
 
 func createWebhookHandler(svc *platform.WebhookService) neutron.HandlerFunc[createWebhookInput, platform.Webhook] {
@@ -5655,7 +5704,7 @@ func createWebhookHandler(svc *platform.WebhookService) neutron.HandlerFunc[crea
 		if input.SiteID == "" || input.URL == "" {
 			return platform.Webhook{}, neutron.ErrBadRequest("site_id and url required")
 		}
-		w, err := svc.Create(ctx, input.SiteID, input.Name, input.WebhookType, input.URL)
+		w, err := svc.Create(ctx, input.SiteID, input.Name, input.WebhookType, input.URL, input.Severities)
 		if err != nil {
 			return platform.Webhook{}, err
 		}

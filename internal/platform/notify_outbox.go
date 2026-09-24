@@ -48,9 +48,15 @@ import (
 
 // Notification intent kinds (the edge that caused them).
 const (
-	NotifyIncidentOpened   = "incident_opened"
+	NotifyIncidentOpened    = "incident_opened"
 	NotifyIncidentRecovered = "incident_recovered"
-	NotifyIncidentRepeat   = "incident_repeat"
+	NotifyIncidentRepeat    = "incident_repeat"
+
+	// O10 tails: cron heartbeat incidents ride the same durable outbox
+	// (they were EnsureOpen-only - the incident existed, nothing was
+	// delivered).
+	NotifyCronMissed    = "cron_missed"
+	NotifyCronRecovered = "cron_recovered"
 )
 
 // Notifier defaults (mirroring the derived-outbox worker).
@@ -230,6 +236,49 @@ func (n *Notifier) enqueueTx(ctx context.Context, sql *nucleus.SQLModel, in Noti
 		return "", fmt.Errorf("notification enqueue: %w", err)
 	}
 	return id, nil
+}
+
+// Enqueue writes one intent outside an originating transaction - for
+// origins that own no transaction of their own (the cron missed/recovered
+// paths: the incident service commits the incident, then this runs). The
+// atomicity gap is bounded and self-healing: a committed cron incident
+// whose intents failed re-enqueues on the next missed-check tick, and the
+// created-gate suppresses duplicates.
+func (n *Notifier) Enqueue(ctx context.Context, in NotificationIntent) (string, error) {
+	return n.enqueueTx(ctx, n.db.SQL(), in)
+}
+
+// CronMonitorRef is the cron identity the notification payload carries
+// (monitoring.CronMonitor narrowed to what delivery needs - platform
+// cannot import internal/monitoring without a cycle through the engine).
+type CronMonitorRef struct {
+	CronID string
+	SiteID string
+	Name   string
+	Slug   string
+}
+
+// BuildCronPayload freezes the payload for a cron heartbeat notification -
+// the same NotificationPayload receivers already parse, with the fields a
+// missed heartbeat can honestly fill (no metric value exists; the message
+// carries the schedule context).
+func BuildCronPayload(kind string, cron CronMonitorRef, incidentID string, graceSecs int, at time.Time) string {
+	p := NotificationPayload{
+		Kind: kind, IncidentID: incidentID,
+		RuleID: "cron:" + cron.CronID, RuleName: cron.Name,
+		Metric: "cron_heartbeat", SiteID: cron.SiteID, Severity: "warning",
+		EvaluatedAt: at.UTC().Format(time.RFC3339),
+	}
+	switch kind {
+	case NotifyCronMissed:
+		p.Message = fmt.Sprintf("Cron missed: %q (slug %q) has not checked in within its %ds grace period (incident %s)",
+			cron.Name, cron.Slug, graceSecs, incidentID)
+	case NotifyCronRecovered:
+		p.Message = fmt.Sprintf("Cron recovered: %q (slug %q) checked in again (incident %s closed)",
+			cron.Name, cron.Slug, incidentID)
+	}
+	raw, _ := json.Marshal(p)
+	return string(raw)
 }
 
 // LastIntentAt returns the newest enqueued intent time for a rule (0 when

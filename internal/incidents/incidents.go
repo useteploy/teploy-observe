@@ -186,19 +186,24 @@ func (s *Service) Close(ctx context.Context, incidentID string) error {
 	return err
 }
 
-// CloseByRule closes any open incident whose rule_id matches. Used by
-// the alert service when a rule transitions from firing back to normal.
-func (s *Service) CloseByRule(ctx context.Context, ruleID string) error {
+// CloseByRule closes any open incident whose rule_id matches and returns
+// how many it closed. Used by the alert service when a rule transitions
+// from firing back to normal, and by the cron check-in hook - the count is
+// the recovered-notification gate (notify only when something actually
+// closed).
+func (s *Service) CloseByRule(ctx context.Context, ruleID string) (int, error) {
 	actives, err := s.ActiveByRule(ctx, ruleID)
 	if err != nil {
-		return err
+		return 0, err
 	}
+	closed := 0
 	for _, inc := range actives {
 		if err := s.Close(ctx, inc.IncidentID); err != nil {
-			return err
+			return closed, err
 		}
+		closed++
 	}
-	return nil
+	return closed, nil
 }
 
 func (s *Service) ActiveByRule(ctx context.Context, ruleID string) ([]Incident, error) {

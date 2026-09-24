@@ -74,6 +74,10 @@ type Webhook struct {
 	WebhookType string `json:"webhook_type" db:"webhook_type"`
 	URL         string `json:"url"`
 	Secret      string `json:"-" db:"secret"`
+	// Severities (O10): comma-delivered subset of the severity domain this
+	// webhook wants (info, warning, critical, error). Empty = all - the
+	// pre-056 behavior every existing webhook keeps.
+	Severities string `json:"severities" db:"severities"`
 	// SecretReveal carries the signing secret back to the caller exactly once,
 	// at creation. It has no db tag, so List/Get never populate it.
 	SecretReveal string    `json:"secret,omitempty"`
@@ -82,21 +86,72 @@ type Webhook struct {
 	Version      string    `json:"-" db:"version"`
 }
 
-func (s *WebhookService) Create(ctx context.Context, siteID, name, webhookType, url string) (*Webhook, error) {
+// SeverityDomain is the closed set a webhook's severities filter may name.
+var SeverityDomain = map[string]bool{
+	"info":     true,
+	"warning":  true,
+	"critical": true,
+	"error":    true,
+}
+
+// NormalizeSeverities validates and canonicalizes a comma-delimited
+// severity filter: entries must be in the domain, output is lowercase,
+// deduped, comma-joined. Empty input is valid (receives everything).
+func NormalizeSeverities(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return "", nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		s := strings.ToLower(strings.TrimSpace(part))
+		if s == "" {
+			continue
+		}
+		if !SeverityDomain[s] {
+			return "", fmt.Errorf("unknown severity %q (domain: info, warning, critical, error)", s)
+		}
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return strings.Join(out, ","), nil
+}
+
+// MatchesSeverity reports whether a webhook receives the given severity:
+// an empty filter receives everything.
+func MatchesSeverity(severities, severity string) bool {
+	if severities == "" {
+		return true
+	}
+	for _, part := range strings.Split(severities, ",") {
+		if strings.TrimSpace(part) == severity {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *WebhookService) Create(ctx context.Context, siteID, name, webhookType, url, severities string) (*Webhook, error) {
 	if webhookType != "slack" && webhookType != "http" {
 		webhookType = "http"
 	}
 	if err := netsafe.ValidateURL(url); err != nil {
 		return nil, fmt.Errorf("webhook url: %w", err)
 	}
+	severities, err := NormalizeSeverities(severities)
+	if err != nil {
+		return nil, fmt.Errorf("webhook severities: %w", err)
+	}
 	id := genID()
 	secret := genID() + genID() // 32 random bytes, hex-encoded
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 
-	_, err := s.db.SQL().Exec(ctx,
-		`INSERT INTO webhooks (webhook_id, tenant_id, site_id, name, webhook_type, url, secret, enabled, created_at, version)
-		 VALUES ($1, 'default', $2, $3, $4, $5, $6, 'true', $7, $8)`,
-		id, siteID, name, webhookType, url, secret, now, now,
+	_, err = s.db.SQL().Exec(ctx,
+		`INSERT INTO webhooks (webhook_id, tenant_id, site_id, name, webhook_type, url, secret, severities, enabled, created_at, version)
+		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, 'true', $8, $9)`,
+		id, siteID, name, webhookType, url, secret, severities, now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create webhook: %w", err)
@@ -105,7 +160,7 @@ func (s *WebhookService) Create(ctx context.Context, siteID, name, webhookType, 
 	nowMs, _ := strconv.ParseInt(now, 10, 64)
 	return &Webhook{
 		WebhookID: id, SiteID: siteID, Name: name,
-		WebhookType: webhookType, URL: url, Enabled: true,
+		WebhookType: webhookType, URL: url, Enabled: true, Severities: severities,
 		Secret: secret, SecretReveal: secret,
 		CreatedAt: time.UnixMilli(nowMs).UTC(),
 	}, nil
@@ -113,7 +168,7 @@ func (s *WebhookService) Create(ctx context.Context, siteID, name, webhookType, 
 
 func (s *WebhookService) List(ctx context.Context, siteID string) ([]Webhook, error) {
 	return nucleus.Query[Webhook](ctx, s.db.SQL(),
-		`SELECT webhook_id, tenant_id, site_id, name, webhook_type, url, secret, enabled, created_at, version
+		`SELECT webhook_id, tenant_id, site_id, name, webhook_type, url, secret, severities, enabled, created_at, version
 		 FROM `+webhooksLatest("site_id = $1")+`
 		 WHERE enabled = 'true'
 		 ORDER BY created_at DESC`, siteID)
@@ -125,8 +180,8 @@ func (s *WebhookService) Delete(ctx context.Context, webhookID string) error {
 	// same-millisecond create+delete must not tie, or the tombstone loses
 	// the collapse and the deleted webhook keeps receiving payloads.
 	_, err := s.db.SQL().Exec(ctx,
-		`INSERT INTO webhooks (webhook_id, tenant_id, site_id, name, webhook_type, url, secret, enabled, created_at, version)
-		 SELECT webhook_id, tenant_id, site_id, name, webhook_type, url, secret, 'false', created_at,
+		`INSERT INTO webhooks (webhook_id, tenant_id, site_id, name, webhook_type, url, secret, severities, enabled, created_at, version)
+		 SELECT webhook_id, tenant_id, site_id, name, webhook_type, url, secret, severities, 'false', created_at,
 		        GREATEST(CAST($2 AS BIGINT), version + 1)
 		 FROM `+webhooksLatest("webhook_id = $1"),
 		webhookID, now,

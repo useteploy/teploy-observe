@@ -1,0 +1,34 @@
+-- 056 (2026-09-24): O10 tails - per-severity webhook routing + cron
+-- heartbeat incidents through the durable notification outbox.
+--
+-- 1. SEVERITY ROUTING. Severity exists end to end (alert_rules.severity ->
+--   incidents.severity -> notification payload), but every webhook received
+--   every notification: a page-on-critical channel got info-grade noise,
+--   and there was no way to split destinations by how bad a thing is.
+--   webhooks.severities is a comma-delimited subset of the severity domain
+--   (info, warning, critical, error); EMPTY means receives everything -
+--   every existing webhook keeps its behavior. Validation happens at
+--   CREATE time in the service; the engine filters hooks by the rule's
+--   severity before freezing intents, so the routing decision is durable
+--   on the intent row (target frozen at enqueue, 050).
+--
+-- 2. CRON HEARTBEAT DELIVERY. Missed-cron incidents were EnsureOpen-only:
+--   the incident existed but NOTHING was delivered - the durable outbox
+--   (050) carried alert notifications while the cron path stayed silent.
+--   No schema: the notification_outbox rows are the storage. Two new
+--   kinds ride it: 'cron_missed' (the missed-cron worker enqueues one
+--   intent per severity-matched webhook when EnsureOpen actually CREATES
+--   the incident) and 'cron_recovered' (the check-in hook enqueues when
+--   its CloseByRule actually closed something). Same delivery contract as
+--   alerts: stable X-Observe-Delivery id, backoff, budget, dead letters.
+--
+--   Atomicity note (the engine's documented class): the cron intents are
+--   enqueued AFTER the incident write rather than in one transaction with
+--   it - the incident services own their own writes. The gap is bounded
+--   and self-healing: a committed incident whose intents failed re-enqueues
+--   on the next missed-check tick (created=false suppresses duplicate
+--   notifications, so the retry is idempotent at the incident level).
+--
+-- Comments pure ASCII (038 rule).
+
+ALTER TABLE webhooks ADD COLUMN IF NOT EXISTS severities TEXT NOT NULL DEFAULT '';
