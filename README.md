@@ -563,7 +563,9 @@ Two processes. No Redis, no Kafka, no ClickHouse, no ZooKeeper.
 
 ## License
 
-**Server**: AGPL-3.0-or-later. See `LICENSE`.
+**Server**: FSL-1.1-MIT (Functional Source License) — any use is permitted
+except offering a competing product, and each version automatically becomes
+MIT two years after its release. See `LICENSE`.
 
 **SDKs** (`sdk/browser`, `sdk/sentry-shim`, `sdk/python`, `sdk/go`):
 MIT. Each SDK subdirectory has its own `LICENSE`.
