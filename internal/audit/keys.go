@@ -44,7 +44,7 @@ const minAuditKeyBytes = 32
 
 // Keyring is the resolved audit-chain key state: exactly one signer, a map
 // of historical verification keys (for rotation), and the deduplicated
-// legacy candidates used to verify pre-042 rows (key_id='').
+// legacy candidates used to verify pre-042 rows (key_id=”).
 type Keyring struct {
 	Status  KeyStatus
 	Signer  KeyMaterial
@@ -136,7 +136,7 @@ type persistentKeyFile struct {
 //  4. Unkeyed (file unusable and no fallback): the pre-F46 empty-key
 //     semantics, loudly.
 //
-// Legacy verification candidates (for key_id='' rows) are, deduplicated:
+// Legacy verification candidates (for key_id=” rows) are, deduplicated:
 // the resolved signer, the RAW bytes of OBSERVE_AUDIT_KEY (the pre-F46
 // interpretation), the JWT fallback, and the empty key.
 func LoadKeyring(env KeyEnv) (*Keyring, error) {
@@ -401,7 +401,7 @@ func (kr *Keyring) KeyFor(id string) ([]byte, bool) {
 	return k, ok
 }
 
-// LegacyCandidates returns the SECRET keys a key_id='' row may have been
+// LegacyCandidates returns the SECRET keys a key_id=” row may have been
 // signed with (pre-042 semantics: the then-configured key, which the row
 // does not record, so each configured candidate is tried). The empty key
 // is not among them: a row that matches only the empty key is reported as

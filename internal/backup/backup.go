@@ -56,6 +56,7 @@ var Tables = []string{
 	"sso_configs",
 	"instance_settings",
 	"audit_events",
+	"audit_checkpoints",
 	"events",
 	"events_recent",
 	"sessions",

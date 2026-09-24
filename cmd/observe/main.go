@@ -493,7 +493,7 @@ func main() {
 		// F46 empty-key warning, now the last resort rather than the default.
 		logger.Warn("audit chain is UNKEYED (empty HMAC key): tamper-evidence detects accidental edits only — set OBSERVE_AUDIT_KEY for a chain a database-level attacker cannot recompute")
 	}
-	auditSvc := audit.NewServiceWithKeys(db, auditKeyring)
+	auditSvc := audit.NewServiceWithKeys(db, auditKeyring).WithLogger(logger)
 
 	// SSO sign-ins land in the same audit trail as password logins. Wired here
 	// rather than at construction because the audit service is built after
@@ -1325,6 +1325,10 @@ func main() {
 	r.Handle("POST /api/v1/audit", jwtMW(requireEditor(auditRecordHandler(auditSvc))))
 	// Tamper-evidence: walk the hash chain and report whether it's intact.
 	r.Handle("GET /api/v1/audit/verify", jwtMW(requireAdmin(auditVerifyHandler(auditSvc))))
+	// O14: on-demand checkpoint digest - the externally storable anchor
+	// that makes tail truncation detectable. GET returns the latest.
+	r.Handle("POST /api/v1/audit/checkpoint", jwtMW(requireAdmin(auditCheckpointHandler(auditSvc))))
+	r.Handle("GET /api/v1/audit/checkpoint", jwtMW(requireAdmin(auditLatestCheckpointHandler(auditSvc))))
 	// Compliance control-status report (the evidence-layer surface).
 	r.Handle("GET /api/v1/compliance", jwtMW(requireAdmin(complianceHandler(auditSvc, true, cfg.DemoMode, string(auditKeyring.Status)))))
 
