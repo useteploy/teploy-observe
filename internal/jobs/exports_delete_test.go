@@ -48,16 +48,16 @@ func TestDeleteRemovesTheExportAndItsRunHistory(t *testing.T) {
 		_, _ = db.SQL().Exec(context.Background(), `DELETE FROM scheduled_exports WHERE export_id = $1`, e.ExportID)
 	})
 
-	// recordRun's `ORDER BY updated_at DESC LIMIT 1` is what keeps an
+	// mirrorLastRun's `ORDER BY updated_at DESC LIMIT 1` is what keeps an
 	// INSERT...SELECT-from-the-same-table to one row per call. Three runs must
 	// leave four rows, not eight.
 	for i := 0; i < 3; i++ {
-		if err := svc.recordRun(ctx, e.ExportID, time.Now(), "ok", "", int64(i)); err != nil {
+		if err := svc.mirrorLastRun(ctx, e.ExportID, time.Now(), "ok", "", int64(i)); err != nil {
 			t.Fatalf("record run %d: %v", i, err)
 		}
 	}
 	if got := exportRows(ctx, t, db, e.ExportID); got != 4 {
-		t.Fatalf("three recorded runs left %d rows, want 4 — the LIMIT 1 that bounds recordRun is gone", got)
+		t.Fatalf("three recorded runs left %d rows, want 4 — the LIMIT 1 that bounds mirrorLastRun is gone", got)
 	}
 
 	if err := svc.Delete(ctx, e.ExportID); err != nil {

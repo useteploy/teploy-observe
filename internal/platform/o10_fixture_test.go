@@ -195,7 +195,7 @@ func newO10Engine(t *testing.T, db *nucleus.Client, recv *o10Receiver, clk *o10C
 	t.Cleanup(srv.Close)
 	// Sweep any earlier run's rows for this site, then create the sink.
 	o10Cleanup(t, db, site)
-	if _, err := hooks.Create(context.Background(), site, "o10-sink", "http", srv.URL); err != nil {
+	if _, err := hooks.Create(context.Background(), site, "o10-sink", "http", srv.URL, ""); err != nil {
 		t.Fatalf("create webhook: %v", err)
 	}
 	t.Cleanup(func() {

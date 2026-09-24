@@ -445,7 +445,7 @@ func main() {
 	ssoSvc := sso.NewSSOService(db)
 	flagSvc := flags.NewFlagService(db)
 	experimentSvc := experiments.NewExperimentService(db)
-	surveySvc := surveys.NewSurveyService(db)
+	surveySvc := surveys.NewSurveyService(db, cfg.SessionSalt, siteSvc)
 	logSvc := logs.NewLogService(db)
 	logSvc.SetPipelines(pipelineSvc)
 	uptimeSvc := monitoring.NewUptimeService(db, logger)
@@ -493,7 +493,7 @@ func main() {
 		// F46 empty-key warning, now the last resort rather than the default.
 		logger.Warn("audit chain is UNKEYED (empty HMAC key): tamper-evidence detects accidental edits only — set OBSERVE_AUDIT_KEY for a chain a database-level attacker cannot recompute")
 	}
-	auditSvc := audit.NewServiceWithKeys(db, auditKeyring)
+	auditSvc := audit.NewServiceWithKeys(db, auditKeyring).WithLogger(logger)
 
 	// SSO sign-ins land in the same audit trail as password logins. Wired here
 	// rather than at construction because the audit service is built after
@@ -516,11 +516,46 @@ func main() {
 		})
 	})
 
-	// A cron check-in resolves any open missed-cron incident for that monitor.
-	cronSvc.OnCheckin = func(ctx context.Context, c monitoring.CronMonitor) {
-		if err := incidentSvc.CloseByRule(ctx, "cron:"+c.CronID); err != nil {
-			logger.Warn("cron incident auto-resolve failed", "cron", c.CronID, "err", err)
+	// A cron check-in resolves any open missed-cron incident for that
+	// monitor - and (O10 tail) notifies through the durable outbox when it
+	// actually closed something, so a recovered cron reaches the same
+	// channels its missing did.
+	// notifyCronIncident enqueues one durable notification intent per
+	// severity-matched webhook (cron severity is warning) - the same
+	// outbox, delivery contract and dead-letter posture as alerts.
+	notifyCronIncident := func(ctx context.Context, kind string, cron platform.CronMonitorRef, incidentID string, graceSecs int) {
+		hooks, err := webhookSvc.List(ctx, cron.SiteID)
+		if err != nil {
+			logger.Warn("cron notification: webhook listing failed", "cron", cron.CronID, "err", err)
+			return
 		}
+		payload := platform.BuildCronPayload(kind, cron, incidentID, graceSecs, time.Now())
+		for _, hook := range hooks {
+			if !platform.MatchesSeverity(hook.Severities, "warning") {
+				continue
+			}
+			if _, err := notifier.Enqueue(ctx, platform.NotificationIntent{
+				Kind: kind, RuleID: "cron:" + cron.CronID, IncidentID: incidentID,
+				SiteID: cron.SiteID, WebhookID: hook.WebhookID,
+				TargetType: hook.WebhookType, TargetURL: hook.URL, Secret: hook.Secret,
+				Payload: payload,
+			}); err != nil {
+				logger.Warn("cron notification enqueue failed", "cron", cron.CronID, "err", err)
+			}
+		}
+	}
+	cronSvc.OnCheckin = func(ctx context.Context, c monitoring.CronMonitor) {
+		closed, err := incidentSvc.CloseByRule(ctx, "cron:"+c.CronID)
+		if err != nil {
+			logger.Warn("cron incident auto-resolve failed", "cron", c.CronID, "err", err)
+			return
+		}
+		if closed == 0 {
+			return
+		}
+		notifyCronIncident(ctx, platform.NotifyCronRecovered, platform.CronMonitorRef{
+			CronID: c.CronID, SiteID: c.SiteID, Name: c.Name, Slug: c.Slug,
+		}, "", 0)
 	}
 
 	// W2.B: cross-site board summary. SiteLookup adapts the SiteService
@@ -703,7 +738,7 @@ func main() {
 						// old `if active, _ := ActiveByRule(...)` read a failed
 						// query as "nothing open" and opened another incident
 						// every tick.
-						_, _, err := incidentSvc.EnsureOpen(ctx, incidents.CreateInput{
+						inc, created, err := incidentSvc.EnsureOpen(ctx, incidents.CreateInput{
 							SiteID:      c.SiteID,
 							Title:       fmt.Sprintf("Cron missed: %s", c.Name),
 							Description: fmt.Sprintf("cron %q (slug %q) has not checked in within its %ds grace period", c.Name, c.Slug, c.GracePeriod),
@@ -713,6 +748,17 @@ func main() {
 						}, "cron")
 						if err != nil {
 							logger.Warn("cron incident auto-create failed", "cron", c.CronID, "err", err)
+							continue
+						}
+						// O10 tail: the missed-cron notification rides the
+						// DURABLE outbox (it was EnsureOpen-only - the
+						// incident existed, nothing was delivered). Gated on
+						// created so a still-missing cron does not re-notify
+						// every tick; the check-in hook sends the recovery.
+						if created {
+							notifyCronIncident(ctx, platform.NotifyCronMissed, platform.CronMonitorRef{
+								CronID: c.CronID, SiteID: c.SiteID, Name: c.Name, Slug: c.Slug,
+							}, inc.IncidentID, c.GracePeriod)
 						}
 					}
 					return nil
@@ -1170,6 +1216,13 @@ func main() {
 		neutron.WithTags("llm"), neutron.WithSummary("LLM model breakdown"))
 	neutron.Get(llmGroup, "/traces", llmTracesHandler(llmSvc),
 		neutron.WithTags("llm"), neutron.WithSummary("Recent LLM traces"))
+	// O14: the versioned model/cost catalog (admin maintains; estimation
+	// reads it at ingest).
+	llmAdmin := llmGroup.Group("", requireAdmin)
+	neutron.Get(llmAdmin, "/prices", llmPricesListHandler(llmSvc),
+		neutron.WithTags("llm"), neutron.WithSummary("List effective model prices"))
+	neutron.Post(llmAdmin, "/prices", llmPricesSetHandler(llmSvc),
+		neutron.WithTags("llm"), neutron.WithSummary("Set a model price (versioned by valid_from)"))
 
 	// --- Infrastructure monitoring (API-key agent reports, JWT for queries) ---
 	// OBS-014: this was keyless — it validated that the caller-supplied
@@ -1297,6 +1350,7 @@ func main() {
 	r.Handle("POST /api/v1/exports/scheduled", jwtMW(requireAdmin(exportsCreateHandler(scheduledExportSvc))))
 	r.Handle("DELETE /api/v1/exports/scheduled/{export_id}", jwtMW(requireAdmin(exportsDeleteHandler(scheduledExportSvc))))
 	r.Handle("POST /api/v1/exports/scheduled/{export_id}/run", jwtMW(requireAdmin(exportsRunNowHandler(scheduledExportSvc))))
+	r.Handle("GET /api/v1/exports/scheduled/{export_id}/runs", jwtMW(requireAdmin(exportsRunsHandler(scheduledExportSvc))))
 
 	// --- Incidents (admin+editor may create/close; all roles may read) ---
 	r.Handle("GET /api/v1/incidents", jwtMW(incidentsListHandler(incidentSvc)))
@@ -1317,6 +1371,10 @@ func main() {
 	r.Handle("POST /api/v1/audit", jwtMW(requireEditor(auditRecordHandler(auditSvc))))
 	// Tamper-evidence: walk the hash chain and report whether it's intact.
 	r.Handle("GET /api/v1/audit/verify", jwtMW(requireAdmin(auditVerifyHandler(auditSvc))))
+	// O14: on-demand checkpoint digest - the externally storable anchor
+	// that makes tail truncation detectable. GET returns the latest.
+	r.Handle("POST /api/v1/audit/checkpoint", jwtMW(requireAdmin(auditCheckpointHandler(auditSvc))))
+	r.Handle("GET /api/v1/audit/checkpoint", jwtMW(requireAdmin(auditLatestCheckpointHandler(auditSvc))))
 	// Compliance control-status report (the evidence-layer surface).
 	r.Handle("GET /api/v1/compliance", jwtMW(requireAdmin(complianceHandler(auditSvc, true, cfg.DemoMode, string(auditKeyring.Status)))))
 
@@ -1362,10 +1420,15 @@ func main() {
 		neutron.WithTags("surveys"), neutron.WithSummary("Create survey"))
 	neutron.Post(surveyEditor, "/{survey_id}/activate", activateSurveyHandler(surveySvc),
 		neutron.WithTags("surveys"), neutron.WithSummary("Activate survey"))
+	neutron.Post(surveyEditor, "/{survey_id}/close", closeSurveyHandler(surveySvc),
+		neutron.WithTags("surveys"), neutron.WithSummary("Close survey (stops exposure and response recording)"))
 	neutron.Get(surveyGroup, "/{survey_id}/responses", surveyResponsesHandler(surveySvc),
 		neutron.WithTags("surveys"), neutron.WithSummary("List survey responses"))
-	// Public: get active surveys + submit response
+	neutron.Get(surveyGroup, "/{survey_id}/stats", surveyStatsHandler(surveySvc),
+		neutron.WithTags("surveys"), neutron.WithSummary("Survey exposure/response stats"))
+	// Public: get active surveys, record exposure, submit response
 	r.HandleFunc("GET /api/v1/surveys/active", activeSurveysPublicHandler(surveySvc))
+	r.HandleFunc("POST /api/v1/surveys/expose", surveyExposeHandler(surveySvc))
 	r.HandleFunc("POST /api/v1/surveys/respond", surveyRespondHandler(surveySvc))
 
 	// --- Release health (JWT auth) ---
@@ -2918,6 +2981,18 @@ func llmTracesHandler(svc *llm.LLMService) neutron.HandlerFunc[llmTracesInput, [
 	}
 }
 
+func llmPricesListHandler(svc *llm.LLMService) neutron.HandlerFunc[neutron.Empty, []llm.CatalogEntry] {
+	return func(ctx context.Context, _ neutron.Empty) ([]llm.CatalogEntry, error) {
+		return emptyOnNil(svc.ListPrices(ctx))
+	}
+}
+
+func llmPricesSetHandler(svc *llm.LLMService) neutron.HandlerFunc[llm.CatalogEntry, neutron.Empty] {
+	return func(ctx context.Context, input llm.CatalogEntry) (neutron.Empty, error) {
+		return neutron.Empty{}, svc.SetPrice(ctx, input)
+	}
+}
+
 // --- Infra handlers ---
 
 func infraReportHandler(svc *infra.InfraService) neutron.HandlerFunc[infra.MetricInput, map[string]string] {
@@ -3383,6 +3458,29 @@ func exportsRunNowHandler(svc *jobs.ExportService) http.HandlerFunc {
 	}
 }
 
+// exportsRunsHandler serves the durable run history for one export (the
+// 053 ledger: attempts, backoff schedule, dead letters with their
+// last_error - inspectable across restarts).
+func exportsRunsHandler(svc *jobs.ExportService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("export_id")
+		if id == "" {
+			http.Error(w, "export_id required", http.StatusBadRequest)
+			return
+		}
+		runs, err := svc.ListRuns(r.Context(), id, int(auditParseInt(r.URL.Query().Get("limit"))))
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if runs == nil {
+			runs = []jobs.ExportRun{}
+		}
+		json.NewEncoder(w).Encode(runs)
+	}
+}
+
 func aiConfigGetHandler(svc *aiquery.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cfg, err := svc.GetConfig(r.Context())
@@ -3840,11 +3938,60 @@ func createSurveyHandler(svc *surveys.SurveyService) neutron.HandlerFunc[createS
 
 type surveyIDInput struct {
 	SurveyID string `path:"survey_id"`
+	SiteID   string `query:"site_id"`
 }
 
 func activateSurveyHandler(svc *surveys.SurveyService) neutron.HandlerFunc[surveyIDInput, neutron.Empty] {
 	return func(ctx context.Context, input surveyIDInput) (neutron.Empty, error) {
 		return neutron.Empty{}, svc.Activate(ctx, input.SurveyID)
+	}
+}
+
+func closeSurveyHandler(svc *surveys.SurveyService) neutron.HandlerFunc[surveyIDInput, neutron.Empty] {
+	return func(ctx context.Context, input surveyIDInput) (neutron.Empty, error) {
+		return neutron.Empty{}, svc.Close(ctx, input.SurveyID)
+	}
+}
+
+func surveyStatsHandler(svc *surveys.SurveyService) neutron.HandlerFunc[surveyIDInput, *surveys.Stats] {
+	return func(ctx context.Context, input surveyIDInput) (*surveys.Stats, error) {
+		return svc.Stats(ctx, input.SurveyID, input.SiteID)
+	}
+}
+
+// surveyExposeHandler is the public exposure ping: the SDK reports that an
+// active survey was shown to a reader. The entity is derived SERVER-side
+// from the request IP/UA (or the hashed identify value when user_id is
+// sent) - the caller never names its own identity, matching the analytics
+// posture. Same bounds as respond (bounded body, strict decode).
+func surveyExposeHandler(svc *surveys.SurveyService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		r.Body = http.MaxBytesReader(w, r.Body, publicFormMaxBodyBytes)
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		var input surveyRespondInput
+		if err := dec.Decode(&input); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid request body"})
+			return
+		}
+		if input.SurveyID == "" || input.SiteID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "survey_id and site_id required"})
+			return
+		}
+		if err := svc.RecordExposure(r.Context(), input.SurveyID, input.SiteID, input.UserID,
+			ingest.ClientIPFromContext(r.Context()), ingest.UserAgentFromContext(r.Context())); err != nil {
+			// Same shape as respond: a gated refusal (unknown/inactive/cross-
+			// site survey) is a 400 the SDK can drop quietly.
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	}
 }
 
@@ -3886,10 +4033,11 @@ func activeSurveysPublicHandler(svc *surveys.SurveyService) http.HandlerFunc {
 }
 
 type surveyRespondInput struct {
-	SurveyID string         `json:"survey_id"`
-	SiteID   string         `json:"site_id"`
-	UserID   string         `json:"user_id"`
-	Answers  map[string]any `json:"answers"`
+	SurveyID   string         `json:"survey_id"`
+	SiteID     string         `json:"site_id"`
+	UserID     string         `json:"user_id"`
+	ResponseID string         `json:"response_id"`
+	Answers    map[string]any `json:"answers"`
 }
 
 // OBS-001/002/003: the decode error was ignored (malformed/truncated/wrongly
@@ -3923,13 +4071,15 @@ func surveyRespondHandler(svc *surveys.SurveyService) http.HandlerFunc {
 			return
 		}
 
-		id, err := svc.SubmitResponse(r.Context(), input.SurveyID, input.SiteID, input.UserID, input.Answers)
+		res, err := svc.SubmitResponse(r.Context(), input.SurveyID, input.SiteID, input.UserID,
+			input.ResponseID, input.Answers,
+			ingest.ClientIPFromContext(r.Context()), ingest.UserAgentFromContext(r.Context()))
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{"ok": true, "response_id": id})
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "response_id": res.ResponseID, "deduped": res.Deduped})
 	}
 }
 
@@ -5544,6 +5694,9 @@ type createWebhookInput struct {
 	Name        string `json:"name"`
 	WebhookType string `json:"webhook_type"`
 	URL         string `json:"url"`
+	// Severities (O10): optional comma-delivered routing filter
+	// (info,warning,critical,error); empty receives everything.
+	Severities string `json:"severities"`
 }
 
 func createWebhookHandler(svc *platform.WebhookService) neutron.HandlerFunc[createWebhookInput, platform.Webhook] {
@@ -5551,7 +5704,7 @@ func createWebhookHandler(svc *platform.WebhookService) neutron.HandlerFunc[crea
 		if input.SiteID == "" || input.URL == "" {
 			return platform.Webhook{}, neutron.ErrBadRequest("site_id and url required")
 		}
-		w, err := svc.Create(ctx, input.SiteID, input.Name, input.WebhookType, input.URL)
+		w, err := svc.Create(ctx, input.SiteID, input.Name, input.WebhookType, input.URL, input.Severities)
 		if err != nil {
 			return platform.Webhook{}, err
 		}

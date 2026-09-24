@@ -56,6 +56,7 @@ var Tables = []string{
 	"sso_configs",
 	"instance_settings",
 	"audit_events",
+	"audit_checkpoints",
 	"events",
 	"events_recent",
 	"sessions",
@@ -72,6 +73,7 @@ var Tables = []string{
 	"service_dependencies",
 	"derived_outbox",
 	"llm_traces",
+	"llm_model_prices",
 	"metric_points",
 	"host_metrics",
 	"replay_sessions",
@@ -85,6 +87,7 @@ var Tables = []string{
 	"experiment_conversions",
 	"surveys",
 	"survey_responses",
+	"survey_exposures",
 	"cohorts",
 	"feedback",
 	"alert_rules",
@@ -111,6 +114,7 @@ var Tables = []string{
 	"share_links",
 	"report_schedules",
 	"scheduled_exports",
+	"scheduled_export_runs",
 	"mcp_tokens",
 }
 

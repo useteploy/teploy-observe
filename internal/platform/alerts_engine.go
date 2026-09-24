@@ -201,7 +201,7 @@ func (s *AlertService) evaluateFiring(ctx context.Context, rule AlertRule, prev 
 		if created {
 			kind = NotifyIncidentOpened
 		}
-		hooks := s.listHooks(ctx, rule.SiteID)
+		hooks := s.listHooks(ctx, rule.SiteID, rule.severityOrDefault())
 		if err := s.commitEdge(ctx, edgeInput{
 			rule: rule, from: prev.State, to: StateFiring,
 			value: value, samples: samples, now: now,
@@ -236,7 +236,7 @@ func (s *AlertService) evaluateFiring(ctx context.Context, rule AlertRule, prev 
 			return s.commitEdge(ctx, edgeInput{
 				rule: rule, from: prev.State, to: StateFiring,
 				value: value, samples: samples, now: now, incidentID: inc.IncidentID,
-				notifyKind: NotifyIncidentRepeat, hooks: s.listHooks(ctx, rule.SiteID),
+				notifyKind: NotifyIncidentRepeat, hooks: s.listHooks(ctx, rule.SiteID, rule.severityOrDefault()),
 			})
 		}
 	}
@@ -265,7 +265,7 @@ func (s *AlertService) evaluateHealthy(ctx context.Context, rule AlertRule, prev
 		})
 	}
 
-	hooks := s.listHooks(ctx, rule.SiteID)
+	hooks := s.listHooks(ctx, rule.SiteID, rule.severityOrDefault())
 	if err := s.commitEdge(ctx, edgeInput{
 		rule: rule, from: prev.State, to: StateHealthy,
 		value: value, samples: samples, now: now,
@@ -353,11 +353,12 @@ func (s *AlertService) commitEdge(ctx context.Context, in edgeInput) error {
 	return nil
 }
 
-// listHooks returns the site's enabled webhook targets (frozen per
-// notification at commit time). A listing failure logs and returns nil:
-// the edge still records, and the first repeat tick past the cooldown
-// re-notifies (LastIntentAt reads 0 with no intents).
-func (s *AlertService) listHooks(ctx context.Context, siteID string) []Webhook {
+// listHooks returns the site's enabled webhook targets that ROUTE the
+// given severity (O10: a webhook's severities filter, empty = all),
+// frozen per notification at commit time. A listing failure logs and
+// returns nil: the edge still records, and the first repeat tick past the
+// cooldown re-notifies (LastIntentAt reads 0 with no intents).
+func (s *AlertService) listHooks(ctx context.Context, siteID, severity string) []Webhook {
 	if s.webhookSvc == nil {
 		return nil
 	}
@@ -366,7 +367,13 @@ func (s *AlertService) listHooks(ctx context.Context, siteID string) []Webhook {
 		s.logger.Error("webhook listing failed; notification deferred to the repeat tick", "site", siteID, "err", err)
 		return nil
 	}
-	return hooks
+	out := hooks[:0]
+	for _, h := range hooks {
+		if MatchesSeverity(h.Severities, severity) {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // recordIncidentEvent is a nil-safe timeline append.

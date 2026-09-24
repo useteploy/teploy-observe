@@ -37,6 +37,14 @@ func (f *fakeAuditStore) Verify(_ context.Context) (audit.VerifyResult, error) {
 	return audit.VerifyResult{Intact: true, Count: len(f.recorded)}, nil
 }
 
+func (f *fakeAuditStore) Checkpoint(_ context.Context) (audit.Checkpoint, error) {
+	return audit.Checkpoint{CheckpointID: "cp", Seq: 1, HeadHash: "h", Digest: "d"}, nil
+}
+
+func (f *fakeAuditStore) LatestCheckpoint(_ context.Context) (*audit.Checkpoint, error) {
+	return nil, nil
+}
+
 func TestAuditVerifyHandler(t *testing.T) {
 	store := &fakeAuditStore{recorded: []audit.AuditEvent{{}, {}}}
 	w := httptest.NewRecorder()

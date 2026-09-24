@@ -37,6 +37,7 @@ const webhookColumns = `(
 	webhook_type   TEXT NOT NULL DEFAULT 'http',
 	url            TEXT NOT NULL DEFAULT '',
 	secret         TEXT NOT NULL DEFAULT '',
+	severities     TEXT NOT NULL DEFAULT '',
 	enabled        TEXT NOT NULL DEFAULT 'true',
 	created_at     TEXT NOT NULL,
 	version        BIGINT NOT NULL DEFAULT 0
@@ -84,7 +85,7 @@ func TestSameMillisecondCreateDeleteTombstoneWins(t *testing.T) {
 			}
 		}
 
-		hook, err := hooks.Create(ctx, site, "tie", "http", "https://example.com/hook")
+		hook, err := hooks.Create(ctx, site, "tie", "http", "https://example.com/hook", "")
 		if err != nil {
 			t.Fatalf("iter %d create webhook: %v", i, err)
 		}

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/useteploy/teploy-observe/internal/audit"
@@ -55,13 +56,13 @@ func evaluateControls(in complianceInputs) []controlStatus {
 		// as a pass regardless of how the signer is keyed.
 		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "warn", in.Verify.Detail})
 	case in.TamperKeyState == "dedicated":
-		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "pass", "hash chain intact, keyed by a dedicated key"})
+		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "pass", "hash chain internally consistent (1-" + strconv.FormatInt(in.Verify.VerifiedThroughSeq, 10) + "), keyed by a dedicated key; tail truncation is detectable only against an externally stored checkpoint digest"})
 	case in.TamperKeyState == "persistent":
-		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "pass", "hash chain intact, keyed by the persistent generated key (rotate via OBSERVE_AUDIT_KEY + OBSERVE_AUDIT_KEYRING)"})
+		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "pass", "hash chain internally consistent (1-" + strconv.FormatInt(in.Verify.VerifiedThroughSeq, 10) + "), keyed by the persistent generated key (rotate via OBSERVE_AUDIT_KEY + OBSERVE_AUDIT_KEYRING); tail truncation is detectable only against an externally stored checkpoint digest"})
 	case in.TamperKeyState == "jwt-fallback":
-		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "warn", "chain intact but keyed by the JWT secret — set OBSERVE_AUDIT_KEY so the chain key is not shared with the session domain"})
+		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "warn", "chain internally consistent but keyed by the JWT secret — set OBSERVE_AUDIT_KEY so the chain key is not shared with the session domain"})
 	default:
-		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "warn", "chain intact but unkeyed — set OBSERVE_AUDIT_KEY so a DB-level actor can't forge it"})
+		c = append(c, controlStatus{"audit_tamper_evidence", "Audit tamper-evidence", "warn", "chain internally consistent but unkeyed — set OBSERVE_AUDIT_KEY so a DB-level actor can't forge it"})
 	}
 
 	if in.AuthRequired {

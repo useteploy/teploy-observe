@@ -23,7 +23,7 @@ func alertRulesLatest(where string) string {
 }
 
 var webhookCols = []string{
-	"name", "webhook_type", "url", "secret", "enabled", "created_at", "version",
+	"name", "webhook_type", "url", "secret", "severities", "enabled", "created_at", "version",
 }
 
 func webhooksLatest(where string) string {

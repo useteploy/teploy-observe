@@ -80,7 +80,7 @@ func TestEnsureOpenReusesTheOpenIncident(t *testing.T) {
 
 	// Recovery closes it, and a later relapse is a genuinely NEW incident —
 	// reuse must not extend to a resolved one.
-	if err := svc.CloseByRule(ctx, rule); err != nil {
+	if _, err := svc.CloseByRule(ctx, rule); err != nil {
 		t.Fatalf("close by rule: %v", err)
 	}
 	active, err := svc.ActiveByRule(ctx, rule)

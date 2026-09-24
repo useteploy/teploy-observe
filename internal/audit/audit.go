@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -87,11 +88,29 @@ type Service struct {
 	// the unkeyed legacy service (empty signer, empty-key legacy
 	// verification) — NewService without keys keeps old call sites working.
 	keys *Keyring
+	// Logger, when set, carries the periodic checkpoint digest lines an
+	// operator ships out of band (nil = checkpoints are still written and
+	// readable via the API, just not logged).
+	Logger *slog.Logger
 
 	mu       sync.Mutex
 	lastHash string
 	lastSeq  int64
 	loaded   bool
+}
+
+// WithLogger sets the sink for checkpoint digest lines (chain-of-custody
+// export). Builder-style; returns s.
+func (s *Service) WithLogger(l *slog.Logger) *Service {
+	s.Logger = l
+	return s
+}
+
+// logf is the nil-safe logger.
+func (s *Service) logf(format string, args ...any) {
+	if s.Logger != nil {
+		s.Logger.Info(fmt.Sprintf(format, args...))
+	}
 }
 
 // NewService wires the audit store to the shared Nucleus client. key is the
@@ -250,11 +269,40 @@ type VerifyResult struct {
 	// UnkeyedCount is how many rows verified only under the empty key
 	// (pre-F46 unkeyed history, or a downgrade attack on it).
 	UnkeyedCount int `json:"unkeyed_count,omitempty"`
+	// VerifiedThroughSeq is the chain head this verification walked to
+	// (O14): "intact" means internally consistent 1..VerifiedThroughSeq,
+	// NOT that nothing was removed past an external anchor.
+	VerifiedThroughSeq int64 `json:"verified_through_seq"`
+	// LatestCheckpoint (O14): the newest recorded checkpoint, when one
+	// exists. CheckpointMatch says whether the chain hash AT that
+	// checkpoint's seq equals its recorded head_hash - the in-database
+	// half of the truncation-detectable claim. The OTHER half is external:
+	// the digest, recomputed from this database and compared against a
+	// copy stored outside it. Verify cannot do that comparison for you;
+	// the wording in Detail says exactly what was and was not proven.
+	LatestCheckpoint *Checkpoint `json:"latest_checkpoint,omitempty"`
+	CheckpointMatch  bool        `json:"checkpoint_match"`
+	HasCheckpoint    bool        `json:"has_checkpoint"`
 }
+
+// narrowIntactDetail is the O14 wording: what an in-database chain walk
+// actually proves, and what it cannot.
+const narrowIntactDetail = "chain internally consistent from seq 1 through %d; an append-only hash chain in one mutable database does not prove that its tail was not truncated - compare the latest checkpoint digest against an externally stored copy to extend the guarantee"
 
 // Verify walks the whole chain in order and recomputes each hash. It detects a
 // modified row (hash mismatch), a deleted row (sequence gap), and a relinked or
 // inserted row (prev_hash mismatch). Returns the first break, if any.
+//
+// WHAT THIS PROVES (O14, narrowed deliberately): the chain is internally
+// consistent from seq 1 through VerifiedThroughSeq as of this call. It does
+// NOT prove the tail was not truncated after the last externally anchored
+// checkpoint - an attacker with database write access can delete the tail
+// (checkpoints included) and the shorter chain still verifies. The
+// result carries the latest checkpoint plus whether the chain at its seq
+// still hashes to the recorded head; the truncation-detectable claim
+// additionally requires the checkpoint DIGEST to match a copy stored
+// outside this database. That comparison is the operator's; F47 tracks
+// the automated external anchor.
 //
 // AUD-051 (round 2): verification pages through the chain in keyset batches
 // instead of materializing the entire unbounded history in memory — a
@@ -279,6 +327,15 @@ func (s *Service) Verify(ctx context.Context) (VerifyResult, error) {
 		through = head[0].Seq
 	}
 
+	checkpoint, err := s.latestCheckpoint(ctx)
+	if err != nil {
+		// A checkpoint-table read failure must not weaken the chain walk's
+		// report - it degrades to no-checkpoint, and the error says so.
+		return VerifyResult{}, fmt.Errorf("audit: latest checkpoint read: %w", err)
+	}
+	var hashAtCheckpoint string
+	var checkpointReached bool
+
 	prev := ""
 	var expectSeq int64 = 1
 	checked := 0
@@ -297,11 +354,11 @@ func (s *Service) Verify(ctx context.Context) (VerifyResult, error) {
 			return VerifyResult{}, err
 		}
 		if len(rows) == 0 {
-			return VerifyResult{Count: checked, BrokenAtSeq: last + 1,
+			return VerifyResult{Count: checked, BrokenAtSeq: last + 1, VerifiedThroughSeq: through,
 				Detail: fmt.Sprintf("missing records before verification watermark %d", through)}, nil
 		}
 		if len(rows) > pageSize && rows[pageSize-1].Seq == rows[pageSize].Seq {
-			return VerifyResult{Count: checked, BrokenAtSeq: rows[pageSize].Seq,
+			return VerifyResult{Count: checked, BrokenAtSeq: rows[pageSize].Seq, VerifiedThroughSeq: through,
 				Detail: fmt.Sprintf("duplicate audit sequence %d (record duplicated or chain forked)", rows[pageSize].Seq)}, nil
 		}
 		if len(rows) > pageSize {
@@ -320,10 +377,15 @@ func (s *Service) Verify(ctx context.Context) (VerifyResult, error) {
 				default:
 					detail = "hash mismatch (record contents modified)"
 				}
-				return VerifyResult{Count: checked, BrokenAtSeq: ev.Seq, Detail: fmt.Sprintf(detail, expectSeq, ev.Seq)}, nil
+				return VerifyResult{Count: checked, BrokenAtSeq: ev.Seq, VerifiedThroughSeq: through,
+					Detail: fmt.Sprintf(detail, expectSeq, ev.Seq)}, nil
 			}
 			if kind == matchUnkeyed {
 				unkeyed++
+			}
+			if checkpoint != nil && ev.Seq == checkpoint.Seq {
+				hashAtCheckpoint = ev.Hash
+				checkpointReached = true
 			}
 			prev = ev.Hash
 			expectSeq++
@@ -331,11 +393,46 @@ func (s *Service) Verify(ctx context.Context) (VerifyResult, error) {
 			last = ev.Seq
 		}
 	}
-	if unkeyed > 0 {
-		return VerifyResult{Intact: true, Count: checked, Authenticated: false, UnkeyedCount: unkeyed,
-			Detail: fmt.Sprintf("chain is internally consistent, but %d record(s) verify only under the EMPTY key (pre-F46 unkeyed history, or a downgrade of it) — not tamper-evident against a database writer", unkeyed)}, nil
+
+	res := VerifyResult{Intact: true, Count: checked, VerifiedThroughSeq: through}
+	if checkpoint != nil {
+		res.HasCheckpoint = true
+		res.LatestCheckpoint = checkpoint
+		// The in-database half: the chain at the checkpoint's seq still
+		// hashes to the recorded head. A truncation that removed rows at
+		// or before the checkpoint makes this false (or the checkpoint
+		// disappears entirely - HasCheckpoint says which).
+		res.CheckpointMatch = checkpointReached && hashAtCheckpoint == checkpoint.HeadHash
+		// A SURVIVING checkpoint above the current head is in-database
+		// proof of truncation: the chain once reached cp.Seq and now ends
+		// below it. (An attacker who deletes the checkpoint rows too
+		// leaves no in-database trace - that case is exactly what the
+		// externally stored digest exists for.)
+		if checkpoint.Seq > through {
+			res.Intact = false
+			res.BrokenAtSeq = through + 1
+			res.Detail = fmt.Sprintf("chain head (%d) is below the last recorded checkpoint (seq %d) - records after the checkpoint were truncated", through, checkpoint.Seq)
+			return res, nil
+		}
+		if !res.CheckpointMatch {
+			// The checkpointed row no longer hashes to the recorded head -
+			// history before the anchor was rewritten.
+			res.Intact = false
+			res.BrokenAtSeq = checkpoint.Seq
+			res.Detail = fmt.Sprintf("chain hash at checkpoint seq %d does not match the recorded checkpoint head - history before the anchor was rewritten", checkpoint.Seq)
+			return res, nil
+		}
 	}
-	return VerifyResult{Intact: true, Count: checked, Authenticated: true}, nil
+	if unkeyed > 0 {
+		res.Authenticated = false
+		res.UnkeyedCount = unkeyed
+		res.Detail = fmt.Sprintf("chain is internally consistent through seq %d, but %d record(s) verify only under the EMPTY key (pre-F46 unkeyed history, or a downgrade of it) — not tamper-evident against a database writer; ", through, unkeyed) +
+			fmt.Sprintf(narrowIntactDetail, through)
+		return res, nil
+	}
+	res.Authenticated = true
+	res.Detail = fmt.Sprintf(narrowIntactDetail, through)
+	return res, nil
 }
 
 // verifyChain is the pure chain-verification core (DB-less, unit-tested). Rows
@@ -441,6 +538,18 @@ func (s *Service) Record(ctx context.Context, ev AuditEvent) error {
 	}
 	s.lastSeq = ev.Seq
 	s.lastHash = ev.Hash
+
+	// Periodic checkpoint (O14): every CheckpointEvery records, anchor the
+	// head with an exportable digest. Never fatal to the append - a
+	// checkpoint failure logs and the next boundary retries.
+	if s.lastSeq%CheckpointEvery == 0 {
+		if cp, err := s.checkpointLocked(ctx); err != nil {
+			s.logf("audit: periodic checkpoint write FAILED (chain unaffected): %v", err)
+		} else {
+			s.logf("audit: checkpoint seq=%d digest=%s - store this line outside the database to make tail truncation detectable",
+				cp.Seq, cp.Digest)
+		}
+	}
 	return nil
 }
 

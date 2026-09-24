@@ -17,6 +17,8 @@ type auditStore interface {
 	List(ctx context.Context, f audit.Filter) ([]audit.AuditEvent, error)
 	Record(ctx context.Context, ev audit.AuditEvent) error
 	Verify(ctx context.Context) (audit.VerifyResult, error)
+	Checkpoint(ctx context.Context) (audit.Checkpoint, error)
+	LatestCheckpoint(ctx context.Context) (*audit.Checkpoint, error)
 }
 
 // auditVerifyHandler walks the tamper-evidence hash chain and reports whether
@@ -31,6 +33,41 @@ func auditVerifyHandler(store auditStore) http.HandlerFunc {
 			return
 		}
 		json.NewEncoder(w).Encode(res)
+	}
+}
+
+// auditCheckpointHandler records an on-demand checkpoint: the chain head's
+// (seq, hash) plus the keyed digest the operator stores OUTSIDE the
+// database. That external copy is what makes tail truncation detectable -
+// see Verify's narrowed wording. Admin-only.
+func auditCheckpointHandler(store auditStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cp, err := store.Checkpoint(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			return
+		}
+		json.NewEncoder(w).Encode(cp)
+	}
+}
+
+// auditLatestCheckpointHandler returns the newest recorded checkpoint (the
+// one Verify compares the chain against). Admin-only.
+func auditLatestCheckpointHandler(store auditStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cp, err := store.LatestCheckpoint(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			return
+		}
+		if cp == nil {
+			cp = &audit.Checkpoint{}
+		}
+		json.NewEncoder(w).Encode(cp)
 	}
 }
 

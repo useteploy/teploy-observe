@@ -42,7 +42,7 @@ func TestSurveyStatusResolvesLatestVersion(t *testing.T) {
 	nucleustest.AsPlainMergeTree(t, db, "surveys", surveyColumns,
 		"(tenant_id, site_id, survey_id)", "version")
 
-	svc := NewSurveyService(db)
+	svc := NewSurveyService(db, "", nil)
 	ctx := context.Background()
 	const site = "surveysite"
 
@@ -53,7 +53,7 @@ func TestSurveyStatusResolvesLatestVersion(t *testing.T) {
 	if err := svc.Activate(ctx, s.SurveyID); err != nil {
 		t.Fatalf("activate: %v", err)
 	}
-	if _, err := svc.SubmitResponse(ctx, s.SurveyID, site, "u1", map[string]any{"q1": 9}); err != nil {
+	if _, err := svc.SubmitResponse(ctx, s.SurveyID, site, "u1", "", map[string]any{"q1": 9}, "1.2.3.4", "ua"); err != nil {
 		t.Fatalf("submit while active: %v", err)
 	}
 	if err := svc.Close(ctx, s.SurveyID); err != nil {
@@ -70,12 +70,12 @@ func TestSurveyStatusResolvesLatestVersion(t *testing.T) {
 		}
 	}
 
-	if _, err := svc.SubmitResponse(ctx, s.SurveyID, site, "u2", map[string]any{"q1": 1}); err == nil {
+	if _, err := svc.SubmitResponse(ctx, s.SurveyID, site, "u2", "", map[string]any{"q1": 1}, "1.2.3.4", "ua"); err == nil {
 		t.Fatalf("a closed survey still accepts public responses")
 	}
 
 	// The ownership half of the same gate: another site must never pass.
-	if _, err := svc.SubmitResponse(ctx, s.SurveyID, "othersite", "u3", map[string]any{"q1": 1}); err == nil {
+	if _, err := svc.SubmitResponse(ctx, s.SurveyID, "othersite", "u3", "", map[string]any{"q1": 1}, "1.2.3.4", "ua"); err == nil {
 		t.Fatalf("cross-site submission accepted")
 	}
 
