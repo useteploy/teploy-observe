@@ -6,7 +6,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/neutron-build/neutron/go/nucleus"
+	"github.com/jackc/pgx/v5"
 )
 
 // FunnelStep defines one step in a funnel (event type or pathname match).
@@ -68,9 +68,70 @@ type funnelEvent struct {
 const funnelEntityColumns = `event_id, session_id, visit_id, COALESCE(distinct_id, '') AS distinct_id,
 		event_type, COALESCE(pathname, '') AS pathname, timestamp`
 
+// funnelWalker is the incremental form of the deterministic funnel core.
+// Streaming rows in the pinned (timestamp, event_id) total order and
+// pushing them one at a time is EXACTLY the sorted-slice single pass of
+// walkFunnelEvents — same greedy chain, same window boundary, same
+// exclusions — with O(1) state per entity instead of the entity's whole
+// event slice (O12: the walk no longer materializes the range).
+type funnelWalker struct {
+	steps      []FunnelStep
+	exclusions []FunnelStep
+	windowMs   int64
+	counts     []int
+	stepIdx    int
+	done       bool
+	e0ts       int64
+}
+
+func newFunnelWalker(steps []FunnelStep, windowMs int64, exclusions []FunnelStep) *funnelWalker {
+	return &funnelWalker{
+		steps:      steps,
+		exclusions: exclusions,
+		windowMs:   windowMs,
+		counts:     make([]int, len(steps)),
+	}
+}
+
+// push consumes one event in (timestamp, event_id) order. Once done
+// (chain complete, out of window, or disqualified) further pushes are
+// no-ops, matching the sorted walk's break statements.
+func (w *funnelWalker) push(e funnelEvent) {
+	if w.done {
+		return
+	}
+	if w.stepIdx == 0 {
+		if matchesStep(e, w.steps[0]) {
+			w.counts[0]++
+			w.stepIdx = 1
+			w.e0ts = e.Timestamp
+			if len(w.steps) == 1 {
+				w.done = true
+			}
+		}
+		return
+	}
+	if w.windowMs > 0 && e.Timestamp > w.e0ts+w.windowMs {
+		w.done = true // out of window; every later event is further out
+		return
+	}
+	if matchesAnyStep(e, w.exclusions) {
+		w.done = true // disqualified from further progression
+		return
+	}
+	if matchesStep(e, w.steps[w.stepIdx]) {
+		w.counts[w.stepIdx]++
+		w.stepIdx++
+		if w.stepIdx >= len(w.steps) {
+			w.done = true
+		}
+	}
+}
+
 // walkFunnelEvents is the deterministic funnel core over ONE entity's
 // events (storage-free; pinned by funnel_semantics_test.go and the
-// internal/session O04 oracle tables):
+// internal/session O04 oracle tables). Implemented over funnelWalker so
+// the sorted form and the O12 streaming form cannot diverge:
 //
 //   - order: events sort by (timestamp, event_id) ascending — a total
 //     order, since event_id is unique within a site. This is the pinned
@@ -92,36 +153,11 @@ func walkFunnelEvents(events []funnelEvent, steps []FunnelStep, windowMs int64, 
 		}
 		return events[i].EventID < events[j].EventID
 	})
-	stepCounts := make([]int, len(steps))
-	stepIdx := 0
-	var e0ts int64
+	w := newFunnelWalker(steps, windowMs, exclusions)
 	for _, e := range events {
-		if stepIdx == 0 {
-			if matchesStep(e, steps[0]) {
-				stepCounts[0]++
-				stepIdx = 1
-				e0ts = e.Timestamp
-				if len(steps) == 1 {
-					break
-				}
-			}
-			continue
-		}
-		if windowMs > 0 && e.Timestamp > e0ts+windowMs {
-			break // out of window; every later event is further out
-		}
-		if matchesAnyStep(e, exclusions) {
-			break // disqualified from further progression
-		}
-		if matchesStep(e, steps[stepIdx]) {
-			stepCounts[stepIdx]++
-			stepIdx++
-			if stepIdx >= len(steps) {
-				break
-			}
-		}
+		w.push(e)
 	}
-	return stepCounts
+	return w.counts
 }
 
 // matchesAnyStep reports whether the event matches any exclusion step.
@@ -142,6 +178,12 @@ func (s *StatsService) Funnel(ctx context.Context, siteID string, from, to time.
 
 // FunnelWithOptions is Funnel with the O04 entity/window/exclusion
 // semantics. See FunnelOptions for the pinned meaning of each field.
+//
+// O12: the read is a budgeted stream (guard.go) in the walk's pinned
+// (timestamp, event_id) order — one funnelWalker per entity, O(entities)
+// memory — under the declared window clamp, row budget and time budget,
+// with per-site/global concurrency admission. It replaces the unbounded
+// whole-range SELECT the funnel used to run.
 func (s *StatsService) FunnelWithOptions(ctx context.Context, siteID string, from, to time.Time, steps []FunnelStep, opts FunnelOptions) ([]FunnelResult, error) {
 	if len(steps) == 0 {
 		return nil, nil
@@ -151,25 +193,38 @@ func (s *StatsService) FunnelWithOptions(ctx context.Context, siteID string, fro
 		return nil, err
 	}
 
-	fromMs := from.UnixMilli()
-	toMs := to.UnixMilli()
+	from = s.clampWindow(from, to)
+	qctx, finish, err := s.beginQuery(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
 
-	// Fetch all events in the time range for this site. Ordering happens
-	// in the walk (the SQL order is just a scan order).
-	rows, err := nucleus.Query[funnelEvent](ctx, s.db.SQL(),
-		`SELECT `+funnelEntityColumns+`
-		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
-		siteID, fromMs, toMs,
-	)
+	walkers := make(map[string]*funnelWalker)
+	err = s.streamEvents(qctx, siteID, from.UnixMilli(), to.UnixMilli(), "", func(row pgx.Row) error {
+		e, err := scanFunnelEvent(row)
+		if err != nil {
+			return fmt.Errorf("funnel scan: %w", err)
+		}
+		id, ok := entityKeyOf(entity, e)
+		if !ok {
+			return nil
+		}
+		w, seen := walkers[id]
+		if !seen {
+			w = newFunnelWalker(steps, opts.ConversionWindowMs, opts.Exclusions)
+			walkers[id] = w
+		}
+		w.push(e)
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("funnel query: %w", err)
 	}
 
 	counts := make([]int, len(steps))
-	for _, events := range groupFunnelByEntity(rows, entity) {
-		entityCounts := walkFunnelEvents(events, steps, opts.ConversionWindowMs, opts.Exclusions)
-		for i, c := range entityCounts {
+	for _, w := range walkers {
+		for i, c := range w.counts {
 			counts[i] += c
 		}
 	}
@@ -216,6 +271,12 @@ func (s *StatsService) FunnelByBreakdown(ctx context.Context, siteID string, fro
 
 // FunnelByBreakdownWithOptions is FunnelByBreakdown with the O04 entity /
 // window / exclusion semantics applied per breakdown group.
+//
+// O12: same budgeted stream as FunnelWithOptions, with the breakdown
+// expression riding each row. One determinism note versus the old
+// whole-range read: an entity spanning several breakdown values keeps the
+// value of its EARLIEST event in the pinned total order — the old code
+// kept whichever row an unordered scan happened to deliver first.
 func (s *StatsService) FunnelByBreakdownWithOptions(ctx context.Context, siteID string, from, to time.Time, steps []FunnelStep, breakdownBy string, minSize int, opts FunnelOptions) ([]FunnelBreakdownResult, error) {
 	if len(steps) == 0 {
 		return nil, nil
@@ -234,50 +295,52 @@ func (s *StatsService) FunnelByBreakdownWithOptions(ctx context.Context, siteID 
 		return nil, fmt.Errorf("unsupported breakdown: %s", breakdownBy)
 	}
 
-	fromMs := from.UnixMilli()
-	toMs := to.UnixMilli()
-
-	type breakdownRow struct {
-		funnelEvent
-		Breakdown string `db:"breakdown"`
+	from = s.clampWindow(from, to)
+	qctx, finish, err := s.beginQuery(ctx, siteID)
+	if err != nil {
+		return nil, err
 	}
-	rows, err := nucleus.Query[breakdownRow](ctx, s.db.SQL(),
-		fmt.Sprintf(`SELECT %s, %s AS breakdown
-		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`, funnelEntityColumns, col),
-		siteID, fromMs, toMs,
-	)
+	defer finish()
+
+	// Group walkers by (breakdown, entity); an entity can span different
+	// breakdown values in theory; keep the first seen in stream order.
+	type key struct{ Breakdown, Entity string }
+	grouped := make(map[key]*funnelWalker)
+	entityBreakdown := make(map[string]string)
+	err = s.streamEvents(qctx, siteID, from.UnixMilli(), to.UnixMilli(), col+" AS breakdown", func(row pgx.Row) error {
+		e, err := scanFunnelEventWithBreakdown(row)
+		if err != nil {
+			return fmt.Errorf("funnel breakdown scan: %w", err)
+		}
+		eid, ok := entityKeyOf(entity, e.funnelEvent)
+		if !ok {
+			return nil
+		}
+		if _, seen := entityBreakdown[eid]; !seen {
+			entityBreakdown[eid] = e.Breakdown
+		}
+		k := key{Breakdown: entityBreakdown[eid], Entity: eid}
+		w, seen := grouped[k]
+		if !seen {
+			w = newFunnelWalker(steps, opts.ConversionWindowMs, opts.Exclusions)
+			grouped[k] = w
+		}
+		w.push(e.funnelEvent)
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("funnel breakdown query: %w", err)
 	}
 
-	// Group events by (breakdown, entity). An entity can span different
-	// breakdown values in theory; keep the first seen.
-	type key struct{ Breakdown, Entity string }
-	grouped := make(map[key][]funnelEvent)
-	entityBreakdown := make(map[string]string)
-	for _, r := range rows {
-		eid, ok := entityKeyOf(entity, r.funnelEvent)
-		if !ok {
-			continue
-		}
-		if _, seen := entityBreakdown[eid]; !seen {
-			entityBreakdown[eid] = r.Breakdown
-		}
-		k := key{Breakdown: entityBreakdown[eid], Entity: eid}
-		grouped[k] = append(grouped[k], r.funnelEvent)
-	}
-
-	// Walk per-breakdown.
+	// Sum step counts per breakdown.
 	perBreakdown := make(map[string][]int) // breakdown -> stepCounts[]
-	for k, events := range grouped {
+	for k, w := range grouped {
 		counts, ok := perBreakdown[k.Breakdown]
 		if !ok {
 			counts = make([]int, len(steps))
 			perBreakdown[k.Breakdown] = counts
 		}
-		entityCounts := walkFunnelEvents(events, steps, opts.ConversionWindowMs, opts.Exclusions)
-		for i, c := range entityCounts {
+		for i, c := range w.counts {
 			counts[i] += c
 		}
 	}

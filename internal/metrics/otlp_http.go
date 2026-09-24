@@ -126,9 +126,17 @@ func (h *OTLPHandler) handle(w http.ResponseWriter, r *http.Request, siteID stri
 	}
 
 	if _, err := h.svc.Ingest(r.Context(), siteID, req); err != nil {
-		// Audit F13 (logs precedent): OTLP exporters treat 500 as
-		// non-retryable and drop the batch; 503 + Retry-After tells them to
-		// re-send instead of silently losing every point.
+		// O12 cardinality refusal is PERMANENT for this batch — the
+		// exporter must split it, retrying cannot help, so it gets a 413
+		// with the remedy in the body. Everything else keeps the F13
+		// posture below: OTLP exporters treat 500 as non-retryable and
+		// drop the batch; 503 + Retry-After tells them to re-send
+		// instead of silently losing every point.
+		var tooBig *ErrTooManyPoints
+		if errors.As(err, &tooBig) {
+			http.Error(w, tooBig.Error(), http.StatusRequestEntityTooLarge)
+			return
+		}
 		w.Header().Set("Retry-After", "5")
 		http.Error(w, "storage unavailable", http.StatusServiceUnavailable)
 		return

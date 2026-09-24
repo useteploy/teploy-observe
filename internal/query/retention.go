@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/neutron-build/neutron/go/nucleus"
 )
 
@@ -104,11 +106,16 @@ func (s *StatsService) RetentionWithOptions(ctx context.Context, siteID string, 
 	}
 
 	// Clamp the window so a single request can't trigger an unbounded events
-	// scan / map build. 186 days covers the widest realistic retention grid.
-	const maxRetentionWindow = 186 * 24 * time.Hour
-	if to.Sub(from) > maxRetentionWindow {
-		from = to.Add(-maxRetentionWindow)
+	// scan / map build. The declared MaxWindow budget (default 186 days,
+	// matching this pinned clamp) governs; the grid stays capped at 12
+	// columns (pre-O04 behavior, unchanged).
+	from = s.clampWindow(from, to)
+
+	qctx, finish, err := s.beginQuery(ctx, siteID)
+	if err != nil {
+		return nil, err
 	}
+	defer finish()
 
 	fromMs := from.UnixMilli()
 	toMs := to.UnixMilli()
@@ -128,7 +135,7 @@ func (s *StatsService) RetentionWithOptions(ctx context.Context, siteID string, 
 	// first_ts. Superseded by CohortEvent below when that is set.
 	usingSessionsCohorts := entity == "" && opts.CohortEvent == ""
 	if usingSessionsCohorts {
-		rows, err := nucleus.Query[sessionFirstLast](ctx, s.db.SQL(),
+		rows, err := nucleus.Query[sessionFirstLast](qctx, s.db.SQL(),
 			`SELECT session_id, first_ts
 		 FROM `+LatestRows("sessions", []string{"first_ts"},
 				`site_id = $1 AND first_ts >= $2 AND first_ts < $3`)+` AS s`,
@@ -143,21 +150,18 @@ func (s *StatsService) RetentionWithOptions(ctx context.Context, siteID string, 
 	}
 
 	// Activity (and, outside the sessions path, cohort entry) come from
-	// raw events. All three entity columns ride the row so the dispatch
-	// is a Go-side grouping decision.
-	events, err := nucleus.Query[funnelEvent](ctx, s.db.SQL(),
-		`SELECT `+funnelEntityColumns+`
-		 FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
-		siteID, fromMs, toMs,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("retention query events: %w", err)
-	}
-	for _, r := range events {
+	// raw events, streamed in the pinned (timestamp, event_id) order
+	// under the O12 row/time budgets (guard.go) instead of one unbounded
+	// whole-range read. All three entity columns ride the row so the
+	// dispatch is a Go-side grouping decision; memory is O(entities).
+	err = s.streamEvents(qctx, siteID, fromMs, toMs, "", func(row pgx.Row) error {
+		r, err := scanFunnelEvent(row)
+		if err != nil {
+			return fmt.Errorf("retention scan: %w", err)
+		}
 		id, ok := entityKeyOf(entity, r)
 		if !ok {
-			continue
+			return nil
 		}
 		e := getEntity(id)
 		isReturn := opts.ReturnEvent == "" || r.EventType == opts.ReturnEvent
@@ -172,6 +176,10 @@ func (s *StatsService) RetentionWithOptions(ctx context.Context, siteID string, 
 		if isReturn {
 			e.buckets[(r.Timestamp/periodMs)*periodMs] = true
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("retention query events: %w", err)
 	}
 
 	// Entities that never got a cohort entry (a CohortEvent that never

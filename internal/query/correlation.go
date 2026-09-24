@@ -7,8 +7,6 @@ import (
 	"math"
 	"sort"
 	"time"
-
-	"github.com/neutron-build/neutron/go/nucleus"
 )
 
 // Correlation represents a property value correlated with a target event.
@@ -32,12 +30,23 @@ type correlationEvent struct {
 // CorrelationAnalysis finds properties correlated with a target event.
 // targetEvent: the event type to correlate with (e.g., "signup")
 // Returns properties whose presence significantly increases the rate of the target event.
+//
+// O12: the read is admission-gated and bounded — the SQL carries a LIMIT
+// of budget+1 rows and reading past the declared row budget converts to a
+// labeled refusal instead of an unbounded slice (guard.go
+// boundedRangeQuery). Below the ceiling the result set is unchanged.
 func (s *StatsService) CorrelationAnalysis(ctx context.Context, siteID, targetEvent string, from, to time.Time) ([]Correlation, error) {
 	fromMs := from.UnixMilli()
 	toMs := to.UnixMilli()
 
+	qctx, finish, err := s.beginQuery(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+
 	// Get all events with properties in the time range
-	rows, err := nucleus.Query[correlationEvent](ctx, s.db.SQL(),
+	rows, err := boundedRangeQuery[correlationEvent](qctx, s,
 		`SELECT session_id, event_type, COALESCE(properties, '') AS properties
 		 FROM events
 		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3

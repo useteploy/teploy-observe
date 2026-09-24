@@ -23,14 +23,16 @@ import (
 )
 
 // Service writes OTLP metric points and answers list / query requests.
-// One Service shared across HTTP handlers — it has no per-request state.
+// One Service shared across HTTP handlers — it has no per-request state
+// beyond the O12 cardinality guard (bounded, counter-only).
 type Service struct {
 	db     *nucleus.Client
 	logger *slog.Logger
+	guard  *seriesGuard
 }
 
 func NewService(db *nucleus.Client) *Service {
-	return &Service{db: db, logger: slog.Default()}
+	return &Service{db: db, logger: slog.Default(), guard: newSeriesGuard(DefaultCardinalityLimits())}
 }
 
 // WithLogger threads a custom logger so ingest failures appear under the
@@ -41,6 +43,18 @@ func (s *Service) WithLogger(logger *slog.Logger) *Service {
 	}
 	s.logger = logger
 	return s
+}
+
+// WithCardinalityLimits installs the O12 ingest-side cardinality limits
+// (env-tunable at boot; defaults declared in cardinality.go).
+func (s *Service) WithCardinalityLimits(l CardinalityLimits) *Service {
+	s.guard = newSeriesGuard(l)
+	return s
+}
+
+// CardinalityStats snapshots the ingest cardinality guard for /healthz.
+func (s *Service) CardinalityStats() CardinalityStats {
+	return s.guard.Stats()
 }
 
 // IngestResponse is returned to the OTLP exporter.
@@ -79,6 +93,13 @@ type metricPointRow struct {
 // loop was directly contributing to Nucleus memory pressure (each INSERT is
 // a separate write that also invalidates the whole query-result cache), and
 // a single histogram-heavy export can carry hundreds of data points.
+//
+// O12 cardinality guard (cardinality.go): per-point attribute maps are
+// truncated with counters, a request above MaxPointsPerRequest is refused
+// labeled (ErrTooManyPoints — permanent, the exporter must split), and a
+// data point introducing a NEW series past the per-site cap is dropped
+// and counted (known series keep flowing; the registry is in-memory and
+// re-learns after restart). IngestResponse.Points is the ACCEPTED count.
 func (s *Service) Ingest(ctx context.Context, siteID string, req ExportMetricsRequest) (IngestResponse, error) {
 	if siteID == "" {
 		return IngestResponse{}, fmt.Errorf("metrics: site_id required")
@@ -86,6 +107,16 @@ func (s *Service) Ingest(ctx context.Context, siteID string, req ExportMetricsRe
 	sql := s.db.SQL()
 
 	var rows []metricPointRow
+	var dropped int
+	// guardedAttrs applies the cardinality guard to one data point's
+	// label map (truncation with counters) and returns the marshaled,
+	// deterministic JSON the row persists.
+	guardedAttrs := func(attrs []KeyValue) string {
+		return MarshalAttrs(s.guard.truncateAttrs(siteID, AttrsToMap(attrs)))
+	}
+	admit := func(r metricPointRow) bool {
+		return s.guard.admit(siteID, seriesKey(r.name, r.service, r.attrsJSON))
+	}
 	for _, rm := range req.ResourceMetrics {
 		serviceName := ExtractServiceName(rm.Resource.Attributes)
 		for _, sm := range rm.ScopeMetrics {
@@ -93,7 +124,12 @@ func (s *Service) Ingest(ctx context.Context, siteID string, req ExportMetricsRe
 				switch {
 				case m.Gauge != nil:
 					for _, dp := range m.Gauge.DataPoints {
-						rows = append(rows, numberRow(m.Name, "gauge", serviceName, dp, "false", "cumulative"))
+						r := numberRow(m.Name, "gauge", serviceName, dp, guardedAttrs(dp.Attributes), "false", "cumulative")
+						if admit(r) {
+							rows = append(rows, r)
+						} else {
+							dropped++
+						}
 					}
 				case m.Sum != nil:
 					monotonic := "false"
@@ -102,27 +138,44 @@ func (s *Service) Ingest(ctx context.Context, siteID string, req ExportMetricsRe
 					}
 					temp := AggregationTemporality(m.Sum.AggregationTemporality)
 					for _, dp := range m.Sum.DataPoints {
-						rows = append(rows, numberRow(m.Name, "sum", serviceName, dp, monotonic, temp))
+						r := numberRow(m.Name, "sum", serviceName, dp, guardedAttrs(dp.Attributes), monotonic, temp)
+						if admit(r) {
+							rows = append(rows, r)
+						} else {
+							dropped++
+						}
 					}
 				case m.Histogram != nil:
 					temp := AggregationTemporality(m.Histogram.AggregationTemporality)
 					for _, dp := range m.Histogram.DataPoints {
-						rows = append(rows, histogramRow(m.Name, serviceName, dp, temp))
+						r := histogramRow(m.Name, serviceName, dp, guardedAttrs(dp.Attributes), temp)
+						if admit(r) {
+							rows = append(rows, r)
+						} else {
+							dropped++
+						}
 					}
 				}
 			}
 		}
+	}
+	if err := s.guard.checkBatch(len(rows)); err != nil {
+		return IngestResponse{}, err
 	}
 
 	count, err := insertMetricRows(ctx, sql, siteID, rows)
 	if err != nil {
 		return IngestResponse{}, fmt.Errorf("insert metric points: %w", err)
 	}
+	if dropped > 0 {
+		s.logger.Warn("metrics ingest: dropped points past the per-site series cap",
+			"site", siteID, "dropped", dropped, "limit", s.guard.limits.MaxSeriesPerSite)
+	}
 
 	return IngestResponse{OK: true, Points: count}, nil
 }
 
-func numberRow(name, kind, service string, dp NumberDataPoint, monotonic, temporality string) metricPointRow {
+func numberRow(name, kind, service string, dp NumberDataPoint, attrsJSON, monotonic, temporality string) metricPointRow {
 	tsNs, _ := strconv.ParseInt(dp.TimeUnixNano, 10, 64)
 	value := dp.AsDouble
 	if value == 0 && dp.AsInt != "" {
@@ -132,7 +185,7 @@ func numberRow(name, kind, service string, dp NumberDataPoint, monotonic, tempor
 	}
 	return metricPointRow{
 		name: name, kind: kind, service: service,
-		attrsJSON:   MarshalAttrs(AttrsToMap(dp.Attributes)),
+		attrsJSON:   attrsJSON,
 		tsNs:        tsNs,
 		value:       value,
 		monotonic:   monotonic,
@@ -140,11 +193,11 @@ func numberRow(name, kind, service string, dp NumberDataPoint, monotonic, tempor
 	}
 }
 
-func histogramRow(name, service string, dp HistogramDataPoint, temporality string) metricPointRow {
+func histogramRow(name, service string, dp HistogramDataPoint, attrsJSON, temporality string) metricPointRow {
 	tsNs, _ := strconv.ParseInt(dp.TimeUnixNano, 10, 64)
 	return metricPointRow{
 		name: name, kind: "histogram", service: service,
-		attrsJSON:   MarshalAttrs(AttrsToMap(dp.Attributes)),
+		attrsJSON:   attrsJSON,
 		tsNs:        tsNs,
 		value:       0,
 		histogram:   MarshalHistogram(dp),

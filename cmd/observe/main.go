@@ -57,6 +57,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/platform"
 	"github.com/useteploy/teploy-observe/internal/principals"
 	"github.com/useteploy/teploy-observe/internal/query"
+	"github.com/useteploy/teploy-observe/internal/queryguard"
 	"github.com/useteploy/teploy-observe/internal/replays"
 	"github.com/useteploy/teploy-observe/internal/reports"
 	"github.com/useteploy/teploy-observe/internal/schema"
@@ -380,6 +381,15 @@ func main() {
 		RawDays:      jobs.PolicyDays(retentionPolicies, "events"),
 		SessionsDays: jobs.PolicyDays(retentionPolicies, "sessions"),
 	})
+	// O12 query admission: per-site/global concurrency bound + declared
+	// row/time/window budgets on the expensive read paths (funnel,
+	// breakdown, retention, journeys, correlation). Refusals are labeled
+	// with remedies and counted at /healthz (capacity.query). Knobs are
+	// env-tunable; see docs/operations/capacity.md.
+	querySlotsGlobal, querySlotsSite := queryguard.LoadSlotsFromEnv(os.Getenv, logger)
+	queryLimiter := queryguard.NewLimiter(querySlotsGlobal, querySlotsSite)
+	queryBudgets := queryguard.LoadBudgetsFromEnv(os.Getenv, logger)
+	statsSvc.WithQueryGuard(queryLimiter, queryBudgets)
 
 	// Live event stream service
 	liveSvc := live.NewLiveService(db, logger)
@@ -394,8 +404,12 @@ func main() {
 	traceIngest := tracing.NewIngestService(db)
 	traceQuery := tracing.NewQueryService(db)
 
-	// Metrics service (W3.A Phase 1 — OTLP metrics ingest + query)
-	metricsSvc := metrics.NewService(db).WithLogger(logger)
+	// Metrics service (W3.A Phase 1 — OTLP metrics ingest + query).
+	// O12: ingest-side cardinality guard (bounded label maps, request
+	// ceiling, per-site series cap) — counters surface at /healthz under
+	// metrics_ingest; knobs are env-tunable (docs/operations/capacity.md).
+	metricsSvc := metrics.NewService(db).WithLogger(logger).
+		WithCardinalityLimits(metrics.LoadCardinalityLimitsFromEnv(os.Getenv, logger))
 
 	// C2 (Wave 4) — persons + cohorts. Persons is read-only (aggregate
 	// over events.distinct_id). Cohorts owns its own table (migration
@@ -1659,6 +1673,13 @@ func main() {
 		// dead-lettered per kind (restart-honest, read from the table) plus
 		// failed delivery attempts since this process started.
 		health["notifications"] = notifier.Stats(req.Context())
+		// O12: one coherent capacity view — disk pressure on every data
+		// path visible to this process, the query-admission posture
+		// (in-flight slots, refusal counters, declared budgets), and the
+		// metrics-ingest cardinality counters. The WAL high-water posture
+		// rides the wal block above; together they are the O12 surface.
+		health["capacity"] = capacityView(effectiveDataDir(), queryLimiter.Snapshot(queryBudgets))
+		health["metrics_ingest"] = metricsSvc.CardinalityStats()
 		if degraded {
 			health["status"] = "degraded"
 			writeJSONError(w, http.StatusServiceUnavailable, "telemetry pipeline degraded: "+durability)

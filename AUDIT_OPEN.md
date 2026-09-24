@@ -2158,3 +2158,113 @@ Open items this slice deliberately leaves (programme O10 tails):
   standing AUD-018 posture, same boundary as the derived outbox).
 - Deleting a rule while firing leaves its incident open (no sweep for
   tombstoned rules) — noted for the tails slice.
+
+## O12 storage/capacity slice — 2026-09-23
+
+Closes the bounded O12 slice for this wave: query admission + budgets,
+concurrency bounds, ingest cardinality guard, table-layout audit, and
+the disk-pressure health surface. Programme O12's wider line (engine
+capability contract, compaction guidance, ingest/query separation,
+backup capacity notes) remains open below.
+
+Landed:
+
+- `internal/queryguard` (new): declared per-query budgets (wall time,
+  scanned rows, window clamp) + per-site/global concurrency bound with
+  labeled refusals (code + remedy + status: rows 429, time 504,
+  concurrency 429). v1 posture is refused-with-remedy (no queue wait);
+  in-flight set and refusal counters surface at `/healthz`
+  `capacity.query` together with the budgets in force. All knobs
+  env-tunable (`OBSERVE_QUERY_*`, defaults declared in the package and
+  docs/operations/capacity.md).
+- Funnel, funnel breakdown and retention reads rewritten from unbounded
+  whole-range SELECTs (funnel had NO range clamp at all) to a budgeted
+  pgx STREAM in the pinned `(timestamp, event_id)` total order — one
+  walker per entity, O(entities) memory, row/time budgets enforced
+  mid-scan, labeled refusal instead of truncation. The walk core
+  (`funnelWalker`) is shared with the sorted-slice oracle path so the
+  two cannot diverge; the O04 oracle tables
+  (funnel_retention_nucleus_test.go) pass unchanged, and the engine is
+  pinned to actually deliver that ORDER BY (a silently-ignored term
+  would corrupt results, not just performance) by
+  `TestO12_StreamOrderPinnedAtEngine` with out-of-order inserts and
+  timestamp ties. One deliberate determinism improvement: an entity
+  spanning breakdown values now keeps its EARLIEST event's value in the
+  pinned order (the old unordered read kept an arbitrary one).
+- Journeys and correlation (same whole-range shape, aggregation maps):
+  bounded by `LIMIT budget+1` converting to the same labeled refusal;
+  below the ceiling results are unchanged. Explorer audited as already
+  contained (10s timeout, 4 concurrent, 1000-row cap, outer LIMIT 100) —
+  unchanged.
+- Retention's pinned 186-day clamp is now the declared, env-tunable
+  MaxWindow budget shared by funnel + retention (default 186d = old
+  behavior).
+- Metrics ingest cardinality guard (`internal/metrics/cardinality.go`):
+  per-point label-map truncation (lexicographic, UTF-8-safe, counted),
+  request-level point ceiling (labeled 413 via ErrTooManyPoints —
+  permanent, exporter must split; everything else keeps the 503+retry
+  posture), and a bounded per-site series registry — new series past the
+  cap are dropped and counted, known series keep flowing, registry is
+  in-memory and re-learns after restart (labeled honest in
+  `/healthz` `metrics_ingest`). Event properties were already capped
+  (50/event, ingest handler); spans/logs attribute JSONB noted below.
+- `/healthz` capacity block (`cmd/observe/capacity.go`): statfs of the
+  observe data dir + the engine's data dir where co-located and declared
+  (`OBSERVE_NUCLEUS_DATA_DIR`), the query-admission snapshot, and the
+  metrics-ingest counters — one coherent capacity view alongside the
+  existing WAL high-water block.
+- Acceptance load fixture (`internal/query/o12_load_test.go`, real
+  engine, fail-not-skip under REQUIRE_NUCLEUS): 30s of mixed load — 3
+  ingesters through the REAL ingest.Buffer (~600 events/s), 6 queriers
+  alternating wide (must refuse `query_budget_rows`) and narrow (must
+  answer) funnel/retention/journeys, one OTLP cardinality-attack
+  stream — asserting: every query answers or refuses labeled within
+  budget (zero hangs/unlabeled errors), backlog bounded during load
+  (max observed 7,050 events vs the 60,000 bound) and drained to zero
+  after, buffer accepted == pushed, metrics drops counted. First run of
+  this fixture produced a real measurement: a querier retrying in a
+  tight loop issues ~1.7M refusals/s and starves the engine — the
+  limiter is cheap but not free; the fixture now models client-realistic
+  retry pacing (50ms), and that finding is the reason refusal responses
+  carry a remedy clients can act on.
+
+Table-layout audit (hot tables; full table in
+docs/operations/capacity.md):
+
+- `error_events` (mergetree ORDER BY tenant,site,timestamp,group_hash),
+  `spans` (tenant,site,start_time,trace_id,span_id) and `logs`
+  (tenant,site,timestamp): retention column IS the order key's third
+  component — deletes are layout-aligned. No action.
+- `events` + `events_recent`: plain OLTP since migration 027 (the
+  Nucleus 0.1.0 ALTER-ADD-COLUMN workaround dropped the mergetree
+  layout) — NO physical order and no index, so every range read is an
+  engine-side scan+sort and retention's chunked boundary probe
+  (`ORDER BY col LIMIT 1 OFFSET 4999`) re-scans per 5k-row chunk.
+  THIS slice's app-side remedy is the budget ceiling on every heavy
+  read; the layout fix itself needs an engine-side index/order
+  capability (or a 027-style rebuild once the engine keeps order under
+  post-create DDL) — recorded as the top audited finding, not fixed
+  here.
+- Trace funnels (internal/tracing/funnels.go): span reads filtered by
+  `operation_name IN (...)`, bounded by spans' 14d retention —
+  acceptable now, revisit at the next capacity pass.
+
+Open items this slice deliberately leaves (programme O12 tails):
+
+- Engine capability contract (versioned transactions/uniqueness/
+  ordering/retention/KV-enumeration/snapshot-lease test matrix) — the
+  upstream KV_KEYS fix (6d10d192) is in the v1.1.1-era train but the
+  write-side KV snapshot-lease gate stays open upstream, so the backup
+  srcmap workaround and the lease-gate pin tests remain in force; no
+  workaround was retired this slice and none should be until the
+  capability matrix proves it on the RUNNING engine version.
+- Compaction guidance (engine-side merge/table-size posture per signal)
+  and ingest/query separation at scale — deferred with the small-install
+  default unchanged.
+- Backup capacity notes: backup runs under the snapshot lease; its reads
+  are outside the query budgets by design (consistency > admission
+  there) — worth revisiting if backups ever run against the production
+  query path.
+- Spans/logs attribute JSONB cardinality at ingest (metrics + event
+  properties are guarded; span/log attributes are not) — next slice
+  candidate, same pattern applies.
