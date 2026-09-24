@@ -1297,6 +1297,7 @@ func main() {
 	r.Handle("POST /api/v1/exports/scheduled", jwtMW(requireAdmin(exportsCreateHandler(scheduledExportSvc))))
 	r.Handle("DELETE /api/v1/exports/scheduled/{export_id}", jwtMW(requireAdmin(exportsDeleteHandler(scheduledExportSvc))))
 	r.Handle("POST /api/v1/exports/scheduled/{export_id}/run", jwtMW(requireAdmin(exportsRunNowHandler(scheduledExportSvc))))
+	r.Handle("GET /api/v1/exports/scheduled/{export_id}/runs", jwtMW(requireAdmin(exportsRunsHandler(scheduledExportSvc))))
 
 	// --- Incidents (admin+editor may create/close; all roles may read) ---
 	r.Handle("GET /api/v1/incidents", jwtMW(incidentsListHandler(incidentSvc)))
@@ -3385,6 +3386,29 @@ func exportsRunNowHandler(svc *jobs.ExportService) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"ok":true}`)
+	}
+}
+
+// exportsRunsHandler serves the durable run history for one export (the
+// 053 ledger: attempts, backoff schedule, dead letters with their
+// last_error - inspectable across restarts).
+func exportsRunsHandler(svc *jobs.ExportService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("export_id")
+		if id == "" {
+			http.Error(w, "export_id required", http.StatusBadRequest)
+			return
+		}
+		runs, err := svc.ListRuns(r.Context(), id, int(auditParseInt(r.URL.Query().Get("limit"))))
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if runs == nil {
+			runs = []jobs.ExportRun{}
+		}
+		json.NewEncoder(w).Encode(runs)
 	}
 }
 

@@ -112,6 +112,7 @@ var Tables = []string{
 	"share_links",
 	"report_schedules",
 	"scheduled_exports",
+	"scheduled_export_runs",
 	"mcp_tokens",
 }
 
