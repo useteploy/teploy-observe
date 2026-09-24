@@ -1,10 +1,17 @@
 import { useState, useEffect } from "preact/hooks";
 import { settingsApi } from "../api/settings.js";
 import type { Site, Webhook, User, ShareLink, APIKeyInfo, MCPToken } from "../api/settings.js";
+import { get } from "../api/helpers.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
 import ConfirmDialog from "../components/shared/ConfirmDialog.js";
+import LoadError from "../components/shared/LoadError.js";
+import {
+  signalRows, formatDays, EXPORT_NOTES, DELETION_NOTES, IDENTITY_NOTES, UNPOLICED_SIGNALS,
+} from "../lib/dataHandling.js";
+import type { MetaPolicy } from "../lib/dataHandling.js";
 import "../styles/settings.css";
+import "../styles/meta.css";
 import { useFilters } from "../hooks/useFilters.js";
 import { copyToClipboard } from "../lib/clipboard.js";
 
@@ -275,9 +282,166 @@ function SitesSection() {
         onClose={() => setDeletingSiteId(null)}
         onConfirm={handleDeleteConfirm}
         title="Delete Site"
-        message="This will permanently delete the site and all its data. This cannot be undone."
+        message="This removes the site record and revokes its API keys immediately. The events, sessions, replays and errors it captured are not deleted now — they remain until each signal's retention window expires (see Data Handling). This cannot be undone."
         loading={deleteLoading}
       />
+    </div>
+  );
+}
+
+// ─── Data Handling (O13 privacy + data-controls surface) ───
+
+interface MetaSnapshot {
+  retention?: MetaPolicy[];
+  tables?: Array<{ table: string; rows: number }>;
+}
+
+interface ScheduledExportRow {
+  export_id: string;
+  name: string;
+  cron: string;
+  format: string;
+  last_status: string;
+  last_error: string;
+  last_rows: number;
+}
+
+function DataHandlingSection() {
+  // Retention comes from the live policy set via /api/v1/meta (admin-only);
+  // exports status from the scheduled-exports list. Each block fails alone.
+  const [policies, setPolicies] = useState<MetaPolicy[] | null>(null);
+  const [policiesError, setPoliciesError] = useState<string | null>(null);
+  const [exports, setExports] = useState<ScheduledExportRow[] | null>(null);
+  const [exportsError, setExportsError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+
+  useEffect(() => {
+    setPoliciesError(null);
+    get<MetaSnapshot>("/api/v1/meta")
+      .then((m) => { setPolicies(m?.retention ?? []); })
+      .catch((err) => { setPoliciesError(err instanceof Error ? err.message : String(err)); });
+    setExportsError(null);
+    get<ScheduledExportRow[]>("/api/v1/exports/scheduled")
+      .then((e) => { setExports(Array.isArray(e) ? e : []); })
+      .catch((err) => { setExportsError(err instanceof Error ? err.message : String(err)); });
+  }, [reloadKey]);
+
+  const retry = () => setReloadKey((k) => k + 1);
+  const rows = policies !== null ? signalRows(policies) : [];
+
+  return (
+    <div class="settings-section" data-testid="data-handling">
+      <div class="settings-section-header">
+        <h2 class="settings-section-title">Data Handling</h2>
+      </div>
+      <div class="settings-key-note" style={{ marginBottom: "16px" }}>
+        What this instance does with the data it holds: how long each signal is
+        kept, what export and deletion actually do, and where those mechanisms
+        stop. Every row below reflects the running configuration — not an
+        aspiration.
+      </div>
+
+      <section aria-label="Retention by signal" style={{ marginBottom: "24px" }}>
+        <h3 style={{ fontSize: "13px", fontWeight: 600, margin: "0 0 8px" }}>Retention by signal</h3>
+        {policiesError !== null ? (
+          <LoadError what="retention policies" detail={policiesError} onRetry={retry} />
+        ) : policies === null ? (
+          <SettingsSkeleton />
+        ) : (
+          <div class="obs-scrollable">
+            <table class="meta-table" style={{ width: "100%" }}>
+              <thead>
+                <tr>
+                  <th scope="col" style={{ textAlign: "left" }}>Signal</th>
+                  <th scope="col" style={{ textAlign: "left" }}>Kept for</th>
+                  <th scope="col" style={{ textAlign: "left" }}>Deletion behavior</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={r.signal}>
+                    <td>{r.signal}</td>
+                    <td style={{ fontVariantNumeric: "tabular-nums" }}>{formatDays(r.days)}</td>
+                    <td style={{ color: "var(--obs-text-muted)" }}>{r.deletion}</td>
+                  </tr>
+                ))}
+                {UNPOLICED_SIGNALS.map((u) => (
+                  <tr key={u.signal}>
+                    <td>{u.signal}</td>
+                    <td>release-count / manual</td>
+                    <td style={{ color: "var(--obs-text-muted)" }}>{u.note}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <p class="settings-key-note" style={{ marginTop: "8px" }}>
+          Retention runs as a scheduled cleanup job; a policy of N days means data
+          older than N days is deleted by that job, not that deletion is
+          instantaneous at exactly N days.
+        </p>
+      </section>
+
+      <section aria-label="Export status" style={{ marginBottom: "24px" }}>
+        <h3 style={{ fontSize: "13px", fontWeight: 600, margin: "0 0 8px" }}>Export</h3>
+        <ul style={{ margin: "0 0 12px", paddingLeft: "18px", fontSize: "13px", color: "var(--obs-text-secondary)" }}>
+          {EXPORT_NOTES.map((n) => <li key={n.slice(0, 40)} style={{ marginBottom: "4px" }}>{n}</li>)}
+        </ul>
+        {exportsError !== null ? (
+          <LoadError what="scheduled exports" detail={exportsError} onRetry={retry} />
+        ) : exports === null ? (
+          <SettingsSkeleton />
+        ) : exports.length === 0 ? (
+          <div class="obs-empty-state">No scheduled SQL exports configured.</div>
+        ) : (
+          <div class="obs-scrollable">
+            <table class="meta-table" style={{ width: "100%" }}>
+              <thead>
+                <tr>
+                  <th scope="col" style={{ textAlign: "left" }}>Name</th>
+                  <th scope="col" style={{ textAlign: "left" }}>Schedule</th>
+                  <th scope="col" style={{ textAlign: "left" }}>Last run</th>
+                  <th scope="col" style={{ textAlign: "right" }}>Rows</th>
+                </tr>
+              </thead>
+              <tbody>
+                {exports.map((e) => (
+                  <tr key={e.export_id}>
+                    <td>{e.name}</td>
+                    <td><code style={{ fontSize: "11px" }}>{e.cron}</code></td>
+                    <td>
+                      <StatusBadge
+                        status={e.last_status === "success" ? "enabled" : e.last_status ? "error" : "disabled"}
+                        size="sm"
+                      />
+                      <span style={{ marginLeft: "6px" }}>{e.last_status || "never run"}</span>
+                      {e.last_error && (
+                        <div style={{ color: "var(--obs-danger)", fontSize: "11px" }}>{e.last_error}</div>
+                      )}
+                    </td>
+                    <td style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{e.last_rows || ""}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <section aria-label="Deletion" style={{ marginBottom: "24px" }}>
+        <h3 style={{ fontSize: "13px", fontWeight: 600, margin: "0 0 8px" }}>Deletion</h3>
+        <ul style={{ margin: 0, paddingLeft: "18px", fontSize: "13px", color: "var(--obs-text-secondary)" }}>
+          {DELETION_NOTES.map((n) => <li key={n.slice(0, 40)} style={{ marginBottom: "4px" }}>{n}</li>)}
+        </ul>
+      </section>
+
+      <section aria-label="Identity handling">
+        <h3 style={{ fontSize: "13px", fontWeight: 600, margin: "0 0 8px" }}>Identity</h3>
+        <ul style={{ margin: 0, paddingLeft: "18px", fontSize: "13px", color: "var(--obs-text-secondary)" }}>
+          {IDENTITY_NOTES.map((n) => <li key={n.slice(0, 40)} style={{ marginBottom: "4px" }}>{n}</li>)}
+        </ul>
+      </section>
     </div>
   );
 }
@@ -1021,6 +1185,7 @@ export default function SettingsPage() {
 
   const tabs = [
     { key: "sites", label: "Sites" },
+    { key: "data", label: "Data Handling" },
     { key: "webhooks", label: "Webhooks" },
     { key: "users", label: "Users" },
     { key: "keys", label: "API Keys" },
@@ -1036,10 +1201,12 @@ export default function SettingsPage() {
         <h1 class="obs-page-title">Settings</h1>
       </div>
 
-      <div class="obs-tabs-bar" style={{ marginBottom: "20px" }}>
+      <div class="obs-tabs-bar" style={{ marginBottom: "20px" }} role="tablist" aria-label="Settings sections">
         {tabs.map(t => (
           <button key={t.key}
             class={`obs-tab ${tab === t.key ? "obs-tab--active" : ""}`}
+            role="tab"
+            aria-selected={tab === t.key}
             onClick={() => setTab(t.key)}>
             {t.label}
           </button>
@@ -1047,6 +1214,7 @@ export default function SettingsPage() {
       </div>
 
       {tab === "sites" && <SitesSection />}
+      {tab === "data" && <DataHandlingSection />}
       {tab === "webhooks" && <WebhooksSection />}
       {tab === "users" && <UsersSection />}
       {tab === "keys" && <APIKeysSection />}
