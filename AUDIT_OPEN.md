@@ -14,6 +14,27 @@ report lives outside the repo) — remediation record below. Round 4: audit
 passes 1-5) are closed history; their one surviving item is folded into F16
 below.
 
+## L9 (2026-09-24) - P1 - Open: live llm_traces unreadable after migration 054; ALTER-ADD migrations
+
+Found deploying `d4bcbe6` (the zombie-reaping image fix) to infra-home, the
+first deploy of migrations 045-056 onto a populated store. Migration 054's
+`ALTER TABLE llm_traces ADD COLUMN` pair failed twice with `corrupt tuple:
+page 6 slot 0 does not decode against the column types of 'llm_traces'`,
+then a third boot recorded 054 as applied. Live now: `token_source` exists,
+`cost_source` does not, and every row read of `llm_traces` (12,080 rows)
+fails, so the LLM views return errors on that install. Engine side is
+upstream and logged in the umbrella `_internal/UPSTREAM_BUGS.md` (2026-09-24
+entry; does not reproduce on fresh data, v1.1.1 disk or memory).
+
+Observe side: 048, 049, 051, 052, 054 and 056 all use `ALTER TABLE ... ADD
+COLUMN IF NOT EXISTS` on existing tables, against this repo's own convention
+(rename-aside + create + copy, see CLAUDE.md and 027/028). The suite cannot
+catch it: on a fresh database these tables are empty when the ALTER runs.
+Open decisions: (a) repair the live table (rename-aside + recreate; loses
+regenerable LLM traces - owner call), (b) whether new ALTER-ADD migrations
+should be refused by a test, and (c) a migration test against a populated,
+upgraded store rather than a fresh one.
+
 ## Round-4 register (2026-09-19 audit, 45 findings R01..R45)
 
 Audited revision `5e2108d`. Every finding was verified against local source
