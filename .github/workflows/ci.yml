@@ -151,8 +151,12 @@ jobs:
           corepack enable
           corepack prepare "pnpm@$version" --activate
           pnpm --version
+      - name: Add Observe to the isolated pinned workspace
+        run: node .ci/prepare-ui-workspace.mjs ../Neutron
       - name: Provision TS workspace
         run: pnpm -C ../Neutron/typescript install --frozen-lockfile
+      - name: Build framework and CLI from the pinned source
+        run: pnpm -C ../Neutron/typescript --filter '@neutron-build/cli...' run build
       - name: ui-sync (build + embed)
         run: bash scripts/ui-sync.sh
         env:
@@ -171,10 +175,9 @@ jobs:
   # 027) was fixed upstream on 2026-09-18 (Neutron 6286531a) and
   # repo-built engines pass the full migration ladder again — the
   # lease-capability job below builds from the pin and relies on it. This
-  # job keeps the published v0.1.8 fixture for compatibility coverage;
-  # its known flake (intermittent committed-upsert loss on accumulated
-  # data, also fixed in the tree) is why the capability job exists
-  # separately rather than replacing this one.
+  # Supported-release coverage now uses v1.1.1 on both architectures.
+  # v0.1.8 no longer satisfies the full suite (leases, parameterized paging,
+  # and committed upserts); its failing run is recorded in AUDIT_OPEN.md.
   # X01: the vendor/ tree is what actually compiles, but go.mod's replace
   # points at a LOCAL Neutron checkout — nothing proved vendor/ matches the
   # pinned submodule until this check. Drift here means the shipped build
@@ -278,7 +281,7 @@ jobs:
             -e NUCLEUS_ALLOW_NO_AUTH=1 \
             -e NUCLEUS_ALLOW_INSECURE_CLUSTER=1 \
             -e NUCLEUS_ALLOW_INSECURE_REPLICATION=1 \
-            ghcr.io/neutron-build/nucleus:v0.1.8 \
+            ghcr.io/neutron-build/nucleus:v1.1.1 \
             start --host 0.0.0.0 --port 5432 --cluster-port 5433 --data /data --max-memory 512
           for i in $(seq 1 60); do
             if (exec 3<>/dev/tcp/127.0.0.1/55432) 2>/dev/null; then exec 3>&-; exit 0; fi

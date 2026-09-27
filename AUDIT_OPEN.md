@@ -2372,3 +2372,24 @@ Open items this slice deliberately leaves (programme O11 tails):
 - Package publication prep is owner-controlled per the O11 spec: npm
   tarball dry-runs (browser, sentry-shim), PyPI sdist/wheel build,
   Go module tagging — none attempted from the lane.
+
+## 2026-09-27 — reproducible UI and supported-engine CI
+
+CI run 36336753676 proved the complete suite on Nucleus v1.1.1 arm64
+and the source-pinned snapshot-lease suite. Its v0.1.8 amd64 job failed
+lease expectations, parameterized paging, and committed-upsert assertions.
+That obsolete release is not a passing compatibility target. The amd64
+gate now uses v1.1.1, matching the existing arm64 gate; no tests are skipped
+or weakened. The failed historical run remains the compatibility receipt.
+
+The pinned Neutron repository deliberately excludes the external Observe app.
+CI now assembles it in its isolated checkout using a checked-in lockfile patch,
+then installs frozen dependencies and builds the framework/CLI before ui-sync.
+No developer-local canonical app or uncommitted shared Neutron changes are used.
+Embedded-asset freshness remains a required check.
+
+A clean rebuild matched every application asset but exposed upstream static
+adapter wall-clock timestamps. ui-sync normalizes those metadata timestamps
+and their compressed policy/size counts before embedding; all application
+assets remain byte-checked. Upstream report: private UPSTREAM_BUGS.md entry
+2026-09-27. Two local builds and normalization idempotence verified.

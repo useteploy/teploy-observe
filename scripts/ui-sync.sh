@@ -59,6 +59,8 @@ find "$CANONICAL_SRC" -type f \( -name '*.ts' -o -name '*.tsx' \) -print0 \
 log "pnpm build (canonical)"
 pnpm -C "$CANONICAL_APP" build
 
+node "$SCRIPT_DIR/normalize-ui-metadata.mjs" "$CANONICAL_APP/dist"
+
 log "replacing embedded dist"
 rm -rf "$EMBED_DIST"
 mkdir -p "$EMBED_DIST"
