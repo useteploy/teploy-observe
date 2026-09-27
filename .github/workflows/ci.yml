@@ -154,9 +154,10 @@ jobs:
       - name: Provision TS workspace
         run: pnpm -C ../Neutron/typescript install --frozen-lockfile
       - name: ui-sync (build + embed)
-        run: sh scripts/ui-sync.sh
+        run: bash scripts/ui-sync.sh
         env:
           OBSERVE_BIN: /tmp/observe-ui-sync
+          NEUTRON_ROOT: ${{ github.workspace }}/../Neutron
       - name: Embedded dist must be fresh
         run: git diff --exit-code -- cmd/observe/ui/dist
 
@@ -244,7 +245,7 @@ jobs:
         run: |
           OBSERVE_NUCLEUS_URL='postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable' \
           OBSERVE_ADMIN_PASSWORD=ci-migration-boot \
-          OBSERVE_JWT_SECRET=ci-migration-secret \
+          OBSERVE_JWT_SECRET=ci-only-migration-secret-at-least-32-characters \
           /tmp/observe &
           OBS_PID=$!
           for i in $(seq 1 90); do
@@ -292,7 +293,7 @@ jobs:
         run: |
           OBSERVE_NUCLEUS_URL='postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable' \
           OBSERVE_ADMIN_PASSWORD=ci-migration-boot \
-          OBSERVE_JWT_SECRET=ci-migration-secret \
+          OBSERVE_JWT_SECRET=ci-only-migration-secret-at-least-32-characters \
           /tmp/observe &
           OBS_PID=$!
           for i in $(seq 1 90); do
