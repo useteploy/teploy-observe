@@ -47,10 +47,9 @@ type RetentionService struct {
 	policies []RetentionPolicy
 }
 
-// DefaultPolicies returns the out-of-box retention policies. Called with the two
-// legacy env-configured durations for raw events + hourly rollups so existing
-// deployments keep their behavior.
-func DefaultPolicies(rawDays, hourlyDays int) []RetentionPolicy {
+// DefaultPolicies returns the out-of-box retention policies, using configured
+// durations for raw events, hourly rollups and LLM traces.
+func DefaultPolicies(rawDays, hourlyDays, llmDays int) []RetentionPolicy {
 	return []RetentionPolicy{
 		{Table: "events", Column: "timestamp", Days: rawDays},
 		{Table: "events_recent", Column: "timestamp", Days: 7},
@@ -58,6 +57,7 @@ func DefaultPolicies(rawDays, hourlyDays int) []RetentionPolicy {
 		{Table: "sessions", Column: "last_ts", Days: 90},
 		{Table: "error_events", Column: "timestamp", Days: 180},
 		{Table: "logs", Column: "timestamp", Days: 30},
+		{Table: "llm_traces", Column: "timestamp", Days: llmDays},
 		{Table: "spans", Column: "start_time", Days: 14},
 		{Table: "service_stats", Column: "ts_bucket", Days: 30},
 		{Table: "replay_sessions", Column: "start_time", Days: 14},
@@ -111,7 +111,7 @@ func PolicyDays(policies []RetentionPolicy, table string) int {
 
 // NewRetentionService keeps the old two-arg constructor for backwards compat.
 func NewRetentionService(db *nucleus.Client, logger *slog.Logger, rawDays, hourlyDays int) *RetentionService {
-	return NewRetentionServiceWithPolicies(db, logger, DefaultPolicies(rawDays, hourlyDays))
+	return NewRetentionServiceWithPolicies(db, logger, DefaultPolicies(rawDays, hourlyDays, 30))
 }
 
 // NewRetentionServiceWithPolicies allows callers to supply a fully custom policy set.

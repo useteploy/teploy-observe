@@ -14,6 +14,17 @@ report lives outside the repo) — remediation record below. Round 4: audit
 passes 1-5) are closed history; their one surviving item is folded into F16
 below.
 
+## L10 (2026-09-27) — Fixed in source: LLM traces omitted from retention
+
+LLM traces, including prompt/completion payloads, were never expired by the
+scheduled cleanup. Added a validated OBSERVE_LLM_RETENTION_DAYS setting (30-day
+default) and included the table in the existing bounded cleanup path. Historical
+model-price catalog entries remain independent of trace retention. Regression
+coverage checks expiry and preservation against a real Nucleus fixture.
+This fixes unbounded logical trace retention; it does not claim SQL DELETE
+shrinks files or establish this table as the cause of a past host incident.
+Deployment and sustained storage measurements remain separate acceptance gates.
+
 ## L9 (2026-09-24) - P1 - Open: live llm_traces unreadable after migration 054; ALTER-ADD migrations
 
 Found deploying `d4bcbe6` (the zombie-reaping image fix) to infra-home, the
@@ -2361,3 +2372,24 @@ Open items this slice deliberately leaves (programme O11 tails):
 - Package publication prep is owner-controlled per the O11 spec: npm
   tarball dry-runs (browser, sentry-shim), PyPI sdist/wheel build,
   Go module tagging — none attempted from the lane.
+
+## 2026-09-27 — reproducible UI and supported-engine CI
+
+CI run 36336753676 proved the complete suite on Nucleus v1.1.1 arm64
+and the source-pinned snapshot-lease suite. Its v0.1.8 amd64 job failed
+lease expectations, parameterized paging, and committed-upsert assertions.
+That obsolete release is not a passing compatibility target. The amd64
+gate now uses v1.1.1, matching the existing arm64 gate; no tests are skipped
+or weakened. The failed historical run remains the compatibility receipt.
+
+The pinned Neutron repository deliberately excludes the external Observe app.
+CI now assembles it in its isolated checkout using a checked-in lockfile patch,
+then installs frozen dependencies and builds the framework/CLI before ui-sync.
+No developer-local canonical app or uncommitted shared Neutron changes are used.
+Embedded-asset freshness remains a required check.
+
+A clean rebuild matched every application asset but exposed upstream static
+adapter wall-clock timestamps. ui-sync normalizes those metadata timestamps
+and their compressed policy/size counts before embedding; all application
+assets remain byte-checked. Upstream report: private UPSTREAM_BUGS.md entry
+2026-09-27. Two local builds and normalization idempotence verified.

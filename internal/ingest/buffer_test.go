@@ -195,14 +195,15 @@ func TestBuffer_FlushFailureSurvivesRetryAndRestart(t *testing.T) {
 // wakeup is one bounded attempt, so Stop completes even with a dead DB.
 func TestBuffer_FlushFailureDoesNotLivelock(t *testing.T) {
 	buf := NewBuffer(nil, 8, 2, time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	buf.Start()
-	defer buf.Stop()
-
+	// Seed before starting: after its first flush panics, the worker correctly
+	// refuses admission. Racing those later pushes tests scheduling, not Stop.
 	for i := 0; i < 4; i++ {
 		if err := buf.Push(ev(fmt.Sprintf("e%d", i))); err != nil {
 			t.Fatalf("push %d refused: %v", i, err)
 		}
 	}
+	buf.Start()
+	defer buf.Stop()
 	// nil db -> insertBatch panics inside Flush, recovered by the worker's
 	// panic guard, leaving the events requeued... in fact the panic aborts
 	// the whole worker goroutine (recover logs and exits the goroutine),

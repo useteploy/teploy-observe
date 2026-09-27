@@ -372,7 +372,7 @@ func main() {
 	// same numbers rather than a constant of its own. The ledger policies
 	// (O01 slice 5) ride the same job: dedupe ledgers expire with the data
 	// they dedupe, processed outbox intents prune, dead letters never do.
-	retentionPolicies := append(jobs.DefaultPolicies(cfg.RawRetentionDays, cfg.HourlyRetentionDays),
+	retentionPolicies := append(jobs.DefaultPolicies(cfg.RawRetentionDays, cfg.HourlyRetentionDays, cfg.LLMRetentionDays),
 		jobs.DefaultLedgerPolicies(cfg.ErrorInboxRetentionDays, cfg.ReplayBatchesRetentionDays, cfg.DerivedOutboxRetentionDays)...)
 
 	// Stats service

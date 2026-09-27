@@ -24,6 +24,7 @@ func TestValidateRejectsBrokenNumericConfig(t *testing.T) {
 		{"negative interval", func(c *Config) { c.FlushInterval = -time.Second }, "OBSERVE_FLUSH_INTERVAL_MS"},
 		{"huge interval", func(c *Config) { c.FlushInterval = 10 * time.Minute }, "OBSERVE_FLUSH_INTERVAL_MS"},
 		{"zero rate limit", func(c *Config) { c.RateLimit = 0 }, "OBSERVE_RATE_LIMIT"},
+		{"zero LLM retention", func(c *Config) { c.LLMRetentionDays = 0 }, "OBSERVE_LLM_RETENTION_DAYS"},
 		{"zero retention", func(c *Config) { c.RawRetentionDays = 0 }, "OBSERVE_RAW_RETENTION_DAYS"},
 		{"malformed integer", func(c *Config) {
 			c.parseErr = fmt.Errorf("OBSERVE_BUFFER_SIZE must be an integer, got %q", "big")
@@ -32,7 +33,7 @@ func TestValidateRejectsBrokenNumericConfig(t *testing.T) {
 	for _, tc := range cases {
 		c := Config{
 			BufferSize: 1000, FlushSize: 100, FlushInterval: time.Second,
-			RateLimit: 100, RawRetentionDays: 30, HourlyRetentionDays: 365,
+			RateLimit: 100, RawRetentionDays: 30, HourlyRetentionDays: 365, LLMRetentionDays: 30,
 			ErrorInboxRetentionDays: 14, ReplayBatchesRetentionDays: 14, DerivedOutboxRetentionDays: 7,
 		}
 		tc.mut(&c)
@@ -46,10 +47,23 @@ func TestValidateRejectsBrokenNumericConfig(t *testing.T) {
 func TestValidateAcceptsDefaults(t *testing.T) {
 	c := Config{
 		BufferSize: 100_000, FlushSize: 500, FlushInterval: 2 * time.Second,
-		RateLimit: 1000, RawRetentionDays: 30, HourlyRetentionDays: 365,
+		RateLimit: 1000, RawRetentionDays: 30, HourlyRetentionDays: 365, LLMRetentionDays: 30,
 		ErrorInboxRetentionDays: 14, ReplayBatchesRetentionDays: 14, DerivedOutboxRetentionDays: 7,
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("default-shaped config must validate: %v", err)
+	}
+}
+
+func TestLoadLLMRetentionWindow(t *testing.T) {
+	t.Setenv("OBSERVE_LLM_RETENTION_DAYS", "7")
+	c := Load()
+	if c.LLMRetentionDays != 7 {
+		t.Fatalf("LLM retention=%d, want 7", c.LLMRetentionDays)
+	}
+	t.Setenv("OBSERVE_LLM_RETENTION_DAYS", "invalid")
+	c = Load()
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "OBSERVE_LLM_RETENTION_DAYS") {
+		t.Fatalf("invalid LLM duration must fail validation, got %v", err)
 	}
 }

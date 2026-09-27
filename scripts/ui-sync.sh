@@ -8,7 +8,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OBSERVE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OBSERVE_UI_SRC="$OBSERVE_ROOT/ui/src"
-CANONICAL_APP="$OBSERVE_ROOT/../../Neutron/typescript/apps/observe"
+NEUTRON_ROOT="${NEUTRON_ROOT:-$OBSERVE_ROOT/../../Neutron}"
+CANONICAL_APP="$NEUTRON_ROOT/typescript/apps/observe"
 CANONICAL_SRC="$CANONICAL_APP/src"
 EMBED_DIST="$OBSERVE_ROOT/cmd/observe/ui/dist"
 BIN_OUT="${OBSERVE_BIN:-/tmp/obs-launch/observe}"
@@ -57,6 +58,8 @@ find "$CANONICAL_SRC" -type f \( -name '*.ts' -o -name '*.tsx' \) -print0 \
 
 log "pnpm build (canonical)"
 pnpm -C "$CANONICAL_APP" build
+
+node "$SCRIPT_DIR/normalize-ui-metadata.mjs" "$CANONICAL_APP/dist"
 
 log "replacing embedded dist"
 rm -rf "$EMBED_DIST"
