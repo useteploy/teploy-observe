@@ -1,7 +1,7 @@
 // Embedding does not need build wall-clock timestamps. Neutron currently emits
 // them unconditionally (reported in Teploy/_internal/UPSTREAM_BUGS.md).
 // Preserve policy content and accurate compression counts while removing time.
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { gzipSync, brotliCompressSync, constants } from 'node:zlib';
 
@@ -26,3 +26,19 @@ for (const [suffix, field, compress] of [
 }
 writeFileSync(policyPath, normalized);
 writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+
+// gzip's OS header differs on macOS/Linux despite identical deflate payloads.
+// RFC 1952 value 255 means unknown OS; this byte is outside the payload CRC.
+function normalizeGzipHeaders(dir) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = resolve(dir, entry.name);
+    if (entry.isDirectory()) normalizeGzipHeaders(path);
+    else if (entry.name.endsWith('.gz')) {
+      const bytes = readFileSync(path);
+      if (bytes[0] !== 0x1f || bytes[1] !== 0x8b || bytes[3] !== 0) throw new Error(`Unexpected gzip header: ${path}`);
+      bytes[9] = 255;
+      writeFileSync(path, bytes);
+    }
+  }
+}
+normalizeGzipHeaders(dist);
