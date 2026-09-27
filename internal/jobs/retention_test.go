@@ -155,3 +155,57 @@ func TestRetentionPrunesProcessedOutboxIntentsNotDeadLetters(t *testing.T) {
 		t.Errorf("dead-lettered intent was auto-pruned (got %d, want 1) — dead letters are the operator's queue", c)
 	}
 }
+
+// Trace expiry must use the configured window without erasing the price catalog
+// needed to explain historical cost estimates.
+func TestLLMRetentionExpiresOldTracesPreservesRecentAndCatalog(t *testing.T) {
+	ctx, db, done := connect(t)
+	defer done()
+	site := "llm_ret_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	now := time.Now().UnixMilli()
+	const day = int64(24 * 60 * 60 * 1000)
+	for _, row := range []struct {
+		id string
+		ts int64
+	}{{"old", now - 8*day}, {"recent", now - 6*day}} {
+		if _, err := db.SQL().Exec(ctx, `INSERT INTO llm_traces (trace_id, site_id, timestamp, prompt, completion) VALUES ($1,$2,$3,$4,$5)`, site+row.id, site, row.ts, "retained input", "retained output"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.SQL().Exec(ctx, `INSERT INTO llm_model_prices (model_prefix, created_at, valid_from) VALUES ($1,$2,$3)`, site, now-40*day, now-40*day); err != nil {
+		t.Fatal(err)
+	}
+	policies := DefaultPolicies(30, 365, 7)
+	var selected []RetentionPolicy
+	for _, p := range policies {
+		if p.Table == "llm_traces" {
+			selected = append(selected, p)
+		}
+	}
+	if len(selected) != 1 {
+		t.Fatalf("expected exactly one LLM policy, got %d", len(selected))
+	}
+	svc := NewRetentionServiceWithPolicies(db, slog.New(slog.NewTextHandler(io.Discard, nil)), selected)
+	if err := svc.RunCleanup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct {
+		id   string
+		want int64
+	}{{"old", 0}, {"recent", 1}} {
+		got, err := nucleus.Query[countRow](ctx, db.SQL(), `SELECT COUNT(*) AS n FROM llm_traces WHERE trace_id=$1`, site+row.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].N != row.want {
+			t.Errorf("%s trace count=%v, want %d", row.id, got, row.want)
+		}
+	}
+	got, err := nucleus.Query[countRow](ctx, db.SQL(), `SELECT COUNT(*) AS n FROM llm_model_prices WHERE model_prefix=$1`, site)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].N != 1 {
+		t.Fatalf("price catalog was removed: %v", got)
+	}
+}

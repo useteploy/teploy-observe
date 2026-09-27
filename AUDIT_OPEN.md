@@ -14,6 +14,17 @@ report lives outside the repo) — remediation record below. Round 4: audit
 passes 1-5) are closed history; their one surviving item is folded into F16
 below.
 
+## L10 (2026-09-27) — Fixed in source: LLM traces omitted from retention
+
+LLM traces, including prompt/completion payloads, were never expired by the
+scheduled cleanup. Added a validated OBSERVE_LLM_RETENTION_DAYS setting (30-day
+default) and included the table in the existing bounded cleanup path. Historical
+model-price catalog entries remain independent of trace retention. Regression
+coverage checks expiry and preservation against a real Nucleus fixture.
+This fixes unbounded logical trace retention; it does not claim SQL DELETE
+shrinks files or establish this table as the cause of a past host incident.
+Deployment and sustained storage measurements remain separate acceptance gates.
+
 ## L9 (2026-09-24) - P1 - Open: live llm_traces unreadable after migration 054; ALTER-ADD migrations
 
 Found deploying `d4bcbe6` (the zombie-reaping image fix) to infra-home, the
