@@ -443,6 +443,7 @@ func main() {
 	groupSvc := groups.NewGroupService(db)
 	ssoSvc := sso.NewSSOService(db)
 	flagSvc := flags.NewFlagService(db)
+	flagSvc.WithEvalDedup(flags.LoadEvalDedupFromEnv(os.Getenv))
 	experimentSvc := experiments.NewExperimentService(db)
 	surveySvc := surveys.NewSurveyService(db, cfg.SessionSalt, siteSvc)
 	logSvc := logs.NewLogService(db)
