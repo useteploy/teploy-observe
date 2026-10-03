@@ -44,6 +44,8 @@ const truncated = "[Truncated]"
 const (
 	scrubMaxDepth = 16
 	scrubMaxNodes = 20000
+	// scrubMaxString bounds the bytes examined per string value.
+	scrubMaxString = 64 << 10
 )
 
 // Substring-matched key fragments (compared against the key lowercased
@@ -178,23 +180,51 @@ func luhnValid(digits string) bool {
 	return len(digits) > 0 && sum%10 == 0
 }
 
+func countDigits(v string) int {
+	n := 0
+	for i := 0; i < len(v); i++ {
+		if v[i] >= '0' && v[i] <= '9' {
+			n++
+		}
+	}
+	return n
+}
+
 // scrubString applies the value-pattern rules to one string.
 func (s *Scrubber) scrubString(v string) string {
 	if v == "" {
 		return v
 	}
-	v = jwtRe.ReplaceAllString(v, Filtered)
-	v = bearerRe.ReplaceAllString(v, "$1 "+Filtered)
-	v = queryParamRe.ReplaceAllStringFunc(v, func(m string) string {
-		sub := queryParamRe.FindStringSubmatch(m)
-		name := sub[2]
-		ln := strings.ToLower(name)
-		if s.sensitiveKey(name) || ln == "key" || ln == "sig" || ln == "signature" {
-			return sub[1] + name + "=" + Filtered
+	if len(v) > scrubMaxString {
+		// Bounded work per string; the unexamined tail is dropped, not
+		// passed through.
+		v = v[:scrubMaxString] + truncated
+	}
+	// Cheap substring pre-filters keep the regexes off strings that cannot
+	// match (the counted-repeat card pattern is the expensive one).
+	if strings.Contains(v, "eyJ") {
+		v = jwtRe.ReplaceAllString(v, Filtered)
+	}
+	if strings.Contains(strings.ToLower(v), "bearer") {
+		v = bearerRe.ReplaceAllString(v, "$1 "+Filtered)
+	}
+	if strings.Contains(v, "=") {
+		if strings.ContainsAny(v, "?&;") {
+			v = queryParamRe.ReplaceAllStringFunc(v, func(m string) string {
+				sub := queryParamRe.FindStringSubmatch(m)
+				name := sub[2]
+				ln := strings.ToLower(name)
+				if s.sensitiveKey(name) || ln == "key" || ln == "sig" || ln == "signature" {
+					return sub[1] + name + "=" + Filtered
+				}
+				return m
+			})
 		}
-		return m
-	})
-	v = kvSecretRe.ReplaceAllString(v, "$1="+Filtered)
+		v = kvSecretRe.ReplaceAllString(v, "$1="+Filtered)
+	}
+	if countDigits(v) < 14 {
+		return v
+	}
 	v = cardRe.ReplaceAllStringFunc(v, func(m string) string {
 		digits := make([]byte, 0, 19)
 		for i := 0; i < len(m); i++ {

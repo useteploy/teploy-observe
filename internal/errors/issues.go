@@ -51,10 +51,14 @@ type IssueService struct {
 	db *nucleus.Client
 	// notifier receives new-issue and regression events (see notify.go).
 	notifier atomic.Pointer[IssueNotifier]
+	// merge holds issue merge/assignment state (merge.go).
+	merge *mergeState
 }
 
 func NewIssueService(db *nucleus.Client) *IssueService {
-	return &IssueService{db: db}
+	s := &IssueService{db: db}
+	s.merge = newMergeState(sqlMergeStore{db})
+	return s
 }
 
 // Issue represents a grouped error issue.
@@ -99,6 +103,13 @@ type Issue struct {
 	// Releases is the release-impact breakdown (per-release event
 	// counts) for this issue, populated on detail reads only.
 	Releases []IssueRelease `json:"releases,omitempty"`
+	// Merge/assignment (migration 058). ResolvedFrom is set when a read of
+	// a merged source id was answered with its target; MergedSources lists
+	// the issues folded into this one.
+	ResolvedFrom  string   `json:"resolved_from,omitempty"`
+	MergedSources []string `json:"merged_sources,omitempty"`
+	Assignee      string   `json:"assignee,omitempty"`
+	AssignedAt    int64    `json:"assigned_at,omitempty"`
 }
 
 // IssueRelease is one release's share of an issue's events.
@@ -405,14 +416,27 @@ func (s *IssueService) ListIssues(ctx context.Context, siteID, status string, li
 	}
 	now := time.Now().UTC()
 	out := make([]Issue, 0, len(issues))
+	merges := s.siteMerges(ctx, siteID)
+	assigns := s.siteAssignments(ctx, siteID)
 	for i := range issues {
+		if _, hidden := merges[issues[i].IssueID]; hidden {
+			// Merged away: shown only through its target. (A page can run
+			// short by the number of merged sources it contained.)
+			continue
+		}
 		issue := issues[i].toIssue(now)
+		sources := capIDs(sourcesOf(merges, issue.IssueID))
+		ids := append([]string{issue.IssueID}, sources...)
+		issue.MergedSources = sources
+		if a, ok := assigns[issue.IssueID]; ok {
+			issue.Assignee, issue.AssignedAt = a.Assignee, a.AssignedAt
+		}
 		// user_count and event_count are computed on read (the stored counters race
 		// under concurrent flushes — read-modify-write into a ReplacingMergeTree
 		// loses increments). COUNT over error_events is exact and concurrency-safe.
 		// Bounded by the page limit, so the per-issue lookups stay cheap.
-		issue.UserCount = s.affectedUsers(ctx, siteID, issue.IssueID)
-		issue.EventCount = s.eventCount(ctx, siteID, issue.IssueID)
+		issue.UserCount = s.affectedUsers(ctx, siteID, ids)
+		issue.EventCount = s.eventCount(ctx, siteID, ids)
 		out = append(out, issue)
 	}
 	return out, nil
@@ -420,6 +444,10 @@ func (s *IssueService) ListIssues(ctx context.Context, siteID, status string, li
 
 // GetIssue returns a single issue by ID.
 func (s *IssueService) GetIssue(ctx context.Context, issueID, siteID string) (*Issue, error) {
+	// A merged source resolves to its target (merge.go); the lookup stays
+	// site-scoped, so a foreign id still reads as not found.
+	requested := issueID
+	issueID = s.ResolveMerged(ctx, siteID, issueID)
 	rows, err := nucleus.Query[issueScan](ctx, s.db.SQL(),
 		`SELECT `+issueSelectCols+`
 		 FROM `+issuesLatest("issue_id = $1 AND site_id = $2"),
@@ -432,19 +460,28 @@ func (s *IssueService) GetIssue(ctx context.Context, issueID, siteID string) (*I
 		return nil, nil
 	}
 	issue := rows[0].toIssue(time.Now().UTC())
-	issue.UserCount = s.affectedUsers(ctx, siteID, issueID)
-	issue.EventCount = s.eventCount(ctx, siteID, issueID)
-	issue.Releases = s.issueReleases(ctx, siteID, issueID)
+	if requested != issueID {
+		issue.ResolvedFrom = requested
+	}
+	ids := s.issueScope(ctx, siteID, issueID)
+	issue.MergedSources = ids[1:]
+	if a, ok := s.siteAssignments(ctx, siteID)[issueID]; ok {
+		issue.Assignee, issue.AssignedAt = a.Assignee, a.AssignedAt
+	}
+	issue.UserCount = s.affectedUsers(ctx, siteID, ids)
+	issue.EventCount = s.eventCount(ctx, siteID, ids)
+	issue.Releases = s.issueReleases(ctx, siteID, ids)
 	return &issue, nil
 }
 
 // eventCount returns the exact number of events for an issue, computed on read
 // from the append-only error_events table (the stored issues.event_count is
 // racey). Best-effort: returns 0 on any error.
-func (s *IssueService) eventCount(ctx context.Context, siteID, issueID string) int64 {
+func (s *IssueService) eventCount(ctx context.Context, siteID string, ids []string) int64 {
+	in, args := issueIDClause(2, ids)
 	rows, err := nucleus.Query[issueCountRow](ctx, s.db.SQL(),
-		`SELECT COUNT(*) AS n FROM error_events WHERE site_id = $1 AND issue_id = $2`,
-		siteID, issueID,
+		`SELECT COUNT(*) AS n FROM error_events WHERE site_id = $1 AND `+in,
+		append([]any{siteID}, args...)...,
 	)
 	if err != nil || len(rows) == 0 {
 		return 0
@@ -470,13 +507,14 @@ type issueCountRow struct {
 // pre-O05 session proxy (distinct session_id), documented as an
 // estimate of affected anonymous traffic, never conflated with
 // identified persons. Best-effort: returns 0 on any error.
-func (s *IssueService) affectedUsers(ctx context.Context, siteID, issueID string) int64 {
+func (s *IssueService) affectedUsers(ctx context.Context, siteID string, ids []string) int64 {
+	in, args := issueIDClause(2, ids)
 	rows, err := nucleus.Query[affectedRow](ctx, s.db.SQL(),
 		`SELECT COUNT(DISTINCT CASE WHEN distinct_id <> '' THEN distinct_id ELSE NULL END) AS n_distinct,
 		        COUNT(DISTINCT CASE WHEN distinct_id = '' AND session_id <> '' THEN session_id ELSE NULL END) AS n_sessions
 		 FROM error_events
-		 WHERE site_id = $1 AND issue_id = $2`,
-		siteID, issueID,
+		 WHERE site_id = $1 AND `+in,
+		append([]any{siteID}, args...)...,
 	)
 	if err != nil || len(rows) == 0 {
 		return 0
@@ -497,15 +535,16 @@ type affectedRow struct {
 // event's own release field (SDKs send `release`; absent = ” = unknown
 // — never fabricated). Ordered by release_tag for a total order under
 // the LIMIT. Best-effort: returns nil on error.
-func (s *IssueService) issueReleases(ctx context.Context, siteID, issueID string) []IssueRelease {
+func (s *IssueService) issueReleases(ctx context.Context, siteID string, ids []string) []IssueRelease {
+	in, args := issueIDClause(2, ids)
 	rows, err := nucleus.Query[IssueRelease](ctx, s.db.SQL(),
 		`SELECT release_tag, COUNT(*) AS event_count
 		 FROM error_events
-		 WHERE site_id = $1 AND issue_id = $2 AND release_tag <> ''
+		 WHERE site_id = $1 AND `+in+` AND release_tag <> ''
 		 GROUP BY release_tag
 		 ORDER BY release_tag ASC
 		 LIMIT 10`,
-		siteID, issueID,
+		append([]any{siteID}, args...)...,
 	)
 	if err != nil {
 		return nil
@@ -544,6 +583,8 @@ func (s *IssueService) LatestEvents(ctx context.Context, issueID, siteID string,
 	if limit <= 0 {
 		limit = 10
 	}
+	// Includes events filed under issues merged into this one.
+	in, args := issueIDClause(2, s.issueScope(ctx, siteID, s.ResolveMerged(ctx, siteID, issueID)))
 	return nucleus.Query[ErrorEvent](ctx, s.db.SQL(),
 		fmt.Sprintf(`SELECT error_id, tenant_id, site_id, session_id,
 			COALESCE(replay_id, '') AS replay_id,
@@ -557,10 +598,10 @@ func (s *IssueService) LatestEvents(ctx context.Context, issueID, siteID string,
 			COALESCE(contexts, '') AS contexts,
 			COALESCE(extra, '') AS extra
 		 FROM error_events
-		 WHERE issue_id = $1 AND site_id = $2
+		 WHERE site_id = $1 AND `+in+`
 		 ORDER BY timestamp DESC
 		 LIMIT %d`, limit),
-		issueID, siteID,
+		append([]any{siteID}, args...)...,
 	)
 }
 
