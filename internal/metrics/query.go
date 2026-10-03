@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,6 +12,22 @@ import (
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
+
+// fetchPointRows / fetchMetricRows run the read queries through the test
+// seams when set, else straight against the engine.
+func (s *Service) fetchPointRows(ctx context.Context, query string, args ...any) ([]pointRow, error) {
+	if s.queryPointRows != nil {
+		return s.queryPointRows(ctx, query, args...)
+	}
+	return nucleus.Query[pointRow](ctx, s.db.SQL(), query, args...)
+}
+
+func (s *Service) fetchMetricRows(ctx context.Context, query string, args ...any) ([]metricRow, error) {
+	if s.queryMetricRows != nil {
+		return s.queryMetricRows(ctx, query, args...)
+	}
+	return nucleus.Query[metricRow](ctx, s.db.SQL(), query, args...)
+}
 
 // MetricInfo names a metric and reports its kind. Used by the /metrics/list
 // endpoint to populate the left-hand picker in the UI.
@@ -71,13 +88,25 @@ func (s *Service) ListMetrics(ctx context.Context, siteID string) ([]MetricInfo,
 	if siteID == "" {
 		return nil, fmt.Errorf("metrics: site_id required")
 	}
-	rows, err := nucleus.Query[metricRow](ctx, s.db.SQL(),
+	// O12: concurrency slot + time budget; the grouped result is bounded
+	// by LIMIT budget+1 and a result past the ceiling is refused, never
+	// truncated (a clipped metric picker would silently hide metrics).
+	qctx, release, err := s.qguard.Begin(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	rows, err := s.fetchMetricRows(qctx,
 		`SELECT metric_name, metric_kind FROM metric_points WHERE site_id = $1
-		 GROUP BY metric_name, metric_kind`,
+		 GROUP BY metric_name, metric_kind
+		 LIMIT `+strconv.FormatInt(s.qguard.MaxRows()+1, 10),
 		siteID,
 	)
 	if err != nil {
-		return nil, err
+		return nil, s.qguard.DeadlineError(ctx, err)
+	}
+	if int64(len(rows)) > s.qguard.MaxRows() {
+		return nil, s.qguard.RowRefusal()
 	}
 	// A name can still appear under two kinds if a producer changed kind
 	// mid-stream; last wins, matching the previous behaviour.
@@ -229,24 +258,38 @@ func (s *Service) QuerySeries(ctx context.Context, siteID, name string, labels m
 	fromNs := fromMs * 1_000_000
 	toNs := toMs * 1_000_000
 
+	// O12: concurrency slot + time budget, and a hard row cap. Every raw
+	// point in range is loaded into Go memory before aggregation, so the
+	// SQL carries LIMIT budget+1 and one row past the ceiling is a labeled
+	// refusal - never a truncated series that would draw as a real answer.
+	qctx, release, err := s.qguard.Begin(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	// Both sides of the comparison need an explicit BIGINT cast — Nucleus
 	// pgwire advertises ts_ns as TEXT (dogfood finding #6) so a bare
 	// `ts_ns >= literal` returns zero rows even when the row is in range.
 	// The tracing package solved this the same way for `start_time`.
-	rows, err := nucleus.Query[pointRow](ctx, s.db.SQL(),
+	rows, err := s.fetchPointRows(qctx,
 		`SELECT ts_ns, value, histogram, metric_kind, attributes,
 		        COALESCE(aggregation_temporality, 'cumulative') AS aggregation_temporality
 		 FROM metric_points
 		 WHERE site_id = $1 AND metric_name = $2
 		   AND ts_ns >= $3
 		   AND ts_ns < $4
-		 ORDER BY ts_ns ASC`,
+		 ORDER BY ts_ns ASC
+		 LIMIT `+strconv.FormatInt(s.qguard.MaxRows()+1, 10),
 		siteID, name,
 		dbutil.IntParam(fromNs),
 		dbutil.IntParam(toNs),
 	)
 	if err != nil {
-		return nil, err
+		return nil, s.qguard.DeadlineError(ctx, err)
+	}
+	if int64(len(rows)) > s.qguard.MaxRows() {
+		return nil, s.qguard.RowRefusal()
 	}
 
 	// Group rows by (label-set fingerprint) → list of points. Even when
