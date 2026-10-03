@@ -434,6 +434,7 @@ func main() {
 	// Feature expansion services
 	reportSvc := reports.NewReportService(db, logger)
 	integrationSvc := integrations.NewIntegrationService(db, logger)
+	wireAlertsToIntegrations(alertSvc, integrationSvc, logger)
 	feedbackSvc := feedback.NewFeedbackService(db)
 	viewSvc := views.NewViewService(db)
 	explorerSvc := explorer.NewExplorerService(db)
@@ -5589,9 +5590,7 @@ type createAlertRuleInput struct {
 	Cooldown      int     `json:"cooldown"`
 }
 
-var validAlertMetrics = map[string]struct{}{
-	"error_count": {}, "error_rate": {}, "pageviews": {}, "visitors": {},
-}
+var validAlertMetrics = platform.AlertMetricSet()
 
 var validAlertOperators = map[string]struct{}{
 	"gt": {}, "gte": {}, "lt": {}, "lte": {}, "eq": {},

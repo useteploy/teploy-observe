@@ -473,7 +473,7 @@ The experiment detail page shows:
 ## Rules
 
 Create rules in **Alerts > Create Rule**:
-- **Metric**: error_count, error_rate, pageviews, visitors
+- **Metric**: error_count, error_rate, pageviews, visitors, trace_error_rate (% of spans with error status), trace_p95_ms (p95 root-span duration, ms), log_error_count (error/fatal logs), uptime_failures (failed uptime checks). Trace, log and uptime metrics are site-wide; a window with no spans, logs or checks reads as no data, not healthy.
 - **Operator**: >, >=, <, <=, =
 - **Threshold**: numeric value
 - **Window**: minutes over which to evaluate (default 5)
