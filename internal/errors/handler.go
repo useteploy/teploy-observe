@@ -62,6 +62,11 @@ type ErrorInput struct {
 	EventID string `json:"event_id,omitempty"`
 	// ProducerID optionally namespaces EventID (scoped inbox key).
 	ProducerID string `json:"producer_id,omitempty"`
+	// PreGroupHash is SERVER-SET: ErrorBuffer.Push overwrites it (a client
+	// value is discarded) with the grouping hash derived from the raw
+	// input before scrubbing, so redaction can never move an event to a
+	// different issue. Empty = derive at insert (seed, scrub disabled).
+	PreGroupHash string `json:"_pre_group_hash,omitempty"`
 }
 
 // Breadcrumb is a user action that preceded the error.
@@ -193,9 +198,12 @@ func (s *Service) insertErrorEvent(ctx context.Context, sqlc *nucleus.SQLModel, 
 	// derivation (O05). The issue records the version at create; a
 	// future v2 cutover is a new case in ComputeGroupHash, documented in
 	// grouping.go — existing issues are never rewritten.
-	groupHash, err := ComputeGroupHash(FingerprintVersion, input)
-	if err != nil {
-		return "", "", fmt.Errorf("group fingerprint: %w", err)
+	groupHash := input.PreGroupHash
+	if groupHash == "" {
+		groupHash, err = ComputeGroupHash(FingerprintVersion, input)
+		if err != nil {
+			return "", "", fmt.Errorf("group fingerprint: %w", err)
+		}
 	}
 
 	title := IssueTitle(input.ErrorType, input.ErrorValue)
