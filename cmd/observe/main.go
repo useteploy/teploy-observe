@@ -1443,10 +1443,9 @@ func main() {
 		neutron.WithTags("surveys"), neutron.WithSummary("List survey responses"))
 	neutron.Get(surveyGroup, "/{survey_id}/stats", surveyStatsHandler(surveySvc),
 		neutron.WithTags("surveys"), neutron.WithSummary("Survey exposure/response stats"))
-	// Public: get active surveys, record exposure, submit response
-	r.HandleFunc("GET /api/v1/surveys/active", activeSurveysPublicHandler(surveySvc))
-	r.HandleFunc("POST /api/v1/surveys/expose", surveyExposeHandler(surveySvc))
-	r.HandleFunc("POST /api/v1/surveys/respond", surveyRespondHandler(surveySvc))
+	// Public: get active surveys, record exposure, submit response, and the
+	// widget script (surveys_routes.go).
+	registerSurveyPublicRoutes(r, surveySvc)
 
 	// --- Release health (JWT auth) ---
 	releaseHealthSvc := obserrors.NewReleaseHealthService(db)

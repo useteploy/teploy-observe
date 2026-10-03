@@ -33,7 +33,9 @@ func TestIngestListenerAllowsTelemetryWrites(t *testing.T) {
 		{"POST", "/api/v1/flags/evaluate"},
 		{"GET", "/api/v1/flags/config"},
 		{"GET", "/api/v1/surveys/active"},
+		{"POST", "/api/v1/surveys/expose"},
 		{"POST", "/api/v1/surveys/respond"},
+		{"GET", "/t/observe-surveys.js"},
 		{"POST", "/api/v1/sourcemaps/upload"},
 		{"GET", "/healthz"},
 		// OTLP, both the standard and the group-mounted path.
