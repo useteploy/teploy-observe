@@ -73,6 +73,9 @@ func (s *IngestService) WithLogger(logger *slog.Logger) *IngestService {
 type IngestResponse struct {
 	OK    bool `json:"ok"`
 	Spans int  `json:"spans"`
+	// LinksTruncated counts span links (or link attributes/fields) dropped by
+	// the ingest caps; omitted when nothing was dropped.
+	LinksTruncated int `json:"links_truncated,omitempty"`
 }
 
 // Ingest processes an OTLP ExportTraceServiceRequest. Spans AND their
@@ -139,6 +142,12 @@ func (s *IngestService) ingest(ctx context.Context, siteID string, req ExportTra
 		return IngestResponse{}, fmt.Errorf("insert span: %w", err)
 	}
 
+	// Links ride the same transaction: a rolled-back export leaves no orphan
+	// links, and a committed one never lacks them.
+	if err := insertSpanLinks(ctx, sqlc, siteID, flat); err != nil {
+		return IngestResponse{}, fmt.Errorf("insert span links: %w", err)
+	}
+
 	intentIDs := make([]string, 0, 2)
 	id, err := s.outbox.Enqueue(ctx, sqlc, siteID, outbox.KindTraceRollup, rollupPL)
 	if err != nil {
@@ -169,7 +178,14 @@ func (s *IngestService) ingest(ctx context.Context, siteID string, req ExportTra
 		}
 	}
 
-	return IngestResponse{OK: true, Spans: total}, nil
+	truncated := 0
+	for i := range flat {
+		truncated += flat[i].LinksTruncated
+	}
+	if truncated > 0 {
+		s.logger.Warn("trace ingest: span links truncated", "site_id", siteID, "dropped", truncated)
+	}
+	return IngestResponse{OK: true, Spans: total, LinksTruncated: truncated}, nil
 }
 
 // handleRollupIntent derives service_stats / service_dependencies rows from
@@ -322,6 +338,8 @@ type flatSpan struct {
 	AttributesJSON string
 	ResourceJSON   string
 	EventsJSON     string
+	Links          []flatLink
+	LinksTruncated int
 }
 
 // spansCols is the number of bound parameters per row in the batch INSERT
@@ -425,6 +443,7 @@ func flattenSpans(req ExportTraceRequest) []flatSpan {
 					svcName = override
 				}
 
+				links, linksDropped := flattenLinks(span.Links)
 				out = append(out, flatSpan{
 					TraceID:        span.TraceID,
 					SpanID:         span.SpanID,
@@ -440,6 +459,8 @@ func flattenSpans(req ExportTraceRequest) []flatSpan {
 					AttributesJSON: jsonOrEmpty(AttrsToMap(span.Attributes)),
 					ResourceJSON:   resourceJSON,
 					EventsJSON:     jsonOrEmpty(span.Events),
+					Links:          links,
+					LinksTruncated: linksDropped,
 				})
 			}
 		}

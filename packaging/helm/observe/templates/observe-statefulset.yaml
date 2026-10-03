@@ -1,0 +1,152 @@
+{{- include "observe.validate" . -}}
+{{- $keys := .Values.secrets.keys }}
+{{- $secret := include "observe.secretName" . }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "observe.fullname" . }}
+  labels:
+    {{- include "observe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: observe
+spec:
+  # SINGLE INSTANCE, deliberately not configurable: the ingest WAL is
+  # single-process and Observe has no clustering. A second replica would
+  # corrupt the WAL/queue state or double-process events.
+  replicas: 1
+  serviceName: {{ include "observe.fullname" . }}
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "observe.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "observe.labels" . | nindent 8 }}
+        app.kubernetes.io/component: observe
+      {{- with .Values.observe.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.observe.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: observe
+          image: {{ include "observe.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 3000
+            {{- if .Values.ingest.enabled }}
+            - name: ingest
+              containerPort: {{ .Values.ingest.port }}
+            {{- end }}
+          env:
+            - name: OBSERVE_ADDR
+              value: ":3000"
+            - name: OBSERVE_NUCLEUS_URL
+              value: {{ include "observe.nucleusUrl" . | quote }}
+            - name: OBSERVE_DATA_DIR
+              value: /var/lib/observe
+            - name: OBSERVE_SITE_ID
+              value: {{ .Values.observe.siteId | quote }}
+            - name: OBSERVE_ADMIN_USER
+              value: {{ .Values.observe.adminUser | quote }}
+            - name: OBSERVE_SEED_DEMO
+              value: {{ .Values.observe.seedDemo | quote }}
+            {{- if .Values.observe.publicUrl }}
+            - name: OBSERVE_PUBLIC_URL
+              value: {{ .Values.observe.publicUrl | quote }}
+            {{- end }}
+            {{- if .Values.observe.trustedProxies }}
+            - name: OBSERVE_TRUSTED_PROXIES
+              value: {{ .Values.observe.trustedProxies | quote }}
+            {{- end }}
+            {{- if .Values.ingest.enabled }}
+            - name: OBSERVE_INGEST_ADDR
+              value: {{ printf ":%v" .Values.ingest.port | quote }}
+            {{- end }}
+            {{- range $k, $v := .Values.observe.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            - name: OBSERVE_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: {{ $keys.jwtSecret }}
+            - name: OBSERVE_SESSION_SALT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: {{ $keys.sessionSalt }}
+            - name: OBSERVE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: {{ $keys.secretKey }}
+                  optional: true
+            - name: OBSERVE_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: {{ $keys.adminPassword }}
+                  optional: true
+            {{- with .Values.observe.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            {{- toYaml .Values.probes.startup | nindent 12 }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          livenessProbe:
+            tcpSocket: { port: http }
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          resources:
+            {{- toYaml .Values.observe.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/observe
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.tmpSizeLimit }}
+      {{- with .Values.observe.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.observe.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.observe.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "observe.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.observe.persistence.accessModes | nindent 10 }}
+        {{- if .Values.observe.persistence.storageClassName }}
+        storageClassName: {{ .Values.observe.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.observe.persistence.size }}

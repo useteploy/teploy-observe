@@ -15,15 +15,8 @@ func AttrsToMap(attrs []KeyValue) map[string]string {
 	}
 	m := make(map[string]string, len(attrs))
 	for _, kv := range attrs {
-		switch {
-		case kv.Value.StringValue != "":
-			m[kv.Key] = kv.Value.StringValue
-		case kv.Value.IntValue != "":
-			m[kv.Key] = string(kv.Value.IntValue)
-		case kv.Value.BoolValue:
-			m[kv.Key] = "true"
-		case kv.Value.DoubleValue != 0:
-			m[kv.Key] = fmt.Sprintf("%g", kv.Value.DoubleValue)
+		if v, ok := kv.Value.text(); ok {
+			m[kv.Key] = v
 		}
 	}
 	return m

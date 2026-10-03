@@ -1,0 +1,10 @@
+apiVersion: v2
+name: observe
+description: Single-instance Teploy Observe (analytics, errors, logs, traces, replays) with a Nucleus database StatefulSet.
+type: application
+version: 0.1.0
+appVersion: "0.2.0"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/useteploy/teploy-observe
+sources:
+  - https://github.com/useteploy/teploy-observe
