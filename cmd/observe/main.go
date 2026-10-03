@@ -39,6 +39,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/feedback"
 	"github.com/useteploy/teploy-observe/internal/flags"
 	"github.com/useteploy/teploy-observe/internal/groups"
+	"github.com/useteploy/teploy-observe/internal/guardmap"
 	"github.com/useteploy/teploy-observe/internal/heatmaps"
 	"github.com/useteploy/teploy-observe/internal/incidents"
 	"github.com/useteploy/teploy-observe/internal/infra"
@@ -448,6 +449,9 @@ func main() {
 	surveySvc := surveys.NewSurveyService(db, cfg.SessionSalt, siteSvc)
 	logSvc := logs.NewLogService(db)
 	logSvc.SetPipelines(pipelineSvc)
+	// The same limiter and budgets guard the log and metric read paths.
+	logSvc.WithQueryGuard(queryLimiter, queryBudgets)
+	metricsSvc.WithQueryGuard(queryLimiter, queryBudgets)
 	uptimeSvc := monitoring.NewUptimeService(db, logger)
 	cronSvc := monitoring.NewCronService(db, logger)
 	linkSvc := tracking.NewLinkService(db)
@@ -4554,7 +4558,8 @@ func logSearchHandler(svc *logs.LogService) neutron.HandlerFunc[logSearchInput, 
 		if err != nil {
 			return nil, neutron.ErrBadRequest(err.Error())
 		}
-		return emptyOnNil(svc.SearchLogs(ctx, input.SiteID, from, to, input.Level, input.Service, input.Query, input.Limit, input.Offset))
+		out, err := svc.SearchLogs(ctx, input.SiteID, from, to, input.Level, input.Service, input.Query, input.Limit, input.Offset)
+		return emptyOnNil(out, guardmap.HTTPError(err))
 	}
 }
 
@@ -4573,7 +4578,8 @@ func logStatsHandler(svc *logs.LogService) neutron.HandlerFunc[logStatsInput, []
 		if err != nil {
 			return nil, neutron.ErrBadRequest(err.Error())
 		}
-		return emptyOnNil(svc.LogStats(ctx, input.SiteID, from, to))
+		out, err := svc.LogStats(ctx, input.SiteID, from, to)
+		return emptyOnNil(out, guardmap.HTTPError(err))
 	}
 }
 
@@ -4593,7 +4599,8 @@ func logHistogramHandler(svc *logs.LogService) neutron.HandlerFunc[logHistogramI
 		if err != nil {
 			return nil, neutron.ErrBadRequest(err.Error())
 		}
-		return emptyOnNil(svc.Histogram(ctx, input.SiteID, from, to, input.BucketMs))
+		out, err := svc.Histogram(ctx, input.SiteID, from, to, input.BucketMs)
+		return emptyOnNil(out, guardmap.HTTPError(err))
 	}
 }
 
