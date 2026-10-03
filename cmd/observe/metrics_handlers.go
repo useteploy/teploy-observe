@@ -8,8 +8,20 @@ import (
 
 	"github.com/neutron-build/neutron/go/neutron"
 
+	"github.com/useteploy/teploy-observe/internal/guardmap"
 	"github.com/useteploy/teploy-observe/internal/metrics"
 )
+
+// writeMetricsError answers a failed read. O12 admission refusals keep
+// their labeled 429/504 problem response; every other error keeps the
+// handler's historical status.
+func writeMetricsError(w http.ResponseWriter, r *http.Request, err error, fallback int) {
+	if mapped := guardmap.HTTPError(err); mapped != err {
+		neutron.WriteError(w, r, mapped)
+		return
+	}
+	http.Error(w, err.Error(), fallback)
+}
 
 // RegisterMetricsRoutes wires the metrics API onto the root router. Three
 // concerns are bundled here:
@@ -44,7 +56,7 @@ func metricsListHandler(svc *metrics.Service) http.HandlerFunc {
 		}
 		list, err := svc.ListMetrics(r.Context(), siteID)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeMetricsError(w, r, err, http.StatusInternalServerError)
 			return
 		}
 		if list == nil {
@@ -77,7 +89,7 @@ func metricsQueryHandler(svc *metrics.Service) http.HandlerFunc {
 		}
 		points, err := svc.Query(r.Context(), req.siteID, req.name, req.labels, req.fromMs, req.toMs, req.agg)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeMetricsError(w, r, err, http.StatusBadRequest)
 			return
 		}
 		if points == nil {
@@ -108,7 +120,7 @@ func metricsSeriesHandler(svc *metrics.Service) http.HandlerFunc {
 			GroupBy: req.groupBy,
 		})
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeMetricsError(w, r, err, http.StatusBadRequest)
 			return
 		}
 		if series == nil {

@@ -253,9 +253,13 @@ Declared limits, fixture-tested scale points, and where to read them live:
   a row.
 
 ### Product tools
-- Feature flags (boolean + multivariate, rollout %, user targeting).
+- Feature flags (boolean + multivariate, rollout %, user targeting),
+  evaluated over a public HTTP endpoint (`POST /api/v1/flags/evaluate`);
+  there is no flag client in the browser SDK.
 - A/B experiments (frequentist p-value + Bayesian probability-to-beat).
-- Surveys, custom dashboards with panels.
+- Surveys (create / activate / collect responses via the API and UI; there
+  is no on-page survey widget, so you render them yourself), custom
+  dashboards with panels, and dynamic AND-only cohorts.
 
 ### Platform
 - **RBAC** enforced — JWT carries a role claim (`admin` / `editor` /
@@ -295,10 +299,17 @@ Declared limits, fixture-tested scale points, and where to read them live:
 - **Per-site rate limiting** — each site has its own token bucket. One
   noisy site can't starve a quiet one. Admin-editable via
   `PUT /api/v1/sites/{id}/ratelimit`.
-- Alerting (threshold per metric, cooldown, silence). Alert-fire
-  auto-opens an incident marker.
-- Integrations (Jira, GitHub, PagerDuty, Slack, email) + webhooks.
-- SSO / SAML, email digests, data export (CSV/JSON).
+- Alerting (threshold rules on `pageviews`, `visitors`, `error_count` and
+  `error_rate`, with cooldown and silence). Alert-fire auto-opens an
+  incident marker and delivers to webhooks.
+- Integrations (Jira, GitHub, PagerDuty, Slack, email) can be configured,
+  tested and replayed from `/api/v1/integrations`, but alerts and issue
+  events do not trigger them today: the delivery path
+  (`IntegrationService.Fire`) has no production caller. Only webhooks
+  receive alert notifications.
+- SSO via OIDC (see below). SAML is not available: the SAML callback is
+  disabled and returns 501 (`internal/sso/sso.go`). Also email digests and
+  data export (CSV/JSON).
 - SQL query explorer with lexer-guarded read-only enforcement
   (rejects `/* comment */ INSERT ...` and stacked statements).
 - `POST /api/v1/query/explain` returns the Nucleus plan.
@@ -385,6 +396,9 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 | `OBSERVE_RAW_RETENTION_DAYS` | `30` | Raw event retention. Also the window over which visitor counts are exact from raw events; past it they are counted from the `sessions` table (90 days), and past both the dashboard says which window the figure covers. |
 | `OBSERVE_HOURLY_RETENTION_DAYS` | `365` | Hourly rollup retention. |
 | `OBSERVE_LLM_RETENTION_DAYS` | `30` | LLM trace retention, including stored prompts/completions. Must be at least 1. Cleanup runs daily; historical model-price catalog entries are retained. Logical expiry does not guarantee database files immediately shrink. |
+| `OBSERVE_METRICS_RETENTION_DAYS` | `30` | OTLP metric point (`metric_points`) retention. Must be at least 1. |
+| `OBSERVE_INFRA_RETENTION_DAYS` | `30` | Host metric (`host_metrics`) retention. Must be at least 1. |
+| `OBSERVE_UPTIME_RETENTION_DAYS` | `90` | Uptime check result (`uptime_results`) retention. Must be at least 1. Fixed windows on the same daily cleanup: `performance_issues` 90 days (by last detection), `service_dependencies` 30 days. |
 | `OBSERVE_LOG_ROUTES` | `0` | Set to `1` to print route table at boot. |
 | `OBSERVE_SMTP_HOST` | | SMTP server for email reports. |
 | `OBSERVE_SMTP_PORT` | `587` | SMTP port. |

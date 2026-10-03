@@ -39,12 +39,18 @@
 
 services:
   nucleus:
-    image: ghcr.io/neutron-build/nucleus:latest
+    # Pinned (was :latest). Keep in sync with NUCLEUS_VERSION in
+    # .github/workflows/ci.yml; override with NUCLEUS_VERSION=... to upgrade.
+    image: ghcr.io/neutron-build/nucleus:${NUCLEUS_VERSION:-v1.1.1}
     restart: unless-stopped
     networks:
       # R43 (round 4): database on the internal backend network only — the
       # TLS proxy (and anything else on frontend) cannot reach it directly.
       backend: {}
+    # No `ports:` on purpose. NUCLEUS_ALLOW_NO_AUTH=1 below means anyone who
+    # can reach 5432 has full database access; the only network this service
+    # joins is the `internal: true` backend network. See
+    # docs/operations/hardening.md before changing this.
     volumes:
       - nucleus_data:/data
     command: ["start", "--port", "5432", "--cluster-port", "5433", "--data", "/data", "--max-memory", "512"]
@@ -130,13 +136,13 @@ services:
     volumes:
       - caddy_data:/data
       - caddy_config:/config
-    command:
-      - caddy
-      - reverse-proxy
-      - --from
-      - "${OBSERVE_DOMAIN:-observe.localhost}"
-      - --to
-      - "observe:3000"
+      - ./packaging/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+    environment:
+      OBSERVE_DOMAIN: "${OBSERVE_DOMAIN:-observe.localhost}"
+    # Security headers (HSTS, nosniff, Referrer-Policy, frame-ancestors) live
+    # in packaging/caddy/Caddyfile; the old `caddy reverse-proxy` one-liner
+    # set none of them.
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
     depends_on:
       observe:
         condition: service_healthy

@@ -1,0 +1,180 @@
+# Observe is SINGLE-INSTANCE. There is no clustering: the ingest WAL is a
+# single-process on-disk queue and Nucleus runs as one node. Both workloads are
+# StatefulSets with replicas fixed at 1 in the templates; there is deliberately
+# no replicaCount value. Running a second Observe against the same data or
+# database is unsupported. See docs/operations/kubernetes.md.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/useteploy/teploy-observe
+  # Empty means the chart appVersion (release image tags carry no "v").
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+observe:
+  # OBSERVE_SITE_ID, OBSERVE_PUBLIC_URL, OBSERVE_TRUSTED_PROXIES
+  siteId: default
+  # External base URL. Set it whenever the instance is reachable by a name.
+  publicUrl: ""
+  # Comma-separated CIDRs whose X-Forwarded-For is trusted (your ingress
+  # controller pods). Empty trusts no one.
+  trustedProxies: ""
+  adminUser: admin
+  seedDemo: false
+  # Plain (non-secret) OBSERVE_* settings, e.g. OBSERVE_RAW_RETENTION_DAYS.
+  # Values are rendered as strings.
+  env:
+    OBSERVE_BUFFER_SIZE: "100000"
+    OBSERVE_FLUSH_INTERVAL_MS: "2000"
+    OBSERVE_FLUSH_SIZE: "500"
+    OBSERVE_RAW_RETENTION_DAYS: "30"
+    OBSERVE_HOURLY_RETENTION_DAYS: "365"
+  # Extra env entries in full Kubernetes EnvVar form (valueFrom etc.).
+  extraEnv: []
+  # Must exceed Observe's own shutdown drain (compose uses 90s).
+  terminationGracePeriodSeconds: 90
+  persistence:
+    size: 10Gi
+    storageClassName: ""
+    accessModes: [ReadWriteOnce]
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { memory: 1Gi }
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+nucleus:
+  # false = use an external database (set externalUrl); the Nucleus StatefulSet,
+  # Service and NetworkPolicy are not rendered.
+  enabled: true
+  externalUrl: ""
+  image:
+    repository: ghcr.io/neutron-build/nucleus
+    # Pinned. Do not use :latest. Supported release: v1.1.1.
+    tag: v1.1.1
+    pullPolicy: IfNotPresent
+  port: 5432
+  maxMemoryMB: 512
+  persistence:
+    size: 20Gi
+    storageClassName: ""
+    accessModes: [ReadWriteOnce]
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 768Mi }
+  # Nucleus runs with NUCLEUS_ALLOW_NO_AUTH=1: anyone who can open a TCP
+  # connection to it owns all data. Keep this NetworkPolicy on. It needs a CNI
+  # that enforces NetworkPolicy (Calico, Cilium, ...); otherwise it is ignored.
+  networkPolicy:
+    enabled: true
+  # Not verified for the Nucleus image (user/path layout unknown here), so the
+  # root filesystem is left writable and the user is the image default.
+  # Dropped capabilities and no privilege escalation still apply.
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities: { drop: [ALL] }
+  podSecurityContext: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Secrets. OBSERVE_JWT_SECRET and OBSERVE_SESSION_SALT are REQUIRED: the chart
+# refuses to render unless one of (a) existingSecret, (b) explicit values, or
+# (c) autogenerate=true is chosen. Unset in the app means "random per start",
+# which logs everyone out on every restart.
+secrets:
+  # Name of a Secret you manage. Key names are configurable below.
+  existingSecret: ""
+  keys:
+    jwtSecret: OBSERVE_JWT_SECRET
+    sessionSalt: OBSERVE_SESSION_SALT
+    secretKey: OBSERVE_SECRET_KEY
+    adminPassword: OBSERVE_ADMIN_PASSWORD
+  # Inline values (stored in the release Secret; prefer existingSecret).
+  jwtSecret: ""
+  sessionSalt: ""
+  # Optional. Master key encrypting stored LLM/S3 credentials at rest.
+  secretKey: ""
+  # Optional. Empty = first-run /setup wizard creates the admin.
+  adminPassword: ""
+  # Generate jwtSecret/sessionSalt once and persist them via lookup. WARNING:
+  # lookup returns nothing under `helm template`, `--dry-run` and Argo CD/Flux
+  # rendering, so those regenerate values every render and invalidate all
+  # sessions. Use existingSecret there.
+  autogenerate: false
+
+service:
+  type: ClusterIP
+  port: 3000
+  annotations: {}
+
+# Separate telemetry-only listener (OBSERVE_INGEST_ADDR). Expose THIS publicly,
+# never the dashboard.
+ingest:
+  enabled: false
+  port: 3001
+  service:
+    type: ClusterIP
+    annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: observe.example.com
+  tls:
+    enabled: false
+    secretName: ""
+  # Ingress for the ingest listener (requires ingest.enabled).
+  ingest:
+    enabled: false
+    host: ingest.example.com
+    annotations: {}
+    tls:
+      enabled: false
+      secretName: ""
+
+# Observe runs as 10001 (Dockerfile). The root filesystem is read-only; /tmp
+# is an emptyDir because backup/restore stage files there.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: { drop: [ALL] }
+  seccompProfile: { type: RuntimeDefault }
+podSecurityContext:
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+tmpSizeLimit: 1Gi
+
+# Probes target /healthz, which runs SELECT 1 and answers 503 when the
+# database is unreachable or ingest durability is degraded. 503 => not Ready
+# (removed from Service), which is intended. /healthz is NOT used for liveness:
+# a database outage must not restart-loop the pod. Timeouts follow the
+# Dockerfile (cold Nucleus connect measured ~7.8s).
+probes:
+  startup:
+    periodSeconds: 5
+    timeoutSeconds: 12
+    failureThreshold: 36
+  readiness:
+    periodSeconds: 15
+    timeoutSeconds: 12
+    failureThreshold: 3
+  liveness:
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+# A PodDisruptionBudget is intentionally not provided: with one replica,
+# minAvailable 1 would block node drains forever and maxUnavailable 1 is a
+# no-op. A drain restarts the pod; the durable WAL covers acknowledged events.

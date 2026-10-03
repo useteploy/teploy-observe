@@ -10,10 +10,58 @@ import (
 	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/identity"
 )
 
 type ExperimentService struct {
 	db *nucleus.Client
+
+	// Optional per-site privacy lookup for EventDistinctID; nil means the
+	// helper falls back to the global salt (matches the ingest path for
+	// unknown sites).
+	privacy PrivacyLookup
+	salt    string
+}
+
+// PrivacyLookup resolves a site's distinct_id hashing config: the per-site
+// salt and whether the site stores raw distinct_ids. ok=false means the
+// site is unknown. Satisfied by (*sites.SiteService).PrivacyConfig.
+type PrivacyLookup func(ctx context.Context, siteID string) (salt string, rawOptIn bool, ok bool)
+
+// WithPrivacy installs the per-site lookup and the global fallback salt used
+// by EventDistinctID. Returns the receiver for fluent boot-time setup.
+func (s *ExperimentService) WithPrivacy(lookup PrivacyLookup, fallbackSalt string) *ExperimentService {
+	s.privacy = lookup
+	s.salt = fallbackSalt
+	return s
+}
+
+// EventDistinctID derives, from a raw experiment user id, the exact
+// distinct_id the event pipeline stores on events for the same user: the
+// HMAC under the site's salt (or the raw value for a raw_distinct_id site),
+// resolved the same way internal/ingest does (per-site config, global salt
+// fallback for unknown sites).
+//
+// Identity contract (see docs/IDENTITY_MODEL_ADR.md): exposure and
+// conversion rows keep the user_id the caller sent, verbatim, and are joined
+// to each other on it. Events carry the hashed distinct_id. Anything that
+// must join experiment rows to the events table (a goal measured from
+// events, a per-user drill-down) has to hash the experiment user_id with
+// this helper first, or send the already-hashed id to the expose/convert
+// endpoints from the start. Stored values are deliberately not rewritten
+// (D5: no silent history rewrites).
+func (s *ExperimentService) EventDistinctID(ctx context.Context, siteID, rawUserID string) string {
+	if rawUserID == "" {
+		return ""
+	}
+	salt, rawOptIn := s.salt, false
+	if s.privacy != nil {
+		if ps, raw, ok := s.privacy(ctx, siteID); ok {
+			salt, rawOptIn = ps, raw
+		}
+	}
+	return identity.MaybeHashDistinctID(rawUserID, salt, rawOptIn)
 }
 
 func NewExperimentService(db *nucleus.Client) *ExperimentService {
@@ -136,19 +184,31 @@ func (s *ExperimentService) RecordExposure(ctx context.Context, experimentID, si
 	return err
 }
 
+// firstExposureSQL selects the user's earliest exposure (attribution
+// choice documented on RecordConversion).
+const firstExposureSQL = `SELECT variant FROM experiment_exposures
+		 WHERE experiment_id = $1 AND site_id = $2 AND user_id = $3
+		 ORDER BY timestamp ASC LIMIT 1`
+
 // RecordConversion records that an exposed user converted. The conversion is
 // stored in its own append-only table (not a row-copy back into exposures,
 // which used to duplicate rows and corrupt counts). The user's variant is
 // resolved from their exposure so Results can attribute the conversion without
 // a join. A conversion with no prior exposure is ignored.
+//
+// Attribution is FIRST-exposure: the stored variant is the one the user was
+// first assigned to, the same choice every first-touch experiment readout
+// makes. It used to read the LATEST exposure, so a user exposed to several
+// variants (an allocation change mid-run, a client that re-sends expose with
+// a different arm) was attributed to whichever arm happened to expose last,
+// and the answer moved as more exposures arrived. Note Results does not read
+// this stored variant: it counts a converting user in every arm whose
+// in-interval exposure window contains the conversion.
 func (s *ExperimentService) RecordConversion(ctx context.Context, experimentID, siteID, userID string) error {
 	type vrow struct {
 		Variant string `db:"variant"`
 	}
-	rows, err := nucleus.Query[vrow](ctx, s.db.SQL(),
-		`SELECT variant FROM experiment_exposures
-		 WHERE experiment_id = $1 AND site_id = $2 AND user_id = $3
-		 ORDER BY timestamp DESC LIMIT 1`,
+	rows, err := nucleus.Query[vrow](ctx, s.db.SQL(), firstExposureSQL,
 		experimentID, siteID, userID)
 	if err != nil {
 		return err

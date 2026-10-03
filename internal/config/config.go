@@ -34,6 +34,11 @@ type Config struct {
 	RawRetentionDays    int
 	HourlyRetentionDays int
 	LLMRetentionDays    int
+	// Telemetry retention: metric_points, host_metrics and uptime_results
+	// were previously unbounded.
+	MetricsRetentionDays int
+	InfraRetentionDays   int
+	UptimeRetentionDays  int
 	// Ledger retention (O01 ADR 5.8, decided 2026-09-23). Expiry means a
 	// retried record is processed as new — no silent infinite exactly-once
 	// promise beyond the window.
@@ -97,6 +102,9 @@ func Load() Config {
 	set("OBSERVE_RAW_RETENTION_DAYS", 30, &c.RawRetentionDays)
 	set("OBSERVE_HOURLY_RETENTION_DAYS", 365, &c.HourlyRetentionDays)
 	set("OBSERVE_LLM_RETENTION_DAYS", 30, &c.LLMRetentionDays)
+	set("OBSERVE_METRICS_RETENTION_DAYS", 30, &c.MetricsRetentionDays)
+	set("OBSERVE_INFRA_RETENTION_DAYS", 30, &c.InfraRetentionDays)
+	set("OBSERVE_UPTIME_RETENTION_DAYS", 90, &c.UptimeRetentionDays)
 	// O01 slice 5 ledger retention (decided defaults 2026-09-23): the
 	// error_inbox and replay_batches ledgers must not outlive the data they
 	// dedupe (error_events 180d, replay_sessions 14d); derived_outbox
@@ -172,6 +180,15 @@ func (c Config) Validate() error {
 	}
 	if c.LLMRetentionDays < 1 {
 		return fmt.Errorf("OBSERVE_LLM_RETENTION_DAYS must be >= 1, got %d", c.LLMRetentionDays)
+	}
+	if c.MetricsRetentionDays < 1 {
+		return fmt.Errorf("OBSERVE_METRICS_RETENTION_DAYS must be >= 1, got %d", c.MetricsRetentionDays)
+	}
+	if c.InfraRetentionDays < 1 {
+		return fmt.Errorf("OBSERVE_INFRA_RETENTION_DAYS must be >= 1, got %d", c.InfraRetentionDays)
+	}
+	if c.UptimeRetentionDays < 1 {
+		return fmt.Errorf("OBSERVE_UPTIME_RETENTION_DAYS must be >= 1, got %d", c.UptimeRetentionDays)
 	}
 	if c.ErrorInboxRetentionDays < 1 {
 		return fmt.Errorf("OBSERVE_ERROR_INBOX_RETENTION_DAYS must be >= 1, got %d", c.ErrorInboxRetentionDays)
