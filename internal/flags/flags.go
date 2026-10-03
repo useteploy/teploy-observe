@@ -1,17 +1,15 @@
 package flags
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -76,6 +74,9 @@ type Variant struct {
 	Key        string `json:"key"`
 	Name       string `json:"name"`
 	RolloutPct int    `json:"rollout_pct"`
+	// Payload is optional JSON returned with the variant by evaluate
+	// (<= MaxPayloadBytes compacted). Absent and null mean no payload.
+	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
 // Evaluation condition, carried additively on every SDK response (O08).
@@ -89,8 +90,13 @@ const (
 type EvaluationResult struct {
 	Enabled bool   `json:"enabled"`
 	Variant string `json:"variant,omitempty"`
-	Reason  string `json:"reason"`
-	Detail  string `json:"detail,omitempty"`
+	// Payload is the chosen variant's JSON payload, when it has one.
+	Payload json.RawMessage `json:"payload,omitempty"`
+	// Group is the key of the condition group that admitted the user
+	// (groups-format targeting only).
+	Group  string `json:"group,omitempty"`
+	Reason string `json:"reason"`
+	Detail string `json:"detail,omitempty"`
 }
 
 func (s *FlagService) Create(ctx context.Context, siteID, flagKey, name, description, flagType, variants, targeting string, rolloutPct int) (*FeatureFlag, error) {
@@ -110,10 +116,7 @@ func (s *FlagService) Create(ctx context.Context, siteID, flagKey, name, descrip
 	// or a semantically invalid ruleset (unknown operator, missing value)
 	// stores fine and used to silently skip the targeting condition at
 	// evaluation. Reject here, naming the error.
-	if _, err := ValidateTargeting(targeting); err != nil {
-		return nil, &ValidationError{Err: err}
-	}
-	if _, err := ValidateVariants(variants); err != nil {
+	if err := ValidateConfig(flagType, variants, targeting); err != nil {
 		return nil, &ValidationError{Err: err}
 	}
 
@@ -234,11 +237,8 @@ type ValidationError struct{ Err error }
 func (e *ValidationError) Error() string { return e.Err.Error() }
 func (e *ValidationError) Unwrap() error { return e.Err }
 
-var targetingOperators = map[string]bool{
-	"eq": true, "neq": true, "in": true, "not_in": true, "contains": true,
-}
-
-// ValidateTargeting parses and sanity-checks a targeting ruleset. Empty,
+// ValidateTargeting parses and sanity-checks a LEGACY flat targeting ruleset
+// (the groups format is handled by parseTargetingConfig). Empty,
 // "null" and "[]" mean "no restrictions" and are valid. Anything else must
 // be a JSON array of rules with a non-empty attribute, a known operator
 // and a present value — the same operators matchesTargeting enforces.
@@ -250,16 +250,8 @@ func ValidateTargeting(raw string) ([]TargetingRule, error) {
 	if err := json.Unmarshal([]byte(raw), &rules); err != nil {
 		return nil, fmt.Errorf("targeting: invalid JSON: %w", err)
 	}
-	for i, r := range rules {
-		if r.Attribute == "" {
-			return nil, fmt.Errorf("targeting: rule %d: attribute is required", i)
-		}
-		if !targetingOperators[r.Operator] {
-			return nil, fmt.Errorf("targeting: rule %d: unknown operator %q", i, r.Operator)
-		}
-		if r.Value == nil {
-			return nil, fmt.Errorf("targeting: rule %d: value is required", i)
-		}
+	if err := validateRules(rules, "rule"); err != nil {
+		return nil, err
 	}
 	return rules, nil
 }
@@ -287,6 +279,16 @@ func ValidateVariants(raw string) ([]Variant, error) {
 		if v.RolloutPct < 0 || v.RolloutPct > 100 {
 			return nil, fmt.Errorf("variants: entry %d: rollout_pct %d out of range 0..100", i, v.RolloutPct)
 		}
+		if len(v.Payload) > 0 {
+			var compact bytes.Buffer
+			if err := json.Compact(&compact, v.Payload); err != nil {
+				return nil, fmt.Errorf("variants: entry %d: payload is not valid JSON: %w", i, err)
+			}
+			if compact.Len() > MaxPayloadBytes {
+				return nil, fmt.Errorf("variants: entry %d: payload is %d bytes, limit %d", i, compact.Len(), MaxPayloadBytes)
+			}
+			variants[i].Payload = json.RawMessage(compact.Bytes())
+		}
 	}
 	return variants, nil
 }
@@ -311,53 +313,6 @@ func errorClass(err error) string {
 	default:
 		return "storage"
 	}
-}
-
-func matchesTargeting(rules []TargetingRule, userCtx map[string]string) bool {
-	for _, r := range rules {
-		actual, ok := userCtx[r.Attribute]
-		if !ok {
-			return false
-		}
-		switch r.Operator {
-		case "eq":
-			if actual != fmt.Sprintf("%v", r.Value) {
-				return false
-			}
-		case "neq":
-			if actual == fmt.Sprintf("%v", r.Value) {
-				return false
-			}
-		case "in":
-			vals := toStringSlice(r.Value)
-			found := false
-			for _, v := range vals {
-				if actual == v {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
-		case "not_in":
-			vals := toStringSlice(r.Value)
-			for _, v := range vals {
-				if actual == v {
-					return false
-				}
-			}
-		case "contains":
-			if !strings.Contains(actual, fmt.Sprintf("%v", r.Value)) {
-				return false
-			}
-		default:
-			// Fail closed: an unknown operator must not silently match (which
-			// would expose a flag to everyone), so treat the rule as unmatched.
-			return false
-		}
-	}
-	return true
 }
 
 func toStringSlice(v any) []string {
@@ -394,8 +349,11 @@ func toStringSlice(v any) []string {
 // invalid both answer Enabled=false. Flags gate feature exposure and the
 // create-path default is disabled, so neither an outage nor a corrupt
 // config may widen exposure. A per-flag fail-open override (the
-// kill-switch pattern) needs a stored default plus an SDK contract —
-// recorded as an O08 residual.
+// kill-switch pattern) needs a stored default readable WITHOUT the config
+// it guards (it cannot live in the targeting JSON: an unavailable or
+// invalid config is exactly when it is needed) plus an SDK contract, so it
+// stays an O08 residual. SDKs that evaluate locally from
+// GET /api/v1/flags/config can keep their last-known config instead.
 func (s *FlagService) Evaluate(ctx context.Context, siteID, flagKey, userID string, userCtx map[string]string) (*EvaluationResult, error) {
 	rows, err := s.fetchFlag(ctx, siteID, flagKey)
 	if err != nil {
@@ -417,48 +375,15 @@ func (s *FlagService) Evaluate(ctx context.Context, siteID, flagKey, userID stri
 	// config surfaces even while the flag is disabled (operators learn
 	// without enabling first), and so invalid rules can never be evaluated
 	// as "no restrictions".
-	rules, err := ValidateTargeting(flag.Targeting)
-	if err != nil {
-		return s.quarantine(flag, "targeting", err), nil
-	}
-	var variants []Variant
-	if flag.FlagType == "multivariate" && flag.Variants != "" {
-		variants, err = ValidateVariants(flag.Variants)
-		if err != nil {
-			return s.quarantine(flag, "variants", err), nil
-		}
+	def, cerr := ParseDefinition(flag)
+	if cerr != nil {
+		return s.quarantine(flag, cerr.Part, cerr.Err), nil
 	}
 
-	if !flag.Enabled {
-		return &EvaluationResult{Enabled: false, Reason: ReasonEvaluated, Detail: "flag disabled"}, nil
-	}
-
-	if flag.RolloutPct < 100 {
-		hash := hashUser(flagKey, userID)
-		if hash > flag.RolloutPct {
-			return &EvaluationResult{Enabled: false, Reason: ReasonEvaluated, Detail: "rollout"}, nil
-		}
-	}
-
-	if len(rules) > 0 && !matchesTargeting(rules, userCtx) {
-		return &EvaluationResult{Enabled: false, Reason: ReasonEvaluated, Detail: "targeting"}, nil
-	}
-
-	result := &EvaluationResult{Enabled: true, Reason: ReasonEvaluated}
-
-	if flag.FlagType == "multivariate" && len(variants) > 0 {
-		hash := hashUser(flagKey+":variant", userID)
-		cumulative := 0
-		for _, v := range variants {
-			cumulative += v.RolloutPct
-			if hash <= cumulative {
-				result.Variant = v.Key
-				break
-			}
-		}
-		if result.Variant == "" {
-			result.Variant = variants[0].Key
-		}
+	r := EvaluateDefinition(def, userID, userCtx)
+	result := &r
+	if !result.Enabled {
+		return result, nil
 	}
 
 	// Fire-and-forget: evaluation tracking is best-effort, must not block
@@ -494,11 +419,8 @@ func (s *FlagService) quarantine(flag FeatureFlag, part string, err error) *Eval
 	}
 }
 
-func hashUser(flagKey, userID string) int {
-	h := sha256.Sum256([]byte(flagKey + ":" + userID))
-	val := int(h[0])<<8 | int(h[1])
-	return int(math.Abs(float64(val%100))) + 1
-}
+// hashUser is the pre-groups name for Bucket, kept for existing tests.
+func hashUser(flagKey, userID string) int { return Bucket(flagKey, userID) }
 
 func genID() string {
 	b := make([]byte, 16)
