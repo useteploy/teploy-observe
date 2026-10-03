@@ -436,6 +436,9 @@ func main() {
 	// Feature expansion services
 	reportSvc := reports.NewReportService(db, logger)
 	integrationSvc := integrations.NewIntegrationService(db, logger)
+	// New-issue and regression events fire the site's integrations. Wired
+	// after the demo seed above so seeded issues do not page anyone.
+	issueNotifier := wireIssueNotifications(issueSvc, integrationSvc, cfg.PublicURL)
 	feedbackSvc := feedback.NewFeedbackService(db)
 	viewSvc := views.NewViewService(db)
 	explorerSvc := explorer.NewExplorerService(db)
@@ -656,6 +659,12 @@ func main() {
 		}),
 		// R22 (round 4): webhook delivery drains on shutdown instead of
 		// dying with the process mid-alert.
+		neutron.WithLifecycle(neutron.LifecycleHook{
+			Name: "issue-notifications",
+			OnStop: func(ctx context.Context) error {
+				return shutdownIssueNotifications(issueNotifier)
+			},
+		}),
 		neutron.WithLifecycle(neutron.LifecycleHook{
 			Name: "webhook-delivery",
 			OnStop: func(ctx context.Context) error {
@@ -1707,6 +1716,13 @@ func main() {
 		// conflicting-id / pending (plus the legacy queued/bytes backlog
 		// fields and replayed-on-restart).
 		health["errors"] = errorBuf.Stats()
+		// Source-map resolution outcomes per frame (hit / no map for the
+		// release+file / map without a covering mapping / read error).
+		health["sourcemaps"] = sourcemaps.Stats()
+		// New-issue / regression integration notifications: queue depth,
+		// delivered / failed / timed-out, and the overflow and cooldown
+		// suppression counters.
+		health["issue_notifications"] = issueNotifier.Stats()
 		// O08: flag-evaluation condition counters — how many evaluations
 		// could not read their config (unavailable) and how many flags
 		// were quarantined from evaluation by invalid stored config.

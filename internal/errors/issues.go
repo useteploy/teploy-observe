@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
@@ -48,6 +49,8 @@ const issueSelectCols = `issue_id, tenant_id, site_id, group_hash, title, culpri
 // IssueService manages error grouping, issue creation, and the grouphash-to-issue KV cache.
 type IssueService struct {
 	db *nucleus.Client
+	// notifier receives new-issue and regression events (see notify.go).
+	notifier atomic.Pointer[IssueNotifier]
 }
 
 func NewIssueService(db *nucleus.Client) *IssueService {
@@ -172,6 +175,10 @@ func kvCacheKey(siteID, groupHash string) string {
 type cachedIssue struct {
 	IssueID    string `json:"id"`
 	EventCount int64  `json:"ec"`
+	// Resolved marks an issue UpdateStatus resolved, so the cache-hit path
+	// can recognise the next event as a regression without a SQL read. The
+	// cache-miss path reads the real status and does not depend on it.
+	Resolved bool `json:"rs,omitempty"`
 }
 
 // ResolveIssue looks up or creates an issue for the given grouphash.
@@ -188,6 +195,12 @@ func (s *IssueService) ResolveIssue(ctx context.Context, siteID, groupHash, titl
 			newCount := ci.EventCount + 1
 			_ = s.bumpIssue(ctx, ci.IssueID, siteID, ts, newCount)
 			ci.EventCount = newCount
+			if ci.Resolved {
+				// bumpIssue reopened it (resolved -> open).
+				ci.Resolved = false
+				s.notify(ctx, IssueEvent{Kind: IssueEventRegression, SiteID: siteID, IssueID: ci.IssueID,
+					Title: title, Culprit: culprit, Level: level, Release: release, EventCount: newCount})
+			}
 			if raw, err := json.Marshal(ci); err == nil {
 				_ = kv.Set(ctx, cacheKey, raw)
 			}
@@ -203,6 +216,10 @@ func (s *IssueService) ResolveIssue(ctx context.Context, siteID, groupHash, titl
 		ci := cachedIssue{IssueID: existing.IssueID, EventCount: newCount}
 		if raw, err := json.Marshal(ci); err == nil {
 			_ = kv.Set(ctx, cacheKey, raw)
+		}
+		if existing.Status == "resolved" {
+			s.notify(ctx, IssueEvent{Kind: IssueEventRegression, SiteID: siteID, IssueID: existing.IssueID,
+				Title: existing.Title, Culprit: existing.Culprit, Level: existing.Level, Release: release, EventCount: newCount})
 		}
 		return existing.IssueID, nil
 	}
@@ -229,7 +246,38 @@ func (s *IssueService) ResolveIssue(ctx context.Context, siteID, groupHash, titl
 		_ = kv.Set(ctx, cacheKey, raw)
 	}
 
+	s.notify(ctx, IssueEvent{Kind: IssueEventNew, SiteID: siteID, IssueID: issueID,
+		Title: title, Culprit: culprit, Level: level, Release: release, EventCount: 1})
 	return issueID, nil
+}
+
+// markCachedResolved records on the grouphash cache entry (when one exists)
+// whether the issue is now resolved. Best-effort: a miss only costs the
+// cache-hit path a regression notification until the entry is rebuilt from
+// the database, which reads the real status.
+func (s *IssueService) markCachedResolved(ctx context.Context, issueID, siteID string, resolved bool) {
+	rows, err := nucleus.Query[issueScan](ctx, s.db.SQL(),
+		`SELECT `+issueSelectCols+`
+		 FROM `+issuesLatest("issue_id = $1 AND site_id = $2"),
+		issueID, siteID,
+	)
+	if err != nil || len(rows) == 0 {
+		return
+	}
+	kv := s.db.KV()
+	key := kvCacheKey(siteID, rows[0].GroupHash)
+	data, err := kv.Get(ctx, key)
+	if err != nil || data == nil {
+		return
+	}
+	var ci cachedIssue
+	if json.Unmarshal(data, &ci) != nil || ci.IssueID != issueID || ci.Resolved == resolved {
+		return
+	}
+	ci.Resolved = resolved
+	if raw, err := json.Marshal(ci); err == nil {
+		_ = kv.Set(ctx, key, raw)
+	}
 }
 
 func (s *IssueService) findIssueByHash(ctx context.Context, siteID, groupHash string) (*Issue, error) {
@@ -317,6 +365,9 @@ func (s *IssueService) UpdateStatus(ctx context.Context, issueID, siteID, status
 		 FROM `+issuesLatest("issue_id = $1 AND site_id = $2"),
 		issueID, siteID, status, now, untilStr,
 	)
+	if err == nil {
+		s.markCachedResolved(ctx, issueID, siteID, status == "resolved")
+	}
 	return err
 }
 

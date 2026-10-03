@@ -65,6 +65,11 @@ const DefaultKeepReleases = 10
 // legacy key so pre-upgrade maps stay resolvable until pruned.
 func (s *SourceMapService) Upload(ctx context.Context, siteID, release, filename string, mapData []byte) error {
 	kv := s.db.KV()
+	// Store under the canonical name (no query/fragment/host/leading slash)
+	// so lookups can match a frame's full URL, path or basename to it.
+	if c := canonicalName(filename); c != "" {
+		filename = c
+	}
 	key := kvKeyV2(siteID, release, filename)
 	if err := kv.Set(ctx, key, mapData); err != nil {
 		return err
@@ -265,8 +270,7 @@ func releasesSetKey(siteID string) string {
 // unavailable store used to look identical to an unsymbolicated stack, so
 // outages produced silently wrong output instead of a diagnosable one.
 func (s *SourceMapService) ResolveFrame(ctx context.Context, siteID, release, filename string, line, col int) (*SourceMapping, error) {
-	kv := s.db.KV()
-	meta, err := loadSourceMap(ctx, kv, siteID, release, filename)
+	meta, err := findSourceMap(ctx, s.db.KV(), siteID, release, filename)
 	if err != nil || meta == nil {
 		return nil, err
 	}
@@ -281,7 +285,7 @@ const maxSourceMapBytes = 8 << 20
 
 // loadSourceMap fetches and parses the map for one (site, release, file),
 // trying the v2 key first and falling back to the legacy raw key.
-func loadSourceMap(ctx context.Context, kv *nucleus.KVModel, siteID, release, filename string) (*SourceMapMeta, error) {
+func loadSourceMap(ctx context.Context, kv kvGetter, siteID, release, filename string) (*SourceMapMeta, error) {
 	data, err := kv.Get(ctx, kvKeyV2(siteID, release, filename))
 	if err != nil {
 		return nil, fmt.Errorf("read source map: %w", err)
@@ -312,21 +316,39 @@ func loadSourceMap(ctx context.Context, kv *nucleus.KVModel, siteID, release, fi
 // AUD-048 (round 2): maps are loaded and parsed at most ONCE per distinct
 // file within one stack request (a 50-frame stack used to fetch and decode
 // the same map 50 times), with failures memoized for the request.
+//
+// A resolved frame keeps its minified position in orig_filename/orig_line/
+// orig_col and is marked resolved:true; filename/lineno/colno carry the
+// original source position as before, so existing consumers are unchanged.
+// Already-resolved frames are skipped, which makes the operation idempotent
+// (the read path re-resolves stored stacks). Outcomes are counted per frame;
+// failures leave the raw frame in place and are counted and (rate-limited)
+// logged rather than dropped silently.
 func (s *SourceMapService) ResolveStackTrace(ctx context.Context, siteID, release, stackJSON string) (string, error) {
+	return resolveStack(ctx, s.db.KV(), siteID, release, stackJSON)
+}
+
+type stackFrame struct {
+	Filename string `json:"filename"`
+	Function string `json:"function"`
+	Lineno   int    `json:"lineno"`
+	Colno    int    `json:"colno"`
+	InApp    bool   `json:"in_app"`
+	// Set only on frames resolved through a source map.
+	OrigFilename string `json:"orig_filename,omitempty"`
+	OrigLine     int    `json:"orig_line,omitempty"`
+	OrigCol      int    `json:"orig_col,omitempty"`
+	Resolved     bool   `json:"resolved,omitempty"`
+}
+
+func resolveStack(ctx context.Context, kv kvGetter, siteID, release, stackJSON string) (string, error) {
 	if stackJSON == "" || release == "" {
 		return stackJSON, nil
 	}
 
-	type frame struct {
-		Filename string `json:"filename"`
-		Function string `json:"function"`
-		Lineno   int    `json:"lineno"`
-		Colno    int    `json:"colno"`
-		InApp    bool   `json:"in_app"`
-	}
-
-	var frames []frame
+	var frames []stackFrame
 	if err := json.Unmarshal([]byte(stackJSON), &frames); err != nil {
+		noteResolveError(siteID, release, "", fmt.Errorf("stack is not a frame array: %w", err))
 		return stackJSON, nil
 	}
 
@@ -335,28 +357,39 @@ func (s *SourceMapService) ResolveStackTrace(ctx context.Context, siteID, releas
 		err  error
 	}
 	cache := make(map[string]mapResult)
-	kv := s.db.KV()
+	changed := false
 
 	for i, f := range frames {
+		if f.Resolved || f.Filename == "" {
+			continue
+		}
 		hit, cached := cache[f.Filename]
 		if !cached {
-			meta, err := loadSourceMap(ctx, kv, siteID, release, f.Filename)
-			if err != nil {
-				// A store/parse failure is observable but must not discard
-				// the raw frame — record it and keep the stack readable.
-				hit = mapResult{err: err}
-			} else {
-				hit = mapResult{meta: meta}
-			}
+			meta, err := findSourceMap(ctx, kv, siteID, release, f.Filename)
+			hit = mapResult{meta: meta, err: err}
 			cache[f.Filename] = hit
 		}
-		if hit.err != nil || hit.meta == nil {
+		if hit.err != nil {
+			// A store/parse failure is observable but must not discard
+			// the raw frame — record it and keep the stack readable.
+			noteResolveError(siteID, release, f.Filename, hit.err)
+			continue
+		}
+		if hit.meta == nil {
+			resolveNoMap.Add(1)
 			continue
 		}
 		mapping := decodeMappings(hit.meta.Mappings, hit.meta.Sources, hit.meta.Names, f.Lineno, f.Colno)
 		if mapping == nil {
+			resolveNoMapping.Add(1)
 			continue
 		}
+		resolveHit.Add(1)
+		changed = true
+		frames[i].OrigFilename = f.Filename
+		frames[i].OrigLine = f.Lineno
+		frames[i].OrigCol = f.Colno
+		frames[i].Resolved = true
 		frames[i].Filename = mapping.OriginalFile
 		frames[i].Lineno = mapping.OriginalLine
 		frames[i].Colno = mapping.OriginalColumn
@@ -365,6 +398,9 @@ func (s *SourceMapService) ResolveStackTrace(ctx context.Context, siteID, releas
 		}
 	}
 
+	if !changed {
+		return stackJSON, nil
+	}
 	result, _ := json.Marshal(frames)
 	return string(result), nil
 }
