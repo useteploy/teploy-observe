@@ -1,0 +1,13 @@
+# Used only by CI template validation. Placeholder secrets, not for installs.
+secrets:
+  jwtSecret: ci-only-jwt-secret-0000000000000000
+  sessionSalt: ci-only-session-salt-000000000000
+ingest:
+  enabled: true
+ingress:
+  enabled: true
+  className: nginx
+  tls: { enabled: true, secretName: observe-tls }
+  ingest:
+    enabled: true
+    tls: { enabled: true, secretName: ingest-tls }
