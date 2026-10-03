@@ -1,0 +1,28 @@
+# Caddy front for the compose "tls" profile (docker-compose.yml mounts this
+# at /etc/caddy/Caddyfile). OBSERVE_DOMAIN comes from the compose
+# environment; Caddy obtains and renews the certificate automatically.
+{$OBSERVE_DOMAIN:observe.localhost} {
+	encode zstd gzip
+
+	header {
+		# "?" = default only: the app sets stricter values on share pages
+		# (no-referrer) and replay assets (CSP default-src none; sandbox),
+		# which must not be overridden.
+		# Browsers refuse plain HTTP for this host for a year. No
+		# includeSubDomains/preload: those depend on the operator's other
+		# subdomains and are hard to undo.
+		Strict-Transport-Security "max-age=31536000"
+		?X-Content-Type-Options "nosniff"
+		?Referrer-Policy "strict-origin-when-cross-origin"
+		# Clickjacking defense for the dashboard. Deliberately only
+		# frame-ancestors: a full script-src/style-src policy has not been
+		# validated against the embedded UI.
+		?Content-Security-Policy "frame-ancestors 'none'"
+		-Server
+	}
+
+	# observe is the only upstream; the database is not reachable from this
+	# network. Caddy sets X-Forwarded-For/-Proto/-Host itself, and observe
+	# trusts only this container via OBSERVE_TRUSTED_PROXIES.
+	reverse_proxy observe:3000
+}
