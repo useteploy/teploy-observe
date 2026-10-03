@@ -374,6 +374,8 @@ func main() {
 	// they dedupe, processed outbox intents prune, dead letters never do.
 	retentionPolicies := append(jobs.DefaultPolicies(cfg.RawRetentionDays, cfg.HourlyRetentionDays, cfg.LLMRetentionDays),
 		jobs.DefaultLedgerPolicies(cfg.ErrorInboxRetentionDays, cfg.ReplayBatchesRetentionDays, cfg.DerivedOutboxRetentionDays)...)
+	retentionPolicies = append(retentionPolicies,
+		jobs.DefaultTelemetryPolicies(cfg.MetricsRetentionDays, cfg.InfraRetentionDays, cfg.UptimeRetentionDays)...)
 
 	// Stats service
 	statsSvc := query.NewStatsService(db).WithRetention(query.RetentionWindows{
