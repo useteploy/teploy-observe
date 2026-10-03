@@ -69,6 +69,7 @@ var Tables = []string{
 	"logs",
 	"log_pipelines",
 	"spans",
+	"span_links",
 	"service_stats",
 	"service_dependencies",
 	"derived_outbox",
