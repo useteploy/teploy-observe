@@ -1,0 +1,151 @@
+{{- if .Values.nucleus.enabled }}
+{{- $n := include "observe.nucleusName" . }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $n }}
+  labels:
+    {{- include "observe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nucleus
+spec:
+  # SINGLE NODE, not configurable. Nucleus runs without authentication and
+  # without clustering here.
+  replicas: 1
+  serviceName: {{ $n }}
+  selector:
+    matchLabels:
+      {{- include "observe.nucleusSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "observe.labels" . | nindent 8 }}
+        app.kubernetes.io/component: nucleus
+      {{- with .Values.nucleus.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 60
+      {{- with .Values.nucleus.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: nucleus
+          image: "{{ .Values.nucleus.image.repository }}:{{ .Values.nucleus.image.tag }}"
+          imagePullPolicy: {{ .Values.nucleus.image.pullPolicy }}
+          args:
+            - start
+            - --port
+            - {{ .Values.nucleus.port | quote }}
+            - --cluster-port
+            - "5433"
+            - --data
+            - /data
+            - --max-memory
+            - {{ .Values.nucleus.maxMemoryMB | quote }}
+          env:
+            # NO_AUTH: reachable only from the Observe pod (see the
+            # NetworkPolicy). The cluster/replication flags mirror
+            # docker-compose.yml; the cluster port is not exposed by the Service.
+            - { name: NUCLEUS_ALLOW_INSECURE_CLUSTER, value: "1" }
+            - { name: NUCLEUS_ALLOW_INSECURE_REPLICATION, value: "1" }
+            - { name: NUCLEUS_ALLOW_NO_AUTH, value: "1" }
+          ports:
+            - name: pg
+              containerPort: {{ .Values.nucleus.port }}
+          startupProbe:
+            tcpSocket: { port: pg }
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            tcpSocket: { port: pg }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket: { port: pg }
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          securityContext:
+            {{- toYaml .Values.nucleus.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.nucleus.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      {{- with .Values.nucleus.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nucleus.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nucleus.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "observe.nucleusSelectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.nucleus.persistence.accessModes | nindent 10 }}
+        {{- if .Values.nucleus.persistence.storageClassName }}
+        storageClassName: {{ .Values.nucleus.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.nucleus.persistence.size }}
+---
+# ClusterIP only. There is intentionally no Ingress, NodePort or LoadBalancer
+# option for Nucleus.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $n }}
+  labels:
+    {{- include "observe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nucleus
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "observe.nucleusSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: pg
+      port: {{ .Values.nucleus.port }}
+      targetPort: pg
+{{- if .Values.nucleus.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $n }}
+  labels:
+    {{- include "observe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nucleus
+spec:
+  # Only the Observe pod of this release may connect, and only to the database
+  # port. The cluster/replication port accepts nothing.
+  podSelector:
+    matchLabels:
+      {{- include "observe.nucleusSelectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "observe.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.nucleus.port }}
+{{- end }}
+{{- end }}
