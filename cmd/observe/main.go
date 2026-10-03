@@ -1705,6 +1705,9 @@ func main() {
 		// conflicting-id / pending (plus the legacy queued/bytes backlog
 		// fields and replayed-on-restart).
 		health["errors"] = errorBuf.Stats()
+		// Source-map resolution outcomes per frame (hit / no map for the
+		// release+file / map without a covering mapping / read error).
+		health["sourcemaps"] = sourcemaps.Stats()
 		// O08: flag-evaluation condition counters — how many evaluations
 		// could not read their config (unavailable) and how many flags
 		// were quarantined from evaluation by invalid stored config.
