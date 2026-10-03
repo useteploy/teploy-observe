@@ -201,8 +201,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	case <-done:
 		return nil
 	case <-ctx.Done():
+		// Stop closes every connection and cancels handler contexts; it is not
+		// waited on further, so a sink that ignores its context cannot hold
+		// shutdown past the deadline.
 		s.gs.Stop()
-		<-done
 		return ctx.Err()
 	}
 }

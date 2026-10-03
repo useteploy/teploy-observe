@@ -75,7 +75,11 @@ func (s *sink) record(ctx context.Context, site string) error {
 		}
 	}
 	if s.block != nil {
-		<-s.block
+		select {
+		case <-s.block:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -151,7 +155,10 @@ func newHarness(t *testing.T, mutate func(*Config)) *harness {
 }
 
 func withKey(key string) context.Context {
-	ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+	// The 10s deadline only guards against a hung test; it is released by the
+	// timer, which is fine for short-lived test contexts.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	_ = cancel
 	return metadata.AppendToOutgoingContext(ctx, "x-api-key", key)
 }
 
