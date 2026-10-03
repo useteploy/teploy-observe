@@ -78,13 +78,23 @@ type Options struct {
 	// oversized entries, failed background flushes). Never called from
 	// inside the client's locks; must not call back into the Client.
 	OnError func(error)
+
+	// MaxBreadcrumbs is the breadcrumb ring size. Default: 100 (max 1000).
+	MaxBreadcrumbs int
+
+	// BeforeBreadcrumb, when set, may edit a breadcrumb or return nil to
+	// drop it. Applies to manual and slog-recorded breadcrumbs. A panicking
+	// hook drops the breadcrumb (fail closed: it is usually a scrubber).
+	BeforeBreadcrumb func(Breadcrumb) *Breadcrumb
 }
 
 // Client submits events, errors, logs, traces, and metrics to Observe.
 type Client struct {
 	opts Options
 	http *http.Client
-	mu   sync.Mutex
+	// crumbs buffers breadcrumbs attached to captured errors/messages.
+	crumbs *breadcrumbRing
+	mu     sync.Mutex
 	// logs holds entries serialized AT ADMISSION (AUD-036, round 2): the
 	// old code stored the caller's LogEntry with its live map attributes,
 	// so mutation after log() changed the eventual body and one
@@ -149,13 +159,13 @@ type Client struct {
 // covers every admitted record. Queues are in-memory; kill -9 loses the
 // queue and these counters with the process.
 type Stats struct {
-	DeliveredLogs         int64          `json:"delivered_logs"`
-	DeliveredSpans        int64          `json:"delivered_spans"`
-	DeliveredMetricPoints int64          `json:"delivered_metric_points"`
-	Retries               int64          `json:"retries"`
+	DeliveredLogs         int64            `json:"delivered_logs"`
+	DeliveredSpans        int64            `json:"delivered_spans"`
+	DeliveredMetricPoints int64            `json:"delivered_metric_points"`
+	Retries               int64            `json:"retries"`
 	Dropped               map[string]int64 `json:"dropped"`
-	QueuedLogs            int            `json:"queued_logs"`
-	QueuedSpans           int            `json:"queued_spans"`
+	QueuedLogs            int              `json:"queued_logs"`
+	QueuedSpans           int              `json:"queued_spans"`
 }
 
 // Stats returns a deep copy of the current diagnostics counters (O11).
@@ -273,6 +283,8 @@ type ErrorPayload struct {
 	Level       string       `json:"level,omitempty"`
 	TraceID     string       `json:"trace_id,omitempty"`
 	SpanID      string       `json:"span_id,omitempty"`
+	// Breadcrumbs are the buffered Client breadcrumbs at capture time.
+	Breadcrumbs []Breadcrumb `json:"breadcrumbs,omitempty"`
 }
 
 // StackFrame is a single frame in an error's stack trace.
@@ -345,6 +357,7 @@ func New(opts Options) (*Client, error) {
 	c := &Client{
 		opts:             opts,
 		http:             &owned,
+		crumbs:           newBreadcrumbRing(opts.MaxBreadcrumbs, opts.BeforeBreadcrumb),
 		closed:           make(chan struct{}),
 		done:             make(chan struct{}),
 		flushWake:        make(chan struct{}, 1),
@@ -481,6 +494,7 @@ func (c *Client) CaptureException(err error, opts ...ExceptionOption) error {
 		Environment: c.opts.Environment,
 		Level:       "error",
 		StackTrace:  captureStack(2),
+		Breadcrumbs: c.crumbs.snapshot(),
 	}
 	for _, opt := range opts {
 		opt(&payload)
