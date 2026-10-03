@@ -50,6 +50,7 @@ var ingestRoutes = map[string]bool{
 	"POST /api/v1/experiments/convert": true,
 	"POST /api/v1/flags/evaluate":      true,
 	"GET /api/v1/surveys/active":       true,
+	"POST /api/v1/surveys/expose":      true,
 	"POST /api/v1/surveys/respond":     true,
 
 	// CI uploads source maps so stack traces symbolicate; the handler accepts
