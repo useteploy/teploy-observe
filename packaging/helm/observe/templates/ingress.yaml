@@ -1,0 +1,65 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "observe.fullname" . }}
+  labels:
+    {{- include "observe.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts: [{{ .Values.ingress.host | quote }}]
+      secretName: {{ required "ingress.tls.secretName is required when ingress.tls.enabled" .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "observe.fullname" . }}
+                port:
+                  name: http
+{{- end }}
+{{- if and .Values.ingress.ingest.enabled .Values.ingest.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "observe.fullname" . }}-ingest
+  labels:
+    {{- include "observe.labels" . | nindent 4 }}
+  {{- with .Values.ingress.ingest.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- if .Values.ingress.ingest.tls.enabled }}
+  tls:
+    - hosts: [{{ .Values.ingress.ingest.host | quote }}]
+      secretName: {{ required "ingress.ingest.tls.secretName is required when ingress.ingest.tls.enabled" .Values.ingress.ingest.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.ingest.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "observe.fullname" . }}-ingest
+                port:
+                  name: ingest
+{{- end }}

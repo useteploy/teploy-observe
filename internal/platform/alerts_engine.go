@@ -212,6 +212,8 @@ func (s *AlertService) evaluateFiring(ctx context.Context, rule AlertRule, prev 
 		if created {
 			s.recordIncidentEvent(ctx, inc.IncidentID, incidents.EventOpened, "alert",
 				fmt.Sprintf("rule %s fired: %s=%.2f samples=%d", rule.RuleID, rule.Metric, value, samples))
+			// FIRE only, after the edge committed, never blocking the tick.
+			s.fireIntegrations(rule, value, fmt.Sprintf("alert rule fired: %s=%.2f (threshold %s %.2f)", rule.Metric, value, rule.Operator, rule.Threshold))
 		}
 		return nil
 	}
@@ -422,6 +424,9 @@ func (r AlertRule) severityOrDefault() string {
 //	                                  no-data; a silent site is no-data)
 //	error_rate value = 100*errors/events; samples = events - an empty
 //	                                  window is NO DATA, never "0%"
+//
+// trace_error_rate, trace_p95_ms, log_error_count and uptime_failures live
+// in alerts_engine_metrics.go with their own sample semantics.
 func (s *AlertService) queryMetric(ctx context.Context, siteID, metric, fromMs, toMs string) (float64, int64, error) {
 	switch metric {
 	case "pageviews":
@@ -478,7 +483,11 @@ func (s *AlertService) queryMetric(ctx context.Context, siteID, metric, fromMs, 
 		}
 		return 100.0 * errs / events, int64(events), nil
 	default:
-		return 0, 0, fmt.Errorf("unknown metric: %s", metric)
+		v, n, handled, err := s.queryExtendedMetric(ctx, siteID, metric, fromMs, toMs)
+		if !handled {
+			return 0, 0, fmt.Errorf("unknown metric: %s", metric)
+		}
+		return v, n, err
 	}
 }
 
@@ -487,6 +496,9 @@ func (s *AlertService) queryMetric(ctx context.Context, siteID, metric, fromMs, 
 func (s *AlertService) scalarMetric(ctx context.Context, siteID, fromMs, toMs, q string) (float64, error) {
 	type result struct {
 		Value float64 `db:"value"`
+	}
+	if s.scalarHook != nil {
+		return s.scalarHook(ctx, q, siteID, fromMs, toMs)
 	}
 	rows, err := nucleus.Query[result](ctx, s.db.SQL(), q, siteID, fromMs, toMs)
 	if err != nil || len(rows) == 0 {

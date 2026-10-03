@@ -205,17 +205,23 @@ func (l *Limiter) Acquire(ctx context.Context, siteID string) (func(), error) {
 	l.mu.Lock()
 	if l.global >= l.globalSlots {
 		l.refused[CodeConcurrencyGlobal]++
+		// Capture under the lock: l.global is written by concurrent
+		// Acquire/release, so it must not be read after Unlock.
+		inUse, limit := l.global, l.globalSlots
 		l.mu.Unlock()
 		return nil, refusal(CodeConcurrencyGlobal,
-			fmt.Sprintf("%d of %d global query slots in use", l.global, l.globalSlots),
+			fmt.Sprintf("%d of %d global query slots in use", inUse, limit),
 			"retry when in-flight queries finish, or raise OBSERVE_QUERY_GLOBAL_CONCURRENCY",
 			429)
 	}
 	if l.sites[siteID] >= l.siteSlots {
 		l.refused[CodeConcurrencySite]++
+		// Capture under the lock: l.sites is a map mutated by concurrent
+		// Acquire/release; reading it after Unlock is a fatal map race.
+		inUse, limit := l.sites[siteID], l.siteSlots
 		l.mu.Unlock()
 		return nil, refusal(CodeConcurrencySite,
-			fmt.Sprintf("site has %d of %d query slots in use", l.sites[siteID], l.siteSlots),
+			fmt.Sprintf("site has %d of %d query slots in use", inUse, limit),
 			"retry when this site's in-flight queries finish, or raise OBSERVE_QUERY_SITE_CONCURRENCY",
 			429)
 	}
