@@ -120,15 +120,15 @@ func protoAttrs(kvs []*commonpb.KeyValue) []KeyValue {
 func protoAnyValue(v *commonpb.AnyValue) AnyValue {
 	switch val := v.GetValue().(type) {
 	case *commonpb.AnyValue_StringValue:
-		return AnyValue{StringValue: val.StringValue}
+		return stringAny(val.StringValue)
 	case *commonpb.AnyValue_BoolValue:
-		return AnyValue{BoolValue: val.BoolValue}
+		return boolAny(val.BoolValue)
 	case *commonpb.AnyValue_IntValue:
-		return AnyValue{IntValue: jsonInt(fmt.Sprintf("%d", val.IntValue))}
+		return intAny(fmt.Sprintf("%d", val.IntValue))
 	case *commonpb.AnyValue_DoubleValue:
-		return AnyValue{DoubleValue: val.DoubleValue}
+		return doubleAny(val.DoubleValue)
 	case *commonpb.AnyValue_BytesValue:
-		return AnyValue{StringValue: hex.EncodeToString(val.BytesValue)}
+		return stringAny(hex.EncodeToString(val.BytesValue))
 	case nil:
 		return AnyValue{}
 	default:
