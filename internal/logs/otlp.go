@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"google.golang.org/protobuf/encoding/protojson"
@@ -60,21 +61,69 @@ type otlpAny struct {
 	IntValue    string  `json:"intValue,omitempty"`
 	BoolValue   bool    `json:"boolValue,omitempty"`
 	DoubleValue float64 `json:"doubleValue,omitempty"`
+
+	// kind records which field the producer set, so false, 0, 0.0 and "" are
+	// kept instead of being indistinguishable from "not set".
+	kind byte
+}
+
+const (
+	otlpUnset byte = iota
+	otlpString
+	otlpInt
+	otlpBool
+	otlpDouble
+)
+
+func (v *otlpAny) UnmarshalJSON(b []byte) error {
+	*v = otlpAny{}
+	var w struct {
+		StringValue *string  `json:"stringValue"`
+		IntValue    *string  `json:"intValue"`
+		BoolValue   *bool    `json:"boolValue"`
+		DoubleValue *float64 `json:"doubleValue"`
+	}
+	if err := json.Unmarshal(b, &w); err != nil {
+		return err
+	}
+	switch {
+	case w.StringValue != nil:
+		*v = otlpAny{StringValue: *w.StringValue, kind: otlpString}
+	case w.IntValue != nil:
+		*v = otlpAny{IntValue: *w.IntValue, kind: otlpInt}
+	case w.BoolValue != nil:
+		*v = otlpAny{BoolValue: *w.BoolValue, kind: otlpBool}
+	case w.DoubleValue != nil:
+		*v = otlpAny{DoubleValue: *w.DoubleValue, kind: otlpDouble}
+	}
+	return nil
 }
 
 func (v otlpAny) text() string {
-	switch {
-	case v.StringValue != "":
-		return v.StringValue
-	case v.IntValue != "":
-		return v.IntValue
-	case v.DoubleValue != 0:
-		return fmt.Sprintf("%v", v.DoubleValue)
-	case v.BoolValue:
-		return "true"
-	default:
-		return ""
+	k := v.kind
+	if k == otlpUnset {
+		switch {
+		case v.StringValue != "":
+			k = otlpString
+		case v.IntValue != "":
+			k = otlpInt
+		case v.DoubleValue != 0:
+			k = otlpDouble
+		case v.BoolValue:
+			k = otlpBool
+		}
 	}
+	switch k {
+	case otlpString:
+		return v.StringValue
+	case otlpInt:
+		return v.IntValue
+	case otlpDouble:
+		return fmt.Sprintf("%v", v.DoubleValue)
+	case otlpBool:
+		return strconv.FormatBool(v.BoolValue)
+	}
+	return ""
 }
 
 // severityToLevel maps an OTLP severity number onto the level vocabulary the

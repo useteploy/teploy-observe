@@ -1,6 +1,11 @@
 package metrics
 
-import "strings"
+import (
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 // OTLP JSON types for ExportMetricsServiceRequest.
 // These mirror the OpenTelemetry protobuf-to-JSON mapping for the metrics
@@ -107,10 +112,86 @@ type AnyValue struct {
 	IntValue    jsonInt `json:"intValue,omitempty"`
 	BoolValue   bool    `json:"boolValue,omitempty"`
 	DoubleValue float64 `json:"doubleValue,omitempty"`
+
+	// kind records which field the decoder saw set. The scalar fields cannot
+	// say that themselves (false, 0, 0.0 and "" are Go zero values), so
+	// without it AttrsToMap dropped those attributes. A literal with no kind
+	// falls back to non-zero detection.
+	kind valueKind
+}
+
+type valueKind uint8
+
+const (
+	kindUnset valueKind = iota
+	kindString
+	kindInt
+	kindBool
+	kindDouble
+)
+
+func stringAny(s string) AnyValue  { return AnyValue{StringValue: s, kind: kindString} }
+func intAny(s string) AnyValue     { return AnyValue{IntValue: jsonInt(s), kind: kindInt} }
+func boolAny(b bool) AnyValue      { return AnyValue{BoolValue: b, kind: kindBool} }
+func doubleAny(f float64) AnyValue { return AnyValue{DoubleValue: f, kind: kindDouble} }
+
+func (a *AnyValue) UnmarshalJSON(b []byte) error {
+	*a = AnyValue{}
+	var w struct {
+		StringValue *string  `json:"stringValue"`
+		IntValue    *jsonInt `json:"intValue"`
+		BoolValue   *bool    `json:"boolValue"`
+		DoubleValue *float64 `json:"doubleValue"`
+	}
+	if err := json.Unmarshal(b, &w); err != nil {
+		return err
+	}
+	switch {
+	case w.StringValue != nil:
+		*a = stringAny(*w.StringValue)
+	case w.IntValue != nil:
+		*a = intAny(string(*w.IntValue))
+	case w.BoolValue != nil:
+		*a = boolAny(*w.BoolValue)
+	case w.DoubleValue != nil:
+		*a = doubleAny(*w.DoubleValue)
+	}
+	return nil
+}
+
+// text renders the value for the string-map label store; ok is false when the
+// producer set no value.
+func (a AnyValue) text() (string, bool) {
+	k := a.kind
+	if k == kindUnset {
+		switch {
+		case a.StringValue != "":
+			k = kindString
+		case a.IntValue != "":
+			k = kindInt
+		case a.BoolValue:
+			k = kindBool
+		case a.DoubleValue != 0:
+			k = kindDouble
+		}
+	}
+	switch k {
+	case kindString:
+		return a.StringValue, true
+	case kindInt:
+		return string(a.IntValue), true
+	case kindBool:
+		return strconv.FormatBool(a.BoolValue), true
+	case kindDouble:
+		return fmt.Sprintf("%g", a.DoubleValue), true
+	}
+	return "", false
 }
 
 // AggregationTemporality maps the OTLP enum to the column value.
-//   1 = delta, 2 = cumulative.
+//
+//	1 = delta, 2 = cumulative.
+//
 // Anything else collapses to "cumulative" — matches the OTLP default
 // for SDKs that omit the field.
 func AggregationTemporality(t int) string {
