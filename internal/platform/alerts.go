@@ -30,6 +30,12 @@ type AlertService struct {
 	// cooldowns and windows deterministic.
 	evalMu sync.Mutex
 	now    func() time.Time
+
+	// scalarHook, when set, replaces the database in scalarMetric (unit
+	// tests inject a fake query layer). integrationsHook is the optional
+	// FIRE-only integrations dispatcher (SetIntegrationsHook).
+	scalarHook       func(ctx context.Context, q string, args ...any) (float64, error)
+	integrationsHook func(ctx context.Context, ev AlertFireEvent)
 }
 
 func NewAlertService(db *nucleus.Client, logger *slog.Logger, webhookSvc *WebhookService, incidentSvc *incidents.Service, notifier *Notifier) *AlertService {

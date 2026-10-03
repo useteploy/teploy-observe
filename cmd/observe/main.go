@@ -440,6 +440,7 @@ func main() {
 	// New-issue and regression events fire the site's integrations. Wired
 	// after the demo seed above so seeded issues do not page anyone.
 	issueNotifier := wireIssueNotifications(issueSvc, integrationSvc, cfg.PublicURL)
+	wireAlertsToIntegrations(alertSvc, integrationSvc, logger)
 	feedbackSvc := feedback.NewFeedbackService(db)
 	viewSvc := views.NewViewService(db)
 	explorerSvc := explorer.NewExplorerService(db)
@@ -5615,9 +5616,7 @@ type createAlertRuleInput struct {
 	Cooldown      int     `json:"cooldown"`
 }
 
-var validAlertMetrics = map[string]struct{}{
-	"error_count": {}, "error_rate": {}, "pageviews": {}, "visitors": {},
-}
+var validAlertMetrics = platform.AlertMetricSet()
 
 var validAlertOperators = map[string]struct{}{
 	"gt": {}, "gte": {}, "lt": {}, "lte": {}, "eq": {},
