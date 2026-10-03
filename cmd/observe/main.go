@@ -444,7 +444,7 @@ func main() {
 	ssoSvc := sso.NewSSOService(db)
 	flagSvc := flags.NewFlagService(db)
 	flagSvc.WithEvalDedup(flags.LoadEvalDedupFromEnv(os.Getenv))
-	experimentSvc := experiments.NewExperimentService(db)
+	experimentSvc := experiments.NewExperimentService(db).WithPrivacy(siteSvc.PrivacyConfig, cfg.SessionSalt)
 	surveySvc := surveys.NewSurveyService(db, cfg.SessionSalt, siteSvc)
 	logSvc := logs.NewLogService(db)
 	logSvc.SetPipelines(pipelineSvc)
