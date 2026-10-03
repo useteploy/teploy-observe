@@ -385,6 +385,9 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 | `OBSERVE_RAW_RETENTION_DAYS` | `30` | Raw event retention. Also the window over which visitor counts are exact from raw events; past it they are counted from the `sessions` table (90 days), and past both the dashboard says which window the figure covers. |
 | `OBSERVE_HOURLY_RETENTION_DAYS` | `365` | Hourly rollup retention. |
 | `OBSERVE_LLM_RETENTION_DAYS` | `30` | LLM trace retention, including stored prompts/completions. Must be at least 1. Cleanup runs daily; historical model-price catalog entries are retained. Logical expiry does not guarantee database files immediately shrink. |
+| `OBSERVE_METRICS_RETENTION_DAYS` | `30` | OTLP metric point (`metric_points`) retention. Must be at least 1. |
+| `OBSERVE_INFRA_RETENTION_DAYS` | `30` | Host metric (`host_metrics`) retention. Must be at least 1. |
+| `OBSERVE_UPTIME_RETENTION_DAYS` | `90` | Uptime check result (`uptime_results`) retention. Must be at least 1. Fixed windows on the same daily cleanup: `performance_issues` 90 days (by last detection), `service_dependencies` 30 days. |
 | `OBSERVE_LOG_ROUTES` | `0` | Set to `1` to print route table at boot. |
 | `OBSERVE_SMTP_HOST` | | SMTP server for email reports. |
 | `OBSERVE_SMTP_PORT` | `587` | SMTP port. |
