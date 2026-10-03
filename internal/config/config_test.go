@@ -25,6 +25,9 @@ func TestValidateRejectsBrokenNumericConfig(t *testing.T) {
 		{"huge interval", func(c *Config) { c.FlushInterval = 10 * time.Minute }, "OBSERVE_FLUSH_INTERVAL_MS"},
 		{"zero rate limit", func(c *Config) { c.RateLimit = 0 }, "OBSERVE_RATE_LIMIT"},
 		{"zero LLM retention", func(c *Config) { c.LLMRetentionDays = 0 }, "OBSERVE_LLM_RETENTION_DAYS"},
+		{"zero metrics retention", func(c *Config) { c.MetricsRetentionDays = 0 }, "OBSERVE_METRICS_RETENTION_DAYS"},
+		{"zero infra retention", func(c *Config) { c.InfraRetentionDays = 0 }, "OBSERVE_INFRA_RETENTION_DAYS"},
+		{"negative uptime retention", func(c *Config) { c.UptimeRetentionDays = -1 }, "OBSERVE_UPTIME_RETENTION_DAYS"},
 		{"zero retention", func(c *Config) { c.RawRetentionDays = 0 }, "OBSERVE_RAW_RETENTION_DAYS"},
 		{"malformed integer", func(c *Config) {
 			c.parseErr = fmt.Errorf("OBSERVE_BUFFER_SIZE must be an integer, got %q", "big")
@@ -34,6 +37,7 @@ func TestValidateRejectsBrokenNumericConfig(t *testing.T) {
 		c := Config{
 			BufferSize: 1000, FlushSize: 100, FlushInterval: time.Second,
 			RateLimit: 100, RawRetentionDays: 30, HourlyRetentionDays: 365, LLMRetentionDays: 30,
+			MetricsRetentionDays: 30, InfraRetentionDays: 30, UptimeRetentionDays: 90,
 			ErrorInboxRetentionDays: 14, ReplayBatchesRetentionDays: 14, DerivedOutboxRetentionDays: 7,
 		}
 		tc.mut(&c)
@@ -48,6 +52,7 @@ func TestValidateAcceptsDefaults(t *testing.T) {
 	c := Config{
 		BufferSize: 100_000, FlushSize: 500, FlushInterval: 2 * time.Second,
 		RateLimit: 1000, RawRetentionDays: 30, HourlyRetentionDays: 365, LLMRetentionDays: 30,
+		MetricsRetentionDays: 30, InfraRetentionDays: 30, UptimeRetentionDays: 90,
 		ErrorInboxRetentionDays: 14, ReplayBatchesRetentionDays: 14, DerivedOutboxRetentionDays: 7,
 	}
 	if err := c.Validate(); err != nil {
@@ -65,5 +70,22 @@ func TestLoadLLMRetentionWindow(t *testing.T) {
 	c = Load()
 	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "OBSERVE_LLM_RETENTION_DAYS") {
 		t.Fatalf("invalid LLM duration must fail validation, got %v", err)
+	}
+}
+
+func TestLoadTelemetryRetentionDefaultsAndOverrides(t *testing.T) {
+	c := Load()
+	if c.MetricsRetentionDays != 30 || c.InfraRetentionDays != 30 || c.UptimeRetentionDays != 90 {
+		t.Fatalf("defaults metrics/infra/uptime = %d/%d/%d, want 30/30/90",
+			c.MetricsRetentionDays, c.InfraRetentionDays, c.UptimeRetentionDays)
+	}
+	t.Setenv("OBSERVE_METRICS_RETENTION_DAYS", "3")
+	t.Setenv("OBSERVE_UPTIME_RETENTION_DAYS", "bogus")
+	c = Load()
+	if c.MetricsRetentionDays != 3 {
+		t.Fatalf("metrics retention=%d, want 3", c.MetricsRetentionDays)
+	}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "OBSERVE_UPTIME_RETENTION_DAYS") {
+		t.Fatalf("invalid uptime duration must fail validation, got %v", err)
 	}
 }

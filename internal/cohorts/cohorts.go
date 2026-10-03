@@ -27,6 +27,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -37,6 +38,19 @@ import (
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
+
+// MaxFilterMembers is the largest cohort MembersForFilter will hand to the
+// chart pipeline. The pipeline expands a cohort into one SQL parameter per
+// member (`distinct_id IN ($4, $5, ...)`), and the wire protocol caps a
+// statement at 65535 parameters, so a larger cohort would fail at the
+// engine with an opaque error (or, worse, be truncated). Refusing up front
+// with ErrTooLarge keeps that failure labeled. The ceiling leaves headroom
+// for the fixed site/time and dimension-filter parameters.
+const MaxFilterMembers = 30000
+
+// ErrTooLarge is returned (wrapped) by MembersForFilter when a cohort has
+// more than MaxFilterMembers members.
+var ErrTooLarge = errors.New("cohort too large for chart filtering")
 
 // Service exposes cohort CRUD and evaluation.
 type Service struct {
@@ -56,7 +70,8 @@ func NewService(db *nucleus.Client) *Service {
 //
 // Property rules apply on the events table (one row per event); the
 // distinct_id set returned is the set of users who emitted *any* event
-// matching the property. That matches the PostHog "person property"
+// matching the property ("=") or that have NO event with that value
+// ("!="). That matches the PostHog "person property"
 // semantic in the common case where users carry session-level
 // attributes (country, browser, etc.) on each event.
 type Rule struct {
@@ -246,23 +261,72 @@ func (s *Service) evalPropertyRule(ctx context.Context, siteID string, r Rule) (
 	type idRow struct {
 		DistinctID string `db:"distinct_id"`
 	}
-	// Direct column comparison — safe because isAllowedPropertyKey
-	// constrains the column name to a hard-coded allow-list, so the
-	// fmt.Sprintf can't be SQL-injected.
-	q := fmt.Sprintf(`SELECT DISTINCT distinct_id
-	 FROM events
-	 WHERE site_id = $1
-	   AND %s %s $2
-	   AND distinct_id != ''`, r.Key, op)
-	rows, err := nucleus.Query[idRow](ctx, s.db.SQL(), q, siteID, r.Value)
+	matched, err := nucleus.Query[idRow](ctx, s.db.SQL(), propertyMatchSQL(r.Key), siteID, r.Value)
 	if err != nil {
 		return nil, fmt.Errorf("property rule query: %w", err)
 	}
-	out := make([]string, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, row.DistinctID)
+	matchedIDs := make([]string, 0, len(matched))
+	for _, row := range matched {
+		matchedIDs = append(matchedIDs, row.DistinctID)
 	}
-	return out, nil
+	if op == "=" {
+		return matchedIDs, nil
+	}
+
+	// "!=" means NO event of the user has this value. The old query
+	// (`key != value` row filter) returned every user with at least one
+	// non-matching event, so a user with events in both US and DE matched
+	// both "country = US" and "country != US". Compute it as the set
+	// difference (all users) minus (users with a matching event). Two
+	// plain DISTINCT scans and a Go-side subtraction keep the SQL to forms
+	// the engine is known to handle (no NOT IN subquery). Events whose
+	// column is NULL/empty never match "=", so their users are kept.
+	all, err := nucleus.Query[idRow](ctx, s.db.SQL(), propertyUniverseSQL(), siteID)
+	if err != nil {
+		return nil, fmt.Errorf("property rule query: %w", err)
+	}
+	allIDs := make([]string, 0, len(all))
+	for _, row := range all {
+		allIDs = append(allIDs, row.DistinctID)
+	}
+	return subtractIDs(allIDs, matchedIDs), nil
+}
+
+// propertyMatchSQL is the query for users with at least one event whose
+// column equals $2. The column name is interpolated, so the caller must
+// have validated key with isAllowedPropertyKey (hard-coded allow-list);
+// the value is always a bind parameter.
+func propertyMatchSQL(key string) string {
+	return fmt.Sprintf(`SELECT DISTINCT distinct_id
+	 FROM events
+	 WHERE site_id = $1
+	   AND %s = $2
+	   AND distinct_id != ''`, key)
+}
+
+// propertyUniverseSQL is the query for every identified user of the site;
+// the "!=" operator subtracts the "=" matches from it.
+func propertyUniverseSQL() string {
+	return `SELECT DISTINCT distinct_id
+	 FROM events
+	 WHERE site_id = $1
+	   AND distinct_id != ''`
+}
+
+// subtractIDs returns the members of all that are not in remove,
+// preserving all's order.
+func subtractIDs(all, remove []string) []string {
+	drop := make(map[string]struct{}, len(remove))
+	for _, id := range remove {
+		drop[id] = struct{}{}
+	}
+	out := make([]string, 0, len(all))
+	for _, id := range all {
+		if _, ok := drop[id]; !ok {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // allowedPropertyKeys returns the columns a property rule may filter
@@ -554,7 +618,14 @@ func (s *Service) MembersForFilter(ctx context.Context, siteID, cohortID string)
 	if err != nil {
 		return nil, err
 	}
-	return s.EvaluateCohort(ctx, siteID, def)
+	ids, err := s.EvaluateCohort(ctx, siteID, def)
+	if err != nil {
+		return nil, err
+	}
+	if len(ids) > MaxFilterMembers {
+		return nil, fmt.Errorf("%w: %d members, limit %d", ErrTooLarge, len(ids), MaxFilterMembers)
+	}
+	return ids, nil
 }
 
 func genID() string {

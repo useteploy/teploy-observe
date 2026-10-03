@@ -6,8 +6,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	otlptrace "go.opentelemetry.io/proto/otlp/trace/v1"
 )
 
@@ -77,12 +77,21 @@ func protoSpan(s *otlptrace.Span) OTLPSpan {
 			Attributes:   protoAttrs(e.GetAttributes()),
 		})
 	}
+	for _, l := range s.GetLinks() {
+		span.Links = append(span.Links, SpanLink{
+			TraceID:                hex.EncodeToString(l.GetTraceId()),
+			SpanID:                 hex.EncodeToString(l.GetSpanId()),
+			TraceState:             l.GetTraceState(),
+			Attributes:             protoAttrs(l.GetAttributes()),
+			DroppedAttributesCount: int(l.GetDroppedAttributesCount()),
+		})
+	}
 	return span
 }
 
 // protoAttrs flattens OTLP attribute values into the same shape the JSON path
-// unmarshals into. Array, kvlist and bytes values are rendered as their string
-// form rather than dropped — a resource attribute that arrives as a list is
+// unmarshals into. Array, kvlist and bytes values are rendered as deterministic text
+// (compact sorted JSON / hex) rather than dropped — a resource attribute that arrives as a list is
 // still worth keeping, and the JSON path has no richer representation either.
 func protoAttrs(kvs []*commonpb.KeyValue) []KeyValue {
 	if len(kvs) == 0 {
@@ -96,22 +105,46 @@ func protoAttrs(kvs []*commonpb.KeyValue) []KeyValue {
 }
 
 func protoAnyValue(v *commonpb.AnyValue) AnyValue {
+	return protoAnyValueDepth(v, 0)
+}
+
+func protoAnyValueDepth(v *commonpb.AnyValue, depth int) AnyValue {
 	switch val := v.GetValue().(type) {
 	case *commonpb.AnyValue_StringValue:
-		return AnyValue{StringValue: val.StringValue}
+		return stringAny(val.StringValue)
 	case *commonpb.AnyValue_BoolValue:
-		return AnyValue{BoolValue: val.BoolValue}
+		return boolAny(val.BoolValue)
 	case *commonpb.AnyValue_IntValue:
-		return AnyValue{IntValue: jsonInt(fmt.Sprintf("%d", val.IntValue))}
+		return intAny(fmt.Sprintf("%d", val.IntValue))
 	case *commonpb.AnyValue_DoubleValue:
-		return AnyValue{DoubleValue: val.DoubleValue}
+		return doubleAny(val.DoubleValue)
 	case *commonpb.AnyValue_BytesValue:
-		return AnyValue{StringValue: hex.EncodeToString(val.BytesValue)}
-	case nil:
-		return AnyValue{}
-	default:
-		// Arrays and kvlists: keep the protobuf text form rather than lose the
-		// attribute entirely.
-		return AnyValue{StringValue: v.String()}
+		return stringAny(hex.EncodeToString(val.BytesValue))
+	case *commonpb.AnyValue_ArrayValue, *commonpb.AnyValue_KvlistValue:
+		return stringAny(renderNative(protoNative(v, depth)))
 	}
+	return AnyValue{}
+}
+
+// protoNative mirrors jsonNative so an array or kvlist renders to the same
+// text whichever wire format carried it.
+func protoNative(v *commonpb.AnyValue, depth int) any {
+	if depth > maxAnyDepth {
+		return "..."
+	}
+	switch val := v.GetValue().(type) {
+	case *commonpb.AnyValue_ArrayValue:
+		list := make([]any, 0, len(val.ArrayValue.GetValues()))
+		for _, e := range val.ArrayValue.GetValues() {
+			list = append(list, protoNative(e, depth+1))
+		}
+		return list
+	case *commonpb.AnyValue_KvlistValue:
+		m := make(map[string]any, len(val.KvlistValue.GetValues()))
+		for _, e := range val.KvlistValue.GetValues() {
+			m[e.GetKey()] = protoNative(e.GetValue(), depth+1)
+		}
+		return m
+	}
+	return protoAnyValueDepth(v, depth).native()
 }

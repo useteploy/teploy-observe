@@ -39,6 +39,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/feedback"
 	"github.com/useteploy/teploy-observe/internal/flags"
 	"github.com/useteploy/teploy-observe/internal/groups"
+	"github.com/useteploy/teploy-observe/internal/guardmap"
 	"github.com/useteploy/teploy-observe/internal/heatmaps"
 	"github.com/useteploy/teploy-observe/internal/incidents"
 	"github.com/useteploy/teploy-observe/internal/infra"
@@ -374,6 +375,8 @@ func main() {
 	// they dedupe, processed outbox intents prune, dead letters never do.
 	retentionPolicies := append(jobs.DefaultPolicies(cfg.RawRetentionDays, cfg.HourlyRetentionDays, cfg.LLMRetentionDays),
 		jobs.DefaultLedgerPolicies(cfg.ErrorInboxRetentionDays, cfg.ReplayBatchesRetentionDays, cfg.DerivedOutboxRetentionDays)...)
+	retentionPolicies = append(retentionPolicies,
+		jobs.DefaultTelemetryPolicies(cfg.MetricsRetentionDays, cfg.InfraRetentionDays, cfg.UptimeRetentionDays)...)
 
 	// Stats service
 	statsSvc := query.NewStatsService(db).WithRetention(query.RetentionWindows{
@@ -434,6 +437,9 @@ func main() {
 	// Feature expansion services
 	reportSvc := reports.NewReportService(db, logger)
 	integrationSvc := integrations.NewIntegrationService(db, logger)
+	// New-issue and regression events fire the site's integrations. Wired
+	// after the demo seed above so seeded issues do not page anyone.
+	issueNotifier := wireIssueNotifications(issueSvc, integrationSvc, cfg.PublicURL)
 	feedbackSvc := feedback.NewFeedbackService(db)
 	viewSvc := views.NewViewService(db)
 	explorerSvc := explorer.NewExplorerService(db)
@@ -443,10 +449,14 @@ func main() {
 	groupSvc := groups.NewGroupService(db)
 	ssoSvc := sso.NewSSOService(db)
 	flagSvc := flags.NewFlagService(db)
-	experimentSvc := experiments.NewExperimentService(db)
+	flagSvc.WithEvalDedup(flags.LoadEvalDedupFromEnv(os.Getenv))
+	experimentSvc := experiments.NewExperimentService(db).WithPrivacy(siteSvc.PrivacyConfig, cfg.SessionSalt)
 	surveySvc := surveys.NewSurveyService(db, cfg.SessionSalt, siteSvc)
 	logSvc := logs.NewLogService(db)
 	logSvc.SetPipelines(pipelineSvc)
+	// The same limiter and budgets guard the log and metric read paths.
+	logSvc.WithQueryGuard(queryLimiter, queryBudgets)
+	metricsSvc.WithQueryGuard(queryLimiter, queryBudgets)
 	uptimeSvc := monitoring.NewUptimeService(db, logger)
 	cronSvc := monitoring.NewCronService(db, logger)
 	linkSvc := tracking.NewLinkService(db)
@@ -654,6 +664,12 @@ func main() {
 		}),
 		// R22 (round 4): webhook delivery drains on shutdown instead of
 		// dying with the process mid-alert.
+		neutron.WithLifecycle(neutron.LifecycleHook{
+			Name: "issue-notifications",
+			OnStop: func(ctx context.Context) error {
+				return shutdownIssueNotifications(issueNotifier)
+			},
+		}),
 		neutron.WithLifecycle(neutron.LifecycleHook{
 			Name: "webhook-delivery",
 			OnStop: func(ctx context.Context) error {
@@ -1704,6 +1720,13 @@ func main() {
 		// conflicting-id / pending (plus the legacy queued/bytes backlog
 		// fields and replayed-on-restart).
 		health["errors"] = errorBuf.Stats()
+		// Source-map resolution outcomes per frame (hit / no map for the
+		// release+file / map without a covering mapping / read error).
+		health["sourcemaps"] = sourcemaps.Stats()
+		// New-issue / regression integration notifications: queue depth,
+		// delivered / failed / timed-out, and the overflow and cooldown
+		// suppression counters.
+		health["issue_notifications"] = issueNotifier.Stats()
 		// O08: flag-evaluation condition counters — how many evaluations
 		// could not read their config (unavailable) and how many flags
 		// were quarantined from evaluation by invalid stored config.
@@ -4552,7 +4575,8 @@ func logSearchHandler(svc *logs.LogService) neutron.HandlerFunc[logSearchInput, 
 		if err != nil {
 			return nil, neutron.ErrBadRequest(err.Error())
 		}
-		return emptyOnNil(svc.SearchLogs(ctx, input.SiteID, from, to, input.Level, input.Service, input.Query, input.Limit, input.Offset))
+		out, err := svc.SearchLogs(ctx, input.SiteID, from, to, input.Level, input.Service, input.Query, input.Limit, input.Offset)
+		return emptyOnNil(out, guardmap.HTTPError(err))
 	}
 }
 
@@ -4571,7 +4595,8 @@ func logStatsHandler(svc *logs.LogService) neutron.HandlerFunc[logStatsInput, []
 		if err != nil {
 			return nil, neutron.ErrBadRequest(err.Error())
 		}
-		return emptyOnNil(svc.LogStats(ctx, input.SiteID, from, to))
+		out, err := svc.LogStats(ctx, input.SiteID, from, to)
+		return emptyOnNil(out, guardmap.HTTPError(err))
 	}
 }
 
@@ -4591,7 +4616,8 @@ func logHistogramHandler(svc *logs.LogService) neutron.HandlerFunc[logHistogramI
 		if err != nil {
 			return nil, neutron.ErrBadRequest(err.Error())
 		}
-		return emptyOnNil(svc.Histogram(ctx, input.SiteID, from, to, input.BucketMs))
+		out, err := svc.Histogram(ctx, input.SiteID, from, to, input.BucketMs)
+		return emptyOnNil(out, guardmap.HTTPError(err))
 	}
 }
 
