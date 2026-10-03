@@ -1410,6 +1410,7 @@ func main() {
 	// browser evaluation path.
 	flagEvalLimiter := ingest.NewRateLimiter(60, time.Minute, 120)
 	r.HandleFunc("POST /api/v1/flags/evaluate", flagEvaluateHandler(flagSvc, flagEvalLimiter))
+	r.Handle("GET /api/v1/flags/config", flagConfigRoute(apiKeyMW, rateLimiter.Middleware, flagSvc))
 
 	// --- Experiments (JWT auth; editor+ writes) ---
 	expGroup := r.Group("/api/v1/experiments", jwtMW)

@@ -31,6 +31,7 @@ func TestIngestListenerAllowsTelemetryWrites(t *testing.T) {
 		{"POST", "/api/v1/experiments/expose"},
 		{"POST", "/api/v1/experiments/convert"},
 		{"POST", "/api/v1/flags/evaluate"},
+		{"GET", "/api/v1/flags/config"},
 		{"GET", "/api/v1/surveys/active"},
 		{"POST", "/api/v1/surveys/respond"},
 		{"POST", "/api/v1/sourcemaps/upload"},

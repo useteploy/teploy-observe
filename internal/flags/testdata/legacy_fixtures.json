@@ -1,0 +1,19 @@
+[
+ {"name":"bool-100","flag_key":"bool-100","flag_type":"boolean","enabled":true,"rollout_pct":100,"variants":"","targeting":""},
+ {"name":"bool-disabled","flag_key":"bool-disabled","flag_type":"boolean","enabled":false,"rollout_pct":100,"variants":"","targeting":""},
+ {"name":"bool-30","flag_key":"bool-30","flag_type":"boolean","enabled":true,"rollout_pct":30,"variants":"","targeting":"[]"},
+ {"name":"bool-50-null","flag_key":"bool-50-null","flag_type":"boolean","enabled":true,"rollout_pct":50,"variants":"","targeting":"null"},
+ {"name":"target-eq","flag_key":"target-eq","flag_type":"boolean","enabled":true,"rollout_pct":100,"variants":"","targeting":"[{\"attribute\":\"plan\",\"operator\":\"eq\",\"value\":\"pro\"}]"},
+ {"name":"target-multi","flag_key":"target-multi","flag_type":"boolean","enabled":true,"rollout_pct":75,"variants":"","targeting":"[{\"attribute\":\"plan\",\"operator\":\"neq\",\"value\":\"free\"},{\"attribute\":\"country\",\"operator\":\"in\",\"value\":[\"US\",\"FR\"]}]"},
+ {"name":"target-notin","flag_key":"target-notin","flag_type":"boolean","enabled":true,"rollout_pct":100,"variants":"","targeting":"[{\"attribute\":\"country\",\"operator\":\"not_in\",\"value\":[\"DE\"]}]"},
+ {"name":"target-contains","flag_key":"target-contains","flag_type":"boolean","enabled":true,"rollout_pct":100,"variants":"","targeting":"[{\"attribute\":\"email\",\"operator\":\"contains\",\"value\":\"corp\"}]"},
+ {"name":"target-scalar-in","flag_key":"target-scalar-in","flag_type":"boolean","enabled":true,"rollout_pct":100,"variants":"","targeting":"[{\"attribute\":\"country\",\"operator\":\"in\",\"value\":\"US\"}]"},
+ {"name":"target-numeric-eq","flag_key":"target-numeric-eq","flag_type":"boolean","enabled":true,"rollout_pct":100,"variants":"","targeting":"[{\"attribute\":\"plan\",\"operator\":\"eq\",\"value\":5}]"},
+ {"name":"mv-3","flag_key":"mv-3","flag_type":"multivariate","enabled":true,"rollout_pct":100,"variants":"[{\"key\":\"a\",\"name\":\"A\",\"rollout_pct\":50},{\"key\":\"b\",\"name\":\"B\",\"rollout_pct\":30},{\"key\":\"c\",\"name\":\"C\",\"rollout_pct\":20}]","targeting":""},
+ {"name":"mv-short-sum","flag_key":"mv-short-sum","flag_type":"multivariate","enabled":true,"rollout_pct":60,"variants":"[{\"key\":\"x\",\"rollout_pct\":10},{\"key\":\"y\",\"rollout_pct\":10}]","targeting":"[{\"attribute\":\"plan\",\"operator\":\"eq\",\"value\":\"pro\"}]"},
+ {"name":"mv-legacy-extra-fields","flag_key":"mv-legacy-extra-fields","flag_type":"multivariate","enabled":true,"rollout_pct":100,"variants":"[{\"key\":\"on\",\"name\":\"On\",\"value\":\"1\",\"weight\":9,\"rollout_pct\":50},{\"key\":\"off\",\"rollout_pct\":50}]","targeting":""},
+ {"name":"type-string-variants-ignored","flag_key":"type-string-variants-ignored","flag_type":"string","enabled":true,"rollout_pct":100,"variants":"[{\"key\":\"a\",\"rollout_pct\":100}]","targeting":""},
+ {"name":"bad-targeting-quarantine","flag_key":"bad-targeting-quarantine","flag_type":"boolean","enabled":true,"rollout_pct":100,"variants":"","targeting":"{\"attribute\":\"plan\"}"},
+ {"name":"bad-operator-quarantine","flag_key":"bad-operator-quarantine","flag_type":"boolean","enabled":true,"rollout_pct":100,"variants":"","targeting":"[{\"attribute\":\"plan\",\"operator\":\"regex\",\"value\":\".*\"}]"},
+ {"name":"bad-variants-quarantine","flag_key":"bad-variants-quarantine","flag_type":"multivariate","enabled":true,"rollout_pct":100,"variants":"[{\"key\":\"a\",\"rollout_pct\":150}]","targeting":""}
+]
