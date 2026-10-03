@@ -375,10 +375,21 @@ type Span struct {
 	Attributes    string    `json:"attributes"`
 	Resource      string    `json:"resource"`
 	Events        string    `json:"events"`
+	// Links is additive: omitted when the span has none.
+	Links []StoredSpanLink `json:"links,omitempty"`
 }
 
 // GetTrace returns all spans for a trace, ordered for waterfall rendering.
 func (q *QueryService) GetTrace(ctx context.Context, traceID, siteID string) ([]Span, error) {
+	spans, err := q.getTraceSpans(ctx, traceID, siteID)
+	if err != nil {
+		return nil, err
+	}
+	q.attachLinks(ctx, traceID, siteID, spans)
+	return spans, nil
+}
+
+func (q *QueryService) getTraceSpans(ctx context.Context, traceID, siteID string) ([]Span, error) {
 	return nucleus.Query[Span](ctx, q.db.SQL(),
 		`SELECT trace_id, span_id, parent_span_id, service_name, operation_name,
 			span_kind,

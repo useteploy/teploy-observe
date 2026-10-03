@@ -27,16 +27,43 @@ type FlagService struct {
 	unavailableTotal atomic.Int64
 	invalidTotal     atomic.Int64
 	quarantineSeen   sync.Map // flagID "|" part -> struct{}{} — log-once gate
+
+	// persistEval writes one flag_evaluations row. A seam so the dedupe
+	// path is testable without a store; nil-db services (hermetic unit
+	// tests) record nothing.
+	persistEval func(ctx context.Context, siteID, flagKey, userID, variant string) error
+	dedup       *evalDedup
+	evalWritten atomic.Int64
+	evalDeduped atomic.Int64
+	evalFailed  atomic.Int64
 }
 
 func NewFlagService(db *nucleus.Client) *FlagService {
-	s := &FlagService{db: db}
+	s := &FlagService{db: db, dedup: newEvalDedup(DefaultEvalDedupWindow, DefaultEvalDedupMax)}
+	s.persistEval = func(ctx context.Context, siteID, flagKey, userID, variant string) error {
+		if s.db == nil {
+			return nil
+		}
+		_, err := s.db.SQL().Exec(ctx,
+			`INSERT INTO flag_evaluations (eval_id, tenant_id, site_id, flag_key, user_id, variant, timestamp)
+			 VALUES ($1, 'default', $2, $3, $4, $5, $6)`,
+			genID(), siteID, flagKey, userID, variant, time.Now().UTC().UnixMilli())
+		return err
+	}
 	s.fetchFlag = func(ctx context.Context, siteID, flagKey string) ([]FeatureFlag, error) {
 		return nucleus.Query[FeatureFlag](ctx, s.db.SQL(),
 			`SELECT flag_id, tenant_id, site_id, flag_key, name, description, flag_type, enabled, rollout_pct,
 			COALESCE(variants, '') AS variants, COALESCE(targeting, '') AS targeting, created_at, version
 		 FROM `+flagsLatest("site_id = $1 AND flag_key = $2"), siteID, flagKey)
 	}
+	return s
+}
+
+// WithEvalDedup sets the flag_evaluations write-dedupe window and cache
+// bound (see evaldedup.go). A window <= 0 disables dedupe. Returns the
+// receiver for fluent boot-time setup.
+func (s *FlagService) WithEvalDedup(window time.Duration, max int) *FlagService {
+	s.dedup = newEvalDedup(window, max)
 	return s
 }
 
@@ -51,6 +78,14 @@ func (s *FlagService) Stats() map[string]int64 {
 		"config_unavailable_total": s.unavailableTotal.Load(),
 		"invalid_config_total":     s.invalidTotal.Load(),
 		"invalid_config_distinct":  distinct,
+		// flag_evaluations write accounting: rows written, evaluations
+		// whose row was suppressed by the dedupe window, failed writes,
+		// and the dedupe cache's current size / LRU evictions.
+		"eval_rows_written_total": s.evalWritten.Load(),
+		"eval_rows_deduped_total": s.evalDeduped.Load(),
+		"eval_rows_failed_total":  s.evalFailed.Load(),
+		"eval_dedup_entries":      int64(s.dedup.size()),
+		"eval_dedup_evicted":      s.dedup.evictedTotal(),
 	}
 }
 
@@ -386,20 +421,34 @@ func (s *FlagService) Evaluate(ctx context.Context, siteID, flagKey, userID stri
 		return result, nil
 	}
 
-	// Fire-and-forget: evaluation tracking is best-effort, must not block
-	// response. Reached only for real decisions (unavailable and invalid
-	// return above) — exposure recording semantics unchanged (O08 scope).
-	// The nil-db guard keeps the seam-injected unit path hermetic; the
-	// recording is already best-effort.
-	if s.db != nil {
-		evalID := genID()
-		_, _ = s.db.SQL().Exec(ctx,
-			`INSERT INTO flag_evaluations (eval_id, tenant_id, site_id, flag_key, user_id, variant, timestamp)
-			 VALUES ($1, 'default', $2, $3, $4, $5, $6)`,
-			evalID, siteID, flagKey, userID, result.Variant, time.Now().UTC().UnixMilli())
-	}
+	// Evaluation tracking is best-effort and never changes the answer.
+	// Reached only for real decisions (unavailable and invalid return
+	// above). At most one row per (site, flag, variant, user) per dedupe
+	// window; nothing reads flag_evaluations for experiment exposure
+	// counts (those come from experiment_exposures), see evaldedup.go.
+	s.recordEvaluation(ctx, siteID, flagKey, userID, result.Variant)
 
 	return result, nil
+}
+
+// recordEvaluation applies the dedupe window and writes at most one
+// flag_evaluations row. Failures are counted, forgotten (so the next
+// evaluation retries) and never surfaced to the caller.
+func (s *FlagService) recordEvaluation(ctx context.Context, siteID, flagKey, userID, variant string) {
+	if s.persistEval == nil {
+		return
+	}
+	key := evalKey(siteID, flagKey, variant, userID)
+	if !s.dedup.admit(key) {
+		s.evalDeduped.Add(1)
+		return
+	}
+	if err := s.persistEval(ctx, siteID, flagKey, userID, variant); err != nil {
+		s.dedup.forget(key)
+		s.evalFailed.Add(1)
+		return
+	}
+	s.evalWritten.Add(1)
 }
 
 // quarantine refuses evaluation of a flag whose stored config failed

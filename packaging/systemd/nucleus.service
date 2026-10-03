@@ -10,9 +10,11 @@ User=nucleus
 Group=nucleus
 WorkingDirectory=/var/lib/nucleus
 
+# NO_AUTH is on, so the listener MUST stay on loopback (--host 127.0.0.1
+# below). Do not widen it; see docs/operations/hardening.md.
 Environment=NUCLEUS_ALLOW_NO_AUTH=1
 
-ExecStart=/usr/local/bin/nucleus start --port 5432 --data /var/lib/nucleus/data --max-memory 512
+ExecStart=/usr/local/bin/nucleus start --host 127.0.0.1 --port 5432 --data /var/lib/nucleus/data --max-memory 512
 
 KillSignal=SIGTERM
 TimeoutStopSec=30s
