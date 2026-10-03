@@ -1,0 +1,82 @@
+name: Helm chart
+
+# Lints and renders packaging/helm/observe and validates the rendered manifests
+# against the Kubernetes API schemas. Separate from ci.yml on purpose; only runs
+# when the chart (or this workflow) changes.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packaging/helm/**'
+      - '.github/workflows/helm.yml'
+  pull_request:
+    paths:
+      - 'packaging/helm/**'
+      - '.github/workflows/helm.yml'
+
+permissions:
+  contents: read
+
+env:
+  CHART: packaging/helm/observe
+  KUBERNETES_VERSION: 1.30.0
+
+jobs:
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Install kubeconform
+        run: go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7
+
+      - name: helm lint (secrets supplied)
+        run: helm lint "$CHART" --strict -f "$CHART/ci/values-ci.yaml"
+
+      - name: helm template | kubeconform (all features on)
+        run: |
+          helm template obs "$CHART" -f "$CHART/ci/values-ci.yaml" \
+            | "$(go env GOPATH)/bin/kubeconform" -strict -summary \
+                -kubernetes-version "$KUBERNETES_VERSION"
+
+      - name: helm template | kubeconform (existingSecret, external database)
+        run: |
+          helm template obs "$CHART" \
+            --set secrets.existingSecret=my-observe-secrets \
+            --set nucleus.enabled=false \
+            --set nucleus.externalUrl=postgres://db.example:5432/observe \
+            | "$(go env GOPATH)/bin/kubeconform" -strict -summary \
+                -kubernetes-version "$KUBERNETES_VERSION"
+
+      - name: Render fails without JWT secret and session salt
+        run: |
+          if helm template obs "$CHART" >/tmp/out.txt 2>/tmp/err.txt; then
+            echo "chart rendered without OBSERVE_JWT_SECRET/OBSERVE_SESSION_SALT" >&2
+            exit 1
+          fi
+          grep -q OBSERVE_JWT_SECRET /tmp/err.txt
+
+      - name: Schema rejects unpinned Nucleus and unknown keys
+        run: |
+          if helm template obs "$CHART" -f "$CHART/ci/values-ci.yaml" --set nucleus.image.tag=latest >/dev/null 2>&1; then
+            echo "nucleus.image.tag=latest was accepted" >&2; exit 1
+          fi
+          if helm template obs "$CHART" -f "$CHART/ci/values-ci.yaml" --set replicaCount=2 >/dev/null 2>&1; then
+            echo "unknown key replicaCount was accepted" >&2; exit 1
+          fi
+
+      - name: Invariants (single replica, Nucleus isolated)
+        run: |
+          helm template obs "$CHART" -f "$CHART/ci/values-ci.yaml" > /tmp/all.yaml
+          test "$(grep -c '^  replicas: 1$' /tmp/all.yaml)" = 2
+          grep -q 'kind: NetworkPolicy' /tmp/all.yaml
+          # Nucleus is never given an Ingress or non-ClusterIP Service.
+          if awk '/kind: Ingress/,/^---/' /tmp/all.yaml | grep -q 'obs-observe-nucleus'; then
+            echo "an Ingress references Nucleus" >&2; exit 1
+          fi
