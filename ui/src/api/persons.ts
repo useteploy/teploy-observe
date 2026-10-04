@@ -33,6 +33,10 @@ export interface PersonEvent {
 export interface PersonDetail {
   person: Person;
   timeline: PersonEvent[];
+  // C3: identify() traits (aliases merged, canonical wins), merged keys.
+  properties?: Record<string, string | number | boolean>;
+  aliases?: string[];
+  canonical_key?: string;
 }
 
 export interface PersonsListResult {
@@ -111,6 +115,14 @@ export const personsApi = {
     if (opts?.includeAnonymous) q += `&include_anonymous=true`;
     return get<PersonsListResult>(`${BASE}/persons?${q}`);
   },
+  // C3: editor+ merge of fromKey into intoKey; admin-only erase. Keys go in
+  // the body so a raw identifier never appears in a URL/audit path.
+  merge: (siteId: string, fromKey: string, intoKey: string) =>
+    post<{ site_id: string; from_key: string; canonical_key: string }>(
+      `${BASE}/persons/merge`, { site_id: siteId, from_key: fromKey, into_key: intoKey }),
+  erase: (siteId: string, personKey: string) =>
+    post<{ site_id: string; erased_keys: string[]; events_deleted: boolean }>(
+      `${BASE}/persons/erase`, { site_id: siteId, person_key: personKey }),
   detail: (distinctId: string, siteId: string) =>
     get<PersonDetail>(`${BASE}/persons/${encodeURIComponent(distinctId)}?site_id=${encodeURIComponent(siteId)}`),
 };

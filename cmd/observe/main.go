@@ -1830,7 +1830,13 @@ func main() {
 	// C2 Wave 4: aggregate over events.distinct_id. Read-only; no editor
 	// gating needed. Single-line wiring matches the metrics / boards
 	// convention above.
-	RegisterPersonsRoutes(r, jwtMW, personsSvc)
+	// C3: properties (telemetry key), merge (editor+), erase (admin).
+	RegisterPersonsRoutes(r, PersonsRouteDeps{
+		JWT: jwtMW, Editor: requireEditor, Admin: requireAdmin,
+		Ingest: ingestGroup, Svc: personsSvc,
+		Privacy: siteSvc, GlobalSalt: cfg.SessionSalt,
+		Actor: func(req *http.Request) string { return requestActor(authSvc, req) },
+	})
 
 	// --- Cohorts API ---
 	// C2 Wave 4: behavioural grouping. Owns its own table (migration 023)
