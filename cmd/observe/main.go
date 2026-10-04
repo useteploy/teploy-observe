@@ -458,6 +458,8 @@ func main() {
 	// The same limiter and budgets guard the log and metric read paths.
 	logSvc.WithQueryGuard(queryLimiter, queryBudgets)
 	metricsSvc.WithQueryGuard(queryLimiter, queryBudgets)
+	// O12: trace reads share the stats limiter and budgets.
+	traceQuery.WithQueryGuard(queryLimiter, queryBudgets)
 	uptimeSvc := monitoring.NewUptimeService(db, logger)
 	cronSvc := monitoring.NewCronService(db, logger)
 	linkSvc := tracking.NewLinkService(db)
@@ -1057,6 +1059,7 @@ func main() {
 		neutron.WithTags("traces"),
 		neutron.WithSummary("Get service dependency graph"),
 	)
+	RegisterTraceSearchRoutes(traceGroup, traceQuery)
 
 	// --- Platform API (JWT auth, admin-only for writes) ---
 	// AUD-008: the stream-ticket mint sits here (JWT-authed) rather than on
@@ -5783,127 +5786,6 @@ func otlpTraceHandler(svc *tracing.IngestService) neutron.HandlerFunc[tracing.Ex
 			return tracing.IngestResponse{}, neutron.ErrBadRequest("missing site_id")
 		}
 		return svc.Ingest(ctx, siteID, input)
-	}
-}
-
-// --- Trace query handlers ---
-
-type listServicesInput struct {
-	SiteID string `query:"site_id"`
-	From   string `query:"from"`
-	To     string `query:"to"`
-}
-
-func listServicesHandler(svc *tracing.QueryService) neutron.HandlerFunc[listServicesInput, []tracing.ServiceSummary] {
-	return func(ctx context.Context, input listServicesInput) ([]tracing.ServiceSummary, error) {
-		if input.SiteID == "" {
-			return nil, neutron.ErrBadRequest("site_id required")
-		}
-		from, to, err := parseTimeRange(input.From, input.To)
-		if err != nil {
-			return nil, neutron.ErrBadRequest(err.Error())
-		}
-		return emptyOnNil(svc.ListServices(ctx, input.SiteID, from, to))
-	}
-}
-
-type listOpsInput struct {
-	SiteID  string `query:"site_id"`
-	Service string `path:"service"`
-	From    string `query:"from"`
-	To      string `query:"to"`
-}
-
-func listOperationsHandler(svc *tracing.QueryService) neutron.HandlerFunc[listOpsInput, []tracing.OperationSummary] {
-	return func(ctx context.Context, input listOpsInput) ([]tracing.OperationSummary, error) {
-		if input.SiteID == "" || input.Service == "" {
-			return nil, neutron.ErrBadRequest("site_id and service required")
-		}
-		from, to, err := parseTimeRange(input.From, input.To)
-		if err != nil {
-			return nil, neutron.ErrBadRequest(err.Error())
-		}
-		return emptyOnNil(svc.ListOperations(ctx, input.SiteID, input.Service, from, to))
-	}
-}
-
-type searchTracesInput struct {
-	SiteID      string `query:"site_id"`
-	From        string `query:"from"`
-	To          string `query:"to"`
-	Service     string `query:"service"`
-	Operation   string `query:"operation"`
-	Offset      int    `query:"offset"`
-	Status      string `query:"status"`
-	MinDuration int64  `query:"min_duration"`
-	MaxDuration int64  `query:"max_duration"`
-	Limit       int    `query:"limit"`
-}
-
-func searchTracesHandler(svc *tracing.QueryService) neutron.HandlerFunc[searchTracesInput, []tracing.TraceSummary] {
-	return func(ctx context.Context, input searchTracesInput) ([]tracing.TraceSummary, error) {
-		if input.SiteID == "" {
-			return nil, neutron.ErrBadRequest("site_id required")
-		}
-		from, to, err := parseTimeRange(input.From, input.To)
-		if err != nil {
-			return nil, neutron.ErrBadRequest(err.Error())
-		}
-		return emptyOnNil(svc.SearchTraces(ctx, input.SiteID, from, to, input.Service, input.Operation, input.Status, input.MinDuration, input.MaxDuration, input.Limit, input.Offset))
-	}
-}
-
-type getTraceInput struct {
-	TraceID string `path:"trace_id"`
-	SiteID  string `query:"site_id"`
-}
-
-func getTraceHandler(svc *tracing.QueryService) neutron.HandlerFunc[getTraceInput, []tracing.Span] {
-	return func(ctx context.Context, input getTraceInput) ([]tracing.Span, error) {
-		if input.SiteID == "" || input.TraceID == "" {
-			return nil, neutron.ErrBadRequest("site_id and trace_id required")
-		}
-		return emptyOnNil(svc.GetTrace(ctx, input.TraceID, input.SiteID))
-	}
-}
-
-type traceErrorsInput struct {
-	TraceID string `path:"trace_id"`
-	SiteID  string `query:"site_id"`
-}
-
-func traceErrorsHandler(svc *tracing.QueryService) neutron.HandlerFunc[traceErrorsInput, []tracing.TraceErrorHit] {
-	return func(ctx context.Context, input traceErrorsInput) ([]tracing.TraceErrorHit, error) {
-		if input.SiteID == "" || input.TraceID == "" {
-			return nil, neutron.ErrBadRequest("site_id and trace_id required")
-		}
-		hits, err := svc.TraceErrors(ctx, input.TraceID, input.SiteID)
-		if err != nil {
-			return nil, err
-		}
-		if hits == nil {
-			hits = []tracing.TraceErrorHit{}
-		}
-		return hits, nil
-	}
-}
-
-type serviceDepsInput struct {
-	SiteID string `query:"site_id"`
-	From   string `query:"from"`
-	To     string `query:"to"`
-}
-
-func serviceDepsHandler(svc *tracing.QueryService) neutron.HandlerFunc[serviceDepsInput, []tracing.Dependency] {
-	return func(ctx context.Context, input serviceDepsInput) ([]tracing.Dependency, error) {
-		if input.SiteID == "" {
-			return nil, neutron.ErrBadRequest("site_id required")
-		}
-		from, to, err := parseTimeRange(input.From, input.To)
-		if err != nil {
-			return nil, neutron.ErrBadRequest(err.Error())
-		}
-		return emptyOnNil(svc.ServiceDependencies(ctx, input.SiteID, from, to))
 	}
 }
 
