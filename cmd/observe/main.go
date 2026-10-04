@@ -835,6 +835,9 @@ func main() {
 				return ingestSrv.Shutdown(ctx)
 			},
 		}),
+		// OTLP/gRPC receiver (OBSERVE_OTLP_GRPC_ADDR, default off); configured
+		// below once its dependencies exist. See otlpgrpc_wiring.go.
+		neutron.WithLifecycle(otlpGRPCHook(logger)),
 		neutron.WithMiddleware(ingest.RequestInfoMiddleware(ingest.ParseTrustedProxies(cfg.TrustedProxies))),
 		neutron.WithMiddleware(config.DemoModeMiddleware(cfg.DemoMode)),
 		// Record every admin mutation to the audit trail (comprehensive
@@ -871,6 +874,7 @@ func main() {
 		rateLimit = 1000
 	}
 	rateLimiter := ingest.NewRateLimiter(rateLimit, time.Second, rateLimit*2)
+	configureOTLPGRPC(logger, authSvc, rateLimiter, traceIngest, metricsSvc, logSvc)
 	// Hydrate per-site caps from the sites table so the first ingest after
 	// a restart honors admin overrides.
 	if caps, err := siteSvc.ListRatelimits(ctx); err == nil {
