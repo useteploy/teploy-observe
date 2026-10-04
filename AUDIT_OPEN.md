@@ -21,7 +21,9 @@ built without Nucleus (the sandbox's network policy blocked the image),
 so 214 integration tests were skipped at commit time. The live
 verification ran 2026-10-04 against ghcr.io/neutron-build/nucleus:v1.1.1
 (docker, the CI shape; image digest f8d4362c, binary banner v1.0.2 - the
-known upstream tag/version mismatch).
+known upstream tag/version mismatch), and was RE-RUN after the v1.2.1 pin
+merge against ghcr.io/neutron-build/nucleus:v1.2.1: fresh ladder boot plus
+the full serial suite, 53/53 packages green on both engines.
 
 **Live verification (2026-10-04, green):**
 - Migration ladder applies fresh (001-063) AND on a populated store
