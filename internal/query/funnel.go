@@ -46,6 +46,14 @@ type FunnelOptions struct {
 	// — steps already matched are kept, nothing further counts. Events
 	// at or before the step-0 event never disqualify.
 	Exclusions []FunnelStep
+	// CohortID, when non-empty, restricts the funnel to events whose
+	// distinct_id is a member of the cohort (same membership resolution
+	// as the stats routes' cohort_id filter, applied Go-side on the
+	// streamed rows; see cohort_filter.go). Events with no distinct_id
+	// never match, so the funnel counts identified activity only. A
+	// missing cohort is 404, an oversized one 422, a failed resolution
+	// 503 - never an unfiltered funnel.
+	CohortID string
 }
 
 // funnelEvent is the minimal event data needed for funnel computation.
@@ -199,12 +207,19 @@ func (s *StatsService) FunnelWithOptions(ctx context.Context, siteID string, fro
 		return nil, err
 	}
 	defer finish()
+	members, err := s.resolveCohortSet(qctx, siteID, opts.CohortID)
+	if err != nil {
+		return nil, err
+	}
 
 	walkers := make(map[string]*funnelWalker)
 	err = s.streamEvents(qctx, siteID, from.UnixMilli(), to.UnixMilli(), "", func(row pgx.Row) error {
 		e, err := scanFunnelEvent(row)
 		if err != nil {
 			return fmt.Errorf("funnel scan: %w", err)
+		}
+		if members != nil && !members.has(e.DistinctID) {
+			return nil
 		}
 		id, ok := entityKeyOf(entity, e)
 		if !ok {
@@ -301,6 +316,10 @@ func (s *StatsService) FunnelByBreakdownWithOptions(ctx context.Context, siteID 
 		return nil, err
 	}
 	defer finish()
+	members, err := s.resolveCohortSet(qctx, siteID, opts.CohortID)
+	if err != nil {
+		return nil, err
+	}
 
 	// Group walkers by (breakdown, entity); an entity can span different
 	// breakdown values in theory; keep the first seen in stream order.
@@ -311,6 +330,9 @@ func (s *StatsService) FunnelByBreakdownWithOptions(ctx context.Context, siteID 
 		e, err := scanFunnelEventWithBreakdown(row)
 		if err != nil {
 			return fmt.Errorf("funnel breakdown scan: %w", err)
+		}
+		if members != nil && !members.has(e.DistinctID) {
+			return nil
 		}
 		eid, ok := entityKeyOf(entity, e.funnelEvent)
 		if !ok {

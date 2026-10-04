@@ -86,10 +86,9 @@ func (i StatsInput) resolveFilters(ctx context.Context, svc *StatsService) (*Fil
 	if i.CohortID == "" || svc == nil {
 		return fb, nil
 	}
-	ids, err := svc.ResolveCohort(ctx, i.SiteID, i.CohortID)
+	ids, err := svc.resolveCohortAdmitted(ctx, i.SiteID, i.CohortID)
 	if err != nil {
-		slog.Error("cohort resolve failed", "err", err, "site", i.SiteID, "cohort", i.CohortID)
-		return nil, cohortResolveError(err)
+		return nil, cohortResolveFailure(ctx, i.SiteID, i.CohortID, err)
 	}
 	if ids == nil {
 		// Resolver wired but cohort_id wasn't found / returned nil.
@@ -101,7 +100,18 @@ func (i StatsInput) resolveFilters(ctx context.Context, svc *StatsService) (*Fil
 	return fb, nil
 }
 
+// cohortResolveFailure logs a cohort resolution failure (the raw error stays
+// in the log, never in the response) and returns its HTTP mapping.
+func cohortResolveFailure(ctx context.Context, siteID, cohortID string, err error) error {
+	if !errors.Is(err, cohorts.ErrNotFound) {
+		slog.Error("cohort resolve failed", "err", err, "site", siteID, "cohort", cohortID)
+	}
+	return cohortResolveError(err)
+}
+
 // cohortResolveError maps a cohort resolver failure to an HTTP error:
+//   - cohort missing for this site (including another site's cohort id):
+//     404, indistinguishable from a cohort that never existed;
 //   - cohort larger than the filter can express (one SQL parameter per
 //     member): 422, the caller must narrow the cohort;
 //   - query-admission refusal (429 / 504): the refusal's own status;
@@ -109,6 +119,9 @@ func (i StatsInput) resolveFilters(ctx context.Context, svc *StatsService) (*Fil
 //     retryable server-side condition. The raw error is logged by the
 //     caller, never echoed to the client.
 func cohortResolveError(err error) error {
+	if errors.Is(err, cohorts.ErrNotFound) {
+		return neutron.ErrNotFound("cohort not found")
+	}
 	if errors.Is(err, cohorts.ErrTooLarge) {
 		return neutron.ErrValidation(
 			"cohort has more members than a chart filter supports; narrow the cohort definition",
@@ -213,6 +226,9 @@ type FunnelInput struct {
 	ConversionWindowMs int64 `json:"conversion_window_ms"`
 	// Exclusions are disqualifying steps (see FunnelOptions).
 	Exclusions []FunnelStep `json:"exclusions"`
+	// CohortID restricts the funnel to the cohort's members (see
+	// FunnelOptions.CohortID).
+	CohortID string `json:"cohort_id"`
 }
 
 // FunnelBreakdownInput augments FunnelInput with a breakdown dimension.
@@ -224,6 +240,7 @@ type FunnelBreakdownInput struct {
 	BreakdownBy string       `json:"breakdown_by"`
 	MinSize     int          `json:"min_size"`
 	Entity      string       `json:"entity"`
+	CohortID    string       `json:"cohort_id"`
 }
 
 func (i FunnelBreakdownInput) TimeRange() (time.Time, time.Time) {
@@ -264,6 +281,9 @@ type RetentionInput struct {
 	// ReturnEvent restricts return-activity bucketing to an event_type
 	// (empty = any event).
 	ReturnEvent string `query:"return_event"`
+	// CohortID restricts retention to the cohort's members (see
+	// RetentionOptions.CohortID).
+	CohortID string `query:"cohort_id"`
 }
 
 func (i RetentionInput) TimeRange() (time.Time, time.Time) {
@@ -599,6 +619,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 			Entity:             input.Entity,
 			ConversionWindowMs: input.ConversionWindowMs,
 			Exclusions:         input.Exclusions,
+			CohortID:           input.CohortID,
 		})
 	}, neutron.WithTags("stats"))
 
@@ -610,7 +631,8 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 			min = 5
 		}
 		return svc.FunnelByBreakdownWithOptions(ctx, input.SiteID, from, to, input.Steps, input.BreakdownBy, min, FunnelOptions{
-			Entity: input.Entity,
+			Entity:   input.Entity,
+			CohortID: input.CohortID,
 		})
 	}, neutron.WithTags("stats"))
 
@@ -621,6 +643,7 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 			Entity:      input.Entity,
 			CohortEvent: input.CohortEvent,
 			ReturnEvent: input.ReturnEvent,
+			CohortID:    input.CohortID,
 		})
 	}, neutron.WithTags("stats"))
 }

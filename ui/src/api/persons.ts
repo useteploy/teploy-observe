@@ -52,9 +52,16 @@ export interface CohortRule {
   value?: string;
 }
 
+// CohortDefinition is the stored rule. Three shapes share it: legacy flat
+// ({op:"and", rules}), a tree ({op:"and|or|not", children} with {leaf}
+// leaves, depth <= 4, <= 30 leaves) and static ({op:"static"}; the list
+// lives server-side). The form editor only builds the flat-AND shape; trees
+// are edited as JSON.
 export interface CohortDefinition {
-  op: "and";
-  rules: CohortRule[];
+  op: "and" | "or" | "not" | "static";
+  rules?: CohortRule[];
+  children?: CohortDefinition[];
+  leaf?: CohortRule;
 }
 
 export interface Cohort {
@@ -85,9 +92,17 @@ export function parseRule(raw: string): CohortDefinition {
   if (!raw) return { op: "and", rules: [] };
   try {
     const p = JSON.parse(raw);
-    if (p && p.op === "and" && Array.isArray(p.rules)) return p;
+    if (p && (p.op === "and" || p.op === "or" || p.op === "not" || p.op === "static" || p.leaf)) {
+      return p;
+    }
   } catch { /* fall through */ }
   return { op: "and", rules: [] };
+}
+
+// isFlatAnd reports whether a definition is the legacy shape the form
+// editor can round-trip.
+export function isFlatAnd(def: CohortDefinition): boolean {
+  return def.op === "and" && !def.children?.length && !def.leaf;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +149,14 @@ export const cohortsApi = {
     post<Cohort>(`${BASE}/cohorts/${cohortId}/refresh?site_id=${encodeURIComponent(siteId)}`, {}),
   preview: (siteId: string, rule: CohortDefinition) =>
     post<CohortPreviewResult>(`${BASE}/cohorts/preview`, { site_id: siteId, rule }),
+  // Static cohorts (list-backed). Bodies are bounded server-side (8 MB,
+  // 100k distinct ids); the server answers 422 past the caps.
+  createStatic: (data: { site_id: string; name: string; description?: string; ids: string[] }) =>
+    post<Cohort>(`${BASE}/cohorts/static`, data),
+  addMembers: (cohortId: string, siteId: string, ids: string[]) =>
+    post<{ cohort: Cohort; changed: number }>(`${BASE}/cohorts/${cohortId}/members`, { site_id: siteId, ids }),
+  removeMembers: (cohortId: string, siteId: string, ids: string[]) =>
+    post<{ cohort: Cohort; changed: number }>(`${BASE}/cohorts/${cohortId}/members/remove`, { site_id: siteId, ids }),
   members: (cohortId: string, siteId: string, opts?: { limit?: number; offset?: number }) => {
     let q = `site_id=${encodeURIComponent(siteId)}`;
     if (opts?.limit) q += `&limit=${opts.limit}`;
