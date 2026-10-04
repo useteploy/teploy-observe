@@ -5,7 +5,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/useteploy/teploy-observe/internal/dbutil"
 	"google.golang.org/protobuf/proto"
 
 	tracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
@@ -149,5 +151,44 @@ func TestInsertSpanLinks_NoLinksNoExec(t *testing.T) {
 	// nil SQL would panic if an INSERT were attempted for a link-free batch.
 	if err := insertSpanLinks(nil, nil, "s", []flatSpan{{TraceID: "t", SpanID: "s"}}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBuildTraceLinksSQL_AlwaysLimitedAndOptionallyWindowed(t *testing.T) {
+	q, p := buildTraceLinksSQL("t", "s", LinkWindow{})
+	if !strings.Contains(q, "LIMIT 5000") || strings.Contains(q, "start_time") || len(p) != 2 {
+		t.Errorf("unwindowed: %s %v", q, p)
+	}
+	from := time.UnixMilli(1_000_000_000)
+	q, p = buildTraceLinksSQL("t", "s", LinkWindow{From: from, To: from.Add(time.Minute)})
+	if !strings.Contains(q, "start_time >= CAST($3 AS BIGINT) AND start_time <= CAST($4 AS BIGINT)") ||
+		!strings.Contains(q, "LIMIT 5000") || len(p) != 4 {
+		t.Errorf("windowed: %s %v", q, p)
+	}
+	if p[2] != dbutil.IntParam(from.Add(-linkWindowSlack).UnixMilli()) {
+		t.Errorf("lower bound %v", p[2])
+	}
+}
+
+func TestCapLinksPerSpan(t *testing.T) {
+	var in []StoredSpanLink
+	for i := 0; i < maxTraceLinksPerSpan+10; i++ {
+		in = append(in, StoredSpanLink{SpanID: "a"})
+	}
+	in = append(in, StoredSpanLink{SpanID: "b"})
+	out := capLinksPerSpan(in)
+	if len(out) != maxTraceLinksPerSpan+1 || out[len(out)-1].SpanID != "b" {
+		t.Errorf("len = %d", len(out))
+	}
+}
+
+func TestSpansWindow(t *testing.T) {
+	a, b := time.UnixMilli(100), time.UnixMilli(900)
+	w := spansWindow([]Span{{StartTime: b}, {StartTime: a}})
+	if !w.From.Equal(a) || !w.To.Equal(b) {
+		t.Errorf("window %v", w)
+	}
+	if spansWindow(nil).bounded() || spansWindow([]Span{{StartTime: a}, {}}).bounded() {
+		t.Error("empty or unknown start must give no hint")
 	}
 }
