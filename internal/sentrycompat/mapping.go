@@ -60,6 +60,9 @@ func mapEvent(payload []byte, headerEventID string) (obserrors.ErrorInput, strin
 		Handled:    true,
 		ProducerID: ProducerID,
 	}
+	// Honor the SDK's own event time (float seconds, ms, or RFC 3339 via
+	// toMillis). Absent stays zero: server arrival time is stored.
+	in.ClientTimestamp = toMillis(ev["timestamp"])
 
 	if l := strings.ToLower(str(ev["level"])); validLevels[l] {
 		in.Level = l

@@ -2,6 +2,7 @@ package errors
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -58,6 +59,16 @@ func TestErrorBufferPushFreezesInput(t *testing.T) {
 	in := ErrorInput{SiteID: "s", ErrorType: "T", Extra: inner}
 	if err := b.Push("s", in); err != nil {
 		t.Fatalf("push rejected: %v", err)
+	}
+	// A captured client timestamp more than 24h in the future is refused
+	// at admission (the producer gets a 400, not a silent flush failure).
+	future := time.Now().Add(48 * time.Hour).UnixMilli()
+	if err := b.Push("s", ErrorInput{SiteID: "s", ErrorType: "T", ClientTimestamp: future}); err == nil || !errors.Is(err, ErrBadTimestamp) {
+		t.Fatalf("future client timestamp must be refused with ErrBadTimestamp, got %v", err)
+	}
+	past := time.Now().Add(-2 * time.Hour).UnixMilli()
+	if err := b.Push("s", ErrorInput{SiteID: "s", ErrorType: "T", ClientTimestamp: past}); err != nil {
+		t.Fatalf("past client timestamp must be accepted: %v", err)
 	}
 	inner["k"] = "mutated"
 	in.ErrorType = "MutatedAfterCapture"

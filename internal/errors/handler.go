@@ -68,6 +68,14 @@ type ErrorInput struct {
 	// input before scrubbing, so redaction can never move an event to a
 	// different issue. Empty = derive at insert (seed, scrub disabled).
 	PreGroupHash string `json:"_pre_group_hash,omitempty"`
+	// ClientTimestamp is the producer-captured event time (unix
+	// milliseconds; the Sentry endpoint maps the wire `timestamp` into
+	// it). Zero means "not captured" and the server arrival time is
+	// stored. A value more than 24h in the future is refused: clock
+	// garbage that would poison issue first/last-seen and retention
+	// windows. The past is accepted as-is — offline batching is a
+	// legitimate producer pattern.
+	ClientTimestamp int64 `json:"timestamp,omitempty"`
 }
 
 // Breadcrumb is a user action that preceded the error.
@@ -186,6 +194,19 @@ func (s *Service) ingestEvent(ctx context.Context, input ErrorInput) (issueID st
 // transaction; see ApplyInbox for why that exposure self-heals.
 func (s *Service) insertErrorEvent(ctx context.Context, sqlc *nucleus.SQLModel, input ErrorInput) (errorID, issueID string, err error) {
 	now := time.Now().UTC()
+	// Event time: the producer's own when captured (bounded — anything
+	// past a day of future skew is clock garbage, refused rather than
+	// clamped), else server arrival.
+	ts := now.UnixMilli()
+	if input.ClientTimestamp != 0 {
+		// Admission (ErrorBuffer.Push) refuses future skew with a 400; this
+		// is the same rule on the replay/apply paths, where a refusal can
+		// only surface as a flush error.
+		if input.ClientTimestamp > ts+24*60*60*1000 {
+			return "", "", fmt.Errorf("client timestamp %d is too far in the future", input.ClientTimestamp)
+		}
+		ts = input.ClientTimestamp
+	}
 
 	// Accept either `release` or `release_tag` for the release identifier so a
 	// wire-field mismatch doesn't silently drop it.
@@ -231,7 +252,7 @@ func (s *Service) insertErrorEvent(ctx context.Context, sqlc *nucleus.SQLModel, 
 	}
 
 	// Resolve or create issue
-	issueID, err = s.issueSvc.ResolveIssue(ctx, input.SiteID, groupHash, title, culprit, input.Level, input.ReleaseTag, now.UnixMilli())
+	issueID, err = s.issueSvc.ResolveIssue(ctx, input.SiteID, groupHash, title, culprit, input.Level, input.ReleaseTag, ts)
 	if err != nil {
 		return "", "", fmt.Errorf("resolve issue: %w", err)
 	}
@@ -292,7 +313,7 @@ func (s *Service) insertErrorEvent(ctx context.Context, sqlc *nucleus.SQLModel, 
 			stack_trace, breadcrumbs, contexts, extra, distinct_id, trace_id, span_id
 		) VALUES ($1,'default',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
 		errorID, input.SiteID, input.SessionID, input.ReplayID, issueID, groupHash,
-		now.UnixMilli(), input.ErrorType, input.ErrorValue, input.Mechanism, handled, input.Level,
+		ts, input.ErrorType, input.ErrorValue, input.Mechanism, handled, input.Level,
 		input.ReleaseTag, input.Environment, input.URL, input.Browser, input.OS, input.Device,
 		stackJSON, breadcrumbsJSON, contextsJSON, extraJSON, distinctID, input.TraceID, input.SpanID,
 	)

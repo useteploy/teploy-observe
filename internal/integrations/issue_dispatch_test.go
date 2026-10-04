@@ -194,6 +194,26 @@ func TestPublicSMTPAddr_RebindingMixedAnswerRefused(t *testing.T) {
 	}
 }
 
+func TestPublicSMTPAddr_PrivateRelayAllowlist(t *testing.T) {
+	private := func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("10.1.2.3")}}, nil
+	}
+	if _, err := publicSMTPAddr("relay.tailnet.example", private); err == nil {
+		t.Fatal("private host must be refused without the allowlist")
+	}
+	old := smtpPrivateHosts
+	smtpPrivateHosts = map[string]bool{"relay.tailnet.example": true}
+	defer func() { smtpPrivateHosts = old }()
+	ip, err := publicSMTPAddr("relay.tailnet.example", private)
+	if err != nil || ip != "10.1.2.3" {
+		t.Fatalf("allowlisted relay: %q %v", ip, err)
+	}
+	// The allowlist is exact-name: it does not open the door for others.
+	if _, err := publicSMTPAddr("other.tailnet.example", private); err == nil {
+		t.Fatal("allowlist must not cover sibling names")
+	}
+}
+
 // ---- SSRF -------------------------------------------------------------------
 
 func TestSSRF_StrictClientBlocksLoopbackAndPrivate(t *testing.T) {

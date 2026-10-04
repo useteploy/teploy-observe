@@ -105,6 +105,9 @@ func main() {
 		case "restore":
 			runRestore(cfg, logger)
 			return
+		case "migrate":
+			runMigrate(cfg, logger)
+			return
 		case "version":
 			fmt.Println("observe " + version)
 			return
@@ -435,6 +438,7 @@ func main() {
 
 	// Feature expansion services
 	reportSvc := reports.NewReportService(db, logger)
+	integrations.SetSMTPPrivateHosts(os.Getenv("OBSERVE_SMTP_PRIVATE_HOSTS"))
 	integrationSvc := integrations.NewIntegrationService(db, logger)
 	// New-issue and regression events fire the site's integrations. Wired
 	// after the demo seed above so seeded issues do not page anyone.
@@ -844,6 +848,7 @@ func main() {
 		// below once its dependencies exist. See otlpgrpc_wiring.go.
 		neutron.WithLifecycle(otlpGRPCHook(logger)),
 		neutron.WithMiddleware(ingest.RequestInfoMiddleware(ingest.ParseTrustedProxies(cfg.TrustedProxies))),
+		neutron.WithMiddleware(securityHeadersMiddleware(strings.HasPrefix(cfg.PublicURL, "https://"))),
 		neutron.WithMiddleware(config.DemoModeMiddleware(cfg.DemoMode)),
 		// Record every admin mutation to the audit trail (comprehensive
 		// "who did what" coverage without wiring each handler). Runs after
@@ -1905,6 +1910,7 @@ Usage:
   teploy-observe              Start the HTTP server (default).
   teploy-observe backup       Stream a tar archive of all tables to stdout.
   teploy-observe restore      Read a tar archive from stdin and insert into tables.
+  teploy-observe migrate      Apply migrations without seeding (restore runbook step).
   observe upgrade             Verify and install a release through systemd.
   observe reindex             Rebuild the FTS index from error_events.
   observe version             Print the Observe version.
@@ -2010,6 +2016,29 @@ func runBackup(cfg config.Config, logger *slog.Logger) {
 		fmt.Fprintf(os.Stderr, "backup completed with errors: %v\n", err)
 		os.Exit(2)
 	}
+}
+
+// runMigrate applies the migration ladder and exits without seeding. The
+// restore runbook needs it: `observe restore` refuses a non-empty target,
+// while the server seeds the default site and bootstrap admin at boot — so
+// a database the server has ever started against can never be restored
+// into. The isolated-restore procedure is: fresh database, `observe
+// migrate`, `observe restore`, then start the server (which finds the
+// restored admin and skips seeding).
+func runMigrate(cfg config.Config, logger *slog.Logger) {
+	db := connectForCLI(cfg, logger)
+	defer db.Close()
+
+	report, err := schema.ApplyWithAdoption(context.Background(), db)
+	if err != nil {
+		logger.Error("migrate failed", "err", err)
+		os.Exit(1)
+	}
+	if report != nil {
+		logger.Info("legacy migration history adopted",
+			"verified", len(report.Verified), "unverified", len(report.Unverified))
+	}
+	logger.Info("migrations complete")
 }
 
 func runRestore(cfg config.Config, logger *slog.Logger) {
@@ -2819,6 +2848,8 @@ func errorIngestHandler(buf *obserrors.ErrorBuffer) neutron.HandlerFunc[obserror
 			case errors.Is(err, obserrors.ErrEventIDConflict):
 				return obserrors.ErrorResponse{}, neutron.ErrConflict(err.Error())
 			case errors.Is(err, obserrors.ErrInvalidEventID):
+				return obserrors.ErrorResponse{}, neutron.ErrBadRequest(err.Error())
+			case errors.Is(err, obserrors.ErrBadTimestamp):
 				return obserrors.ErrorResponse{}, neutron.ErrBadRequest(err.Error())
 			case errors.Is(err, obserrors.ErrErrorBufferFull):
 				return obserrors.ErrorResponse{}, neutron.ErrRateLimited("error buffer full")
@@ -5856,6 +5887,32 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
+// securityHeadersMiddleware sets the baseline security headers the Go
+// server itself owes every response (the Caddy TLS profile duplicates the
+// set at the edge; behind a plain HTTP tailnet proxy this was the only
+// layer and it set nothing). Set-if-absent: handler-specific policies
+// (the share pages' R30 cache/referrer set, the replay CSP) win.
+func securityHeadersMiddleware(hsts bool) neutron.Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h := w.Header()
+			if h.Get("X-Content-Type-Options") == "" {
+				h.Set("X-Content-Type-Options", "nosniff")
+			}
+			if h.Get("Referrer-Policy") == "" {
+				h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+			}
+			if h.Get("X-Frame-Options") == "" {
+				h.Set("X-Frame-Options", "SAMEORIGIN")
+			}
+			if hsts && h.Get("Strict-Transport-Security") == "" {
+				h.Set("Strict-Transport-Security", "max-age=31536000")
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // ipRateLimitMW rate-limits by client IP alone (no site_id), for public,

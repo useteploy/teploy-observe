@@ -331,6 +331,11 @@ func (b *ErrorBuffer) Push(siteID string, input ErrorInput) error {
 	if err := ValidateEventIdentity(input.EventID, input.ProducerID); err != nil {
 		return err
 	}
+	// A captured client timestamp is bounded at admission so the refusal
+	// reaches the producer as a 400; a flush-time failure would only log.
+	if input.ClientTimestamp != 0 && input.ClientTimestamp > time.Now().UnixMilli()+24*60*60*1000 {
+		return fmt.Errorf("%w: timestamp is too far in the future", ErrBadTimestamp)
+	}
 	input = b.prepareRecord(input)
 	raw, err := json.Marshal(input)
 	if err != nil || len(raw) > maxErrorRecordBytes {

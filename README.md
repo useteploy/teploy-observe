@@ -420,6 +420,7 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 | `OBSERVE_AUDIT_KEY` | | Audit-chain HMAC key: base64 (>=32 decoded bytes) or raw (>=32 bytes). Unset uses the persistent generated key at `$OBSERVE_DATA_DIR/audit.key`. |
 | `OBSERVE_AUDIT_KEYRING` | | Comma-separated `id:base64key` historical audit keys kept for verification through rotation (startup logs the ready-to-paste entry for the file key). |
 | `OBSERVE_REPLAY_ASSET_HOSTS` | | Comma-separated hostnames the replay asset proxy may fetch images from (empty disables proxied replay images). |
+| `OBSERVE_SMTP_PRIVATE_HOSTS` | | Comma-separated relay hostnames email integrations may dial even though they resolve to private addresses (internal/tailnet relays). Empty keeps the public-only SSRF posture. |
 | `OBSERVE_REQUIRE_WAL` | (unset) | Set to `true` (or `1`) to refuse to start when WAL-backed ingestion durability is unavailable, instead of degrading to memory-only. |
 | `OBSERVE_RAW_RETENTION_DAYS` | `30` | Raw event retention. Also the window over which visitor counts are exact from raw events; past it they are counted from the `sessions` table (90 days), and past both the dashboard says which window the figure covers. |
 | `OBSERVE_HOURLY_RETENTION_DAYS` | `365` | Hourly rollup retention. |

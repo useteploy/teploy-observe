@@ -434,6 +434,24 @@ func TestMappingDeterministic(t *testing.T) {
 	}
 }
 
+func TestEventTimestampHonored(t *testing.T) {
+	in, _, err := mapEvent([]byte(`{"message":"x","timestamp":1760000000.5}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.ClientTimestamp != 1760000000500 {
+		t.Fatalf("float-seconds timestamp not mapped: %d", in.ClientTimestamp)
+	}
+	in, _, _ = mapEvent([]byte(`{"message":"x","timestamp":"2026-10-01T12:00:00Z"}`), "")
+	if in.ClientTimestamp <= 0 {
+		t.Fatalf("RFC3339 timestamp not mapped: %d", in.ClientTimestamp)
+	}
+	in, _, _ = mapEvent([]byte(`{"message":"x"}`), "")
+	if in.ClientTimestamp != 0 {
+		t.Fatalf("absent timestamp must stay zero: %d", in.ClientTimestamp)
+	}
+}
+
 func TestHundredItems(t *testing.T) {
 	sink := &fakeSink{}
 	h := newH(sink, nil)

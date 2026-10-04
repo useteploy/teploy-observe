@@ -49,6 +49,11 @@ var eventIDAlphabet = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
 // identity field that cannot be a stable key.
 var ErrInvalidEventID = errors.New("event_id/producer_id must match [A-Za-z0-9_-]{8,64}")
 
+// ErrBadTimestamp is a boundary rejection (400): the producer-captured
+// event time is more than 24h in the future — clock garbage that would
+// poison issue first/last-seen and retention windows if stored.
+var ErrBadTimestamp = errors.New("client timestamp rejected")
+
 // ErrEventIDConflict is the 409-class rejection (ADR §5.6): the same
 // (site, producer, event_id) was admitted with a DIFFERENT payload
 // digest. Conflicting reuse is a producer bug; it is counted, never

@@ -74,6 +74,44 @@ environment) - see `AUDIT_OPEN.md` S1 for the verification checklist.
   behavior, SAML, integrations, cohorts).
 - Public survey errors no longer leak internals; survey dedupe is per survey.
 
+### Added (close-out session, 2026-10-04)
+
+- `observe migrate` subcommand: applies the migration ladder without
+  seeding, unblocking the isolated-restore runbook (migrate -> restore ->
+  start). Verified against a fresh database on Nucleus v1.1.1.
+- Populated-upgraded-store migration test: the six tables migrations
+  048-063 ALTER are rebuilt in their pre-048 shape, populated, and
+  upgraded — the path the live L9 corruption rode on, which fresh-store
+  runs cannot see.
+- Applied-script checksum pin: the migration runner's refusal to rerun
+  an edited applied migration is pinned by test (documents why in-place
+  L9 conversion is not a code change this repo can make).
+- `OBSERVE_SMTP_PRIVATE_HOSTS`: exact-hostname allowlist letting email
+  integrations dial internal/tailnet relays (resolve-once dial-IP kept;
+  empty keeps the public-only SSRF posture).
+- Sentry wire compatibility now honors the event `timestamp` (float
+  seconds, ms or RFC 3339); more than 24h of future skew is refused at
+  admission with a 400.
+- Global security-header middleware (nosniff, referrer-policy,
+  X-Frame-Options SAMEORIGIN, HSTS when the public URL is https);
+  set-if-absent so handler-specific policies win.
+
+### Changed (close-out session, 2026-10-04)
+
+- Dependencies: grpc v1.83.2, pgx v5.9.2 (govulncheck GO-2026-6443,
+  GO-2026-6348 and GO-2026-5004 were symbol-reachable); vendor
+  regenerated from the pinned submodule revision.
+- staticcheck triaged clean for the first time (dead code removed,
+  struct-conversion rewrites, determinism pins in two-call form).
+- surveys `ValidateAnswers` accepts Go-native `int`/`int64` answers in
+  addition to the JSON-wire `float64`.
+- The legacy-results golden compares floats with 1e-12 relative
+  tolerance (gc fuses multiply-add on arm64 but not amd64; the byte-exact
+  pin failed the arm64 CI job's suite).
+- `scripts/audit.sh` modernized: checkout-relative paths, env-configured
+  base URL and credentials, current tree layout, retired behaviors
+  asserted as refused; 121/121 against a live seeded server.
+
 ### Security
 
 - Pre-authentication cost caps on Sentry and gRPC ingest, negative key cache

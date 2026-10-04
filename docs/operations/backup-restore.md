@@ -92,14 +92,11 @@ Behaviour (`internal/backup/restore.go`):
    discarding that database and starting the restore over on a fresh one.
 
 Restore does not create tables. The schema must already exist, which today
-means starting the `observe` server once against the new database so it runs
-the migrations. **Caveat found by reading the code, not by running it:** server
-startup also inserts the `default` site (`SiteService.EnsureDefault`), and
-the bootstrap admin when `OBSERVE_ADMIN_PASSWORD` is set. Both `sites` and
-`admin_users` are restore tables, so a restore into a database the server has
-already started against would be refused by the emptiness check. Before
-relying on this procedure, rehearse it (below) and be ready to empty those
-rows by hand; the repository has no supported command for it yet.
+means applying the migrations. `observe migrate` (added 2026-10-04) does
+exactly that and nothing else: no site seeding, no bootstrap admin, no
+listener. A restore into a database the SERVER has ever started against
+is still refused — boot inserts the `default` site and the bootstrap
+admin, and both tables are restore tables.
 
 ## Restore drill (do this before you need it)
 
@@ -110,17 +107,16 @@ Run on a scratch host or a second Compose project, never the live database.
    `OBSERVE_JWT_SECRET` and `OBSERVE_SESSION_SALT` as production, leave
    `OBSERVE_ADMIN_PASSWORD` unset, and copy `audit.key` into the new
    `OBSERVE_DATA_DIR`.
-3. Start `observe` once so migrations run, then stop it. Note whether the
-   emptiness check then rejects `sites` (see the caveat) and record the exact
-   manual step you needed.
-4. Run `observe restore` with the encryption key; confirm exit status 0 and
-   the log line `restore complete`.
-5. Start `observe`. Check `/healthz` is `ok`.
-6. Log in with a production account; compare site list, a known issue, a
+3. Run `observe migrate` once so the schema exists, then `observe
+   restore` with the encryption key; confirm exit status 0 and the log
+   line `restore complete`. (Do NOT start the server first — its seeding
+   writes rows the emptiness check refuses.)
+4. Start `observe`. Check `/healthz` is `ok`.
+5. Log in with a production account; compare site list, a known issue, a
    known dashboard and a recent day of stats against production.
-7. Open a source-mapped stack trace to confirm the KV source maps came back.
-8. Check the audit log still verifies (the audit chain is keyed by
+6. Open a source-mapped stack trace to confirm the KV source maps came back.
+7. Check the audit log still verifies (the audit chain is keyed by
    `audit.key`; the manifest records the expected key id).
-9. Record: archive size, backup duration, restore duration, and the gaps you
+8. Record: archive size, backup duration, restore duration, and the gaps you
    hit. Repeat on a schedule and after every upgrade that adds migrations.
 10. Destroy the scratch instance; it holds production data.

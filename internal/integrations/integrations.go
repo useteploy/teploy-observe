@@ -439,9 +439,28 @@ var lookupIP = func(ctx context.Context, host string) ([]net.IPAddr, error) {
 	return net.DefaultResolver.LookupIPAddr(ctx, host)
 }
 
+// smtpPrivateHosts is the operator-declared set of relay hostnames that may
+// resolve to private addresses (an internal/tailnet relay). Empty means the
+// public-only posture: every smtp_host must resolve public (SSRF guard).
+var smtpPrivateHosts = map[string]bool{}
+
+// SetSMTPPrivateHosts parses the OBSERVE_SMTP_PRIVATE_HOSTS csv (exact
+// hostnames, case-insensitive) into the allowlist. Called once at startup.
+func SetSMTPPrivateHosts(csv string) {
+	set := map[string]bool{}
+	for _, h := range strings.Split(csv, ",") {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			set[h] = true
+		}
+	}
+	smtpPrivateHosts = set
+}
+
 // publicSMTPAddr resolves host and returns one address to dial. Every
-// resolved address must be public: a name that resolves to ANY blocked
-// address is refused, so a mixed answer cannot be used to steer the dial.
+// resolved address must be public unless the host is operator-allowlisted:
+// a name that resolves to ANY blocked address is refused, so a mixed answer
+// cannot be used to steer the dial. The dial still goes to the resolved IP,
+// so an allowlisted relay cannot be re-pointed by DNS after the check.
 func publicSMTPAddr(host string, lookup func(context.Context, string) ([]net.IPAddr, error)) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -452,9 +471,11 @@ func publicSMTPAddr(host string, lookup func(context.Context, string) ([]net.IPA
 	if len(addrs) == 0 {
 		return "", fmt.Errorf("email: smtp_host did not resolve")
 	}
-	for _, a := range addrs {
-		if netsafe.IsBlockedIP(a.IP) {
-			return "", fmt.Errorf("email: smtp_host resolves to a non-public address; refusing to connect")
+	if !smtpPrivateHosts[strings.ToLower(host)] {
+		for _, a := range addrs {
+			if netsafe.IsBlockedIP(a.IP) {
+				return "", fmt.Errorf("email: smtp_host resolves to a non-public address; refusing to connect (allowlist internal relays via OBSERVE_SMTP_PRIVATE_HOSTS)")
+			}
 		}
 	}
 	return addrs[0].IP.String(), nil
