@@ -272,7 +272,7 @@ func TestSQLGolden(t *testing.T) {
 		{`100%`, `message ILIKE '%' || $4 || '%'`, 1, false},
 		{`%`, ``, 0, false},
 		{`-100%`, ``, 0, false},
-		{`level:error`, `(level = $4 OR level = $5)`, 2, true},
+		{`level:error`, `(level = $4 OR level = $5 OR level = $6)`, 3, true},
 	}
 	for _, c := range cases {
 		cq := compileFor(t, c.q)

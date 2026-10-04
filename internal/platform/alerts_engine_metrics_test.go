@@ -175,8 +175,10 @@ func TestExtendedMetricSQLText(t *testing.T) {
 	if !strings.Contains(sqlSpanErrorCount, "status_code = 'error'") {
 		t.Error("span error predicate")
 	}
-	if !strings.Contains(sqlLogErrorCount, "level IN ('error', 'fatal')") {
-		t.Error("log error predicate")
+	for _, v := range []string{"error", "ERROR", "Error", "fatal", "FATAL", "Fatal"} {
+		if !strings.Contains(sqlLogErrorCount, "'"+v+"'") {
+			t.Errorf("log error predicate misses level variant %q", v)
+		}
 	}
 	if !strings.Contains(sqlUptimeFailures, "is_up = 'false'") {
 		t.Error("uptime failure predicate")

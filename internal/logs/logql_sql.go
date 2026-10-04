@@ -120,13 +120,22 @@ func longestClean(s string) string {
 	return best
 }
 
+// titleCase upper-cases the first byte and lower-cases the rest.
+func titleCase(v string) string {
+	if v == "" {
+		return v
+	}
+	l := strings.ToLower(v)
+	return strings.ToUpper(l[:1]) + l[1:]
+}
+
 // levelVariants are the spellings a level term matches. Ingest stores the
 // level as sent (OTLP lower-cases it, the JSON API does not) and the SQL here
 // avoids LOWER() since no other query in this repo relies on it, so the
-// as-typed, lower and upper spellings are matched as bound equalities.
+// as-typed, lower, upper and Title spellings are matched as bound equalities.
 func levelVariants(v string) []string {
 	out := []string{v}
-	for _, c := range []string{strings.ToLower(v), strings.ToUpper(v)} {
+	for _, c := range []string{strings.ToLower(v), strings.ToUpper(v), titleCase(v)} {
 		dup := false
 		for _, o := range out {
 			dup = dup || o == c
