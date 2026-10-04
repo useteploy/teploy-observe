@@ -235,9 +235,8 @@ func (s *Service) insertErrorEvent(ctx context.Context, sqlc *nucleus.SQLModel, 
 	if err != nil {
 		return "", "", fmt.Errorf("resolve issue: %w", err)
 	}
-	// A fingerprint that maps to a merged source is attributed to the
-	// merge target (merge.go).
-	issueID = s.issueSvc.attributeMerged(ctx, input.SiteID, issueID, now.UnixMilli())
+	// ResolveIssue already attributed a merged source to its target
+	// (merge_read.go attributeMerged).
 
 	// Serialize JSONB fields
 	stackJSON := jsonOrEmpty(input.StackTrace)

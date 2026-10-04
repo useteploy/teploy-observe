@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Read-side helpers for merge/assignment (see merge.go).
@@ -52,17 +54,66 @@ func (s *IssueService) siteAssignments(ctx context.Context, siteID string) map[s
 	return m
 }
 
-// attributeMerged redirects an ingest-time issue id to its merge target
-// and bumps the target (last_seen, regression reopen) the way ResolveIssue
-// did for the source. Unmerged issues pass through untouched.
-func (s *IssueService) attributeMerged(ctx context.Context, siteID, issueID string, ts int64) string {
-	target := s.ResolveMerged(ctx, siteID, issueID)
-	if target == issueID {
-		return issueID
+// attributeMerged applies one event to a merge TARGET: bumps it (last_seen,
+// regression reopen) and, when the target was resolved, sends the
+// regression notification for the target. The hidden source is never
+// bumped or notified. Returns the target id.
+func (s *IssueService) attributeMerged(ctx context.Context, siteID, target, release string, ts int64) string {
+	lc := s.lifecycle()
+	t, err := lc.issueByID(ctx, siteID, target)
+	count := s.mergedCount(ctx, lc, siteID, target) + 1
+	_ = lc.bump(ctx, target, siteID, ts, count)
+	if err == nil && t != nil && t.Status == "resolved" {
+		s.notify(ctx, IssueEvent{Kind: IssueEventRegression, SiteID: siteID, IssueID: target,
+			Title: t.Title, Culprit: t.Culprit, Level: t.Level, Release: release, EventCount: count})
 	}
-	count := s.eventCount(ctx, siteID, s.issueScope(ctx, siteID, target)) + 1
-	_ = s.bumpIssue(ctx, target, siteID, ts, count)
 	return target
+}
+
+const (
+	scopeCountTTL      = time.Minute
+	scopeCountMaxItems = 4096
+)
+
+type scopeCountEntry struct {
+	n       int64
+	fetched time.Time
+}
+
+// scopeCountCache bounds the COUNT(*) over error_events that attributing an
+// event to a merged issue used to run once per ingested event: the exact
+// count is re-read at most once per TTL per target and incremented
+// in-process in between.
+type scopeCountCache struct {
+	mu  sync.Mutex
+	m   map[string]scopeCountEntry
+	now func() time.Time
+}
+
+func (s *IssueService) mergedCount(ctx context.Context, lc lifecycleStore, siteID, target string) int64 {
+	c := &s.counts
+	key := siteID + "\x00" + target
+	now := time.Now
+	c.mu.Lock()
+	if c.now != nil {
+		now = c.now
+	}
+	if e, ok := c.m[key]; ok && now().Sub(e.fetched) < scopeCountTTL {
+		e.n++
+		c.m[key] = e
+		c.mu.Unlock()
+		return e.n - 1
+	}
+	c.mu.Unlock()
+	n := lc.scopeCount(ctx, siteID, s.issueScope(ctx, siteID, target))
+	c.mu.Lock()
+	if c.m == nil || len(c.m) >= scopeCountMaxItems {
+		c.m = map[string]scopeCountEntry{}
+	}
+	// n counts events stored so far; the caller adds the current one.
+	c.m[key] = scopeCountEntry{n: n + 1, fetched: now()}
+	c.mu.Unlock()
+	return n
 }
 
 // issueScope is [issue, merged sources...] (capped), the id set whose

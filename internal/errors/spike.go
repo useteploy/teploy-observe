@@ -42,7 +42,6 @@ package errors
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"strconv"
@@ -258,19 +257,25 @@ func (l *SpikeLimiter) spikeCheck(siteID, groupHash string, exempt func() bool) 
 }
 
 // spikeExempt reports whether an event for (site, hash) is the first of a
-// new issue or a regression, from the grouphash cache entry alone (no
-// SQL on the flood path). Unknown = exempt (fail open towards keeping).
+// new issue or a regression, judged against the issue the event will be
+// ATTRIBUTED to (the merge target when the fingerprint maps to a merged
+// source). Snoozed issues are status=resolved with a snooze deadline, so a
+// resolved status covers them. Unknown = exempt (fail open towards keeping).
 func (s *IssueService) spikeExempt(ctx context.Context, siteID, groupHash string) bool {
-	if s == nil || s.db == nil {
+	if s == nil || (s.db == nil && s.store == nil) {
 		return true
 	}
-	data, err := s.db.KV().Get(ctx, kvCacheKey(siteID, groupHash))
-	if err != nil || data == nil {
+	lc := s.lifecycle()
+	ci, ok := lc.cacheGet(ctx, siteID, groupHash)
+	if !ok {
 		return true
 	}
-	var ci cachedIssue
-	if json.Unmarshal(data, &ci) != nil || ci.IssueID == "" {
-		return true
+	if target := s.ResolveMerged(ctx, siteID, ci.IssueID); target != ci.IssueID {
+		t, err := lc.issueByID(ctx, siteID, target)
+		if err != nil || t == nil {
+			return true
+		}
+		return t.Status == "resolved"
 	}
 	return ci.Resolved
 }
