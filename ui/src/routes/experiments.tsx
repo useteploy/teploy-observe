@@ -4,6 +4,7 @@ import type { Experiment, ExperimentResults } from "../api/flags.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
 import ExportButton from "../components/shared/ExportButton.js";
+import { formatArmValue, metricKindLabel, secondaryLabel } from "../utils/experimentMetrics.js";
 import "../styles/flags.css";
 import { useFilters } from "../hooks/useFilters.js";
 
@@ -54,6 +55,9 @@ function ResultsPanel({ experimentId }: { experimentId: string }) {
   const totalExposures = results.variants.reduce((sum, v) => sum + v.exposures, 0);
   const an = results.analysis;
   const pct = (x: number) => `${(x * 100).toFixed(2)}%`;
+  const kind = results.metric_kind;
+  const continuous = kind === "count" || kind === "mean";
+  const num = (x: number) => (Math.abs(x) >= 100 ? x.toFixed(0) : x.toFixed(3));
   const pStr = (p: number) => (p < 0.0001 ? "<0.0001" : p.toFixed(4));
 
   return (
@@ -68,6 +72,16 @@ function ResultsPanel({ experimentId }: { experimentId: string }) {
           </span>
         )}
       </div>
+
+      {/* Fixed-horizon contract: peeking warning and contaminated users. */}
+      {(results.peeking_warning || (results.contaminated_users ?? 0) > 0) && (
+        <div style={{ padding: "8px 16px", borderBottom: "1px solid var(--obs-border-subtle)", fontSize: "12px", display: "flex", flexDirection: "column", gap: "4px", color: "var(--obs-text-secondary)" }}>
+          {results.peeking_warning && <div style={{ fontWeight: 600 }}>{results.peeking_warning}</div>}
+          {(results.contaminated_users ?? 0) > 0 && (
+            <div>{results.contaminated_users} user(s) were exposed to more than one variant and are excluded from every count.</div>
+          )}
+        </div>
+      )}
 
       {/* O09 analysis: SRM diagnostic first (it invalidates trust), then the
           gate state, test and winner-rule trace. Estimates always render;
@@ -111,9 +125,9 @@ function ResultsPanel({ experimentId }: { experimentId: string }) {
               <span class="experiments-result-stat">{v.exposures.toLocaleString()} exposures</span>
               <span class="experiments-result-stat">{v.conversions.toLocaleString()} conversions</span>
               <span class="experiments-result-stat" style={{ fontWeight: 600, color: "var(--obs-text)" }}>
-                {(v.conversion_rate * 100).toFixed(2)}%
+                {formatArmValue(kind, v)}
               </span>
-              {v.wilson_low !== undefined && v.wilson_high !== undefined && (
+              {!continuous && v.wilson_low !== undefined && v.wilson_high !== undefined && (
                 <span class="experiments-result-stat" title="Wilson score 95% interval" style={{ fontSize: "11px" }}>
                   [{pct(v.wilson_low)} - {pct(v.wilson_high)}]
                 </span>
@@ -158,14 +172,37 @@ function ResultsPanel({ experimentId }: { experimentId: string }) {
           {an.pairwise_vs_control.map((pw) => (
             <div key={pw.variant} style={{ display: "flex", gap: "14px", flexWrap: "wrap", padding: "3px 0", color: "var(--obs-text-secondary)" }}>
               <span style={{ minWidth: "100px", color: "var(--obs-text)" }}>{pw.variant}</span>
-              <span>lift {pw.lift_absolute >= 0 ? "+" : ""}{pct(pw.lift_absolute)}</span>
-              <span>95% CI [{pct(pw.ci_low)} - {pct(pw.ci_high)}]</span>
+              <span>lift {pw.lift_absolute >= 0 ? "+" : ""}{continuous ? num(pw.lift_absolute) : pct(pw.lift_absolute)}</span>
+              <span>95% CI [{continuous ? num(pw.ci_low) : pct(pw.ci_low)} - {continuous ? num(pw.ci_high) : pct(pw.ci_high)}]</span>
               <span title={pw.used_fisher ? "Fisher exact (small cells)" : "chi-square"}>
-                p={pStr(pw.holm_adjusted_p)} (Holm{pw.used_fisher ? ", Fisher" : ""})
+                p={pStr(pw.holm_adjusted_p)} (Holm{pw.used_fisher ? ", Fisher" : ""}{continuous ? ", Welch t" : ""})
               </span>
               {pw.significant && (
                 <span style={{ color: "var(--obs-success)", fontWeight: 600 }}>significant</span>
               )}
+            </div>
+          ))}
+        </div>
+      )}
+      {/* Secondary metrics: exploratory, never gate the winner. */}
+      {results.secondary && results.secondary.length > 0 && (
+        <div style={{ padding: "10px 16px", fontSize: "12px", borderTop: "1px solid var(--obs-border-subtle)" }}>
+          <div style={{ color: "var(--obs-text-secondary)", marginBottom: "6px", fontWeight: 600 }}>
+            Secondary metrics - {results.multiple_comparison_note}
+          </div>
+          {results.secondary.map((m) => (
+            <div key={m.key} style={{ padding: "4px 0", color: "var(--obs-text-secondary)" }}>
+              <div style={{ color: "var(--obs-text)" }}>{secondaryLabel(m)} - {metricKindLabel(m.kind)}</div>
+              {m.variants.map((v) => (
+                <span key={v.variant} style={{ marginRight: "14px" }}>
+                  {v.variant}: {formatArmValue(m.kind, v)} ({v.exposures.toLocaleString()} exposed)
+                </span>
+              ))}
+              {m.analysis.pairwise_vs_control?.map((pw) => (
+                <div key={pw.variant}>
+                  {pw.variant} vs control: p={pStr(pw.holm_adjusted_p)} (Holm){pw.significant ? " - crossed 0.05, exploratory" : ""}
+                </div>
+              ))}
             </div>
           ))}
         </div>

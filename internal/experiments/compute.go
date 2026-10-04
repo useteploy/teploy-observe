@@ -141,8 +141,16 @@ func evaluateMetric(kind string, winsorPct float64, variants []VariantResult, co
 
 	// Continuous: every exposed user contributes (zero when no events).
 	perArm := make([][]float64, len(arms))
-	for u, c := range cohort {
-		perArm[idx[c.Variant]] = append(perArm[idx[c.Variant]], vals[u])
+	// Sorted user order keeps float summation, and so the output, identical
+	// between identical calls.
+	users := make([]string, 0, len(cohort))
+	for u := range cohort {
+		users = append(users, u)
+	}
+	sort.Strings(users)
+	for _, u := range users {
+		i := idx[cohort[u].Variant]
+		perArm[i] = append(perArm[i], vals[u])
 	}
 	if winsorPct > 0 {
 		winsorizeArms(perArm, winsorPct)
