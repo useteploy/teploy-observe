@@ -8,7 +8,7 @@ TOKEN=$(curl -s -X POST $BASE/api/v1/auth/login -H "Content-Type: application/js
   -d '{"username":"admin","password":"observe"}' \
   | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
 H="Authorization: Bearer $TOKEN"
-DIST="/Users/tyler/Documents/proj rn/Teploy/teploy-observe/cmd/observe/ui/dist"
+DIST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/cmd/observe/ui/dist"
 
 PASS=0; FAIL=0
 check() {
