@@ -909,6 +909,7 @@ func main() {
 	// (O01 ADR §5.2) stamps Retry-After on the durable-mode 503s (disk
 	// high-water refusal, WAL latch) — the OTLP handlers' convention.
 	apiKeyMW := auth.APIKeyAuthMiddleware(authSvc)
+	registerSentryRoutes(r, authSvc, errorBuf, rateLimiter, logger)
 	ingestGroup := r.Group("/api/v1", ingestCORS, apiKeyMW, rateLimiter.Middleware, neutron.BodyLimit(2<<20), ingest.RetryAfterOnUnavailable(5*time.Second))
 	neutron.Post(ingestGroup, "/events", ingest.Handler(buf, cfg.SessionSalt, siteSvc),
 		neutron.WithTags("ingest"),
