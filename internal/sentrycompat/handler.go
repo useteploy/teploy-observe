@@ -13,6 +13,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/useteploy/teploy-observe/internal/auth"
+	"github.com/useteploy/teploy-observe/internal/authguard"
 	obserrors "github.com/useteploy/teploy-observe/internal/errors"
 	"github.com/useteploy/teploy-observe/internal/ingest"
 )
@@ -30,6 +32,18 @@ import (
 type KeyValidator interface {
 	ValidateAPIKey(ctx context.Context, key string) (auth.ValidatedKey, error)
 }
+
+// ipKeyValidator is implemented by *authguard.Guard: a validator that also
+// takes the client IP so failed attempts can be limited before the store is
+// consulted. A plain KeyValidator keeps working without that protection.
+type ipKeyValidator interface {
+	Validate(ctx context.Context, key, clientIP string) (auth.ValidatedKey, error)
+}
+
+// maxPreAuthBytes bounds what is read (and decompressed) before the key is
+// known. It only needs to cover the envelope-header line holding the DSN; the
+// rest of the body is read after authentication succeeds.
+const maxPreAuthBytes = 64 << 10
 
 // ErrorSink is *errors.ErrorBuffer's admission method.
 type ErrorSink interface {
@@ -162,34 +176,41 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, legacyStore bool
 	// in the envelope header is the last resort and needs a bounded peek.
 	key := keyFromRequest(r)
 
-	// 2. The body is read at most once, capped, and only after we know a key
-	// exists; with a header/query key we authenticate before touching it.
-	var raw []byte
-	readBody := func() bool {
-		if r.ContentLength > MaxEnvelopeBytes {
+	// 2. The body is capped. With a header/query key we authenticate before
+	// touching it; with only the envelope-header DSN as a credential just a
+	// 64 KiB prefix is read and decompressed pre-auth, and the remainder is
+	// read only after the key validated.
+	if r.ContentLength > MaxEnvelopeBytes {
+		fail(w, http.StatusRequestEntityTooLarge, "payload too large")
+		return
+	}
+	body := http.MaxBytesReader(w, r.Body, MaxEnvelopeBytes)
+	var pre, raw []byte
+	readFail := func(err error) {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
 			fail(w, http.StatusRequestEntityTooLarge, "payload too large")
-			return false
+		} else {
+			fail(w, http.StatusBadRequest, "could not read body")
 		}
-		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxEnvelopeBytes))
+	}
+	readBody := func() bool {
+		rest, err := io.ReadAll(body)
 		if err != nil {
-			var mbe *http.MaxBytesError
-			if errors.As(err, &mbe) {
-				fail(w, http.StatusRequestEntityTooLarge, "payload too large")
-			} else {
-				fail(w, http.StatusBadRequest, "could not read body")
-			}
+			readFail(err)
 			return false
 		}
-		raw = b
+		raw = append(pre, rest...)
 		return true
 	}
-	bodyRead := false
 	if key == "" && !legacyStore {
-		if !readBody() {
+		var err error
+		pre, err = io.ReadAll(io.LimitReader(body, maxPreAuthBytes))
+		if err != nil {
+			readFail(err)
 			return
 		}
-		bodyRead = true
-		line := peekHeaderLine(raw, r.Header.Get("Content-Encoding"), maxHeaderLine)
+		line := peekHeaderLine(pre, r.Header.Get("Content-Encoding"), maxHeaderLine)
 		var hdr struct {
 			DSN string `json:"dsn"`
 		}
@@ -202,8 +223,18 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, legacyStore bool
 		return
 	}
 
-	validated, err := h.Keys.ValidateAPIKey(r.Context(), key)
+	var validated auth.ValidatedKey
+	var err error
+	if gk, ok := h.Keys.(ipKeyValidator); ok {
+		validated, err = gk.Validate(r.Context(), key, preAuthIP(r))
+	} else {
+		validated, err = h.Keys.ValidateAPIKey(r.Context(), key)
+	}
 	if err != nil {
+		if errors.Is(err, authguard.ErrTooManyAttempts) {
+			h.limited(w, "too many failed authentication attempts")
+			return
+		}
 		if errors.Is(err, auth.ErrAuthUnavailable) {
 			w.Header().Set("Retry-After", "5")
 			fail(w, http.StatusServiceUnavailable, "authentication temporarily unavailable")
@@ -236,7 +267,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, legacyStore bool
 		}
 	}
 
-	if !bodyRead && !readBody() {
+	if !readBody() {
 		return
 	}
 	data, err := decodeBody(raw, r.Header.Get("Content-Encoding"))
@@ -274,18 +305,20 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, legacyStore bool
 
 	respID := pe.Header.EventID
 	goodItems, events, bad := 0, 0, 0
+	evIdx := -1
 	for _, it := range pe.Items {
 		if it.Type != "event" {
 			goodItems++
 			h.countIgnored(it.Type)
 			continue
 		}
+		evIdx++
 		if events >= maxEventsPerEnvelope {
 			h.malformed.Add(1)
 			bad++
 			continue
 		}
-		in, eventID, merr := mapEvent(it.Payload, pe.Header.EventID)
+		in, eventID, merr := mapEvent(it.Payload, itemHeaderID(pe.Header.EventID, evIdx))
 		if merr != nil {
 			h.malformed.Add(1)
 			bad++
@@ -330,6 +363,30 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, legacyStore bool
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"id": respID})
+}
+
+// itemHeaderID derives the fallback identity for the idx-th event item of an
+// envelope. The envelope's event_id names ONE event; an event lacking its own
+// id would otherwise inherit it, so events 2..N would collide with event 1
+// (same id, different payload) and be dropped as conflicts. Item 0 keeps the
+// header id (the common single-event envelope is unchanged); later items get
+// a deterministic "_<idx>" suffix, so a retried envelope maps identically.
+func itemHeaderID(headerID string, idx int) string {
+	if idx <= 0 || headerID == "" {
+		return headerID
+	}
+	return headerID + "_" + strconv.Itoa(idx)
+}
+
+// preAuthIP is the client address used to limit failed key attempts.
+func preAuthIP(r *http.Request) string {
+	if ip := ingest.ClientIPFromContext(r.Context()); ip != "" {
+		return ip
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
 }
 
 // boundProject enforces the BoundSite invariant on the DSN project segment.
