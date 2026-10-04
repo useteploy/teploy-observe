@@ -46,6 +46,19 @@ regenerable LLM traces - owner call), (b) whether new ALTER-ADD migrations
 should be refused by a test, and (c) a migration test against a populated,
 upgraded store rather than a fresh one.
 
+Upstream resolution (2026-10-04): the engine defect is fixed in Nucleus
+v1.2.1 (atomic ALTER rewrites; half-applied ALTERs no longer recorded as
+applied; a new engine-side refusal rejects ALTERs that follow writes to the
+same table in one transaction). This repo pins v1.2.1 in teploy.yml, CI
+(NUCLEUS_VERSION) and docker-compose; observe's full suite plus a fresh
+migration boot verified against that image. Re-scoped: (b) is no longer
+needed for correctness on v1.2.1+ — the engine itself enforces the unsafe
+ordering; (c) is satisfied by `TestMigrationsUpgradePopulatedStore` on the
+S1 branch; (a) remains open as an owner op and now has an in-place path
+(the `catalog.json` repair in Neutron's
+`nucleus/docs/HANDOVER_TEPLOY_OBSERVE_ADD_COLUMN.md`) that preserves the
+rows instead of losing regenerable traces.
+
 ## Round-4 register (2026-09-19 audit, 45 findings R01..R45)
 
 Audited revision `5e2108d`. Every finding was verified against local source
