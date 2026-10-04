@@ -73,6 +73,25 @@ var replacingKeys = map[string][]string{
 	// 046_derived_outbox — one logical intent per id; the outbox worker
 	// rewrites attempts/processed state as strictly-monotonic new versions.
 	"derived_outbox": {"tenant_id", "id"},
+	// 058_issue_merge_assign / 061_persons_identity — every writer takes
+	// max(version)+1 (or now, whichever is higher), so versions per key are
+	// strictly increasing and argMax is deterministic. The collapse keeps the
+	// latest version, so a latest-version soft-delete (active='false') or
+	// tombstone row is carried into the backup and restored as such; only
+	// superseded history is dropped.
+	"issue_merges":      {"tenant_id", "site_id", "source_issue_id"},
+	"issue_assignments": {"tenant_id", "site_id", "issue_id"},
+	"person_properties": {"tenant_id", "site_id", "person_key"},
+	"person_aliases":    {"tenant_id", "site_id", "alias_key"},
+	"person_tombstones": {"tenant_id", "site_id", "person_key"},
+	// Deliberately NOT registered:
+	//   cohort_members - versions can tie between an add and a remove written
+	//     in one batch, and the reader resolves a tie to the tombstone
+	//     (cohorts.collapseMembers) where argMax picks arbitrarily; a backup
+	//     collapse could resurrect a removed member. It is also the largest
+	//     table of the set.
+	//   experiment_settings - plain mergetree with no version column; it is
+	//     an append-only history read with ORDER BY timestamp DESC LIMIT 1.
 }
 
 // Keys returns the registered ORDER BY key of a replacing table, or nil.
