@@ -16,6 +16,14 @@ const TARGETING_OPERATORS = [
   { value: "in", label: "in list" },
   { value: "not_in", label: "not in list" },
   { value: "contains", label: "contains" },
+  { value: "starts_with", label: "starts with" },
+  { value: "ends_with", label: "ends with" },
+  { value: "gt", label: "greater than" },
+  { value: "gte", label: "greater or equal" },
+  { value: "lt", label: "less than" },
+  { value: "lte", label: "less or equal" },
+  { value: "is_set", label: "is set" },
+  { value: "not_set", label: "is not set" },
 ];
 
 interface TargetingRule {
@@ -30,11 +38,18 @@ interface Variant {
   weight: number;
 }
 
+// Targeting is either a legacy rule array or {"groups":[{conditions:[...]}]}
+// (condition groups are authored via the API; the builder below edits the
+// flat form). For display, groups flatten to their conditions.
 function parseTargeting(raw: string): TargetingRule[] {
   if (!raw) return [];
   try {
     const p = JSON.parse(raw);
-    return Array.isArray(p) ? p : [];
+    if (Array.isArray(p)) return p;
+    if (p && Array.isArray(p.groups)) {
+      return p.groups.flatMap((g: { conditions?: TargetingRule[] }) => g.conditions || []);
+    }
+    return [];
   } catch { return []; }
 }
 

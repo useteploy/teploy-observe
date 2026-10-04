@@ -73,6 +73,12 @@ type SurveyResponse struct {
 }
 
 func (s *SurveyService) Create(ctx context.Context, siteID, name, questions, appearance, targeting string) (*Survey, error) {
+	// Targeting is evaluated on the public /surveys/active path, so a bad
+	// value is refused here with a 400 that names the key, rather than being
+	// stored and silently ignored later.
+	if _, err := ParseTargeting(targeting); err != nil {
+		return nil, err
+	}
 	id := genID()
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 	_, err := s.db.SQL().Exec(ctx,
@@ -218,6 +224,9 @@ func (s *SurveyService) RecordExposure(ctx context.Context, surveyID, siteID, us
 // duplicate); a same-millisecond concurrent double-submit is the same
 // window class the events admission cache documents pre-serialization.
 func (s *SurveyService) SubmitResponse(ctx context.Context, surveyID, siteID, userID string, clientID string, answers map[string]any, ip, userAgent string) (SubmitResult, error) {
+	if err := ValidateAnswers(answers); err != nil {
+		return SubmitResult{}, err
+	}
 	if err := s.gateSurvey(ctx, surveyID, siteID); err != nil {
 		return SubmitResult{}, err
 	}

@@ -88,6 +88,37 @@ signal.signal(signal.SIGINT, _shutdown)
 - Queues are in-memory; `kill -9` loses the queue and its counters with
   the process. No durable local spool is claimed.
 
+## Breadcrumbs
+
+```python
+observe.init(endpoint=..., api_key=..., max_breadcrumbs=100,
+             logging_breadcrumbs=True,            # opt-in: logging >= WARNING
+             logging_breadcrumb_level=logging.WARNING,
+             before_breadcrumb=lambda c: None if c["category"] == "noisy" else c)
+observe.add_breadcrumb("cache miss", category="db", level="warning", data={"key": "u:1"})
+observe.capture_message("slow job", level="warning")
+```
+
+The buffer is a thread-safe, process-wide ring (not request-scoped) attached
+to `capture_exception` / `capture_message`. `logging_breadcrumbs` installs one
+handler on the root logger (removed by `close()`); `client.install_logging_breadcrumbs(level, logger)`
+targets another logger. Records from `observe_sdk` itself are skipped. A
+`before_breadcrumb` that raises drops the breadcrumb.
+
+## Feature flags
+
+```python
+r = observe.evaluate_flag("new-checkout", user_id="u1",
+                          attributes={"plan": "pro"}, default={"enabled": False})
+# {"key", "enabled", "variant"?, "reason", "source": "server" | "default", "error"?}
+```
+
+`POST /api/v1/flags/evaluate` over the client's transport (no redirects, API
+key header). Default timeout is min(client timeout, 3 s). Never raises:
+failures, timeouts and server fail-safe answers return `default` with
+`source == "default"`. No cache, no exposure event. See
+`docs/sdk/BREADCRUMBS_FLAGS.md`.
+
 ## License
 
 MIT

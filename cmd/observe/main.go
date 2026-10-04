@@ -440,6 +440,7 @@ func main() {
 	// New-issue and regression events fire the site's integrations. Wired
 	// after the demo seed above so seeded issues do not page anyone.
 	issueNotifier := wireIssueNotifications(issueSvc, integrationSvc, cfg.PublicURL)
+	wireAlertsToIntegrations(alertSvc, integrationSvc, logger)
 	feedbackSvc := feedback.NewFeedbackService(db)
 	viewSvc := views.NewViewService(db)
 	explorerSvc := explorer.NewExplorerService(db)
@@ -834,6 +835,9 @@ func main() {
 				return ingestSrv.Shutdown(ctx)
 			},
 		}),
+		// OTLP/gRPC receiver (OBSERVE_OTLP_GRPC_ADDR, default off); configured
+		// below once its dependencies exist. See otlpgrpc_wiring.go.
+		neutron.WithLifecycle(otlpGRPCHook(logger)),
 		neutron.WithMiddleware(ingest.RequestInfoMiddleware(ingest.ParseTrustedProxies(cfg.TrustedProxies))),
 		neutron.WithMiddleware(config.DemoModeMiddleware(cfg.DemoMode)),
 		// Record every admin mutation to the audit trail (comprehensive
@@ -870,6 +874,7 @@ func main() {
 		rateLimit = 1000
 	}
 	rateLimiter := ingest.NewRateLimiter(rateLimit, time.Second, rateLimit*2)
+	configureOTLPGRPC(logger, authSvc, rateLimiter, traceIngest, metricsSvc, logSvc)
 	// Hydrate per-site caps from the sites table so the first ingest after
 	// a restart honors admin overrides.
 	if caps, err := siteSvc.ListRatelimits(ctx); err == nil {
@@ -1409,6 +1414,7 @@ func main() {
 	// browser evaluation path.
 	flagEvalLimiter := ingest.NewRateLimiter(60, time.Minute, 120)
 	r.HandleFunc("POST /api/v1/flags/evaluate", flagEvaluateHandler(flagSvc, flagEvalLimiter))
+	r.Handle("GET /api/v1/flags/config", flagConfigRoute(apiKeyMW, rateLimiter.Middleware, flagSvc))
 
 	// --- Experiments (JWT auth; editor+ writes) ---
 	expGroup := r.Group("/api/v1/experiments", jwtMW)
@@ -1441,10 +1447,9 @@ func main() {
 		neutron.WithTags("surveys"), neutron.WithSummary("List survey responses"))
 	neutron.Get(surveyGroup, "/{survey_id}/stats", surveyStatsHandler(surveySvc),
 		neutron.WithTags("surveys"), neutron.WithSummary("Survey exposure/response stats"))
-	// Public: get active surveys, record exposure, submit response
-	r.HandleFunc("GET /api/v1/surveys/active", activeSurveysPublicHandler(surveySvc))
-	r.HandleFunc("POST /api/v1/surveys/expose", surveyExposeHandler(surveySvc))
-	r.HandleFunc("POST /api/v1/surveys/respond", surveyRespondHandler(surveySvc))
+	// Public: get active surveys, record exposure, submit response, and the
+	// widget script (surveys_routes.go).
+	registerSurveyPublicRoutes(r, surveySvc)
 
 	// --- Release health (JWT auth) ---
 	releaseHealthSvc := obserrors.NewReleaseHealthService(db)
@@ -5616,9 +5621,7 @@ type createAlertRuleInput struct {
 	Cooldown      int     `json:"cooldown"`
 }
 
-var validAlertMetrics = map[string]struct{}{
-	"error_count": {}, "error_rate": {}, "pageviews": {}, "visitors": {},
-}
+var validAlertMetrics = platform.AlertMetricSet()
 
 var validAlertOperators = map[string]struct{}{
 	"gt": {}, "gte": {}, "lt": {}, "lte": {}, "eq": {},

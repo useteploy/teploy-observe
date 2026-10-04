@@ -19,6 +19,13 @@
  * sends the same payloads to the same ingestion endpoints.
  */
 
+import { createRecorder, type Breadcrumb, type BreadcrumbInput, type BreadcrumbOptions, type BreadcrumbRecorder } from "./breadcrumbs.js";
+import { createFlagClient, type FlagClient, type FlagContext, type FlagResult } from "./flags.js";
+
+export type { Breadcrumb, BreadcrumbInput, BreadcrumbLevel, BreadcrumbOptions } from "./breadcrumbs.js";
+export type { FlagClient, FlagClientOptions, FlagContext, FlagDefault, FlagResult } from "./flags.js";
+export { createFlagClient } from "./flags.js";
+
 export interface InitOptions {
   /** Base URL of your Observe deployment, e.g. `https://observe.example.com`. */
   endpoint: string;
@@ -60,6 +67,13 @@ export interface InitOptions {
    * exist; O11 makes it configurable so slow-endpoint behavior is
    * testable and tunable). Default: 10000 ms; clamped to [250, 600000]. */
   requestTimeoutMs?: number;
+  /** Breadcrumbs attached to captured errors/messages. `true` installs
+   * automatic capture (console, clicks, navigation, fetch, XHR) with
+   * defaults; an object tunes it. Off by default: nothing is patched
+   * unless you opt in. addBreadcrumb() works either way. */
+  breadcrumbs?: boolean | BreadcrumbOptions;
+  /** Flag-evaluation tuning for evaluateFlag()/evaluateFlags(). */
+  flags?: { ttlMs?: number; timeoutMs?: number };
 }
 
 export interface EventPayload {
@@ -171,6 +185,11 @@ interface Client {
   stats: Stats;
   /** Removes this client's interval and DOM listeners (audit F31). */
   dispose: () => void;
+  /** Breadcrumb ring buffer (and, when opted in, its reversible patches). */
+  crumbs: BreadcrumbRecorder;
+  flagClient: FlagClient;
+  /** Exposures already recorded via evaluateFlag({ exposure: true }). */
+  exposed: Set<string>;
 }
 
 /**
@@ -512,7 +531,23 @@ export function init(options: InitOptions): void {
     retryAfter: 0,
     stats: null as unknown as Stats,
     dispose: () => {},
+    crumbs: null as unknown as BreadcrumbRecorder,
+    flagClient: null as unknown as FlagClient,
+    exposed: new Set<string>(),
   };
+  const bc = options.breadcrumbs;
+  const bcOpts: BreadcrumbOptions = typeof bc === "object" && bc !== null ? bc : {};
+  instance.crumbs = createRecorder(
+    { ...bcOpts, ignoreUrls: [...(bcOpts.ignoreUrls ?? []), options.endpoint.replace(/\/+$/, "")] },
+    (err) => reportError(instance, err),
+  );
+  instance.flagClient = createFlagClient({
+    endpoint: options.endpoint,
+    siteId: instance.opts.siteId,
+    apiKey: options.apiKey,
+    ttlMs: options.flags?.ttlMs,
+    timeoutMs: options.flags?.timeoutMs,
+  });
   instance.stats = newStats(instance.producerId);
   client = instance;
 
@@ -526,6 +561,7 @@ export function init(options: InitOptions): void {
       if (typeof window !== "undefined" && instance.timer !== null) window.clearInterval(instance.timer);
       instance.timer = null;
       controller.abort();
+      instance.crumbs.uninstall();
     };
 
     // Auto-flush on buffer age.
@@ -573,6 +609,10 @@ export function init(options: InitOptions): void {
       },
       { signal: controller.signal },
     );
+
+    // Opt-in automatic breadcrumbs (installed last so the SDK's own
+    // listeners above are unaffected).
+    if (bc) instance.crumbs.install();
 
     if (!instance.opts.disableAutoPageview) {
       pageview();
@@ -743,6 +783,34 @@ export interface CaptureContext {
   tags?: Record<string, string>;
   traceId?: string;
   spanId?: string;
+  /** Severity override. captureException defaults to "error". */
+  level?: "error" | "warning" | "info";
+}
+
+/** Record a breadcrumb by hand. Works whether or not automatic capture is
+ * enabled; a no-op before init(). Never throws. */
+export function addBreadcrumb(crumb: BreadcrumbInput): void {
+  try {
+    client?.crumbs.add(crumb);
+  } catch {
+    /* never throw into application code */
+  }
+}
+
+/** Drop all buffered breadcrumbs. */
+export function clearBreadcrumbs(): void {
+  client?.crumbs.clear();
+}
+
+/** Submit a message (no exception object) as an issue event. Sends
+ * immediately; never rejects. Level defaults to "info". */
+export function captureMessage(message: string, ctx?: CaptureContext): Promise<void> {
+  if (!client) return Promise.resolve();
+  const target = client;
+  const payload = buildErrorPayload(target, "Message", String(message), ctx, { level: ctx?.level ?? "info", mechanism: ctx?.mechanism ?? "message" });
+  return sendJSON(target, "/api/v1/errors", payload).catch((sendErr) => {
+    reportError(target, sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
+  });
 }
 
 /** Submit an error. Sends immediately — not buffered. Never rejects into
@@ -754,18 +822,40 @@ export function captureException(err: Error, ctx?: CaptureContext): Promise<void
 }
 
 function captureExceptionFor(target: Client, err: Error, ctx?: CaptureContext): Promise<void> {
+  const payload = buildErrorPayload(target, err.name || "Error", err.message || String(err), ctx, {
+    level: ctx?.level ?? "error",
+    mechanism: ctx?.mechanism ?? "manual",
+    stack: parseStack(err.stack),
+  });
+  // Fire-and-forget public boundary (AUD-021): report, don't reject.
+  return sendJSON(target, "/api/v1/errors", payload).catch((sendErr) => {
+    reportError(target, sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
+  });
+}
+
+function buildErrorPayload(
+  target: Client,
+  errorType: string,
+  errorValue: string,
+  ctx: CaptureContext | undefined,
+  o: { level: "error" | "warning" | "info"; mechanism: string; stack?: ErrorPayload["stack_trace"] },
+): ErrorPayload {
   const payload: ErrorPayload = {
     site_id: target.opts.siteId,
     event_id: makeId(),
-    error_type: err.name || "Error",
-    error_value: err.message || String(err),
+    error_type: errorType,
+    error_value: errorValue,
     release_tag: ctx?.release ?? target.opts.release,
     environment: ctx?.environment ?? target.opts.environment ?? "production",
-    mechanism: ctx?.mechanism ?? "manual",
+    mechanism: o.mechanism,
     url: pageUrl(),
-    level: "error",
-    stack_trace: parseStack(err.stack),
+    level: o.level,
+    stack_trace: o.stack,
   };
+  // Breadcrumbs recorded so far ride along (snapshot: later crumbs do not
+  // mutate an in-flight payload).
+  const crumbs = target.crumbs.snapshot();
+  if (crumbs.length > 0) payload.breadcrumbs = crumbs;
   // Tags ride in the server-supported `extra` envelope (it has no
   // top-level tags field).
   if (ctx?.tags && Object.keys(ctx.tags).length > 0) {
@@ -780,10 +870,62 @@ function captureExceptionFor(target: Client, err: Error, ctx?: CaptureContext): 
   const replayId = activeReplayId();
   if (replayId) payload.replay_id = replayId;
   if (target.userId) payload.distinct_id = target.userId;
-  // Fire-and-forget public boundary (AUD-021): report, don't reject.
-  return sendJSON(target, "/api/v1/errors", payload).catch((sendErr) => {
-    reportError(target, sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
+  return payload;
+}
+
+/** Evaluate one feature flag against the server (POST /api/v1/flags/evaluate).
+ * Never rejects: on any failure it resolves to ctx.default (or disabled)
+ * with `source: "default"`. Results are cached for the TTL and identical
+ * in-flight calls are coalesced. `userId` defaults to the identify()d user.
+ * Exposure is NOT recorded unless you pass `exposure: true` (records one
+ * "flag_exposure" event per flag/user/variant) or call track() yourself
+ * where the variant is actually rendered. Resolves to the default before init(). */
+export function evaluateFlag(key: string, ctx?: FlagContext & { exposure?: boolean }): Promise<FlagResult> {
+  const target = client;
+  if (!target) return Promise.resolve(defaultOnly(key, ctx, "sdk not initialized"));
+  return target.flagClient.evaluateFlag(key, withUser(target, ctx)).then((r) => {
+    maybeExpose(target, r, ctx);
+    return r;
   });
+}
+
+/** Evaluate several flags concurrently (duplicate keys collapse; at most 50
+ * per call). Same failure and exposure semantics as evaluateFlag. */
+export function evaluateFlags(keys: string[], ctx?: FlagContext & { exposure?: boolean }): Promise<Record<string, FlagResult>> {
+  const target = client;
+  if (!target) {
+    const out: Record<string, FlagResult> = {};
+    for (const k of Array.isArray(keys) ? keys : []) out[k] = defaultOnly(k, ctx, "sdk not initialized");
+    return Promise.resolve(out);
+  }
+  return target.flagClient.evaluateFlags(keys, withUser(target, ctx)).then((rs) => {
+    for (const r of Object.values(rs)) maybeExpose(target, r, ctx);
+    return rs;
+  });
+}
+
+function withUser(target: Client, ctx?: FlagContext): FlagContext {
+  return { ...ctx, userId: ctx?.userId ?? target.userId ?? "" };
+}
+
+function defaultOnly(key: string, ctx: FlagContext | undefined, error: string): FlagResult {
+  return {
+    key,
+    enabled: ctx?.default?.enabled === true,
+    ...(ctx?.default?.variant ? { variant: ctx.default.variant } : {}),
+    reason: "default",
+    source: "default",
+    error,
+  };
+}
+
+function maybeExpose(target: Client, r: FlagResult, ctx?: { exposure?: boolean; userId?: string }): void {
+  if (ctx?.exposure !== true || r.source === "default" || client !== target) return;
+  const id = JSON.stringify([r.key, ctx.userId ?? target.userId ?? "", r.enabled, r.variant ?? ""]);
+  if (target.exposed.has(id)) return;
+  if (target.exposed.size >= 1000) target.exposed.clear();
+  target.exposed.add(id);
+  track("flag_exposure", { flag_key: r.key, enabled: r.enabled, ...(r.variant ? { variant: r.variant } : {}) });
 }
 
 function activeReplayId(): string | null {
@@ -1040,4 +1182,4 @@ function parseStack(stack?: string): ErrorPayload["stack_trace"] {
 }
 
 // Default export for convenience with older bundlers.
-export default { init, pageview, track, identify, reset, captureException, log, flush, getStats };
+export default { init, pageview, track, identify, reset, captureException, captureMessage, addBreadcrumb, clearBreadcrumbs, evaluateFlag, evaluateFlags, log, flush, getStats };
