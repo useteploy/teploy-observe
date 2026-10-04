@@ -51,7 +51,7 @@ func TestSubmitResponseValidatesBeforeStore(t *testing.T) {
 
 func TestSubmitLockStable(t *testing.T) {
 	svc := &SurveyService{}
-	if svc.submitLock("s", "sv1", "client-abc12345") != svc.submitLock("s", "sv1", "client-abc12345") {
+	if a, b := svc.submitLock("s", "sv1", "client-abc12345"), svc.submitLock("s", "sv1", "client-abc12345"); a != b {
 		t.Fatal("same key must map to the same lock")
 	}
 }

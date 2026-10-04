@@ -42,10 +42,6 @@ type ReplayFilter struct {
 	DistinctID string
 }
 
-func (f ReplayFilter) active() bool {
-	return f.HasErrors || f.MinDurationMS > 0 || f.URLContains != "" || f.DistinctID != ""
-}
-
 // escapeLike makes s match literally inside a LIKE/ILIKE pattern
 // (backslash is the default escape character).
 func escapeLike(s string) string {

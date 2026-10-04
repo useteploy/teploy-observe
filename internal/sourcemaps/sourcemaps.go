@@ -2,9 +2,7 @@ package sourcemaps
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -532,13 +530,6 @@ func decodeMappings(mappings string, sources, names []string, targetLine, target
 	return nil
 }
 
-func abs(x int) int {
-	if x < 0 {
-		return -x
-	}
-	return x
-}
-
 // decodeVLQ decodes a base64-VLQ encoded string into a slice of integers.
 func decodeVLQ(s string) []int {
 	var result []int
@@ -584,12 +575,6 @@ func vlqCharToInt(c byte) int {
 		return 63
 	}
 	return -1
-}
-
-func genID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }
 
 // unused but needed for interface compatibility

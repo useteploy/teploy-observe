@@ -11,7 +11,8 @@ func TestWriteLimiterWindowAndIsolation(t *testing.T) {
 	now := time.Unix(1000, 0)
 	l := NewWriteLimiter(2, time.Minute)
 	l.now = func() time.Time { return now }
-	if !l.Allow("s", "a") || !l.Allow("s", "a") || l.Allow("s", "a") {
+	a1, a2, a3 := l.Allow("s", "a"), l.Allow("s", "a"), l.Allow("s", "a")
+	if !a1 || !a2 || a3 {
 		t.Fatal("limit of 2 not enforced")
 	}
 	if !l.Allow("s", "b") || !l.Allow("t", "a") {

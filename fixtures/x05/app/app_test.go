@@ -41,7 +41,7 @@ func TestStateReplay(t *testing.T) {
 // Experiment assignment is deterministic per (site, client) and balanced
 // enough across the client space to be a usable O09 fixture.
 func TestArmDeterministic(t *testing.T) {
-	if armFor("x05", "c1") != armFor("x05", "c1") {
+	if a, b := armFor("x05", "c1"), armFor("x05", "c1"); a != b {
 		t.Fatal("assignment not deterministic")
 	}
 	if armFor("x05", "c1") == armFor("x05", "c2") && armFor("x05", "c2") == armFor("x05", "c3") && armFor("x05", "c3") == armFor("x05", "c4") {

@@ -84,7 +84,7 @@ func ValidateAnswers(a map[string]any) error {
 			return fmt.Errorf("invalid answer key (must match [A-Za-z0-9_-]{1,64})")
 		}
 		switch x := v.(type) {
-		case nil, bool, float64:
+		case nil, bool, float64, int, int64:
 		case string:
 			if n := len([]rune(x)); n > maxAnswerRunes {
 				return fmt.Errorf("answer %q too long (max %d characters)", k, maxAnswerRunes)

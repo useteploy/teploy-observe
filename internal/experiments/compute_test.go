@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -61,10 +60,50 @@ func TestLegacyBinaryJSONUnchanged(t *testing.T) {
 			delete(got["analysis"].(map[string]any), "srm")
 			delete(want["analysis"].(map[string]any), "srm")
 		}
-		if !reflect.DeepEqual(got, want) {
+		if !approxEqualJSON(got, want) {
 			t.Fatalf("case %d: legacy JSON changed\n got: %s\nwant: %s", ci, mustJSON(t, got), mustJSON(t, want))
 		}
 	}
+}
+
+// approxEqualJSON is DeepEqual over parsed JSON with a 1e-12 relative
+// tolerance on float leaves. The gc compiler fuses floating-point multiply
+// add on arm64 but not amd64, so transcendent-derived leaves (p-values)
+// differ by 1 ULP between architectures; the pin's contract is structural
+// and numeric identity, not the last mantissa bit.
+func approxEqualJSON(a, b any) bool {
+	fa, aok := a.(float64)
+	fb, bok := b.(float64)
+	if aok || bok {
+		return aok && bok && math.Abs(fa-fb) <= 1e-12*math.Max(math.Abs(fa), math.Abs(fb))
+	}
+	am, aok := a.(map[string]any)
+	bm, bok := b.(map[string]any)
+	if aok || bok {
+		if !aok || !bok || len(am) != len(bm) {
+			return false
+		}
+		for k, v := range am {
+			if !approxEqualJSON(v, bm[k]) {
+				return false
+			}
+		}
+		return true
+	}
+	as, aok := a.([]any)
+	bs, bok := b.([]any)
+	if aok || bok {
+		if !aok || !bok || len(as) != len(bs) {
+			return false
+		}
+		for i := range as {
+			if !approxEqualJSON(as[i], bs[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	return a == b
 }
 
 func mustJSON(t *testing.T, v any) []byte {

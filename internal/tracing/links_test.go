@@ -1,6 +1,7 @@
 package tracing
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -149,7 +150,7 @@ func TestBuildSpanLinkPlaceholders(t *testing.T) {
 
 func TestInsertSpanLinks_NoLinksNoExec(t *testing.T) {
 	// nil SQL would panic if an INSERT were attempted for a link-free batch.
-	if err := insertSpanLinks(nil, nil, "s", []flatSpan{{TraceID: "t", SpanID: "s"}}); err != nil {
+	if err := insertSpanLinks(context.Background(), nil, "s", []flatSpan{{TraceID: "t", SpanID: "s"}}); err != nil {
 		t.Fatal(err)
 	}
 }

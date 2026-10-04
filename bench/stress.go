@@ -38,7 +38,6 @@ type StressConfig struct {
 }
 
 type StressStats struct {
-	mu            sync.Mutex
 	totalReqs     atomic.Int64
 	successReqs   atomic.Int64
 	failedReqs    atomic.Int64
@@ -201,24 +200,21 @@ func stressMain() {
 	go func() {
 		ticker := time.NewTicker(cfg.CheckpointInterval)
 		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				elapsed := time.Since(stats.startTime).Seconds()
-				total := stats.totalReqs.Load()
-				success := stats.successReqs.Load()
-				failed := stats.failedReqs.Load()
-				rps := float64(total) / elapsed
+		for range ticker.C {
+			elapsed := time.Since(stats.startTime).Seconds()
+			total := stats.totalReqs.Load()
+			success := stats.successReqs.Load()
+			failed := stats.failedReqs.Load()
+			rps := float64(total) / elapsed
 
-				fmt.Printf("  [%5.0fs] %6d reqs (%4.0f/s) | ok=%d fail=%d |", elapsed, total, rps, success, failed)
-				for _, t := range []string{"pageview", "error", "trace", "log"} {
-					fmt.Printf(" %s=%d", t, stats.byType[t].Load())
-				}
-				fmt.Println()
+			fmt.Printf("  [%5.0fs] %6d reqs (%4.0f/s) | ok=%d fail=%d |", elapsed, total, rps, success, failed)
+			for _, t := range []string{"pageview", "error", "trace", "log"} {
+				fmt.Printf(" %s=%d", t, stats.byType[t].Load())
+			}
+			fmt.Println()
 
-				if time.Now().After(deadline) {
-					return
-				}
+			if time.Now().After(deadline) {
+				return
 			}
 		}
 	}()

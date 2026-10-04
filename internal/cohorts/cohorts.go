@@ -238,8 +238,8 @@ func (s *Service) evalEventRule(ctx context.Context, siteID string, r Rule) ([]s
 	if min <= 0 {
 		min = 1
 	}
-	windowMs := parseWindow(r.Window)
-	fromMs := time.Now().UTC().Add(-windowMs).UnixMilli()
+	windowDur := parseWindow(r.Window)
+	fromMs := time.Now().UTC().Add(-windowDur).UnixMilli()
 	from := dbutil.IntParam(fromMs)
 
 	type countedRow struct {

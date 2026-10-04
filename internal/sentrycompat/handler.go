@@ -128,13 +128,6 @@ func (h *Handler) retryAfter() time.Duration {
 	return 5 * time.Second
 }
 
-func (h *Handler) logger() *slog.Logger {
-	if h.Logger != nil {
-		return h.Logger
-	}
-	return slog.Default()
-}
-
 // Envelope serves POST /api/{project_id}/envelope/.
 func (h *Handler) Envelope(w http.ResponseWriter, r *http.Request) { h.serve(w, r, false) }
 

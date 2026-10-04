@@ -12,7 +12,7 @@ func TestScrubKeyFoldsFullwidthAndConfusables(t *testing.T) {
 		"ＰＡＳＳＷＯＲＤ",      // fullwidth PASSWORD
 		"pаssword",      // Cyrillic a
 		"ａｐｉ＿ｋｅｙ",       // fullwidth api_key
-		"pass​word",     // zero-width space
+		"pass\u200bword",   // zero-width space
 		"тoken",         // Cyrillic t
 		"AuthorＩzation", // fullwidth I
 		"ⅱⅱⅱ",           // roman numerals: must not panic, not sensitive

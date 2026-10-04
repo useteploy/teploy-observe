@@ -176,7 +176,7 @@ func newMux(st *state, site, release, failpoint string, started *time.Time) *htt
 	})
 	mux.HandleFunc("/api/hit", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", 405)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		if err := st.bump("hit", 1, ""); err != nil {

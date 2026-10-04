@@ -24,7 +24,7 @@ func TestMetricEventID_Keyed(t *testing.T) {
 	if !strings.HasPrefix(a, "k_") {
 		t.Errorf("id = %q", a)
 	}
-	if metricEventID("e", "s", "u", "primary", "") == metricEventID("e", "s", "u", "primary", "") {
+	if a, b := metricEventID("e", "s", "u", "primary", ""), metricEventID("e", "s", "u", "primary", ""); a == b {
 		t.Error("unkeyed ids must be random")
 	}
 }

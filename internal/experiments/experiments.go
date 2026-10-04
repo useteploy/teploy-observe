@@ -353,7 +353,7 @@ func (s *ExperimentService) ResultsWithOptions(ctx context.Context, experimentID
 			return nil, fmt.Errorf("experiment too large for in-process analysis (>= %d converting users)", maxAnalysisRows)
 		}
 		for _, r := range rows {
-			in.BinaryConversions = append(in.BinaryConversions, userVariant{User: r.User, Variant: r.Variant})
+			in.BinaryConversions = append(in.BinaryConversions, userVariant(r))
 		}
 	}
 

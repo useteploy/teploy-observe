@@ -116,7 +116,10 @@ type ServiceSummary struct {
 // Frustrated > 4T; tolerated > T && <= 4T; satisfied <= T. SigNoz parity.
 const apdexThresholdMs int64 = 500
 
-// apdex computes the Apdex score (0..1) for a slice of durations.
+// apdex computes the Apdex score (0..1) for a slice of durations. Retained
+// as the reference formula apdexFromCounts (the SQL-side pre-bucketed form
+// in production use) and query_test.go pin it against; production reads
+// go through the bucketed path.
 //
 //	satisfied = duration <= t
 //	tolerated = t < duration <= 4t
@@ -124,6 +127,8 @@ const apdexThresholdMs int64 = 500
 //	score = (satisfied + tolerated/2) / total
 //
 // Returns 0 for an empty input.
+//
+//lint:ignore U1000 pinned by TestApdex_Formula in query_test.go
 func apdex(durations []int64, t int64) float64 {
 	if len(durations) == 0 || t <= 0 {
 		return 0

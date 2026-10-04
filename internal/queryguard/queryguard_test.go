@@ -132,7 +132,7 @@ func TestLoadSlotsFromEnv(t *testing.T) {
 		t.Fatalf("slots = %d/%d", g, s)
 	}
 	env["OBSERVE_QUERY_GLOBAL_CONCURRENCY"] = "zero"
-	g, s = LoadSlotsFromEnv(func(k string) string { return env[k] }, nil)
+	g, _ = LoadSlotsFromEnv(func(k string) string { return env[k] }, nil)
 	if g != DefaultGlobalSlots {
 		t.Fatalf("bad knob must keep default, got %d", g)
 	}

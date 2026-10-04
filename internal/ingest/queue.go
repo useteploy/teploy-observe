@@ -617,19 +617,6 @@ func decodeWALFrame(line []byte) (walFrame, error) {
 	}
 }
 
-// decodeWALLine decodes an EVENTS frame (legacy or versioned). A records
-// frame is an error here: the events queue must never carry one.
-func decodeWALLine(line []byte) ([]Event, error) {
-	f, err := decodeWALFrame(line)
-	if err != nil {
-		return nil, err
-	}
-	if f.isRecords {
-		return nil, errors.New("record frame on an events queue")
-	}
-	return f.events, nil
-}
-
 // Append writes one event to the write-ahead log and returns the WAL byte
 // offset immediately after the written record. The caller must hold this
 // offset and pass the batch's maximum offset to Checkpoint after the batch

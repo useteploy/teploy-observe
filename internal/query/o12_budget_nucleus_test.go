@@ -225,12 +225,11 @@ func TestO12_WindowClampBoundsTheScan(t *testing.T) {
 	})
 	// Ask for 3 days; the clamp keeps 24h. Both events are pageviews on
 	// one session, so the funnel's visitor count distinguishes inclusion.
-	res, err := svc.FunnelWithOptions(ctx, site, base.Add(-72*time.Hour), base, []FunnelStep{{Type: "page", Value: "/x"}}, FunnelOptions{})
-	if err != nil {
+	if _, err := svc.FunnelWithOptions(ctx, site, base.Add(-72*time.Hour), base, []FunnelStep{{Type: "page", Value: "/x"}}, FunnelOptions{}); err != nil {
 		t.Fatalf("funnel: %v", err)
 	}
 	// No /x pages were seeded; use the event step instead to count.
-	res, err = svc.FunnelWithOptions(ctx, site, base.Add(-72*time.Hour), base, []FunnelStep{{Type: "event", Value: "pageview"}}, FunnelOptions{})
+	res, err := svc.FunnelWithOptions(ctx, site, base.Add(-72*time.Hour), base, []FunnelStep{{Type: "event", Value: "pageview"}}, FunnelOptions{})
 	if err != nil {
 		t.Fatalf("funnel: %v", err)
 	}

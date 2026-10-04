@@ -194,7 +194,8 @@ func TestGroupBucketsIndependent(t *testing.T) {
 	same := 0
 	for i := 0; i < 200; i++ {
 		u := fmt.Sprintf("user-%d", i)
-		if (Bucket(groupSalt("f", "A"), u) <= 50) == (Bucket(groupSalt("f", "A"), u) <= 50) {
+		b1, b2 := Bucket(groupSalt("f", "A"), u) <= 50, Bucket(groupSalt("f", "A"), u) <= 50
+		if b1 == b2 {
 			same++
 		}
 	}

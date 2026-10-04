@@ -44,9 +44,6 @@ type Results struct {
 
 var (
 	paths      = []string{"/", "/about", "/pricing", "/docs", "/blog", "/signup", "/login", "/dashboard", "/settings", "/contact"}
-	browsers   = []string{"Chrome", "Firefox", "Safari", "Edge"}
-	oses       = []string{"Windows", "macOS", "Linux", "iOS", "Android"}
-	countries  = []string{"US", "GB", "DE", "FR", "JP", "BR", "IN", "CA", "AU", "NL"}
 	errorTypes = []string{"TypeError", "ReferenceError", "SyntaxError", "RangeError", "NetworkError"}
 	errorMsgs  = []string{
 		"Cannot read property 'id' of undefined",

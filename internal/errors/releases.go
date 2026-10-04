@@ -27,7 +27,7 @@ func (s *IssueService) ReleaseHealthList(ctx context.Context, siteID string, fro
 	toMs := dbutil.IntParam(to.UnixMilli())
 
 	return nucleus.Query[ReleaseHealth](ctx, s.db.SQL(),
-		fmt.Sprintf(`SELECT
+		`SELECT
 			COALESCE(release_tag, 'unknown') AS release_tag,
 			COUNT(*) AS error_count,
 			COUNT(DISTINCT group_hash) AS issue_count,
@@ -40,7 +40,7 @@ func (s *IssueService) ReleaseHealthList(ctx context.Context, siteID string, fro
 		   AND release_tag != ''
 		 GROUP BY release_tag
 		 ORDER BY last_seen DESC
-		 LIMIT 20`),
+		 LIMIT 20`,
 		siteID, fromMs, toMs,
 	)
 }

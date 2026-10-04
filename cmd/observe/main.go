@@ -77,7 +77,6 @@ import (
 var (
 	version = "dev"
 	commit  = "unknown"
-	date    = "unknown"
 )
 
 // otlpMaxBodyBytes caps a single OTLP export request. Higher than the 2 MiB
@@ -2575,7 +2574,7 @@ func setSiteRatelimitHandler(siteSvc *sites.SiteService, rl *ingest.RateLimiter)
 			return setSiteRatelimitResult{}, err
 		}
 		rl.SetSiteCap(input.SiteID, input.RatePerSecond)
-		return setSiteRatelimitResult{SiteID: input.SiteID, RatePerSecond: input.RatePerSecond}, nil
+		return setSiteRatelimitResult(input), nil
 	}
 }
 
@@ -3059,6 +3058,11 @@ func llmPricesSetHandler(svc *llm.LLMService) neutron.HandlerFunc[llm.CatalogEnt
 
 // --- Infra handlers ---
 
+// infraReportHandler is deliberately kept in sync with the live raw route
+// even though only the raw handler is mounted (audit F07): if the typed
+// route is ever re-mounted, it must not reintroduce the site-binding gap.
+//
+//lint:ignore U1000 reference twin of the mounted raw route (audit F07)
 func infraReportHandler(svc *infra.InfraService) neutron.HandlerFunc[infra.MetricInput, map[string]string] {
 	return func(ctx context.Context, input infra.MetricInput) (map[string]string, error) {
 		// Audit F07: same site binding as the live raw route below — kept
@@ -3199,29 +3203,6 @@ type addMemberInput struct {
 func addGroupMemberHandler(svc *groups.GroupService) neutron.HandlerFunc[addMemberInput, neutron.Empty] {
 	return func(ctx context.Context, input addMemberInput) (neutron.Empty, error) {
 		return neutron.Empty{}, svc.AddMember(ctx, input.SiteID, input.GroupID, input.SessionID, input.UserID)
-	}
-}
-
-// --- Correlation handler ---
-
-type correlationInput struct {
-	SiteID string `query:"site_id"`
-	Target string `query:"target"`
-	From   string `query:"from"`
-	To     string `query:"to"`
-}
-
-func correlationHandler(svc *query.StatsService) neutron.HandlerFunc[correlationInput, []query.Correlation] {
-	return func(ctx context.Context, input correlationInput) ([]query.Correlation, error) {
-		from, to, err := parseTimeRange(input.From, input.To)
-		if err != nil {
-			return nil, neutron.ErrBadRequest(err.Error())
-		}
-		target := input.Target
-		if target == "" {
-			target = "signup"
-		}
-		return emptyOnNil(svc.CorrelationAnalysis(ctx, input.SiteID, target, from, to))
 	}
 }
 
