@@ -41,6 +41,9 @@ type experimentMetricInput struct {
 	UserID       string  `json:"user_id"`
 	Metric       string  `json:"metric"`
 	Value        float64 `json:"value"`
+	// EventKey is an optional client idempotency key (<=64 chars). A retry
+	// with the same key records the event once.
+	EventKey string `json:"event_key"`
 }
 
 func experimentMetricHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[experimentMetricInput, neutron.Empty] {
@@ -55,7 +58,7 @@ func experimentMetricHandler(svc *experiments.ExperimentService) neutron.Handler
 		if math.IsNaN(in.Value) || math.IsInf(in.Value, 0) {
 			return neutron.Empty{}, neutron.ErrBadRequest("value must be finite")
 		}
-		if err := svc.RecordMetric(ctx, in.ExperimentID, siteID, in.UserID, in.Metric, in.Value); err != nil {
+		if err := svc.RecordMetricKeyed(ctx, in.ExperimentID, siteID, in.UserID, in.Metric, in.Value, in.EventKey); err != nil {
 			return neutron.Empty{}, neutron.ErrBadRequest(err.Error())
 		}
 		return neutron.Empty{}, nil
