@@ -16,8 +16,11 @@ import (
 // Authentication, the BoundSite invariant, rate limiting and body caps are
 // all enforced inside the handler (the DSN key can arrive in the query, the
 // X-Sentry-Auth header or the envelope header, so the X-API-Key middleware
-// does not apply). Patterns end in {$} so they match the exact path and do
-// not claim the /api/ subtree.
+// does not apply). Patterns are exact paths (no subtree claim). No OPTIONS
+// route: "OPTIONS /api/{project_id}/..." conflicts with the existing
+// "OPTIONS /api/v1/{path...}" preflight handler at boot, and Sentry SDKs send
+// simple requests (text/plain, DSN key in the query string), which never
+// preflight.
 func registerSentryRoutes(r interface {
 	Handle(pattern string, handler http.Handler)
 }, authSvc *auth.AuthService, buf *obserrors.ErrorBuffer, limiter *ingest.RateLimiter, logger *slog.Logger) {
@@ -33,11 +36,10 @@ func registerSentryRoutes(r interface {
 		fn   http.HandlerFunc
 	}{
 		{"/api/{project_id}/envelope/{$}", h.Envelope},
-		{"/api/{project_id}/envelope{$}", h.Envelope},
+		{"/api/{project_id}/envelope", h.Envelope},
 		{"/api/{project_id}/store/{$}", h.Store},
-		{"/api/{project_id}/store{$}", h.Store},
+		{"/api/{project_id}/store", h.Store},
 	} {
 		r.Handle("POST "+p.path, p.fn)
-		r.Handle("OPTIONS "+p.path, http.HandlerFunc(h.Preflight))
 	}
 }

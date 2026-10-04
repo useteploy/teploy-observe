@@ -127,12 +127,6 @@ func (h *Handler) Envelope(w http.ResponseWriter, r *http.Request) { h.serve(w, 
 // Store serves POST /api/{project_id}/store/ (legacy single-event JSON).
 func (h *Handler) Store(w http.ResponseWriter, r *http.Request) { h.serve(w, r, true) }
 
-// Preflight answers CORS preflight for the Sentry routes.
-func (h *Handler) Preflight(w http.ResponseWriter, r *http.Request) {
-	setCORS(w)
-	w.WriteHeader(http.StatusNoContent)
-}
-
 func setCORS(w http.ResponseWriter) {
 	hd := w.Header()
 	hd.Set("Access-Control-Allow-Origin", "*")
@@ -279,7 +273,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, legacyStore bool
 	h.malformed.Add(int64(pe.Malformed))
 
 	respID := pe.Header.EventID
-	goodItems, events := 0, 0
+	goodItems, events, bad := 0, 0, 0
 	for _, it := range pe.Items {
 		if it.Type != "event" {
 			goodItems++
@@ -288,11 +282,13 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, legacyStore bool
 		}
 		if events >= maxEventsPerEnvelope {
 			h.malformed.Add(1)
+			bad++
 			continue
 		}
 		in, eventID, merr := mapEvent(it.Payload, pe.Header.EventID)
 		if merr != nil {
 			h.malformed.Add(1)
+			bad++
 			continue
 		}
 		goodItems++
@@ -325,8 +321,8 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, legacyStore bool
 	// Nothing usable: an envelope whose every item was oversize is a 413;
 	// one whose items were all undecodable is a 400. A header-only envelope
 	// (no items at all) is valid and acknowledged.
-	if goodItems == 0 && (pe.Oversize > 0 || pe.Malformed > 0 || pe.Dropped > 0 || legacyStore) {
-		if pe.Oversize > 0 && pe.Malformed == 0 {
+	if goodItems == 0 && (pe.Oversize > 0 || pe.Malformed > 0 || bad > 0 || pe.Dropped > 0 || legacyStore) {
+		if pe.Oversize > 0 && pe.Malformed == 0 && bad == 0 {
 			fail(w, http.StatusRequestEntityTooLarge, "item too large")
 			return
 		}

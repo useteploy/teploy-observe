@@ -4,25 +4,24 @@ Observe's error tracking covers the same core surface as Sentry: grouped issues,
 stack traces with source maps, breadcrumbs, releases, and webhook alerts.
 This guide walks through the SDK-level changes and the concept mapping.
 
-> **TL;DR** — Replace your Sentry SDK with one of Observe's SDKs (or the
-> `@teploy/observe-sentry-shim` package). The payload shapes map almost
-> 1-to-1; the only concept Sentry has that Observe doesn't is "organization"
-> (Observe uses sites instead).
-
-> **Stock Sentry SDKs cannot be pointed at Observe by changing the DSN.**
-> Observe has no Sentry-protocol ingest: there is no `/envelope` or `/store`
-> route (nor `/api/<project>/envelope/`). Its error endpoint is
-> `POST /api/v1/errors` with Observe's own JSON body (`internal/errors/handler.go`).
-> A stock `@sentry/*`, `sentry-sdk` or `sentry-go` client given an Observe URL
-> will get 404s and drop events. You must swap the SDK (or use the shim, which
-> speaks Observe's API, not Sentry's).
+> **TL;DR** - Stock Sentry SDKs (`sentry-sdk`, `@sentry/browser`,
+> `@sentry/node`, `sentry-go`) can point their DSN at Observe:
+> `https://<observe_api_key>@<host>/<site_id>`. Error events are ingested;
+> transactions, sessions, replays, profiles, attachments, check-ins and logs
+> are acknowledged with 200 and dropped. For the full Observe feature set
+> (or if you prefer a smaller dependency) swap to an Observe SDK or the
+> `@teploy/observe-sentry-shim` package. The only Sentry concept Observe lacks
+> is "organization" (Observe uses sites instead).
+>
+> The key must be an Observe API key with the telemetry capability, bound to
+> the site named in the DSN. Details: [Sentry wire protocol](../sdk/COMPATIBILITY.md#sentry-wire-protocol-stock-sentry-sdks-no-shim).
 
 ## Concept mapping
 
 | Sentry                       | Observe                                         |
 |------------------------------|-------------------------------------------------|
 | Project                      | Site                                            |
-| DSN                          | Endpoint URL + API key (headers, not URL)       |
+| DSN                          | `https://<api_key>@host/<site_id>` (wire-compatible), or endpoint URL + API key |
 | Issue                        | Issue                                           |
 | Event                        | Error event (`error_events` table)              |
 | Release                      | Release tag (string field)                      |
@@ -181,10 +180,14 @@ Issues are grouped by `group_hash` on ingest, so duplicates merge automatically.
 
 ## What doesn't port cleanly
 
-- **Performance / tracing on the Sentry side** — use Observe's OTLP trace
-  endpoint instead; Sentry's performance SDK doesn't map 1-to-1.
-- **Sentry Replay** — Observe has its own replay format (`observe-replay.js`)
-  rather than rrweb.
+- **Performance / tracing on the Sentry side** — transactions and spans sent by
+  a stock Sentry SDK are acknowledged and dropped; use Observe's OTLP trace
+  endpoint instead.
+- **Release-health sessions, profiles, crons, attachments, user feedback** —
+  acknowledged and dropped (stock SDK path).
+- **Sentry Replay** — dropped on the Sentry wire; Observe has its own replay
+  format (`observe-replay.js`) rather than rrweb.
+- **Event timestamps** — events are timestamped at ingest.
 - **Organization / team permissions** — Observe is single-tenant per deployment.
 
 ## Checklist
