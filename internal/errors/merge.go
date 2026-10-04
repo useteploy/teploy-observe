@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"strings"
 	"sync"
@@ -50,6 +51,8 @@ var (
 	ErrAlreadyMerged   = errors.New("issue is already merged; unmerge it first")
 	ErrNotMerged       = errors.New("issue is not merged")
 	ErrInvalidAssignee = errors.New("invalid assignee")
+	// ErrMergeUnavailable: the service was built without merge state.
+	ErrMergeUnavailable = errors.New("issue merge is not available")
 )
 
 // Assignment is the current assignee of an issue.
@@ -80,6 +83,19 @@ type mergeState struct {
 	mu    sync.Mutex
 	cache map[string]mergeCacheEntry
 	now   func() time.Time
+	// writeLocks serialise merge/unmerge validate-then-write per site
+	// (striped by site hash): two concurrent merges (A->B, B->A) each pass
+	// cycle validation against the pre-write state and would otherwise both
+	// commit, creating a cycle.
+	writeLocks [64]sync.Mutex
+}
+
+func (m *mergeState) lockSite(siteID string) func() {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(siteID))
+	mu := &m.writeLocks[h.Sum32()%uint32(len(m.writeLocks))]
+	mu.Lock()
+	return mu.Unlock
 }
 
 func newMergeState(store mergeStore) *mergeState {
@@ -171,6 +187,10 @@ func (s *IssueService) MergeIssues(ctx context.Context, siteID, sourceID, target
 	if sourceID == targetID {
 		return ErrMergeSelf
 	}
+	if s.merge == nil {
+		return ErrMergeUnavailable
+	}
+	defer s.merge.lockSite(siteID)()
 	// Both issues must exist in THIS site (IDOR boundary).
 	for _, id := range []string{sourceID, targetID} {
 		ok, err := s.merge.store.issueExists(ctx, siteID, id)
@@ -218,6 +238,10 @@ func (s *IssueService) MergeIssues(ctx context.Context, siteID, sourceID, target
 
 // UnmergeIssue restores a merged source.
 func (s *IssueService) UnmergeIssue(ctx context.Context, siteID, sourceID, actor string) error {
+	if s.merge == nil {
+		return ErrMergeUnavailable
+	}
+	defer s.merge.lockSite(siteID)()
 	ok, err := s.merge.store.issueExists(ctx, siteID, sourceID)
 	if err != nil {
 		return err
@@ -259,6 +283,9 @@ func (s *IssueService) AssignIssue(ctx context.Context, siteID, issueID, assigne
 	assignee = strings.TrimSpace(assignee)
 	if err := ValidateAssignee(assignee); err != nil {
 		return err
+	}
+	if s.merge == nil {
+		return ErrMergeUnavailable
 	}
 	ok, err := s.merge.store.issueExists(ctx, siteID, issueID)
 	if err != nil {
