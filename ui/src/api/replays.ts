@@ -27,11 +27,24 @@ export interface ReplayEvent {
   data: string;
 }
 
+export interface ReplayListOpts {
+  limit?: number;
+  offset?: number;
+  hasErrors?: boolean;
+  minDurationMs?: number;
+  urlContains?: string;
+  distinctId?: string;
+}
+
 export const replaysApi = {
-  list: (siteId: string, from: string, to: string, opts?: { limit?: number; offset?: number }) => {
+  list: (siteId: string, from: string, to: string, opts?: ReplayListOpts) => {
     let q = `site_id=${siteId}&from=${from}&to=${to}`;
     if (opts?.limit) q += `&limit=${opts.limit}`;
     if (opts?.offset) q += `&offset=${opts.offset}`;
+    if (opts?.hasErrors) q += `&has_errors=true`;
+    if (opts?.minDurationMs) q += `&min_duration=${Math.floor(opts.minDurationMs)}`;
+    if (opts?.urlContains) q += `&url_contains=${encodeURIComponent(opts.urlContains)}`;
+    if (opts?.distinctId) q += `&distinct_id=${encodeURIComponent(opts.distinctId)}`;
     return get<ReplaySession[]>(`${BASE}?${q}`);
   },
   events: (replayId: string) =>

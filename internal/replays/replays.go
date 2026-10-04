@@ -19,6 +19,7 @@ import (
 	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/guardmap"
 	"github.com/useteploy/teploy-observe/internal/heatmaps"
 	"github.com/useteploy/teploy-observe/internal/identity"
 	"github.com/useteploy/teploy-observe/internal/ingest"
@@ -81,6 +82,11 @@ type ReplayService struct {
 	// process; a multi-replica deployment needs the stable-key + CAS design
 	// deferred with F03-class schema work.
 	replayLocks [64]sync.Mutex
+
+	// guard/budgets are the optional O12 admission state for the list path
+	// (see WithQueryGuard in list_filter.go).
+	guard     *guardmap.Guard
+	maxWindow time.Duration
 }
 
 // lockReplay serializes all writes for one replay ID. NOT keyed by site:
@@ -522,6 +528,12 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (Result, 
 		return Result{}, err
 	}
 
+	// Console/network capture events: bounds, key allowlist and secret
+	// scrub (capture.go). Runs before the batch digest is taken.
+	if err := validateCaptureEvents(&input); err != nil {
+		return Result{}, err
+	}
+
 	replayID := input.ReplayID
 	if replayID == "" {
 		if input.idempotent() {
@@ -783,32 +795,6 @@ func readIntField(data any, key string) (int, bool) {
 // maxListReplaysLimit bounds the listing page size (audit F28: limit had a
 // default but no cap, so an extreme value produced an extreme query).
 const maxListReplaysLimit = 200
-
-// ListReplays returns recent replay sessions for a site, read through the
-// version collapse so multi-batch upserts surface as one row per replay.
-func (s *ReplayService) ListReplays(ctx context.Context, siteID string, from, to time.Time, limit, offset int) ([]ReplaySession, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-	if limit > maxListReplaysLimit {
-		limit = maxListReplaysLimit
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
-
-	return nucleus.Query[ReplaySession](ctx, s.db.SQL(),
-		fmt.Sprintf(`SELECT replay_id, tenant_id, site_id, session_id,
-			CAST(start_time AS TEXT) AS start_time,
-			duration_ms, page_count, url, browser, os, device, has_error
-		 FROM `+replaySessionsLatest("site_id = $1 AND start_time >= $2 AND start_time < $3")+`
-		 ORDER BY start_time DESC
-		 LIMIT %d OFFSET %d`, limit, offset),
-		siteID, fromMs, toMs,
-	)
-}
 
 // GetReplayEvents returns the events of one replay, scoped to the site that
 // owns it (audit F08). Legacy rows written before the site column existed
