@@ -86,6 +86,7 @@ func DefaultPolicies(rawDays, hourlyDays, llmDays int) []RetentionPolicy {
 		{Table: "llm_traces", Column: "timestamp", Days: llmDays},
 		{Table: "spans", Column: "start_time", Days: 14},
 		{Table: "span_links", Column: "start_time", Days: 14},
+		{Table: "experiment_metric_events", Column: "timestamp", Days: 400},
 		{Table: "service_stats", Column: "ts_bucket", Days: 30},
 		{Table: "replay_sessions", Column: "start_time", Days: 14},
 		// O10: the evaluation ledger is a log, not a dedupe set - 14 days

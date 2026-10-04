@@ -117,6 +117,14 @@ var Tables = []string{
 	"scheduled_exports",
 	"scheduled_export_runs",
 	"mcp_tokens",
+	"cohort_members",
+	"experiment_metric_events",
+	"experiment_settings",
+	"issue_assignments",
+	"issue_merges",
+	"person_aliases",
+	"person_properties",
+	"person_tombstones",
 }
 
 // ExcludedTables are tables the migrations create that a backup deliberately

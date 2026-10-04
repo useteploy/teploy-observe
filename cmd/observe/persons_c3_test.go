@@ -70,7 +70,7 @@ func newPersonsTestRouter(m *persons.Memory) http.Handler {
 	return r
 }
 
-func do(h http.Handler, method, path, body string, hdr map[string]string) *httptest.ResponseRecorder {
+func personsDo(h http.Handler, method, path, body string, hdr map[string]string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range hdr {
@@ -120,15 +120,15 @@ func TestPersonsAuthzMatrix(t *testing.T) {
 		if c.role != "" {
 			hdr["X-Test-Role"] = c.role
 		}
-		if got := do(h, c.method, c.path, c.body, hdr).Code; got != c.want {
+		if got := personsDo(h, c.method, c.path, c.body, hdr).Code; got != c.want {
 			t.Errorf("%s: got %d want %d", c.name, got, c.want)
 		}
 	}
 	// A JWT role must not reach the telemetry-key route and vice versa.
-	if got := do(h, "POST", "/api/v1/persons/properties", `{"distinct_id":"u","properties":{"a":1}}`, map[string]string{"X-Test-Role": "admin"}).Code; got != 401 {
+	if got := personsDo(h, "POST", "/api/v1/persons/properties", `{"distinct_id":"u","properties":{"a":1}}`, map[string]string{"X-Test-Role": "admin"}).Code; got != 401 {
 		t.Errorf("properties without API key: %d", got)
 	}
-	if got := do(h, "POST", "/api/v1/persons/merge", mergeBody("a"), map[string]string{"X-Test-Key-Site": "s1"}).Code; got != 401 {
+	if got := personsDo(h, "POST", "/api/v1/persons/merge", mergeBody("a"), map[string]string{"X-Test-Key-Site": "s1"}).Code; got != 401 {
 		t.Errorf("merge with only an API key: %d", got)
 	}
 }
@@ -140,23 +140,23 @@ func TestPersonsMergeErrorsAndIDOR(t *testing.T) {
 	h := newPersonsTestRouter(m)
 	ed := map[string]string{"X-Test-Role": "editor"}
 
-	if got := do(h, "POST", "/api/v1/persons/merge", `{"site_id":"s1","from_key":"a","into_key":"a"}`, ed).Code; got != 400 {
+	if got := personsDo(h, "POST", "/api/v1/persons/merge", `{"site_id":"s1","from_key":"a","into_key":"a"}`, ed).Code; got != 400 {
 		t.Errorf("self-merge: %d", got)
 	}
-	if got := do(h, "POST", "/api/v1/persons/merge", `{"site_id":"s1","from_key":"z","into_key":"b"}`, ed).Code; got != 404 {
+	if got := personsDo(h, "POST", "/api/v1/persons/merge", `{"site_id":"s1","from_key":"z","into_key":"b"}`, ed).Code; got != 404 {
 		t.Errorf("cross-site key: %d", got)
 	}
-	if got := do(h, "POST", "/api/v1/persons/merge", `{"site_id":"s1","from_key":"a","into_key":"b"}`, ed).Code; got != 200 {
+	if got := personsDo(h, "POST", "/api/v1/persons/merge", `{"site_id":"s1","from_key":"a","into_key":"b"}`, ed).Code; got != 200 {
 		t.Errorf("merge: %d", got)
 	}
-	if got := do(h, "POST", "/api/v1/persons/merge", `{"site_id":"s1","from_key":"b","into_key":"a"}`, ed).Code; got != 409 {
+	if got := personsDo(h, "POST", "/api/v1/persons/merge", `{"site_id":"s1","from_key":"b","into_key":"a"}`, ed).Code; got != 409 {
 		t.Errorf("cycle: %d", got)
 	}
-	if got := do(h, "POST", "/api/v1/persons/merge", `not json`, ed).Code; got != 400 {
+	if got := personsDo(h, "POST", "/api/v1/persons/merge", `not json`, ed).Code; got != 400 {
 		t.Errorf("bad json: %d", got)
 	}
 	// s2 listing is unaffected by s1's alias.
-	w := do(h, "GET", "/api/v1/persons?site_id=s2", "", map[string]string{"X-Test-Role": "viewer"})
+	w := personsDo(h, "GET", "/api/v1/persons?site_id=s2", "", map[string]string{"X-Test-Role": "viewer"})
 	if w.Code != 200 || !strings.Contains(w.Body.String(), `"z"`) {
 		t.Errorf("s2 list: %d %s", w.Code, w.Body.String())
 	}
@@ -168,7 +168,7 @@ func TestPersonsPropertiesEndpoint(t *testing.T) {
 	key := map[string]string{"X-Test-Key-Site": "s1"}
 	hashed := identity.HashDistinctID("user-42", testSalt)
 
-	w := do(h, "POST", "/api/v1/persons/properties", `{"distinct_id":"user-42","properties":{"plan":"pro"}}`, key)
+	w := personsDo(h, "POST", "/api/v1/persons/properties", `{"distinct_id":"user-42","properties":{"plan":"pro"}}`, key)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), hashed) || strings.Contains(w.Body.String(), "user-42") {
 		t.Fatalf("hashing/echo: %d %s", w.Code, w.Body.String())
 	}
@@ -176,7 +176,7 @@ func TestPersonsPropertiesEndpoint(t *testing.T) {
 		t.Fatalf("stored under hashed key expected: %q %v", raw, found)
 	}
 	// Body site disagreeing with the key's site is a cross-tenant write.
-	if got := do(h, "POST", "/api/v1/persons/properties", `{"site_id":"s2","distinct_id":"u","properties":{"a":1}}`, key).Code; got != 403 {
+	if got := personsDo(h, "POST", "/api/v1/persons/properties", `{"site_id":"s2","distinct_id":"u","properties":{"a":1}}`, key).Code; got != 403 {
 		t.Errorf("site mismatch: %d", got)
 	}
 	if _, found, _ := m.GetProps(context.Background(), "s2", identity.HashDistinctID("u", testSalt)); found {
@@ -189,15 +189,15 @@ func TestPersonsPropertiesEndpoint(t *testing.T) {
 		"noid":     `{"properties":{"a":1}}`,
 		"big":      `{"distinct_id":"u","properties":{"a":"` + strings.Repeat("x", 2000) + `"}}`,
 	} {
-		if got := do(h, "POST", "/api/v1/persons/properties", body, key).Code; got != 400 {
+		if got := personsDo(h, "POST", "/api/v1/persons/properties", body, key).Code; got != 400 {
 			t.Errorf("%s: %d", name, got)
 		}
 	}
 	// Erased persons refuse writes.
-	if got := do(h, "POST", "/api/v1/persons/erase", `{"site_id":"s1","person_key":"`+hashed+`"}`, map[string]string{"X-Test-Role": "admin"}).Code; got != 200 {
+	if got := personsDo(h, "POST", "/api/v1/persons/erase", `{"site_id":"s1","person_key":"`+hashed+`"}`, map[string]string{"X-Test-Role": "admin"}).Code; got != 200 {
 		t.Fatalf("erase: %d", got)
 	}
-	if got := do(h, "POST", "/api/v1/persons/properties", `{"distinct_id":"user-42","properties":{"a":1}}`, key).Code; got != 409 {
+	if got := personsDo(h, "POST", "/api/v1/persons/properties", `{"distinct_id":"user-42","properties":{"a":1}}`, key).Code; got != 409 {
 		t.Errorf("write to erased person: %d", got)
 	}
 }
