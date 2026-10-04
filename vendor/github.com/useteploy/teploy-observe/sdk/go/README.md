@@ -79,6 +79,37 @@ if err := client.Shutdown(ctx); err != nil {
 - Queues are in-memory; `kill -9` loses the queue and its counters with
   the process. No durable local spool is claimed.
 
+## Breadcrumbs
+
+```go
+c, _ := observe.New(observe.Options{Endpoint: url, APIKey: key, MaxBreadcrumbs: 100,
+    BeforeBreadcrumb: func(b observe.Breadcrumb) *observe.Breadcrumb { return &b }}) // nil drops
+c.AddBreadcrumb(observe.Breadcrumb{Category: "db", Message: "query", Level: "warning",
+    Data: map[string]any{"ms": 420}})
+logger := slog.New(c.NewSlogBreadcrumbHandler(slog.LevelWarn, slog.Default().Handler()))
+// or add breadcrumbs to the log-mirroring handler:
+h := c.NewSlogHandler(slog.LevelError, nil).WithBreadcrumbs(slog.LevelInfo)
+c.CaptureMessage("slow job", observe.WithLevel("warning"))
+```
+
+A mutex-guarded ring (default 100) attached to `CaptureException` and
+`CaptureMessage`. The buffer is per Client, not request-scoped. A panicking
+`BeforeBreadcrumb` drops the breadcrumb. `NewSlogBreadcrumbHandler` records
+without shipping logs.
+
+## Feature flags
+
+```go
+r := c.EvaluateFlag(ctx, "new-checkout", observe.WithFlagUser("u1"),
+    observe.WithFlagAttributes(map[string]string{"plan": "pro"}),
+    observe.WithFlagDefault(observe.FlagDefault{Enabled: false}))
+```
+
+`POST /api/v1/flags/evaluate` via the client transport, 3 s default timeout
+(`WithFlagTimeout`). It never fails: errors, timeouts and server fail-safe
+answers return your default with `Source == "default"` and `Err` set. No
+cache, no exposure. See `docs/sdk/BREADCRUMBS_FLAGS.md`.
+
 ## License
 
 MIT
