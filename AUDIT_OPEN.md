@@ -14,6 +14,119 @@ report lives outside the repo) — remediation record below. Round 4: audit
 passes 1-5) are closed history; their one surviving item is folded into F16
 below.
 
+## S1 (2026-10-03/04) - Competitive-gap and hardening sweep: merged, NOT verified live
+
+Scope: the full list is in CHANGELOG `[Unreleased]`. The build environment had no
+Nucleus (the image's blob host was blocked by the sandbox network policy), so
+214 integration tests were skipped. Everything below that touches SQL or
+storage compiled and passed unit tests only.
+
+**Live-verification checklist (run against a Nucleus v1.1.1 before release):**
+migrations 057, 058, 060, 061, 063 apply on a fresh AND a populated, upgraded
+store; `scripts/audit.sh` is 0 FAIL; the integration suite is green; then
+exercise: span links insert/read, issue merge/assign/unmerge, static cohorts
+and cohort_id on funnels/retention, person properties/alias/erase, experiment
+metrics, replay filters, log `lq` queries (incl. keyset paging and attribute
+terms), trace attribute filters and orphan traces, the new alert metrics, the
+new retention policies (especially `metric_points` nanosecond cutoff), and
+backup/restore with the new tables (TestTablesMatchSchema covers registration
+only).
+
+**Closed in this sweep (pending live verification):** queryguard refusal race;
+dropped false/0 OTLP attributes; span links dropped; unbounded growth of
+metric_points, host_metrics, uptime_results, performance_issues,
+service_dependencies; integrations never firing (`IntegrationService.Fire`);
+source-map filename/release matching and swallowed failures; cohort resolver
+fail-open and `!=` semantics; flag_evaluations write amplification; experiment
+first-exposure attribution and contamination; log/metric/trace reads outside
+the query guard and the unbounded metrics series read; survey widget absence
+and unevaluated targeting; SDK breadcrumb and flag-client gaps; no Sentry wire
+protocol; no OTLP gRPC; alert metrics limited to analytics; log search limited
+to a message ILIKE; CI gaps (-race scope, gofmt, govulncheck, staticcheck,
+Nucleus version drift); docs contradicting code.
+
+**Open items (owner decisions or follow-ups):**
+- **UI is UNBUILT (blocks the `ui-freshness` CI gate).** UI sources changed
+  (traces, logs, errors, alerts, flags, experiments, cohorts, persons,
+  sessions/replay) but `cmd/observe/ui/dist` was not rebuilt because the build
+  needs network. Run `bash scripts/ui-sync.sh` where `npm`/Neutron are
+  available and commit the dist; until then the shipped binary has none of the
+  new UI controls (the APIs work) and `ui-freshness` fails. UI code was never
+  type-checked (no `tsc`/build here); only the pure-logic node tests ran.
+- L9 still open. Observe side: convert migrations 048, 049, 051, 052, 054, 056
+  (and 010's `ALTER TABLE admin_users ADD COLUMN`, which was missing from the
+  list) to rename-aside + create + copy, add a populated-upgraded-store
+  migration test, and decide the live `llm_traces` repair on infra-home.
+  Done in this sweep: a guard test refuses `ALTER ... ADD COLUMN` in any
+  migration from 057 on. Engine side: upstream (see the Neutron thread).
+- Restore gap (P2, code-read only): `observe restore` requires an empty target
+  but the server seeds the default site and bootstrap admin at boot, so
+  restoring into a database the server has started against is refused. There
+  is no migrate-only command. Needs live confirmation and a fix.
+- Nucleus runs with `NUCLEUS_ALLOW_NO_AUTH=1` (compose and systemd); network
+  isolation is the only control (docs/operations/hardening.md). Whether the
+  engine can run with authentication enabled is untested and needs an
+  upstream answer. No global security-header middleware in the Go server
+  (Caddy profile now sets HSTS/nosniff/frame-ancestors).
+- govulncheck and staticcheck are new CI jobs and have never run; triage the
+  first results and decide whether govulncheck is blocking. The gofmt job is
+  red until the repo-wide gofmt commit lands (it is part of this sweep).
+- Integrations: delivery is in-memory (lost on crash); alert recovery cannot
+  resolve PagerDuty/Jira/GitHub tickets (senders are create-only); no SMTP
+  allowlist for private relays; no issue deep link in payloads.
+- Notification buckets, spike windows, persons-properties limiter and survey
+  limiters are per process (reset on restart; per replica).
+- Surveys: no unique index on (site_id, survey_id, client_id), so two replicas
+  can double-insert; `once` is client-side only; authoring UI has no targeting
+  editor; old tracker tests in `cmd/observe/tracker/test/` were added to the
+  CI path list only if CI runs them (check).
+- Persons: erase writes a tombstone and hides the person; event rows are NOT
+  deleted (no verified per-key DELETE); ingest does not check tombstones, so a
+  new event with the same identify value makes the person visible again;
+  browser `identify()` is not wired to the properties endpoint; no un-merge
+  endpoint; the properties route's 404 vs 200 reveals whether a guessed id has
+  events.
+- Replay: console/network capture is inert on the rrweb delta recorder until
+  the bundle is rebuilt with network (`npm ci && npm run build`); per-session
+  capture caps are enforced client-side only.
+- Trace/log attribute filters verify in Go over a bounded candidate window
+  (2000 / 5000 rows, `truncated` flag): move to SQL JSON extraction when
+  Nucleus supports it (no JSONB extract on TEXT today; also a bind-parameter
+  limitation in JSON operands).
+- Experiments: fixed-horizon only (no sequential testing); auto-exposure from
+  `/flags/evaluate` not wired; secondary metrics are not multiplicity
+  corrected; `RecordMetricKeyed` dedupe is check-then-insert (not atomic);
+  `experiment_settings` and `cohort_members` are deliberately excluded from
+  backup version-collapsing (tie semantics).
+- Alerts: no per-service filter and no `metric_value` metric (need an
+  `alert_rules` schema change); `uptime_failures` is a window count, not
+  consecutive failures; query slots (global 8 / site 4) are shared by stats,
+  logs, metrics, traces and cohorts, so a dashboard firing many heavy panels
+  at once can see 429s - tune `OBSERVE_QUERY_SITE_CONCURRENCY`.
+- Sentry endpoint: event `timestamp` not honored; no OPTIONS route for the
+  Sentry paths (SDKs send simple requests); separate listener allowlist
+  covers the paths by exact segment.
+- Flags: per-flag fail-open override (O08 residual) deferred; modulo bias in
+  bucketing documented, not fixed (would reassign users); `/flags/config`
+  exposes full targeting rules to any telemetry key.
+- Multi-tenancy/orgs/SCIM, per-site RBAC, SAML, HA/clustering, PromQL: design
+  notes only (docs/design/); owner decisions.
+- Helm chart has never been rendered or linted (`helm` not installed here);
+  its first green `helm.yml` run is its first validation. The Nucleus
+  container user/filesystem layout is unverified.
+- Legacy ORDER BY on an aliased text cast remains in `logs.go`
+  legacySearchQuery and `tracing/query.go`; if a live run shows a textual sort,
+  that is a Nucleus conformance bug to log upstream.
+- Flaky tests seen once under load: `internal/ingest`
+  TestDiskQueue_AppendAfterCheckpointIsStillFlushed (125 ms sleep vs 25 ms
+  fsync loop) - passed 20/20 alone.
+
+**Upstream (Neutron/Nucleus) notes, to be logged in `Teploy/_internal/UPSTREAM_BUGS.md`:**
+the L9 ALTER-ADD corruption (handover prompt drafted in the session); suspected
+ORDER BY output-alias binding; no JSONB extract on TEXT and no bind parameters
+in JSON operands (already noted in `internal/metrics/attrs.go`); NO_AUTH
+requirement. Observe-side workarounds are recorded above and in the code.
+
 ## L10 (2026-09-27) — Fixed in source: LLM traces omitted from retention
 
 LLM traces, including prompt/completion payloads, were never expired by the

@@ -4,6 +4,87 @@ All notable changes to Observe are recorded here.
 
 ## [Unreleased]
 
+Competitive-gap and hardening sweep (2026-10). Everything below is merged on
+one branch; SQL and storage paths are unit-tested but were **not verified
+against a live Nucleus** (integration tests were skipped in the build
+environment) - see `AUDIT_OPEN.md` S1 for the verification checklist.
+
+### Added
+
+- **Stock Sentry SDKs** can use an Observe DSN (`https://<obs_key>@host/<site_id>`)
+  via `/api/{project}/envelope/` and `/store/` for error events; other item
+  types are acknowledged and dropped.
+- **OTLP/gRPC** receiver for traces, metrics and logs (opt-in:
+  `OBSERVE_OTLP_GRPC_ADDR`, optional TLS), same keys, scopes and limits as HTTP.
+- **Trace search** span-attribute filters (`attr=key:op:value`, max 5),
+  opt-in orphan traces (`include_orphans=true`), and stored **span links**
+  (migration 057).
+- **Alert metrics**: `trace_error_rate`, `trace_p95_ms`, `log_error_count`,
+  `uptime_failures`; empty windows read as no-data. Opt-in
+  `OBSERVE_ALERTS_TO_INTEGRATIONS=true` sends FIRE events to integrations.
+- **Log query language** (`lq` on `/api/v1/logs/search`) with field terms,
+  `attr.`/`resource.` keys, NOT/OR/grouping and keyset paging.
+- **Error tracking**: server-side secret/PII scrubbing, issue merge/unmerge and
+  assignment (migration 058), spike protection with sampled keep.
+- **Integrations fire** on new issues and regressions (bounded async queue,
+  SSRF-checked, cooldown plus hourly budget).
+- **Surveys** server-side targeting and the `/t/observe-surveys.js` widget.
+- **Cohorts** AND/OR/NOT rule trees, static cohorts (migration 060), and
+  `cohort_id` on funnels and retention.
+- **Persons**: identify traits, alias/merge, erasure tombstones (migration 061).
+- **Flags**: condition groups, more operators, payloads, `GET /flags/config`
+  and conformance vectors. **Experiments**: count/mean metrics (Welch),
+  secondary metrics, contamination handling, peeking guard (migration 063).
+- **Replay**: opt-in console/network capture, list filters, player panels
+  (capture is inert on the rrweb delta recorder until its bundle is rebuilt).
+- **SDKs**: breadcrumbs and flag clients for browser, Python and Go.
+- Helm chart (`packaging/helm/observe`), install/upgrade/backup runbooks,
+  hardening guide, and design notes for per-site RBAC, SAML, HA and PromQL.
+- New env settings: see the README environment table.
+
+### Changed
+
+- **Behavior changes to review before upgrading:**
+  - Email integrations now refuse non-public SMTP hosts (no private relay
+    allowlist yet).
+  - Cohort filter failures now fail the request (503/422) instead of silently
+    showing unfiltered charts; `!=` cohort rules mean "no event has this value".
+  - Experiment results exclude users exposed to several variants
+    (`contaminated_users`) and conversions attribute to the first exposure.
+  - `/flags/evaluate` writes at most one `flag_evaluations` row per
+    (site, flag, variant, user) per 5 minutes (`OBSERVE_FLAG_EVAL_DEDUP_SECONDS`).
+  - Log, metric, trace and cohort reads share the query admission limiter and
+    can return 429/504; metrics series queries have a hard row cap.
+  - `POST /api/v1/persons/properties` returns only an acknowledgement and
+    requires an existing person; replace-all moved to
+    `POST /api/v1/persons/properties/replace` (editor+).
+  - Nucleus image is pinned (`v1.1.1`) in compose and CI.
+- OTLP array/kvlist/bytes attributes are stored as deterministic text.
+- Source maps resolve across URL/path/basename forms and keep the minified
+  position (`orig_*`).
+
+### Fixed
+
+- Data race in the query admission limiter refusal path.
+- OTLP attributes with value `false`, `0`, `0.0` or `""` were dropped.
+- Retention now covers `metric_points`, `host_metrics`, `uptime_results`,
+  `performance_issues`, `service_dependencies`, `span_links` and
+  `experiment_metric_events`.
+- Documentation that contradicted the code (source-map upload field, shim
+  behavior, SAML, integrations, cohorts).
+- Public survey errors no longer leak internals; survey dedupe is per survey.
+
+### Security
+
+- Pre-authentication cost caps on Sentry and gRPC ingest, negative key cache
+  and per-IP failure limiter; gRPC authenticates before decoding.
+- SSRF block list gains NAT64, 198.18/15, 192.0.0/24 and 240/4.
+- Issue notification flood protection and Slack control-syntax escaping.
+- CI: full-module `-race`, gofmt, govulncheck and staticcheck jobs; Caddy
+  profile sends HSTS and related headers.
+- New guard test refuses `ALTER TABLE ... ADD COLUMN` in migrations from 057 on.
+
+
 ## v0.2.0 — 2026-09-20
 
 Four ChatGPT audit rounds plus a security hardening pass landed between

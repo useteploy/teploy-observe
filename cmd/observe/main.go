@@ -4078,27 +4078,6 @@ func surveyResponsesHandler(svc *surveys.SurveyService) neutron.HandlerFunc[surv
 // form-style endpoints (survey responses, feedback) accept.
 const publicFormMaxBodyBytes = 64 << 10 // 64 KiB
 
-// OBS-004: GetActive's error was discarded (`_`), so a database outage looked
-// identical to "this site genuinely has no active surveys" — both rendered as
-// 200 []. Surface the failure as a real error instead.
-func activeSurveysPublicHandler(svc *surveys.SurveyService) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		siteID := r.URL.Query().Get("site_id")
-		active, err := svc.GetActive(r.Context(), siteID)
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		if err != nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(map[string]string{"error": "active surveys temporarily unavailable"})
-			return
-		}
-		if active == nil {
-			active = []surveys.Survey{}
-		}
-		json.NewEncoder(w).Encode(active)
-	}
-}
-
 type surveyRespondInput struct {
 	SurveyID   string         `json:"survey_id"`
 	SiteID     string         `json:"site_id"`

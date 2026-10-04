@@ -111,6 +111,21 @@ jobs:
       # dependency-free pure modules — pinned here without an npm install.
       # (smoke.mjs / player-smoke.mjs need system Chrome and stay manual.)
       - run: node --test cmd/observe/tracker/replay-delta/test/sanitizer.test.mjs
+      # Survey widget and replay-capture contract tests (vm sandbox, no deps).
+      - run: node --test cmd/observe/tracker/test/*.test.mjs
+
+  # Pure-logic UI unit tests (helpers, API shapes). Needs Node >= 22.6 for
+  # --experimental-strip-types; no npm install required.
+  ui-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - working-directory: ui
+        run: node --test --experimental-strip-types 'src/**/*.test.ts'
 
   sdk-go:
     runs-on: ubuntu-latest

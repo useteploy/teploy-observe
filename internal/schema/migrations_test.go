@@ -67,6 +67,67 @@ func TestMigrationsFrom038ArePureASCII(t *testing.T) {
 	}
 }
 
+// noAlterAddColumnSince is the first migration version that may not use
+// ALTER TABLE ... ADD COLUMN. Open P1 L9 (AUDIT_OPEN.md): on a populated
+// upgraded store, migration 054's ADD COLUMN pair failed with "corrupt tuple"
+// and left llm_traces unreadable. The failure cannot be seen here - these
+// tests run migrations against empty tables - so the rule is enforced by
+// shape: new columns arrive by rename-aside + create + copy (see 027, 028),
+// never by ALTER. 048-056 predate the rule and are grandfathered until the L9
+// conversion lands.
+const noAlterAddColumnSince = 57
+
+var alterAddColumnPattern = regexp.MustCompile(`(?i)\balter\s+table\s+\S+\s+add\s+(column\b|if\s+not\s+exists\b)`)
+
+func TestNewMigrationsDoNotAlterAddColumn(t *testing.T) {
+	entries, err := migrationsFS.ReadDir("migrations")
+	if err != nil {
+		t.Fatalf("read migrations: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		version := 0
+		if _, err := fmt.Sscanf(e.Name(), "%03d", &version); err != nil {
+			t.Fatalf("parse version from %s: %v", e.Name(), err)
+		}
+		if version < noAlterAddColumnSince {
+			continue
+		}
+		raw, err := migrationsFS.ReadFile("migrations/" + e.Name())
+		if err != nil {
+			t.Fatalf("read %s: %v", e.Name(), err)
+		}
+		for i, line := range strings.Split(string(raw), "\n") {
+			if idx := strings.Index(line, "--"); idx >= 0 {
+				line = line[:idx] // comments may mention the phrase
+			}
+			if alterAddColumnPattern.MatchString(line) {
+				t.Errorf("%s:%d uses ALTER TABLE ... ADD COLUMN, which corrupts populated tables on the current engine (open P1 L9). Use rename-aside + create + copy (see 027, 028) or a new table.\n  %s",
+					e.Name(), i+1, strings.TrimSpace(line))
+			}
+		}
+	}
+}
+
+func TestAlterAddColumnPatternMatches(t *testing.T) {
+	for _, bad := range []string{
+		"ALTER TABLE t ADD COLUMN x INT;",
+		"alter table t add column if not exists x text;",
+		"ALTER TABLE t ADD IF NOT EXISTS x TEXT;",
+	} {
+		if !alterAddColumnPattern.MatchString(bad) {
+			t.Errorf("pattern should flag %q", bad)
+		}
+	}
+	for _, ok := range []string{"CREATE TABLE t (x INT);", "INSERT INTO t SELECT * FROM u;"} {
+		if alterAddColumnPattern.MatchString(ok) {
+			t.Errorf("pattern should not flag %q", ok)
+		}
+	}
+}
+
 func TestMigrationsAvoidNucleusLexerPanic(t *testing.T) {
 	entries, err := migrationsFS.ReadDir("migrations")
 	if err != nil {
