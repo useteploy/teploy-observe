@@ -71,3 +71,6 @@ __pycache__/
 
 # Local compose overrides are, by definition, local.
 docker-compose.override.yml
+
+# Runtime data dir (audit.key, queues) when the server runs from the repo
+data/

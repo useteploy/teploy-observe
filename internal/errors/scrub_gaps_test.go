@@ -9,13 +9,13 @@ import (
 func TestScrubKeyFoldsFullwidthAndConfusables(t *testing.T) {
 	s := NewScrubber()
 	for _, k := range []string{
-		"ＰＡＳＳＷＯＲＤ",      // fullwidth PASSWORD
-		"pаssword",      // Cyrillic a
-		"ａｐｉ＿ｋｅｙ",       // fullwidth api_key
-		"pass\u200bword",   // zero-width space
-		"тoken",         // Cyrillic t
-		"AuthorＩzation", // fullwidth I
-		"ⅱⅱⅱ",           // roman numerals: must not panic, not sensitive
+		"ＰＡＳＳＷＯＲＤ",       // fullwidth PASSWORD
+		"pаssword",       // Cyrillic a
+		"ａｐｉ＿ｋｅｙ",        // fullwidth api_key
+		"pass\u200bword", // zero-width space
+		"тoken",          // Cyrillic t
+		"AuthorＩzation",  // fullwidth I
+		"ⅱⅱⅱ",            // roman numerals: must not panic, not sensitive
 	} {
 		got := s.sensitiveKey(k)
 		want := !strings.HasPrefix(k, "ⅱ")
