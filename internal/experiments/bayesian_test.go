@@ -9,7 +9,7 @@ func TestBayesianWinnerClear(t *testing.T) {
 		{Variant: "control", Exposures: 1000, Conversions: 100},
 		{Variant: "A", Exposures: 1000, Conversions: 300},
 	}
-	computeBayesianProbabilities(v)
+	computeBayesianProbabilities(v, bayesianSeed("test-exp", v))
 	if v[1].ProbBeatControl < 0.99 {
 		t.Errorf("expected P(A > control) ≈ 1, got %v", v[1].ProbBeatControl)
 	}
@@ -24,7 +24,7 @@ func TestBayesianWinnerTight(t *testing.T) {
 		{Variant: "control", Exposures: 1000, Conversions: 100},
 		{Variant: "A", Exposures: 1000, Conversions: 100},
 	}
-	computeBayesianProbabilities(v)
+	computeBayesianProbabilities(v, bayesianSeed("test-exp", v))
 	if v[1].ProbBeatControl < 0.35 || v[1].ProbBeatControl > 0.65 {
 		t.Errorf("expected P(A > control) ~0.5, got %v", v[1].ProbBeatControl)
 	}
@@ -36,7 +36,7 @@ func TestBayesianLoser(t *testing.T) {
 		{Variant: "control", Exposures: 1000, Conversions: 150},
 		{Variant: "A", Exposures: 1000, Conversions: 50},
 	}
-	computeBayesianProbabilities(v)
+	computeBayesianProbabilities(v, bayesianSeed("test-exp", v))
 	if v[1].ProbBeatControl > 0.01 {
 		t.Errorf("expected P(A > control) ~0, got %v", v[1].ProbBeatControl)
 	}

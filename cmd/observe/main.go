@@ -1848,6 +1848,7 @@ func main() {
 	// filtering across every analytics chart.
 	RegisterCohortsRoutes(r, jwtMW, requireEditor, cohortsSvc)
 	RegisterIssueAdminRoutes(r, jwtMW, requireEditor, issueSvc, func(req *http.Request) string { return requestActor(authSvc, req) })
+	RegisterExperimentMetricRoutes(r, ingestGroup, jwtMW, requireEditor, experimentSvc)
 
 	// SPA catch-all: serve index.html for all non-API, non-asset GET requests.
 	// This must be registered last so API routes take precedence.
@@ -3899,6 +3900,8 @@ func stopExperimentHandler(svc *experiments.ExperimentService) neutron.HandlerFu
 type experimentResultsInput struct {
 	ExperimentID string `path:"experiment_id"`
 	SiteID       string `query:"site_id"`
+	// AllowEarly=true waives the planned-sample winner gate for this request.
+	AllowEarly string `query:"allow_early"`
 }
 
 type experimentSampleSizeInput struct {
@@ -3954,7 +3957,8 @@ func experimentSampleSizeHandler() neutron.HandlerFunc[experimentSampleSizeInput
 
 func experimentResultsHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[experimentResultsInput, experiments.ExperimentResults] {
 	return func(ctx context.Context, input experimentResultsInput) (experiments.ExperimentResults, error) {
-		r, err := svc.Results(ctx, input.ExperimentID, input.SiteID)
+		r, err := svc.ResultsWithOptions(ctx, input.ExperimentID, input.SiteID,
+			experiments.ResultsOptions{AllowEarly: input.AllowEarly == "true"})
 		if err != nil {
 			return experiments.ExperimentResults{}, err
 		}
