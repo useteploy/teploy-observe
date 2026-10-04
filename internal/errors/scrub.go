@@ -27,10 +27,15 @@ package errors
 // OBSERVE_SCRUB_DISABLE=true (opt-out; default ON).
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"os"
 	"regexp"
 	"strings"
 	"unicode"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // Filtered is the replacement for every scrubbed value.
@@ -46,6 +51,8 @@ const (
 	scrubMaxNodes = 20000
 	// scrubMaxString bounds the bytes examined per string value.
 	scrubMaxString = 64 << 10
+	// scrubMaxJSONDepth bounds JSON-inside-a-string-inside-JSON recursion.
+	scrubMaxJSONDepth = 3
 )
 
 // Substring-matched key fragments (compared against the key lowercased
@@ -90,11 +97,37 @@ func NewScrubberFromEnv() *Scrubber {
 // Disabled reports whether scrubbing is switched off.
 func (s *Scrubber) Disabled() bool { return s == nil || s.disabled }
 
-// normalizeKey lowercases and strips separators so "API-Key", "api_key"
-// and "apiKey" compare equal.
+// confusables maps common cross-script lookalikes (Cyrillic/Greek) to the
+// ASCII letter they imitate. NFKC folds fullwidth/compat forms but not
+// these, so "pаssword" with a Cyrillic "a" would otherwise dodge the match.
+var confusables = map[rune]rune{
+	'\u0430': 'a', '\u0435': 'e', '\u043e': 'o', '\u0440': 'p', '\u0441': 'c',
+	'\u0445': 'x', '\u0443': 'y', '\u0456': 'i', '\u0455': 's', '\u0458': 'j',
+	'\u04bb': 'h', '\u0501': 'd', '\u051b': 'q', '\u051d': 'w', '\u0442': 't',
+	'\u03bf': 'o', '\u03c1': 'p', '\u03bd': 'v', '\u03b1': 'a', '\u03b5': 'e',
+	'\u03b9': 'i', '\u03ba': 'k', '\u03c4': 't', '\u03c5': 'u', '\u0131': 'i',
+	'\u0261': 'g', '\u0251': 'a', '\u0269': 'i',
+}
+
+// foldKey applies compatibility normalisation (NFKC: fullwidth ASCII,
+// ligatures, circled/superscript forms) and then the confusables map.
+func foldKey(k string) string {
+	k = norm.NFKC.String(k)
+	return strings.Map(func(r rune) rune {
+		r = unicode.ToLower(r)
+		if m, ok := confusables[r]; ok {
+			return m
+		}
+		return r
+	}, k)
+}
+
+// normalizeKey folds compatibility forms, lowercases and strips separators
+// (and format characters such as zero-width spaces) so "API-Key", "api_key",
+// "apiKey" and fullwidth "ＰＡＳＳＷＯＲＤ" compare equal.
 func normalizeKey(k string) string {
 	var b strings.Builder
-	for _, r := range strings.ToLower(k) {
+	for _, r := range foldKey(k) {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			b.WriteRune(r)
 		}
@@ -113,6 +146,16 @@ func keyWords(k string) []string {
 		}
 	}
 	var prev rune
+	// Fold compat forms first, but keep case for camelCase splitting.
+	k = strings.Map(func(r rune) rune {
+		if m, ok := confusables[unicode.ToLower(r)]; ok {
+			if unicode.IsUpper(r) {
+				return unicode.ToUpper(m)
+			}
+			return m
+		}
+		return r
+	}, norm.NFKC.String(k))
 	for _, r := range k {
 		switch {
 		case !unicode.IsLetter(r) && !unicode.IsDigit(r):
@@ -161,6 +204,12 @@ var (
 	queryParamRe = regexp.MustCompile(`([?&;])([^=&#;\s"']+)=([^&#;\s"']*)`)
 	// name=value pairs for obviously secret names in free text.
 	kvSecretRe = regexp.MustCompile(`(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?token|client[_-]?secret)=([^\s&"',;]+)`)
+	// "password: x", "password = x", "api_key : 'x y'" in free text.
+	colonSecretRe = regexp.MustCompile(`(?i)\b(password|passwd|passphrase|pwd|secret|token|api[_-]?key|apikey|access[_-]?token|client[_-]?secret|private[_-]?key)(["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s&"',;]+)`)
+	// "Authorization: Basic xxx" (any scheme) up to the end of the value.
+	authHeaderRe = regexp.MustCompile(`(?i)\b(authorization|proxy-authorization)(["']?\s*[:=]\s*)((?:basic|digest|negotiate|bearer|token)\s+)?[^\s"',;]+`)
+	// A bare "Basic <base64>" that decodes to user:pass.
+	basicRe = regexp.MustCompile(`(?i)\bBasic\s+([A-Za-z0-9+/_-]{8,}={0,2})`)
 )
 
 // luhnValid reports whether the digit string passes the Luhn check.
@@ -192,6 +241,12 @@ func countDigits(v string) int {
 
 // scrubString applies the value-pattern rules to one string.
 func (s *Scrubber) scrubString(v string) string {
+	return s.scrubStringIn(v, nil)
+}
+
+// scrubStringIn is scrubString with the caller's node budget / JSON depth
+// (st nil = a fresh budget).
+func (s *Scrubber) scrubStringIn(v string, st *scrubState) string {
 	if v == "" {
 		return v
 	}
@@ -200,28 +255,11 @@ func (s *Scrubber) scrubString(v string) string {
 		// passed through.
 		v = v[:scrubMaxString] + truncated
 	}
-	// Cheap substring pre-filters keep the regexes off strings that cannot
-	// match (the counted-repeat card pattern is the expensive one).
-	if strings.Contains(v, "eyJ") {
-		v = jwtRe.ReplaceAllString(v, Filtered)
+	if st == nil {
+		st = &scrubState{s: s}
 	}
-	if strings.Contains(strings.ToLower(v), "bearer") {
-		v = bearerRe.ReplaceAllString(v, "$1 "+Filtered)
-	}
-	if strings.Contains(v, "=") {
-		if strings.ContainsAny(v, "?&;") {
-			v = queryParamRe.ReplaceAllStringFunc(v, func(m string) string {
-				sub := queryParamRe.FindStringSubmatch(m)
-				name := sub[2]
-				ln := strings.ToLower(name)
-				if s.sensitiveKey(name) || ln == "key" || ln == "sig" || ln == "signature" {
-					return sub[1] + name + "=" + Filtered
-				}
-				return m
-			})
-		}
-		v = kvSecretRe.ReplaceAllString(v, "$1="+Filtered)
-	}
+	v = s.scrubJSONString(v, st)
+	v = s.scrubTokens(v)
 	if countDigits(v) < 14 {
 		return v
 	}
@@ -243,10 +281,124 @@ func (s *Scrubber) scrubString(v string) string {
 	return v
 }
 
+// scrubJSONString scrubs a string that is itself a JSON document (a
+// stringified request body in an exception message, say): it is parsed,
+// walked with the same key rules and re-serialised. Parse failure, or a
+// string that does not look like an object/array, falls through untouched
+// to the pattern rules. Depth and node budgets bound the work.
+func (s *Scrubber) scrubJSONString(v string, st *scrubState) string {
+	t := strings.TrimSpace(v)
+	if len(t) < 2 || (t[0] != '{' && t[0] != '[') || st.jd >= scrubMaxJSONDepth || st.nodes > scrubMaxNodes {
+		return v
+	}
+	dec := json.NewDecoder(strings.NewReader(t))
+	dec.UseNumber()
+	var doc any
+	if err := dec.Decode(&doc); err != nil || dec.More() {
+		return v
+	}
+	st.jd++
+	out := st.value(doc, 0)
+	st.jd--
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(out); err != nil {
+		return v
+	}
+	return strings.TrimRight(buf.String(), "\n")
+}
+
+// scrubTokens applies the token / credential patterns only (no card
+// numbers): safe for identifiers such as fingerprints, selectors, release
+// tags and function names, where digit runs are legitimate.
+func (s *Scrubber) scrubTokens(v string) string {
+	if v == "" {
+		return v
+	}
+	if len(v) > scrubMaxString {
+		v = v[:scrubMaxString] + truncated
+	}
+	// Cheap substring pre-filters keep the regexes off strings that cannot
+	// match.
+	lower := strings.ToLower(v)
+	if strings.Contains(v, "eyJ") {
+		v = jwtRe.ReplaceAllString(v, Filtered)
+	}
+	if strings.Contains(lower, "authorization") {
+		v = authHeaderRe.ReplaceAllString(v, "$1$2$3"+Filtered)
+	}
+	if strings.Contains(lower, "bearer") {
+		v = bearerRe.ReplaceAllString(v, "$1 "+Filtered)
+	}
+	if strings.Contains(lower, "basic") {
+		v = basicRe.ReplaceAllStringFunc(v, func(m string) string {
+			sub := basicRe.FindStringSubmatch(m)
+			raw := strings.TrimRight(sub[1], "=")
+			for _, enc := range []*base64.Encoding{base64.RawStdEncoding, base64.RawURLEncoding} {
+				if dec, err := enc.DecodeString(raw); err == nil && bytes.IndexByte(dec, ':') > 0 {
+					return "Basic " + Filtered
+				}
+			}
+			return m
+		})
+	}
+	if strings.Contains(v, "=") {
+		if strings.ContainsAny(v, "?&;") {
+			v = queryParamRe.ReplaceAllStringFunc(v, func(m string) string {
+				sub := queryParamRe.FindStringSubmatch(m)
+				name := sub[2]
+				ln := strings.ToLower(name)
+				if s.sensitiveKey(name) || ln == "key" || ln == "sig" || ln == "signature" {
+					return sub[1] + name + "=" + Filtered
+				}
+				return m
+			})
+		}
+		v = kvSecretRe.ReplaceAllString(v, "$1="+Filtered)
+	}
+	return foldedSecretPass(v)
+}
+
+// foldedSecretPass redacts "name: value" / "name = value" forms. For
+// non-ASCII text the match runs on the compat-folded copy so fullwidth
+// "ＰＡＳＳＷＯＲＤ：x" is caught; the folded text replaces the original only
+// when something was actually redacted (other text is left byte-identical).
+func foldedSecretPass(v string) string {
+	ascii := true
+	for i := 0; i < len(v); i++ {
+		if v[i] >= 0x80 {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		if !strings.ContainsAny(v, ":=") {
+			return v
+		}
+		return colonSecretRe.ReplaceAllString(v, "$1$2"+Filtered)
+	}
+	f := foldKeyKeepCase(v)
+	if r := colonSecretRe.ReplaceAllString(f, "$1$2"+Filtered); r != f {
+		return r
+	}
+	return v
+}
+
+func foldKeyKeepCase(v string) string {
+	return strings.Map(func(r rune) rune {
+		if m, ok := confusables[unicode.ToLower(r)]; ok {
+			return m
+		}
+		return r
+	}, norm.NFKC.String(v))
+}
+
 // scrubState carries the per-input node budget.
 type scrubState struct {
 	s     *Scrubber
 	nodes int
+	jd    int // JSON-in-string nesting depth
 }
 
 // value returns a scrubbed COPY of v (the caller's decoded structure is
@@ -262,7 +414,7 @@ func (st *scrubState) value(v any, depth int) any {
 	}
 	switch x := v.(type) {
 	case string:
-		return st.s.scrubString(x)
+		return st.s.scrubStringIn(x, st)
 	case map[string]any:
 		out := make(map[string]any, len(x))
 		for k, val := range x {
@@ -314,12 +466,25 @@ func (s *Scrubber) ScrubInput(in ErrorInput) ErrorInput {
 	out.ErrorType = s.scrubString(in.ErrorType)
 	out.ErrorValue = s.scrubString(in.ErrorValue)
 	out.URL = s.scrubString(in.URL)
+	// Identifier-like fields: token/credential patterns only. The grouping
+	// hash was pinned from the RAW input in prepareRecord (PreGroupHash)
+	// before this runs, so rewriting these cannot change grouping.
+	out.ReleaseTag = s.scrubTokens(in.ReleaseTag)
+	out.ReleaseTagAlt = s.scrubTokens(in.ReleaseTagAlt)
+	out.Selector = s.scrubTokens(in.Selector)
+	if in.Fingerprint != nil {
+		out.Fingerprint = make([]string, len(in.Fingerprint))
+		for i, f := range in.Fingerprint {
+			out.Fingerprint[i] = s.scrubTokens(f)
+		}
+	}
 	out.Contexts = st.value(in.Contexts, 0)
 	out.Extra = st.value(in.Extra, 0)
 	if in.StackTrace != nil {
 		out.StackTrace = make([]StackFrame, len(in.StackTrace))
 		for i, f := range in.StackTrace {
 			f.Filename = s.scrubString(f.Filename)
+			f.Function = s.scrubTokens(f.Function)
 			out.StackTrace[i] = f
 		}
 	}
@@ -327,6 +492,7 @@ func (s *Scrubber) ScrubInput(in ErrorInput) ErrorInput {
 		out.Breadcrumbs = make([]Breadcrumb, len(in.Breadcrumbs))
 		for i, b := range in.Breadcrumbs {
 			b.Message = s.scrubString(b.Message)
+			b.Category = s.scrubTokens(b.Category)
 			b.Data = st.value(b.Data, 0)
 			out.Breadcrumbs[i] = b
 		}
