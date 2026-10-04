@@ -2,13 +2,14 @@
 # Full audit of T001-T022 completed tasks.
 # For each: verify backend API returns expected shape, UI dist contains feature code.
 
-BASE="http://localhost:3000"
+BASE="${OBSERVE_BASE:-http://localhost:3000}"
 SITE="default"
 TOKEN=$(curl -s -X POST $BASE/api/v1/auth/login -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"observe"}' \
+  -d "{\"username\":\"${OBSERVE_USER:-admin}\",\"password\":\"${OBSERVE_PASS:-observeobserv}\"}" \
   | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
 H="Authorization: Bearer $TOKEN"
 DIST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/cmd/observe/ui/dist"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 PASS=0; FAIL=0
 check() {
@@ -56,17 +57,17 @@ check "traces services present" \
 check "replays present" \
   json_has "/api/v1/replays?site_id=$SITE" "isinstance(r, list) and len(r)>0"
 check "seed package exists" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/seed/seed.go"
+  test -f "$REPO"/internal/seed/seed.go
 
 # ================ T004 — smoke test ================
 echo "[T004] smoke test script"
 check "smoketest.sh in repo" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/scripts/smoketest.sh"
+  test -f "$REPO"/scripts/smoketest.sh
 
 # ================ T005 — session replay player ================
 echo "[T005] session replay player UI"
 check "ReplayPlayer.tsx source exists" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/ui/src/components/ReplayPlayer.tsx"
+  test -f "$REPO"/ui/src/components/ReplayPlayer.tsx
 check "sessions chunk contains replay-modal css" \
   dist_contains "replay-modal"
 check "sessions chunk contains ReplayPlayer logic (onKey or scrub)" \
@@ -75,21 +76,24 @@ check "sessions chunk contains ReplayPlayer logic (onKey or scrub)" \
 # ================ T006 — source-map symbolication ================
 echo "[T006] source-map wired to error events"
 check "sourcemaps package exists" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/sourcemaps/sourcemaps.go"
+  test -f "$REPO"/internal/sourcemaps/sourcemaps.go
 check "issue events endpoint returns data" \
   json_has "/api/v1/issues?site_id=$SITE" "isinstance(r, list)"
 # Verify handler got the srcmap arg
 check "issueEventsHandler takes srcmap param" \
-  grep -q 'issueEventsHandler(issueSvc, srcmapSvc)' "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/cmd/observe/main.go"
+  grep -q 'issueEventsHandler(issueSvc, srcmapSvc)' "$REPO"/cmd/observe/main.go
 
 # ================ T007 — log live-tail SSE ================
 echo "[T007] log live-tail SSE"
-# SSE will block; use -m to cap, exit 28 = timeout (expected)
+# R09/R10: query-string tokens are RETIRED - streams open with short-lived
+# tickets minted by an authenticated session. The old check asserted
+# ?token= returned 200; refusing it is the correct posture now.
 code=$(curl -s -o /tmp/sse-test.out -w "%{http_code}" -m 1 "$BASE/api/v1/logs/stream?site_id=$SITE&token=$TOKEN")
-check "stream endpoint returns 200" \
-  test "$code" = "200"
-check "stream sends hello event" \
-  grep -q "connected" /tmp/sse-test.out
+check "stream refuses query-string tokens" \
+  test "$code" = "401"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"route":"/api/v1/logs/stream"}' "$BASE/api/v1/auth/stream-ticket")
+check "stream ticket mints with a session" \
+  test "$code" = "201"
 check "UI logs chunk has live-btn" \
   dist_contains "logs-live-btn"
 
@@ -108,7 +112,7 @@ check "overview no-compare is flat stats" \
   json_has "/api/v1/stats/overview?site_id=$SITE" "isinstance(r, dict) and 'pageviews' in r"
 # TimeSeriesChart.tsx has prevData ref
 check "TimeSeriesChart has prev-period path" \
-  grep -q "prevData" "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/ui/src/components/TimeSeriesChart.tsx"
+  grep -q "prevData" "$REPO"/ui/src/components/TimeSeriesChart.tsx
 
 # ================ T010 — errors daily chart ================
 echo "[T010] errors daily chart"
@@ -122,7 +126,7 @@ echo "[T011] dashboard timeseries panels"
 check "PanelTimeSeries in dashboards chunk" \
   dist_contains "dashboard-panel--chart"
 check "dashboards.tsx has PanelTimeSeries fn" \
-  grep -q "PanelTimeSeries" "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/ui/src/routes/dashboards.tsx"
+  grep -q "PanelTimeSeries" "$REPO"/ui/src/routes/dashboards.tsx
 
 # ================ T016 — alert silencing ================
 echo "[T016] alert silencing"
@@ -194,37 +198,37 @@ check "flags chunk has history UI" \
 # ================ T015 — Bayesian experiments ================
 echo "[T015] experiment Bayesian analysis"
 check "VariantResult carries prob_beat_control" \
-  grep -q 'ProbBeatControl' "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/experiments/experiments.go"
+  grep -q 'ProbBeatControl' "$REPO"/internal/experiments/experiments.go
 check "bayesian tests exist" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/experiments/bayesian_test.go"
+  test -f "$REPO"/internal/experiments/bayesian_test.go
 check "experiments chunk has prob badge" \
   dist_contains "experiments-prob"
 
 # ================ T017 — dashboard layout ================
 echo "[T017] dashboard panel layout updates"
 check "panel layout endpoint registered" \
-  grep -q 'panels/{panel_id}/layout' "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/cmd/observe/main.go"
+  grep -q 'panels/{panel_id}/layout' "$REPO"/cmd/observe/main.go
 check "dashboards chunk has panel controls" \
   dist_contains "dashboard-panel-ctrl"
 
 # ================ T018 — integration test button ================
 echo "[T018] integration test button"
 check "integration test endpoint registered" \
-  grep -q '/test' "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/cmd/observe/main.go"
+  grep -q '/test' "$REPO"/cmd/observe/main.go
 check "integrations chunk has test result badge" \
   dist_contains "integrations-test-result"
 
 # ================ T019 — Cmd-K palette ================
 echo "[T019] Cmd-K palette"
 check "CommandPalette source exists" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/ui/src/components/CommandPalette.tsx"
+  test -f "$REPO"/ui/src/components/CommandPalette.tsx
 check "cmdk-overlay in bundle" \
   dist_contains "cmdk-overlay"
 
 # ================ T020 — CSV export ================
 echo "[T020] CSV export"
 check "ExportButton source exists" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/ui/src/components/shared/ExportButton.tsx"
+  test -f "$REPO"/ui/src/components/shared/ExportButton.tsx
 check "Export CSV string in bundle" \
   dist_contains "Export CSV"
 
@@ -240,7 +244,7 @@ check "releases chunk has health badges" \
 # ================ T024 — onboarding wizard ================
 echo "[T024] onboarding wizard"
 check "onboard.tsx source exists" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/ui/src/routes/onboard.tsx"
+  test -f "$REPO"/ui/src/routes/onboard.tsx
 check "/onboard returns 200" \
   python3 -c "import urllib.request
 r=urllib.request.urlopen('$BASE/onboard')
@@ -251,60 +255,60 @@ check "onboard chunk shipped" \
 # ================ T025 — empty-state CTAs ================
 echo "[T025] empty-state CTAs"
 check "EmptyState component exists" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/ui/src/components/shared/EmptyState.tsx"
+  test -f "$REPO"/ui/src/components/shared/EmptyState.tsx
 check "obs-empty-state--v2 in bundle" \
   dist_contains "obs-empty-state--v2"
 
 # ================ T026 — docker compose ================
 echo "[T026] docker compose"
 check "docker-compose.yml present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/docker-compose.yml"
+  test -f "$REPO"/docker-compose.yml
 check "compose has TLS profile" \
-  grep -q "profiles: \[tls\]" "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/docker-compose.yml"
+  grep -q "profiles: \[tls\]" "$REPO"/docker-compose.yml
 check "compose references caddy" \
-  grep -q "caddy:" "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/docker-compose.yml"
+  grep -q "caddy:" "$REPO"/docker-compose.yml
 
 # ================ T027 — systemd units ================
 echo "[T027] systemd units"
 check "observe.service exists" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/packaging/systemd/observe.service"
+  test -f "$REPO"/packaging/systemd/observe.service
 check "nucleus.service exists" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/packaging/systemd/nucleus.service"
+  test -f "$REPO"/packaging/systemd/nucleus.service
 
 # ================ T028 — teploy.yml ================
 echo "[T028] teploy template"
 check "teploy.yml present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/teploy.yml"
+  test -f "$REPO"/teploy.yml
 check "teploy.yml has nucleus accessory" \
-  grep -q "nucleus:" "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/teploy.yml"
+  grep -q "nucleus:" "$REPO"/teploy.yml
 
 # ================ T029 — install.sh ================
 echo "[T029] install script"
 check "install.sh present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/scripts/install.sh"
+  test -f "$REPO"/scripts/install.sh
 check "install.sh posix syntax" \
-  sh -n "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/scripts/install.sh"
+  sh -n "$REPO"/scripts/install.sh
 
 # ================ T030 — JS SDK ================
 echo "[T030] JS/TS SDK"
 check "@observe/browser package.json present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/sdk/browser/package.json"
+  test -f "$REPO"/sdk/browser/package.json
 check "@observe/browser source present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/sdk/browser/src/index.ts"
+  test -f "$REPO"/sdk/browser/src/index.ts
 
 # ================ T031 — Go SDK ================
 echo "[T031] Go SDK"
 check "Go SDK go.mod present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/sdk/go/go.mod"
+  test -f "$REPO"/sdk/go/go.mod
 check "Go SDK tests pass" \
-  bash -c "cd '/Users/tyler/Documents/proj rn/Teploy/teploy-observe/sdk/go' && go test ./... >/dev/null 2>&1"
+  bash -c "cd '$REPO/sdk/go' && go test ./... >/dev/null 2>&1"
 
 # ================ T032 — Python SDK ================
 echo "[T032] Python SDK"
 check "Python SDK pyproject.toml present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/sdk/python/pyproject.toml"
+  test -f "$REPO"/sdk/python/pyproject.toml
 check "observe_sdk imports cleanly" \
-  bash -c "cd '/Users/tyler/Documents/proj rn/Teploy/teploy-observe/sdk/python' && python3 -c 'import observe_sdk; assert hasattr(observe_sdk, \"init\")' >/dev/null 2>&1"
+  bash -c "cd '$REPO/sdk/python' && python3 -c 'import observe_sdk; assert hasattr(observe_sdk, \"init\")' >/dev/null 2>&1"
 
 # ================ T033 — OpenAPI ================
 echo "[T033] OpenAPI + Swagger UI"
@@ -318,22 +322,24 @@ check "/api/docs swagger UI present" \
 # ================ T034-T036 — migration guides ================
 echo "[T034-T036] migration guides"
 check "Sentry guide present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/docs/migrations/from-sentry.md"
+  test -f "$REPO"/docs/migrations/from-sentry.md
 check "PostHog guide present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/docs/migrations/from-posthog.md"
+  test -f "$REPO"/docs/migrations/from-posthog.md
 check "Umami guide present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/docs/migrations/from-umami.md"
+  test -f "$REPO"/docs/migrations/from-umami.md
 check "Umami import script present" \
-  test -x "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/scripts/migrate-umami.sh"
+  test -x "$REPO"/scripts/migrate-umami.sh
 check "Sentry shim SDK present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/sdk/sentry-shim/src/index.ts"
+  test -f "$REPO"/sdk/sentry-shim/src/index.ts
 
 # ================ T037 — landing page ================
 echo "[T037] landing page"
-check "marketing/index.html present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/marketing/index.html"
-check "marketing html non-trivial" \
-  bash -c "[ \$(wc -c < '/Users/tyler/Documents/proj rn/Teploy/teploy-observe/marketing/index.html') -gt 5000 ]"
+# The static marketing/ page is gone; the app shell at / is the surface a
+# fresh visitor gets (login) and the embedded dist serves it.
+check "app shell serves at /" \
+  bash -c "curl -fsS '$BASE/' >/dev/null"
+check "served shell is non-trivial" \
+  bash -c "curl -s '$BASE/' | grep -q 'assets/'"
 
 # ================ T038 — demo mode ================
 echo "[T038] demo mode"
@@ -342,40 +348,40 @@ check "/api/v1/config exposes demo_mode" \
 r=json.loads(urllib.request.urlopen('$BASE/api/v1/config').read())
 import sys; sys.exit(0 if 'demo_mode' in r else 1)"
 check "DemoModeMiddleware wired" \
-  grep -q 'DemoModeMiddleware' "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/cmd/observe/main.go"
+  grep -q 'DemoModeMiddleware' "$REPO"/cmd/observe/main.go
 check "UI bundle has demo banner" \
   dist_contains "obs-demo-banner"
 
 # ================ T039 — retention ================
 echo "[T039] retention enforcement"
 check "retention covers replay + service_stats" \
-  bash -c "grep -q 'replay_sessions' '/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/jobs/retention.go' && grep -q 'service_stats' '/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/jobs/retention.go'"
+  bash -c "grep -q 'replay_sessions' '$REPO/internal/jobs/retention.go' && grep -q 'service_stats' '$REPO/internal/jobs/retention.go'"
 
 # ================ T040 — backup/restore ================
 echo "[T040] backup/restore CLI"
 check "observe version subcommand works" \
-  bash -c "OBSERVE_NUCLEUS_URL='postgres://postgres@localhost:5432/postgres?sslmode=disable' /tmp/obs-launch/observe version | grep -q 'observe'"
+  bash -c "cd '$REPO' && go run ./cmd/observe version | grep -q 'observe'"
 check "backup package present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/backup/backup.go"
+  test -f "$REPO"/internal/backup/backup.go
 
 # ================ T041 — perf budget ================
 echo "[T041] perf budget script"
 check "perfbudget.sh present" \
-  test -x "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/scripts/perfbudget.sh"
+  test -x "$REPO"/scripts/perfbudget.sh
 check "bench binary builds" \
-  test -x "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/bench/observe-bench"
+  test -x "$REPO"/bench/observe-bench
 
 # ================ T042 — e2e tests ================
 echo "[T042] Playwright e2e suite"
 check "e2e playwright config present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/e2e/playwright.config.ts"
+  test -f "$REPO"/e2e/playwright.config.ts
 check "e2e has 4+ specs" \
-  bash -c "[ \$(ls '/Users/tyler/Documents/proj rn/Teploy/teploy-observe/e2e/tests/'*.spec.ts | wc -l) -ge 4 ]"
+  bash -c "[ \$(ls '$REPO/e2e/tests/'*.spec.ts 2>/dev/null | wc -l) -ge 4 ]"
 
 # ================ T043 — signed updater ================
 echo "[T043] signed updater"
 check "upgrade package present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/upgrade/upgrade.go"
+  test -f "$REPO"/internal/upgrade/upgrade.go
 
 # ================ T044 — dogfood /meta ================
 echo "[T044] /meta self-observability"
@@ -395,23 +401,23 @@ check "meta CSS shipped" \
 echo "[H] Phase 1 hardening"
 
 check "H1 buffer.go has no escapeSQL" \
-  bash -c '! grep -q "escapeSQL" "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/ingest/buffer.go"'
+  bash -c '! grep -q "escapeSQL" "$REPO"/internal/ingest/buffer.go'
 check "H2 buffer.go has no Sprintf INSERT" \
-  bash -c '! grep -E "Sprintf.*INSERT" "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/ingest/buffer.go" > /dev/null'
+  bash -c '! grep -E "Sprintf.*INSERT" "$REPO"/internal/ingest/buffer.go > /dev/null'
 
 check "H3 disk queue package exists" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/ingest/queue.go"
+  test -f "$REPO"/internal/ingest/queue.go
 
 check "H4 per-site ratelimit schema present" \
-  bash -c 'grep -q "ratelimit_per_second" "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/cmd/observe/migrations/010_rbac_and_ratelimit.up.sql"'
+  grep -q 'ratelimit_per_second' "$REPO/internal/schema/migrations/010_rbac_and_ratelimit.up.sql"
 check "H4 set-ratelimit route wired" \
-  bash -c 'grep -q "setSiteRatelimitHandler" "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/cmd/observe/main.go"'
+  grep -q 'setSiteRatelimitHandler' "$REPO/cmd/observe/main.go"
 
 check "H5 JWT contains role claim" \
   python3 -c "
 import sys, base64, json, urllib.request
 req=urllib.request.Request('$BASE/api/v1/auth/login',
-  data=b'{\"username\":\"admin\",\"password\":\"observe\"}',
+  data=b'{\"username\":\"${OBSERVE_USER:-admin}\",\"password\":\"${OBSERVE_PASS:-observeobserv}\"}',
   headers={'Content-Type':'application/json'})
 tok=json.loads(urllib.request.urlopen(req).read())['token']
 payload=tok.split('.')[1]
@@ -421,9 +427,9 @@ sys.exit(0 if c.get('role') in ('admin','editor','viewer') else 1)"
 
 # Demote admin to viewer temporarily, verify 403, restore.
 check "H6 RBAC RequireRole middleware wired into main" \
-  bash -c 'grep -q "requireAdmin := auth.RequireRole" "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/cmd/observe/main.go" && grep -q "siteAdmin := siteGroup.Group" "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/cmd/observe/main.go"'
+  grep -q 'requireAdmin := auth.RequireRole' "$REPO/cmd/observe/main.go" && grep -q 'siteAdmin := siteGroup.Group' "$REPO/cmd/observe/main.go"
 check "H6b RBAC migration adds role column" \
-  bash -c 'grep -q "admin_users ADD COLUMN.*role" "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/cmd/observe/migrations/010_rbac_and_ratelimit.up.sql"'
+  grep -q 'admin_users ADD COLUMN.*role' "$REPO/internal/schema/migrations/010_rbac_and_ratelimit.up.sql"
 
 check "H7 explorer rejects commented write" \
   python3 -c "
@@ -464,41 +470,44 @@ try:
 except urllib.error.HTTPError as e:
     sys.exit(0 if e.code == 401 else 1)"
 
-check "H11 ?token= allowed on GET export" \
+check "H11 ?token= rejected on GET export (stream tickets only)" \
   python3 -c "
-import sys, urllib.request
-r=urllib.request.urlopen('$BASE/api/v1/export?site_id=default&from=0&to=9999999999999&format=csv&token=$TOKEN')
-sys.exit(0 if r.status == 200 else 1)"
+import sys, urllib.request, urllib.error
+try:
+    urllib.request.urlopen('$BASE/api/v1/export?site_id=default&from=0&to=9999999999999&format=csv&token=$TOKEN')
+    sys.exit(1)
+except urllib.error.HTTPError as e:
+    sys.exit(0 if e.code == 401 else 1)"
 
 check "H12 ChangePassword UPDATE not INSERT" \
-  bash -c '! grep -A3 "ChangePassword" "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/auth/auth.go" | grep -q "INSERT INTO admin_users"'
+  bash -c '! grep -A3 "ChangePassword" "$REPO"/internal/auth/auth.go | grep -q "INSERT INTO admin_users"'
 
 # ================ Phase 2 differentiation checks (D1–D9) ================
 echo "[D] Phase 2 differentiation"
 
 check "D1 aiquery package present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/aiquery/aiquery.go"
+  test -f "$REPO"/internal/aiquery/aiquery.go
 check "D2 /api/v1/ai/config returns shape" \
   json_has "/api/v1/ai/config" "'has_key' in r"
 check "D3 exports package present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/jobs/exports.go"
+  test -f "$REPO"/internal/jobs/exports.go
 check "D4 /api/v1/exports/scheduled returns array" \
   json_has "/api/v1/exports/scheduled" "isinstance(r, list)"
 check "D5 incidents package present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/internal/incidents/incidents.go"
+  test -f "$REPO"/internal/incidents/incidents.go
 check "D6 /api/v1/incidents returns array" \
   json_has "/api/v1/incidents" "isinstance(r, list)"
 check "D7 instance_settings migration present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/cmd/observe/migrations/011_instance_settings.up.sql"
+  test -f "$REPO"/internal/schema/migrations/011_instance_settings.up.sql
 check "D8 scheduled_exports migration present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/cmd/observe/migrations/012_scheduled_exports.up.sql"
+  test -f "$REPO"/internal/schema/migrations/012_scheduled_exports.up.sql
 check "D9 incidents migration present" \
-  test -f "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/cmd/observe/migrations/013_incidents.up.sql"
+  test -f "$REPO"/internal/schema/migrations/013_incidents.up.sql
 
 check "D10 AI call logged to llm_traces" \
-  bash -c 'grep -q "Operation:        \"explorer_nl_to_sql\"" "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/cmd/observe/main.go"'
+  grep -q 'explorer_nl_to_sql' "$REPO/cmd/observe/main.go"
 check "D11 alert OnTrigger auto-creates incident" \
-  bash -c 'grep -q "alertSvc.OnTrigger = func" "/Users/tyler/Documents/proj rn/Teploy/teploy-observe/cmd/observe/main.go"'
+  grep -q 'EnsureOpen' "$REPO/internal/platform/alerts_engine.go"
 
 echo
 echo "========================================"
