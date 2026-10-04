@@ -754,6 +754,14 @@
     },
     setSessionId: function(id) { sessionId = id; },
     getReplayId: function() { return replayId; },
+    // Sink for observe-replay-capture.js (opt-in console/network capture).
+    // Allowlisted to those two record types; the server validates the shape.
+    pushEvent: function(type, data) {
+      if (type !== 'console' && type !== 'network') return false;
+      if (!active || events.length >= maxEvents) return false;
+      record(type, data);
+      return true;
+    },
     onError: function(fn) { if (typeof fn === 'function') onErrorHook = fn; }
   };
 

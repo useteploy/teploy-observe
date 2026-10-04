@@ -495,6 +495,16 @@ import { createEventSanitizer } from './sanitizer.mjs';
     },
     setSessionId: function (id) { sessionId = id; },
     getReplayId: function () { return replayId; },
+    // Sink for observe-replay-capture.js. NOTE: present in this source only;
+    // the shipped observe-replay-delta.js bundle predates it, so capture is
+    // inert on the delta recorder until the bundle is rebuilt (needs network
+    // for npm ci; see ../package.json "build").
+    pushEvent: function (type, data) {
+      if (type !== 'console' && type !== 'network') return false;
+      if (!active || capped || events.length >= maxEvents) return false;
+      track(type, data);
+      return true;
+    },
     onError: function (fn) { if (typeof fn === 'function') onErrorHook = fn; },
     mode: function () { return 'rrweb-delta'; }
   };

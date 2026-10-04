@@ -2,7 +2,6 @@ package replays
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/guardmap"
 	"github.com/useteploy/teploy-observe/internal/queryguard"
 )
 
@@ -56,18 +56,11 @@ func escapeLike(s string) string {
 // slot per call plus the wall-time budget and window clamp. A nil limiter
 // disables concurrency admission; zero budget fields fall back to defaults.
 func (s *ReplayService) WithQueryGuard(l *queryguard.Limiter, b queryguard.Budgets) *ReplayService {
-	d := queryguard.DefaultBudgets()
-	if b.Timeout <= 0 {
-		b.Timeout = d.Timeout
+	s.guard = guardmap.NewGuard(l, b)
+	s.maxWindow = b.MaxWindow
+	if s.maxWindow <= 0 {
+		s.maxWindow = queryguard.DefaultBudgets().MaxWindow
 	}
-	if b.MaxWindow <= 0 {
-		b.MaxWindow = d.MaxWindow
-	}
-	if b.MaxScanRows <= 0 {
-		b.MaxScanRows = d.MaxScanRows
-	}
-	s.guard = l
-	s.budgets = b
 	return s
 }
 
@@ -167,27 +160,19 @@ func (s *ReplayService) ListReplaysFiltered(ctx context.Context, siteID string, 
 		distinctHash = hashDistinctID(f.DistinctID, salt, rawOptIn)
 	}
 
-	qctx := ctx
-	if s.guard != nil {
-		release, err := s.guard.Acquire(ctx, siteID)
-		if err != nil {
-			return nil, err
-		}
-		defer release()
+	qctx, release, err := s.guard.Begin(ctx, siteID)
+	if err != nil {
+		return nil, guardmap.HTTPError(err)
 	}
-	if s.budgets.Timeout > 0 {
-		if max := s.budgets.MaxWindow; max > 0 && to.Sub(from) > max {
-			from = to.Add(-max)
-		}
-		var cancel context.CancelFunc
-		qctx, cancel = context.WithTimeout(ctx, s.budgets.Timeout)
-		defer cancel()
+	defer release()
+	if max := s.maxWindow; max > 0 && to.Sub(from) > max {
+		from = to.Add(-max)
 	}
 
 	q, args := buildListQuery(siteID, from, to, limit, offset, f, distinctHash)
 	rows, err := nucleus.Query[ReplaySession](qctx, s.db.SQL(), q, args...)
-	if err != nil && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-		return nil, queryguard.TimeBudgetRefusal(s.guard, s.budgets.Timeout)
+	if err != nil {
+		return nil, guardmap.HTTPError(s.guard.DeadlineError(ctx, err))
 	}
-	return rows, err
+	return rows, nil
 }

@@ -19,11 +19,11 @@ import (
 	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/guardmap"
 	"github.com/useteploy/teploy-observe/internal/heatmaps"
 	"github.com/useteploy/teploy-observe/internal/identity"
 	"github.com/useteploy/teploy-observe/internal/ingest"
 	"github.com/useteploy/teploy-observe/internal/query"
-	"github.com/useteploy/teploy-observe/internal/queryguard"
 )
 
 // ErrCrossSiteReplay indicates the caller tried to append events to a replay
@@ -85,8 +85,8 @@ type ReplayService struct {
 
 	// guard/budgets are the optional O12 admission state for the list path
 	// (see WithQueryGuard in list_filter.go).
-	guard   *queryguard.Limiter
-	budgets queryguard.Budgets
+	guard     *guardmap.Guard
+	maxWindow time.Duration
 }
 
 // lockReplay serializes all writes for one replay ID. NOT keyed by site:

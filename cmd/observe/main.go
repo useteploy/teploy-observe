@@ -5307,7 +5307,7 @@ func listReplaysHandler(svc *replays.ReplayService) neutron.HandlerFunc[listRepl
 			return nil, err
 		}
 		rows, err := svc.ListReplaysFiltered(ctx, input.SiteID, from, to, input.Limit, input.Offset, filter)
-		return emptyOnNil(rows, mapGuardRefusal(err))
+		return emptyOnNil(rows, err)
 	}
 }
 
