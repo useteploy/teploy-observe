@@ -55,11 +55,14 @@ Query-visible entity per surface (pinned):
   estimate and the person exists or is reconstructed. Target: unchanged
   at the boundary; internal association becomes explicit and queryable
   (first-seen-anonymous linkage), with history left as-is.
-- **alias** — NOT SUPPORTED today; two distinct_ids are two persons
+- **alias** — SUPPORTED as an explicit editor action since C3 (see
+  section 8). Before C3: two distinct_ids are two persons
   forever. Target: an alias mapping (one canonical person id + alias
   table) resolved at query time; historical rows are never rewritten —
   queries resolve aliases forward from the mapping (D7-era rule).
-- **merge** — NOT SUPPORTED. Target: merge is a versioned person-graph
+- **merge** — SUPPORTED explicitly since C3 (section 8; `from` becomes
+  an alias of `into`, resolved at read time; no auto-merge on identify).
+  Original target text: merge is a versioned person-graph
   operation (two canonical ids become one going forward; prior rows keep
   their ids and the merge table unifies them at read time). Silent
   history rewriting is prohibited.
@@ -144,6 +147,66 @@ ingestion-time behavior as a known limitation, not a decision.
   and identified are both supported explicitly, and the query entity is
   visible per surface (surface labels always name whether the grouped
   entity is estimate/session/person).
+
+## 8. C3 additions: properties, alias/merge, erasure (migration 061)
+
+Status: IMPLEMENTED (2026-10-03), compile+unit tested; SQL UNVERIFIED
+against a live Nucleus. Persons remain an aggregate over
+`events.distinct_id`; three side tables keyed by the same `person_key`
+(the HMAC'd id, or raw under the site's `raw_distinct_id` opt-in) add data
+without touching events.
+
+Supported now:
+
+- **Person properties** (`person_properties`). `POST /api/v1/persons/properties`
+  (telemetry API key; site bound by the key, a disagreeing body `site_id` is
+  403) takes the RAW identify value, hashes it exactly like event ingest
+  (per-site salt, or raw on opt-in) and stores traits under the hashed key.
+  The raw id is never stored. Bounds: <= 50 keys, key `^[A-Za-z_$][A-Za-z0-9_.$-]{0,63}$`,
+  scalar values only (string/number/bool; null removes in merge mode),
+  <= 1 KiB per encoded value, `user_id`/`distinct_id` keys rejected so the
+  raw id cannot be echoed back. There is NO PII denylist: what a customer
+  puts in a trait (including email) is the customer's choice and their
+  responsibility. The browser SDK's `identify()` still sends traits only as
+  `$identify` event properties (with its own email/user_id filter); wiring
+  it to this endpoint is a separate SDK change. Caveat: a browser-embedded
+  key lets any holder write properties for a person whose raw id they can
+  guess - the same trust level as posting events with a chosen distinct_id.
+  Person detail returns `properties`.
+- **Alias/merge** (`person_aliases`). `POST /api/v1/persons/merge`
+  (editor+; body `site_id`, `from_key`, `into_key`). `from` becomes an alias
+  of the canonical root of `into`. Refused: self-merge, merging a key that is
+  already an alias, merges that close a cycle, tombstoned keys, keys with no
+  events in THIS site (404, so a key from another site cannot be linked),
+  more than 20 aliases per person or 10000 per site. List and detail resolve
+  aliases forward in Go over the bounded alias set; canonical properties win
+  over alias properties. Events are never rewritten (D5). Merged
+  `session_count` is an upper bound (a shared monthly estimate counts
+  twice). The merged list scans at most 5000 persons per window and reports
+  `truncated` beyond that. There is no un-merge endpoint yet (the table
+  supports it: `active='false'`).
+- **Erasure** (`person_tombstones`). `POST /api/v1/persons/erase` (admin
+  only; key in the body so a raw id never lands in the audit path). Writes a
+  tombstone for the key and every alias merged into it, deactivates those
+  alias edges and blanks their stored properties (as new versions; no
+  DELETE). Tombstoned persons disappear from list and detail, cannot be
+  merged, and refuse property writes.
+- All mutating persons routes are recorded by the audit middleware
+  (actor, `persons.<verb>.create`, result).
+
+NOT supported / honest limits:
+
+- **Events are not deleted.** The repo has no per-key DELETE on `events`
+  (retention deletes by time column only) and per-person DELETE semantics on
+  Nucleus are unproven. Erasure therefore hides and de-identifies the person
+  at the persons surface only; the hashed `distinct_id` still sits on event
+  rows, and in session/funnel/retention aggregates, until retention expires
+  them. A new event with the same identify value re-creates a visible
+  person, because ingest does not consult tombstones (only property writes
+  do). A true erasure that removes event rows needs an upstream-verified
+  per-key DELETE plus ingest-side tombstone checks; neither is built.
+- Auto-merge on identify, pre-identify anonymous linkage, un-merge, and
+  person-level funnels/retention remain residual scope (section 7).
 
 ## 7. Residual O03 scope (next slices)
 
