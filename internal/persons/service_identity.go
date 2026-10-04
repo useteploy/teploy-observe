@@ -243,6 +243,50 @@ func (s *Service) SetProperties(ctx context.Context, siteID, key string, in map[
 	return doc, nil
 }
 
+// SetKnownProperties is the telemetry-key write path: merge mode only, and
+// only for a person that already has events in THIS site (ErrNotFound
+// otherwise), so a public key cannot create person rows for arbitrary ids.
+// It never returns stored values: only the sorted names of the keys the
+// caller sent.
+func (s *Service) SetKnownProperties(ctx context.Context, siteID, key string, in map[string]any) ([]string, error) {
+	return s.writeKnown(ctx, siteID, key, in, false)
+}
+
+// ReplaceProperties is the authenticated-editor path (never the telemetry
+// key): the person's whole trait set becomes exactly in. The person must
+// already exist.
+func (s *Service) ReplaceProperties(ctx context.Context, siteID, key string, in map[string]any) ([]string, error) {
+	return s.writeKnown(ctx, siteID, key, in, true)
+}
+
+func (s *Service) writeKnown(ctx context.Context, siteID, key string, in map[string]any, replace bool) ([]string, error) {
+	if siteID == "" {
+		return nil, fmt.Errorf("%w: site_id required", ErrInvalid)
+	}
+	if err := ValidatePersonKey(key); err != nil {
+		return nil, err
+	}
+	if _, _, err := ValidateProperties(in); err != nil {
+		return nil, err // cheap checks first: no store round-trip for junk
+	}
+	ok, err := s.ev.Exists(ctx, siteID, key)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("%w: person", ErrNotFound)
+	}
+	if _, err := s.SetProperties(ctx, siteID, key, in, replace); err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(in))
+	for k := range in {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
 // MergeResult describes a completed merge.
 type MergeResult struct {
 	SiteID       string `json:"site_id"`

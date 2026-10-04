@@ -11,7 +11,12 @@ package main
 //   - reads (list, detail): JWT (viewer+)
 //   - POST /persons/merge: editor+
 //   - POST /persons/erase: admin only
-//   - POST /persons/properties: telemetry (API) key, site bound by the key
+//   - POST /persons/properties: telemetry (API) key, site bound by the key.
+//     The key ships in browsers, so this route is write-only and narrow:
+//     merge mode only, person must already have events, per-person rate
+//     limit, and it never returns stored values.
+//   - POST /persons/properties/replace: editor+ (JWT); the only way to
+//     replace a person's whole trait set.
 //
 // Merge and erase take their person key in the BODY, not the path, so a
 // raw (raw_distinct_id opt-in) identifier never lands in the audit trail's
@@ -23,6 +28,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/neutron-build/neutron/go/neutron"
 
@@ -41,8 +47,11 @@ type personsPrivacy interface {
 type PersonsRouteDeps struct {
 	JWT, Editor, Admin neutron.Middleware
 	// Ingest is the API-key authenticated group rooted at /api/v1.
-	Ingest     *neutron.Router
-	Svc        *persons.Service
+	Ingest *neutron.Router
+	Svc    *persons.Service
+	// PropLimit caps telemetry property writes per person (nil: default
+	// 20 writes per minute per person).
+	PropLimit  *persons.WriteLimiter
 	Privacy    personsPrivacy // nil: global salt only (tests)
 	GlobalSalt string
 	// Actor resolves the acting username from the request (JWT).
@@ -64,8 +73,14 @@ func RegisterPersonsRoutes(r *neutron.Router, d PersonsRouteDeps) {
 	api.Handle("POST /merge", d.Editor(personsMergeHandler(d.Svc, d.Actor)))
 	api.Handle("POST /erase", d.Admin(personsEraseHandler(d.Svc, d.Actor)))
 
+	api.Handle("POST /properties/replace", d.Editor(personsReplacePropertiesHandler(d.Svc)))
+
 	if d.Ingest != nil {
-		d.Ingest.Handle("POST /persons/properties", personsPropertiesHandler(d.Svc, d.Privacy, d.GlobalSalt))
+		lim := d.PropLimit
+		if lim == nil {
+			lim = persons.NewWriteLimiter(20, time.Minute)
+		}
+		d.Ingest.Handle("POST /persons/properties", personsPropertiesHandler(d.Svc, d.Privacy, d.GlobalSalt, lim))
 	}
 }
 
@@ -235,13 +250,23 @@ type personsPropertiesBody struct {
 	SiteID     string         `json:"site_id"`
 	DistinctID string         `json:"distinct_id"`
 	Properties map[string]any `json:"properties"`
-	Replace    bool           `json:"replace"`
+	// Replace is refused on the telemetry route (see
+	// personsReplacePropertiesHandler); it is decoded only to say so.
+	Replace bool `json:"replace"`
 }
 
 // personsPropertiesHandler stores identify() traits. The raw distinct_id is
 // hashed exactly as the event ingest path does (per-site salt, or raw when
 // the site opted in) and never stored; the key-bound site is authoritative.
-func personsPropertiesHandler(svc *persons.Service, priv personsPrivacy, globalSalt string) http.HandlerFunc {
+//
+// The telemetry key is public, so the route is deliberately write-only and
+// narrow: stored values are never returned (only the key names the caller
+// sent), replace mode is refused, the person must already have events in the
+// site (404 otherwise, so the key cannot mint person rows), and writes are
+// rate limited per person. Residual: the 404/200 split tells a caller who
+// can guess a raw id whether that id has events - the same signal posting
+// events with a chosen distinct_id already gives.
+func personsPropertiesHandler(svc *persons.Service, priv personsPrivacy, globalSalt string, lim *persons.WriteLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var in personsPropertiesBody
 		if !decodePersonsBody(w, r, &in, 256<<10) {
@@ -256,6 +281,10 @@ func personsPropertiesHandler(svc *persons.Service, priv personsPrivacy, globalS
 			neutron.WriteError(w, r, neutron.ErrBadRequest("site_id required"))
 			return
 		}
+		if in.Replace {
+			neutron.WriteError(w, r, neutron.ErrForbidden("replace is not available to telemetry keys"))
+			return
+		}
 		if in.DistinctID == "" || len(in.DistinctID) > 512 {
 			neutron.WriteError(w, r, neutron.ErrBadRequest("distinct_id required (max 512 bytes)"))
 			return
@@ -267,11 +296,41 @@ func personsPropertiesHandler(svc *persons.Service, priv personsPrivacy, globalS
 			}
 		}
 		key := identity.MaybeHashDistinctID(in.DistinctID, salt, raw)
-		props, err := svc.SetProperties(r.Context(), site, key, in.Properties, in.Replace)
+		if lim != nil && !lim.Allow(site, key) {
+			w.Header().Set("Retry-After", "60")
+			neutron.WriteError(w, r, neutron.ErrRateLimited("too many property writes for this person"))
+			return
+		}
+		written, err := svc.SetKnownProperties(r.Context(), site, key, in.Properties)
 		if err != nil {
 			writePersonsError(w, r, personsHTTPError(err))
 			return
 		}
-		writePersonsJSON(w, http.StatusOK, map[string]any{"person_key": key, "properties": props})
+		writePersonsJSON(w, http.StatusOK, map[string]any{"ok": true, "keys_written": written})
+	}
+}
+
+type personsReplacePropertiesBody struct {
+	SiteID     string         `json:"site_id"`
+	PersonKey  string         `json:"person_key"`
+	Properties map[string]any `json:"properties"`
+}
+
+// personsReplacePropertiesHandler is the editor+ (JWT) route that replaces a
+// person's whole trait set. The key is the stored person key (as shown by
+// the persons API) and travels in the body so a raw id never lands in the
+// audit path.
+func personsReplacePropertiesHandler(svc *persons.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var in personsReplacePropertiesBody
+		if !decodePersonsBody(w, r, &in, 256<<10) {
+			return
+		}
+		written, err := svc.ReplaceProperties(r.Context(), in.SiteID, in.PersonKey, in.Properties)
+		if err != nil {
+			writePersonsError(w, r, personsHTTPError(err))
+			return
+		}
+		writePersonsJSON(w, http.StatusOK, map[string]any{"ok": true, "keys_written": written})
 	}
 }

@@ -25,7 +25,7 @@ func TestSurveyWidgetServed(t *testing.T) {
 }
 
 func TestSurveyActiveRejectsMissingOrHugeSite(t *testing.T) {
-	h := surveysActiveHandler(nil, ingest.NewRateLimiter(100, time.Minute, 100))
+	h := surveysActiveHandler(nil, ingest.NewRateLimiter(100, time.Minute, 100), allSitesKnown)
 	for _, u := range []string{"/api/v1/surveys/active", "/api/v1/surveys/active?site_id=" + strings.Repeat("a", maxSurveySiteIDLen+1)} {
 		rec := httptest.NewRecorder()
 		h(rec, httptest.NewRequest("GET", u, nil))
@@ -40,7 +40,7 @@ func TestSurveyActivePerSiteLimit(t *testing.T) {
 	// would need a service.
 	rl := ingest.NewRateLimiter(1, time.Hour, 1)
 	rl.Allow("s1", "")
-	h := surveysActiveHandler(nil, rl)
+	h := surveysActiveHandler(nil, rl, allSitesKnown)
 	rec := httptest.NewRecorder()
 	h(rec, httptest.NewRequest("GET", "/api/v1/surveys/active?site_id=s1", nil))
 	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
@@ -59,7 +59,7 @@ func TestSurveySiteLimitMW(t *testing.T) {
 		w.WriteHeader(200)
 	})
 	rl := ingest.NewRateLimiter(1, time.Hour, 2)
-	h := surveyCORS(surveySiteLimitMW(rl)(next))
+	h := surveyCORS(surveySiteLimitMW(rl, allSitesKnown)(next))
 	do := func(site string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest("POST", "/", strings.NewReader(`{"site_id":"`+site+`"}`)))
@@ -89,7 +89,7 @@ func TestSurveySiteLimitMW(t *testing.T) {
 		t.Fatalf("garbage body should reach handler, got %d", rec.Code)
 	}
 	// Absurd site id is refused, never bucketed.
-	if r := do(strings.Repeat("z", maxSurveySiteIDLen+1)); r.Code != 429 {
+	if r := do(strings.Repeat("z", maxSurveySiteIDLen+1)); r.Code != 404 {
 		t.Fatalf("huge site id: %d", r.Code)
 	}
 }

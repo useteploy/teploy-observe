@@ -169,10 +169,37 @@ Supported now:
   puts in a trait (including email) is the customer's choice and their
   responsibility. The browser SDK's `identify()` still sends traits only as
   `$identify` event properties (with its own email/user_id filter); wiring
-  it to this endpoint is a separate SDK change. Caveat: a browser-embedded
-  key lets any holder write properties for a person whose raw id they can
-  guess - the same trust level as posting events with a chosen distinct_id.
-  Person detail returns `properties`.
+  it to this endpoint is a separate SDK change. Person detail returns
+  `properties`.
+
+  **Hardening (security review).** The telemetry key is public (it ships in
+  browsers) and `distinct_id` is caller-chosen, so the route is write-only
+  and narrow:
+  - It never returns stored values: the response is
+    `{"ok":true,"keys_written":[...]}` (the key names the caller sent).
+  - Merge mode only. `replace:true` on this route is 403. Replacing a whole
+    trait set is `POST /api/v1/persons/properties/replace` (JWT, editor+;
+    body `site_id`, `person_key` = the stored key, `properties`), so the
+    destructive path needs an authenticated user and is audited.
+  - The person must already have events in the key-bound site, else 404; the
+    key cannot mint person rows. Residual: the 404/200 split tells someone
+    who can guess a raw id whether it has events - the same signal posting
+    events with a chosen distinct_id already gives.
+  - A person holds at most 50 properties in total (merged document, not just
+    per request); further keys are 400.
+  - Writes are limited to 20 per minute per (site, person), in-process
+    (per replica), 429 with `Retry-After`; the limiter table is bounded.
+
+  **Public survey endpoints (same review).** `/surveys/respond` returns only
+  fixed validation/gate messages (400) and a generic 500 `could not record
+  response` otherwise (real error logged server-side). Response dedupe is per
+  (site, survey, client id); the check-then-insert is serialized by a striped
+  in-process mutex. Remaining limit: no unique index exists (no schema
+  change), so two replicas receiving the same client id at the same instant
+  can both insert. `user_id` is capped at 128 bytes, valid UTF-8, no control
+  characters. Per-site rate-limit buckets are only created for sites that
+  exist (30 s TTL lookup cache); unknown sites get the per-IP limit only
+  (404 on expose/respond, empty list on active).
 - **Alias/merge** (`person_aliases`). `POST /api/v1/persons/merge`
   (editor+; body `site_id`, `from_key`, `into_key`). `from` becomes an alias
   of the canonical root of `into`. Refused: self-merge, merging a key that is

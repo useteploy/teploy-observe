@@ -167,9 +167,10 @@ func TestPersonsPropertiesEndpoint(t *testing.T) {
 	h := newPersonsTestRouter(m)
 	key := map[string]string{"X-Test-Key-Site": "s1"}
 	hashed := identity.HashDistinctID("user-42", testSalt)
+	seedP(m, "s1", hashed) // the person must already have events
 
 	w := personsDo(h, "POST", "/api/v1/persons/properties", `{"distinct_id":"user-42","properties":{"plan":"pro"}}`, key)
-	if w.Code != 200 || !strings.Contains(w.Body.String(), hashed) || strings.Contains(w.Body.String(), "user-42") {
+	if w.Code != 200 || strings.Contains(w.Body.String(), "user-42") || strings.Contains(w.Body.String(), "pro") {
 		t.Fatalf("hashing/echo: %d %s", w.Code, w.Body.String())
 	}
 	if raw, found, _ := m.GetProps(context.Background(), "s1", hashed); !found || !strings.Contains(raw, "pro") {
