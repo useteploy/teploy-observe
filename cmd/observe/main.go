@@ -466,7 +466,8 @@ func main() {
 	dashSvc := dashboards.NewDashboardService(db).WithMetrics(metricsSvc)
 	replaySvc := replays.NewReplayService(db).
 		WithLogger(logger).
-		WithPrivacy(siteSvc.PrivacyConfig, cfg.SessionSalt)
+		WithPrivacy(siteSvc.PrivacyConfig, cfg.SessionSalt).
+		WithQueryGuard(queryLimiter, queryBudgets)
 	heatmapsSvc := heatmaps.NewService(db)
 	aiSvc := aiquery.NewService(db, logger)
 	aiSchema := aiquery.NewSchemaCard(db)
@@ -5288,6 +5289,11 @@ type listReplaysInput struct {
 	To     string `query:"to"`
 	Limit  int    `query:"limit"`
 	Offset int    `query:"offset"`
+	// Optional filters (see parseReplayFilter).
+	HasErrors   string `query:"has_errors"`
+	MinDuration string `query:"min_duration"`
+	URLContains string `query:"url_contains"`
+	DistinctID  string `query:"distinct_id"`
 }
 
 func listReplaysHandler(svc *replays.ReplayService) neutron.HandlerFunc[listReplaysInput, []replays.ReplaySession] {
@@ -5296,7 +5302,12 @@ func listReplaysHandler(svc *replays.ReplayService) neutron.HandlerFunc[listRepl
 		if err != nil {
 			return nil, neutron.ErrBadRequest(err.Error())
 		}
-		return emptyOnNil(svc.ListReplays(ctx, input.SiteID, from, to, input.Limit, input.Offset))
+		filter, err := parseReplayFilter(input.HasErrors, input.MinDuration, input.URLContains, input.DistinctID)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := svc.ListReplaysFiltered(ctx, input.SiteID, from, to, input.Limit, input.Offset, filter)
+		return emptyOnNil(rows, mapGuardRefusal(err))
 	}
 }
 
