@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/useteploy/teploy-observe/internal/dbutil"
 	"github.com/useteploy/teploy-observe/internal/queryguard"
 )
 
@@ -356,6 +357,7 @@ func TestClassifyOrphan(t *testing.T) {
 func TestSearchTracesExIncludeOrphans(t *testing.T) {
 	q := &QueryService{}
 	var traceSQL string
+	var traceArgs []any
 	q.querySpans = func(_ context.Context, sql string, args ...any) ([]Span, error) {
 		switch {
 		case strings.Contains(sql, "parent_span_id = ''"): // root candidates
@@ -364,7 +366,7 @@ func TestSearchTracesExIncludeOrphans(t *testing.T) {
 			// orphan candidates: two orphan traces and one that has a root
 			return []Span{{TraceID: "late"}, {TraceID: "late"}, {TraceID: "gone"}, {TraceID: "rooted"}}, nil
 		default:
-			traceSQL = sql
+			traceSQL, traceArgs = sql, args
 			return []Span{
 				child("gone", "g1", "missing", 30, "ok"),
 				child("late", "l1", "root-not-yet", 50, "ok"),
@@ -388,8 +390,19 @@ func TestSearchTracesExIncludeOrphans(t *testing.T) {
 	if strings.Join(ids, ",") != "rooted:false,late:true,gone:true" {
 		t.Fatalf("traces = %v", ids)
 	}
-	if !strings.Contains(traceSQL, "trace_id IN ($2,$3,$4)") || !strings.Contains(traceSQL, fmt.Sprintf("LIMIT %d", orphanSpanCap+1)) {
+	if !strings.Contains(traceSQL, "trace_id IN ($4,$5,$6)") || !strings.Contains(traceSQL, fmt.Sprintf("LIMIT %d", orphanSpanCap+1)) {
 		t.Errorf("trace span SQL: %s", traceSQL)
+	}
+	// The span-set load is time-bounded: window widened by orphanWindowSlack.
+	if !strings.Contains(traceSQL, "start_time >= CAST($2 AS BIGINT) AND start_time < CAST($3 AS BIGINT)") || len(traceArgs) != 6 {
+		t.Fatalf("trace span SQL not time-bounded: %s (%d args)", traceSQL, len(traceArgs))
+	}
+	if traceArgs[1] != dbutil.IntParam(tsAt(0).Add(-orphanWindowSlack).UnixMilli()) ||
+		traceArgs[2] != dbutil.IntParam(tsAt(100).Add(orphanWindowSlack).UnixMilli()) {
+		t.Errorf("window args = %v %v", traceArgs[1], traceArgs[2])
+	}
+	if !strings.Contains(traceSQL, "ORDER BY trace_id, CAST(start_time AS BIGINT) ASC") {
+		t.Errorf("trace span SQL must order numerically: %s", traceSQL)
 	}
 
 	// Default mode never reports orphans.

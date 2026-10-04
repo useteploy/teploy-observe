@@ -63,7 +63,10 @@ const (
 
 	sqlLogCount = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM logs WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`
 
-	sqlLogErrorCount = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM logs WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT) AND level IN ('error', 'fatal')`
+	sqlLogErrorCount = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM logs WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT) AND level IN ('error', 'ERROR', 'Error', 'fatal', 'FATAL', 'Fatal')`
+	// The level list above is the as-sent spellings (lower/upper/Title): the
+	// JSON log API stores level unmodified, only OTLP lower-cases it. Mirrors
+	// logs.levelVariants; LOWER() is avoided as no other query here uses it.
 
 	sqlUptimeCount = `SELECT CAST(COUNT(*) AS TEXT) AS value FROM uptime_results WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND timestamp < CAST($3 AS BIGINT)`
 

@@ -12,6 +12,7 @@ import (
 
 	"github.com/neutron-build/neutron/go/nucleus"
 
+	"github.com/useteploy/teploy-observe/internal/dbutil"
 	"github.com/useteploy/teploy-observe/internal/identity"
 )
 
@@ -386,9 +387,9 @@ func (s *ExperimentService) readMetricEvents(ctx context.Context, experimentID, 
 	rows, err := nucleus.Query[evRow](ctx, s.db.SQL(),
 		`SELECT user_id, CAST(timestamp AS TEXT) AS ts, value
 		 FROM experiment_metric_events
-		 WHERE experiment_id = $1 AND site_id = $2 AND metric = $3 AND timestamp >= $4 AND timestamp <= $5
+		 WHERE experiment_id = $1 AND site_id = $2 AND metric = $3 AND timestamp >= CAST($4 AS BIGINT) AND timestamp <= CAST($5 AS BIGINT)
 		 LIMIT `+strconv.Itoa(maxAnalysisRows),
-		experimentID, siteID, metric, lower, upperTS)
+		experimentID, siteID, metric, dbutil.IntParam(lower), dbutil.IntParam(upperTS))
 	if err != nil {
 		return nil, false, err
 	}

@@ -272,7 +272,7 @@ func TestSQLGolden(t *testing.T) {
 		{`100%`, `message ILIKE '%' || $4 || '%'`, 1, false},
 		{`%`, ``, 0, false},
 		{`-100%`, ``, 0, false},
-		{`level:error`, `(level = $4 OR level = $5)`, 2, true},
+		{`level:error`, `(level = $4 OR level = $5 OR level = $6)`, 3, true},
 	}
 	for _, c := range cases {
 		cq := compileFor(t, c.q)
@@ -494,4 +494,11 @@ func FuzzParseQuery(f *testing.F) {
 		l := &Log{Message: in, Attributes: in}
 		_ = evalQuery(n, &rowView{l: l})
 	})
+}
+
+func TestLogQLSearchSQLOrdersNumerically(t *testing.T) {
+	q := buildLogQLSearchSQL("site_id = $1", 51)
+	if !strings.Contains(q, "ORDER BY CAST(timestamp AS BIGINT) DESC, log_id DESC") || !strings.HasSuffix(q, "LIMIT 51") {
+		t.Errorf("search SQL: %s", q)
+	}
 }

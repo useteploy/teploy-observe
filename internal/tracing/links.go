@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
+	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
 // Ingest bounds for span links. A hostile or buggy exporter can attach an
@@ -151,23 +153,77 @@ type StoredSpanLink struct {
 	Attributes    string `json:"attributes"`
 }
 
-// GetTraceLinks returns the links of every span in a trace, scoped to the site.
-func (q *QueryService) GetTraceLinks(ctx context.Context, traceID, siteID string) ([]StoredSpanLink, error) {
-	return nucleus.Query[StoredSpanLink](ctx, q.db.SQL(),
-		`SELECT trace_id, span_id,
+// Read-side bounds for span links. Ingest caps links per span (maxLinksPerSpan);
+// these keep the read bounded regardless of what is stored.
+const (
+	maxTraceLinksPerSpan = 128
+	maxTraceLinksTotal   = 5000
+	// linkWindowSlack widens a caller's time hint on both sides.
+	linkWindowSlack = time.Hour
+)
+
+// LinkWindow is an optional time hint for link reads: the range in which the
+// owning spans started. span_links is ordered by start time, so a hint turns a
+// whole-retention scan into a narrow one. The zero value means no hint.
+type LinkWindow struct {
+	From, To time.Time
+}
+
+func (w LinkWindow) bounded() bool { return !w.From.IsZero() && !w.To.IsZero() }
+
+// buildTraceLinksSQL returns the statement and params. With a hint the owning
+// span start_time is bounded to [From-slack, To+slack]; the total is always
+// capped.
+func buildTraceLinksSQL(traceID, siteID string, w LinkWindow) (string, []any) {
+	where := "trace_id = $1 AND site_id = $2"
+	params := []any{traceID, siteID}
+	if w.bounded() {
+		where += " AND start_time >= CAST($3 AS BIGINT) AND start_time <= CAST($4 AS BIGINT)"
+		params = append(params,
+			dbutil.IntParam(w.From.Add(-linkWindowSlack).UnixMilli()),
+			dbutil.IntParam(w.To.Add(linkWindowSlack).UnixMilli()))
+	}
+	return fmt.Sprintf(`SELECT trace_id, span_id,
 			CAST(link_idx AS TEXT) AS link_idx,
 			linked_trace_id, linked_span_id, trace_state,
 			COALESCE(attributes, '') AS attributes
 		 FROM span_links
-		 WHERE trace_id = $1 AND site_id = $2
-		 ORDER BY span_id ASC, link_idx ASC`,
-		traceID, siteID,
-	)
+		 WHERE %s
+		 ORDER BY span_id ASC, link_idx ASC
+		 LIMIT %d`, where, maxTraceLinksTotal), params
+}
+
+// capLinksPerSpan keeps at most maxTraceLinksPerSpan links per span. Input is
+// ordered by span_id so a span's links are contiguous.
+func capLinksPerSpan(in []StoredSpanLink) []StoredSpanLink {
+	out := in[:0:0]
+	run, prev := 0, ""
+	for _, l := range in {
+		if l.SpanID != prev {
+			prev, run = l.SpanID, 0
+		}
+		if run++; run <= maxTraceLinksPerSpan {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// GetTraceLinks returns the links of every span in a trace, scoped to the
+// site. w is an optional time hint (zero value: none); the result is always
+// capped (128 per span, 5000 total).
+func (q *QueryService) GetTraceLinks(ctx context.Context, traceID, siteID string, w LinkWindow) ([]StoredSpanLink, error) {
+	sql, params := buildTraceLinksSQL(traceID, siteID, w)
+	rows, err := nucleus.Query[StoredSpanLink](ctx, q.db.SQL(), sql, params...)
+	if err != nil {
+		return nil, err
+	}
+	return capLinksPerSpan(rows), nil
 }
 
 // GetSpanLinks returns the links of one span.
-func (q *QueryService) GetSpanLinks(ctx context.Context, traceID, spanID, siteID string) ([]StoredSpanLink, error) {
-	all, err := q.GetTraceLinks(ctx, traceID, siteID)
+func (q *QueryService) GetSpanLinks(ctx context.Context, traceID, spanID, siteID string, w LinkWindow) ([]StoredSpanLink, error) {
+	all, err := q.GetTraceLinks(ctx, traceID, siteID, w)
 	if err != nil {
 		return nil, err
 	}
@@ -180,6 +236,24 @@ func (q *QueryService) GetSpanLinks(ctx context.Context, traceID, spanID, siteID
 	return out, nil
 }
 
+// spansWindow is the start-time range of spans (zero value when empty or when
+// any start is unknown: no hint rather than a wrong one).
+func spansWindow(spans []Span) LinkWindow {
+	var w LinkWindow
+	for _, s := range spans {
+		if s.StartTime.IsZero() {
+			return LinkWindow{}
+		}
+		if w.From.IsZero() || s.StartTime.Before(w.From) {
+			w.From = s.StartTime
+		}
+		if s.StartTime.After(w.To) {
+			w.To = s.StartTime
+		}
+	}
+	return w
+}
+
 // attachLinks fills Span.Links from one trace-wide links query. Best effort:
 // a failure (for example the table not yet migrated) leaves Links empty rather
 // than failing the waterfall, which is still correct without them.
@@ -187,7 +261,7 @@ func (q *QueryService) attachLinks(ctx context.Context, traceID, siteID string, 
 	if len(spans) == 0 {
 		return
 	}
-	links, err := q.GetTraceLinks(ctx, traceID, siteID)
+	links, err := q.GetTraceLinks(ctx, traceID, siteID, spansWindow(spans))
 	if err != nil || len(links) == 0 {
 		return
 	}

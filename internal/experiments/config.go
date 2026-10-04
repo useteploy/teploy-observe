@@ -9,6 +9,8 @@ package experiments
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -17,6 +19,8 @@ import (
 	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
+
+	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
 // Metric kinds. Binary is "did the user ever convert"; count is the number of
@@ -176,16 +180,48 @@ func (s *ExperimentService) LoadConfig(ctx context.Context, experimentID, siteID
 	return cfg.Normalize()
 }
 
-// RecordMetric appends one metric event (a count/mean/secondary observation)
-// for an exposed user. Like RecordConversion, an event from a user with no
-// exposure is ignored. value must be finite; binary and count goals ignore it
-// at analysis time but it is still validated and stored.
+// eventKeyRE bounds a client-supplied idempotency key.
+var eventKeyRE = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
+
+// metricEventID derives a stable event_id from an idempotency key. The id is
+// scoped to (experiment, site, user, metric) so one client key cannot collide
+// across users or metrics, and a key from one site can never suppress another
+// site's event. Without a key the id is random (no dedupe).
+func metricEventID(experimentID, siteID, userID, metric, eventKey string) string {
+	if eventKey == "" {
+		return genID()
+	}
+	h := sha256.Sum256([]byte(experimentID + "\x00" + siteID + "\x00" + userID + "\x00" + metric + "\x00" + eventKey))
+	return "k_" + hex.EncodeToString(h[:16])
+}
+
+// RecordMetric appends one metric event (see RecordMetricKeyed); it has no
+// idempotency key, so a retried call is counted again.
 func (s *ExperimentService) RecordMetric(ctx context.Context, experimentID, siteID, userID, metric string, value float64) error {
+	return s.RecordMetricKeyed(ctx, experimentID, siteID, userID, metric, value, "")
+}
+
+// RecordMetricKeyed appends one metric event (a count/mean/secondary
+// observation) for an exposed user. Like RecordConversion, an event from a user
+// with no exposure is ignored. value must be finite; binary and count goals
+// ignore it at analysis time but it is still validated and stored.
+//
+// eventKey is an optional client-supplied idempotency key (<= 64 chars of
+// [A-Za-z0-9._:-]). When set, the stored event_id is derived from it and an
+// existence check skips the insert if that id is already stored, so a client
+// retry does not double-count a count goal. The check-then-insert is not
+// atomic (the table is a plain mergetree with no unique constraint): two
+// truly concurrent submissions of the same key can both land. Retries after a
+// timeout or error, the case this exists for, are sequential.
+func (s *ExperimentService) RecordMetricKeyed(ctx context.Context, experimentID, siteID, userID, metric string, value float64, eventKey string) error {
 	if metric != PrimaryMetricKey && !metricKeyRE.MatchString(metric) {
 		return fmt.Errorf("metric must match %s", metricKeyRE.String())
 	}
 	if math.IsNaN(value) || math.IsInf(value, 0) || math.Abs(value) > maxMetricValueAbs {
 		return fmt.Errorf("value must be a finite number with magnitude <= %g", maxMetricValueAbs)
+	}
+	if eventKey != "" && !eventKeyRE.MatchString(eventKey) {
+		return fmt.Errorf("event_key must match %s", eventKeyRE.String())
 	}
 	type vrow struct {
 		Variant string `db:"variant"`
@@ -200,9 +236,26 @@ func (s *ExperimentService) RecordMetric(ctx context.Context, experimentID, site
 	if len(rows) == 0 {
 		return nil
 	}
+	eventID := metricEventID(experimentID, siteID, userID, metric, eventKey)
+	if eventKey != "" {
+		type erow struct {
+			ID string `db:"event_id"`
+		}
+		seen, err := nucleus.Query[erow](ctx, s.db.SQL(),
+			`SELECT event_id FROM experiment_metric_events
+			 WHERE experiment_id = $1 AND site_id = $2 AND metric = $3 AND event_id = $4 LIMIT 1`,
+			experimentID, siteID, metric, eventID)
+		if err != nil {
+			return err
+		}
+		if len(seen) > 0 {
+			return nil
+		}
+	}
 	_, err = s.db.SQL().Exec(ctx,
 		`INSERT INTO experiment_metric_events (event_id, tenant_id, experiment_id, site_id, user_id, metric, value, timestamp)
-		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7)`,
-		genID(), experimentID, siteID, userID, metric, strconv.FormatFloat(value, 'g', -1, 64), time.Now().UTC().UnixMilli())
+		 VALUES ($1, 'default', $2, $3, $4, $5, $6, CAST($7 AS BIGINT))`,
+		eventID, experimentID, siteID, userID, metric, strconv.FormatFloat(value, 'g', -1, 64),
+		dbutil.IntParam(time.Now().UTC().UnixMilli()))
 	return err
 }
