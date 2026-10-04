@@ -43,6 +43,12 @@ type RetentionOptions struct {
 	// ReturnEvent, when non-empty, restricts return-activity bucketing
 	// to matching event_types. Empty = any event.
 	ReturnEvent string
+	// CohortID, when non-empty, restricts retention to events whose
+	// distinct_id is a member of the cohort (see FunnelOptions.CohortID
+	// for the shared semantics and error mapping). Entities with no
+	// member event are not cohort members, including sessions-rollup
+	// entries in the default visitor-estimate path.
+	CohortID string
 }
 
 // sessionFirstLast is the minimal session data for retention's default
@@ -57,6 +63,9 @@ type sessionFirstLast struct {
 type retentionEntity struct {
 	firstTS int64          // cohort entry instant (ms)
 	buckets map[int64]bool // period buckets with qualifying activity
+	// inCohort is set when a cohort-member event was seen for the entity;
+	// only consulted when a cohort filter is active.
+	inCohort bool
 }
 
 // Retention computes cohort retention over the given time range on the
@@ -116,6 +125,10 @@ func (s *StatsService) RetentionWithOptions(ctx context.Context, siteID string, 
 		return nil, err
 	}
 	defer finish()
+	members, err := s.resolveCohortSet(qctx, siteID, opts.CohortID)
+	if err != nil {
+		return nil, err
+	}
 
 	fromMs := from.UnixMilli()
 	toMs := to.UnixMilli()
@@ -159,11 +172,15 @@ func (s *StatsService) RetentionWithOptions(ctx context.Context, siteID string, 
 		if err != nil {
 			return fmt.Errorf("retention scan: %w", err)
 		}
+		if members != nil && !members.has(r.DistinctID) {
+			return nil
+		}
 		id, ok := entityKeyOf(entity, r)
 		if !ok {
 			return nil
 		}
 		e := getEntity(id)
+		e.inCohort = true
 		isReturn := opts.ReturnEvent == "" || r.EventType == opts.ReturnEvent
 		isEntry := opts.CohortEvent == "" || r.EventType == opts.CohortEvent
 		// In the default visitor-estimate path, cohort membership comes
@@ -186,7 +203,9 @@ func (s *StatsService) RetentionWithOptions(ctx context.Context, siteID string, 
 	// fired, or — impossible in practice — a sessions row without events)
 	// are not cohort members.
 	for id, e := range entities {
-		if e.firstTS < 0 {
+		// With a cohort filter, an entity pre-seeded from the sessions
+		// rollup that never produced a member event is not a member.
+		if e.firstTS < 0 || (members != nil && !e.inCohort) {
 			delete(entities, id)
 		}
 	}

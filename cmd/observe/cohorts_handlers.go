@@ -59,6 +59,7 @@ func RegisterCohortsRoutes(
 		neutron.WithTags("cohorts"),
 		neutron.WithSummary("Re-evaluate a cohort and update member_count"),
 	)
+	registerStaticCohortRoutes(r, jwtMW, requireEditor, svc)
 }
 
 // ---------------------------------------------------------------------------
@@ -135,12 +136,9 @@ func createCohortHandler(svc *cohorts.Service) neutron.HandlerFunc[createCohortI
 		if strings.TrimSpace(in.Name) == "" {
 			return cohorts.Cohort{}, neutron.ErrBadRequest("name required")
 		}
-		if len(in.Rule.Rules) == 0 {
-			return cohorts.Cohort{}, neutron.ErrBadRequest("rule.rules must contain at least one condition")
-		}
 		c, err := svc.Create(ctx, in.SiteID, in.Name, in.Description, in.Rule)
 		if err != nil {
-			return cohorts.Cohort{}, err
+			return cohorts.Cohort{}, cohortHTTPError(err)
 		}
 		return *c, nil
 	}
@@ -153,7 +151,7 @@ func getCohortHandler(svc *cohorts.Service) neutron.HandlerFunc[cohortIDInput, c
 		}
 		c, err := svc.Get(ctx, in.SiteID, in.CohortID)
 		if err != nil {
-			return cohorts.Cohort{}, err
+			return cohorts.Cohort{}, cohortHTTPError(err)
 		}
 		if c == nil {
 			return cohorts.Cohort{}, neutron.ErrNotFound("cohort not found")
@@ -176,7 +174,7 @@ func cohortMembersHandler(svc *cohorts.Service) neutron.HandlerFunc[cohortMember
 		}
 		members, err := svc.Members(ctx, in.SiteID, in.CohortID, limit, in.Offset)
 		if err != nil {
-			return cohortMembersResult{}, err
+			return cohortMembersResult{}, cohortHTTPError(err)
 		}
 		if members == nil {
 			members = []string{}
@@ -192,7 +190,7 @@ func updateCohortHandler(svc *cohorts.Service) neutron.HandlerFunc[updateCohortI
 		}
 		c, err := svc.Update(ctx, in.SiteID, in.CohortID, in.Name, in.Description, in.Rule)
 		if err != nil {
-			return cohorts.Cohort{}, err
+			return cohorts.Cohort{}, cohortHTTPError(err)
 		}
 		return *c, nil
 	}
@@ -214,7 +212,7 @@ func refreshCohortHandler(svc *cohorts.Service) neutron.HandlerFunc[cohortIDInpu
 		}
 		c, err := svc.Refresh(ctx, in.SiteID, in.CohortID)
 		if err != nil {
-			return cohorts.Cohort{}, err
+			return cohorts.Cohort{}, cohortHTTPError(err)
 		}
 		return *c, nil
 	}
@@ -225,9 +223,12 @@ func previewCohortHandler(svc *cohorts.Service) neutron.HandlerFunc[previewCohor
 		if in.SiteID == "" {
 			return previewResult{}, neutron.ErrBadRequest("site_id required")
 		}
+		if err := cohorts.ValidateDefinition(in.Rule); err != nil {
+			return previewResult{}, cohortHTTPError(err)
+		}
 		ids, err := svc.EvaluateCohort(ctx, in.SiteID, in.Rule)
 		if err != nil {
-			return previewResult{}, neutron.ErrBadRequest(err.Error())
+			return previewResult{}, cohortHTTPError(err)
 		}
 		// Cap the sample at 10 — the UI just needs a glance, not the
 		// whole list. Members API serves the full paginated set.

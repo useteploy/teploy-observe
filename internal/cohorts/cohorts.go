@@ -48,6 +48,10 @@ import (
 // for the fixed site/time and dimension-filter parameters.
 const MaxFilterMembers = 30000
 
+// ErrNotFound is returned when a cohort does not exist for the site asked
+// about (including a cohort id that belongs to a different site).
+var ErrNotFound = errors.New("cohort not found")
+
 // ErrTooLarge is returned (wrapped) by MembersForFilter when a cohort has
 // more than MaxFilterMembers members.
 var ErrTooLarge = errors.New("cohort too large for chart filtering")
@@ -84,12 +88,18 @@ type Rule struct {
 	Value    string `json:"value,omitempty"`     // type=property
 }
 
-// Definition is the full saved cohort rule. Op is "and" for v1; "or"
-// + nesting are deferred to a phase-2 builder.
+// Definition is the full saved cohort rule. Three shapes share it (see
+// tree.go): legacy flat ({op, rules}), a tree ({op, children} with {leaf}
+// leaves) and static ({op:"static"}, membership in cohort_members).
 type Definition struct {
-	Op    string `json:"op"`
-	Rules []Rule `json:"rules"`
+	Op       string       `json:"op"`
+	Rules    []Rule       `json:"rules,omitempty"`
+	Children []Definition `json:"children,omitempty"`
+	Leaf     *Rule        `json:"leaf,omitempty"`
 }
+
+// IsStatic reports whether the definition is a static (list-backed) cohort.
+func (d Definition) IsStatic() bool { return d.Op == OpStatic }
 
 // Cohort is a saved cohort row.
 type Cohort struct {
@@ -115,7 +125,7 @@ func ParseDefinition(rule string) (Definition, error) {
 	if err := json.Unmarshal([]byte(rule), &def); err != nil {
 		return Definition{}, fmt.Errorf("invalid cohort rule json: %w", err)
 	}
-	if def.Op == "" {
+	if def.Op == "" && def.Leaf == nil {
 		def.Op = "and"
 	}
 	return def, nil
@@ -129,56 +139,73 @@ func (s *Service) EvaluateCohort(ctx context.Context, siteID string, def Definit
 	if siteID == "" {
 		return []string{}, nil
 	}
-	if def.Op == "" {
-		def.Op = "and"
+	if def.IsStatic() {
+		return nil, invalidf("a static cohort has no rule to evaluate")
 	}
-	if def.Op != "and" {
-		// Defer or / nested to phase 2 explicitly so the API is
-		// predictable. The UI never offers anything but AND for v1.
-		return nil, fmt.Errorf("cohort op %q not supported (v1 supports AND only)", def.Op)
-	}
-	if len(def.Rules) == 0 {
+	if len(def.Rules) == 0 && len(def.Children) == 0 && def.Leaf == nil {
 		return []string{}, nil
 	}
-
-	// Evaluate each rule to a set of distinct_ids, then AND-intersect.
-	// Doing this per-rule (vs one big SQL with N joins) keeps each
-	// query simple — Nucleus's optimizer is young (finding #15 family)
-	// and per-rule queries are easier to reason about.
-	var acc map[string]struct{}
-	for i, r := range def.Rules {
-		ids, err := s.evalRule(ctx, siteID, r)
-		if err != nil {
-			return nil, fmt.Errorf("rule %d (%s): %w", i, r.Type, err)
-		}
-		set := make(map[string]struct{}, len(ids))
-		for _, id := range ids {
-			if id == "" {
-				continue
-			}
-			set[id] = struct{}{}
-		}
-		if i == 0 {
-			acc = set
-			continue
-		}
-		// AND-intersect.
-		for id := range acc {
-			if _, ok := set[id]; !ok {
-				delete(acc, id)
-			}
-		}
-		if len(acc) == 0 {
-			return []string{}, nil
-		}
+	if err := validateShape(def); err != nil {
+		return nil, err
 	}
 
-	out := make([]string, 0, len(acc))
-	for id := range acc {
-		out = append(out, id)
+	// The rule is a tree (tree.go): every leaf runs one bounded query and
+	// the tree is combined with Go-side set algebra. Per-leaf queries (vs
+	// one big SQL with N joins) keep each query simple - Nucleus's
+	// optimizer is young (finding #15 family) and they are easier to
+	// reason about.
+	var universe idSet
+	env := treeEnv{
+		leaf: func(ctx context.Context, r Rule) (idSet, error) {
+			ids, err := s.evalRule(ctx, siteID, r)
+			if err != nil {
+				return nil, fmt.Errorf("rule (%s): %w", r.Type, err)
+			}
+			return toSet(ids), nil
+		},
+		universe: func(ctx context.Context) (idSet, error) {
+			if universe != nil {
+				return universe, nil
+			}
+			ids, err := s.loadUniverse(ctx, siteID)
+			if err != nil {
+				return nil, err
+			}
+			universe = toSet(ids)
+			return universe, nil
+		},
 	}
-	sort.Strings(out)
+	set, err := evalNode(ctx, normalize(def), env)
+	if err != nil {
+		return nil, err
+	}
+	return set.sorted(), nil
+}
+
+// loadUniverse returns every identified user of the site, bounded. It is
+// the complement base for "not" nodes and for the "!=" property operator.
+func (s *Service) loadUniverse(ctx context.Context, siteID string) ([]string, error) {
+	type idRow struct {
+		DistinctID string `db:"distinct_id"`
+	}
+	rows, err := nucleus.Query[idRow](ctx, s.db.SQL(), propertyUniverseSQL()+leafLimitSQL(), siteID)
+	if err != nil {
+		return nil, fmt.Errorf("cohort universe query: %w", err)
+	}
+	if len(rows) > MaxLeafRows {
+		return nil, fmt.Errorf("%w: more than %d identified users", ErrTooLarge, MaxLeafRows)
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.DistinctID)
+	}
 	return out, nil
+}
+
+// leafLimitSQL bounds a leaf query one row past MaxLeafRows so an overrun
+// is detectable (and refused) instead of silently truncated.
+func leafLimitSQL() string {
+	return " LIMIT " + strconv.Itoa(MaxLeafRows+1)
 }
 
 func (s *Service) evalRule(ctx context.Context, siteID string, r Rule) ([]string, error) {
@@ -225,10 +252,13 @@ func (s *Service) evalEventRule(ctx context.Context, siteID string, r Rule) ([]s
 	   AND event_type = $2
 	   AND timestamp >= $3
 	   AND distinct_id != ''
-	 GROUP BY distinct_id`
+	 GROUP BY distinct_id` + leafLimitSQL()
 	rows, err := nucleus.Query[countedRow](ctx, s.db.SQL(), q, siteID, r.Name, from)
 	if err != nil {
 		return nil, fmt.Errorf("event rule query: %w", err)
+	}
+	if len(rows) > MaxLeafRows {
+		return nil, fmt.Errorf("%w: event rule matched more than %d users", ErrTooLarge, MaxLeafRows)
 	}
 	out := make([]string, 0, len(rows))
 	for _, row := range rows {
@@ -261,9 +291,12 @@ func (s *Service) evalPropertyRule(ctx context.Context, siteID string, r Rule) (
 	type idRow struct {
 		DistinctID string `db:"distinct_id"`
 	}
-	matched, err := nucleus.Query[idRow](ctx, s.db.SQL(), propertyMatchSQL(r.Key), siteID, r.Value)
+	matched, err := nucleus.Query[idRow](ctx, s.db.SQL(), propertyMatchSQL(r.Key)+leafLimitSQL(), siteID, r.Value)
 	if err != nil {
 		return nil, fmt.Errorf("property rule query: %w", err)
+	}
+	if len(matched) > MaxLeafRows {
+		return nil, fmt.Errorf("%w: property rule matched more than %d users", ErrTooLarge, MaxLeafRows)
 	}
 	matchedIDs := make([]string, 0, len(matched))
 	for _, row := range matched {
@@ -281,13 +314,9 @@ func (s *Service) evalPropertyRule(ctx context.Context, siteID string, r Rule) (
 	// plain DISTINCT scans and a Go-side subtraction keep the SQL to forms
 	// the engine is known to handle (no NOT IN subquery). Events whose
 	// column is NULL/empty never match "=", so their users are kept.
-	all, err := nucleus.Query[idRow](ctx, s.db.SQL(), propertyUniverseSQL(), siteID)
+	allIDs, err := s.loadUniverse(ctx, siteID)
 	if err != nil {
-		return nil, fmt.Errorf("property rule query: %w", err)
-	}
-	allIDs := make([]string, 0, len(all))
-	for _, row := range all {
-		allIDs = append(allIDs, row.DistinctID)
+		return nil, err
 	}
 	return subtractIDs(allIDs, matchedIDs), nil
 }
@@ -388,6 +417,12 @@ func (s *Service) Create(ctx context.Context, siteID, name, description string, 
 	if siteID == "" || name == "" {
 		return nil, fmt.Errorf("site_id and name required")
 	}
+	if def.IsStatic() {
+		return nil, invalidf("static cohorts are created from a member list (CreateStatic)")
+	}
+	if err := ValidateDefinition(def); err != nil {
+		return nil, err
+	}
 	raw, err := json.Marshal(def)
 	if err != nil {
 		return nil, fmt.Errorf("marshal rule: %w", err)
@@ -485,18 +520,39 @@ func (s *Service) Update(ctx context.Context, siteID, cohortID, name, descriptio
 		return nil, err
 	}
 	if existing == nil {
-		return nil, fmt.Errorf("cohort not found")
+		return nil, ErrNotFound
 	}
 	if name == "" {
 		name = existing.Name
+	}
+	existingDef, _ := ParseDefinition(existing.Rule)
+	var count int64
+	if existingDef.IsStatic() {
+		// A static cohort keeps its list; only name/description (and a
+		// recount) change. A rule cannot be grafted onto it.
+		if def.Op != "" && !def.IsStatic() || len(def.Rules) != 0 || len(def.Children) != 0 || def.Leaf != nil {
+			return nil, invalidf("a static cohort cannot take a rule; create a rule cohort instead")
+		}
+		def = Definition{Op: OpStatic}
+		n, err := s.staticCount(ctx, siteID, cohortID)
+		if err != nil {
+			return nil, err
+		}
+		count = n
+	} else {
+		if def.IsStatic() {
+			return nil, invalidf("a rule cohort cannot become static; create a static cohort instead")
+		}
+		if err := ValidateDefinition(def); err != nil {
+			return nil, err
+		}
+		members, _ := s.EvaluateCohort(ctx, siteID, def)
+		count = int64(len(members))
 	}
 	raw, err := json.Marshal(def)
 	if err != nil {
 		return nil, fmt.Errorf("marshal rule: %w", err)
 	}
-
-	members, _ := s.EvaluateCohort(ctx, siteID, def)
-	count := int64(len(members))
 	nowMs := time.Now().UTC().UnixMilli()
 	// Force monotonic updated_at so the read-side dedup picks this row
 	// even when wall-clock didn't tick since the previous write.
@@ -529,7 +585,7 @@ func (s *Service) Refresh(ctx context.Context, siteID, cohortID string) (*Cohort
 		return nil, err
 	}
 	if existing == nil {
-		return nil, fmt.Errorf("cohort not found")
+		return nil, ErrNotFound
 	}
 	def, err := ParseDefinition(existing.Rule)
 	if err != nil {
@@ -577,13 +633,9 @@ func (s *Service) Members(ctx context.Context, siteID, cohortID string, limit, o
 		return nil, err
 	}
 	if c == nil {
-		return []string{}, nil
+		return nil, ErrNotFound
 	}
-	def, err := ParseDefinition(c.Rule)
-	if err != nil {
-		return nil, err
-	}
-	ids, err := s.EvaluateCohort(ctx, siteID, def)
+	ids, err := s.resolveMembers(ctx, c)
 	if err != nil {
 		return nil, err
 	}
@@ -603,22 +655,20 @@ func (s *Service) Members(ctx context.Context, siteID, cohortID string, limit, o
 }
 
 // MembersForFilter returns the full set of distinct_ids for a cohort,
-// used by the query pipeline to filter analytics charts. Returns an
-// empty slice for an empty / missing cohort so callers can substitute
-// an "impossible" filter without special-casing nil.
+// used by the query pipeline to filter analytics charts. An empty cohort
+// yields an empty slice (callers substitute an "impossible" filter). A
+// cohort that does not exist for THIS site - including one that belongs to
+// another site - is ErrNotFound, so the API answers 404 rather than
+// charting an empty or foreign cohort.
 func (s *Service) MembersForFilter(ctx context.Context, siteID, cohortID string) ([]string, error) {
 	c, err := s.Get(ctx, siteID, cohortID)
 	if err != nil {
 		return nil, err
 	}
 	if c == nil {
-		return []string{}, nil
+		return nil, ErrNotFound
 	}
-	def, err := ParseDefinition(c.Rule)
-	if err != nil {
-		return nil, err
-	}
-	ids, err := s.EvaluateCohort(ctx, siteID, def)
+	ids, err := s.resolveMembers(ctx, c)
 	if err != nil {
 		return nil, err
 	}
