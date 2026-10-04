@@ -4585,16 +4585,23 @@ type logSearchInput struct {
 	Query   string `query:"q"`
 	Limit   int    `query:"limit"`
 	Offset  int    `query:"offset"`
+	// LQ is the log query language expression and Cursor its keyset page
+	// token; see logs_ql_handlers.go. Absent LQ leaves the search untouched.
+	LQ     string `query:"lq"`
+	Cursor string `query:"cursor"`
 }
 
-func logSearchHandler(svc *logs.LogService) neutron.HandlerFunc[logSearchInput, []logs.Log] {
-	return func(ctx context.Context, input logSearchInput) ([]logs.Log, error) {
+func logSearchHandler(svc *logs.LogService) neutron.HandlerFunc[logSearchInput, any] {
+	return func(ctx context.Context, input logSearchInput) (any, error) {
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
 		from, to, err := parseTimeRange(input.From, input.To)
 		if err != nil {
 			return nil, neutron.ErrBadRequest(err.Error())
+		}
+		if strings.TrimSpace(input.LQ) != "" {
+			return logSearchQL(ctx, svc, input, from, to)
 		}
 		out, err := svc.SearchLogs(ctx, input.SiteID, from, to, input.Level, input.Service, input.Query, input.Limit, input.Offset)
 		return emptyOnNil(out, guardmap.HTTPError(err))

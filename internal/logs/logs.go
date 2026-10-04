@@ -359,6 +359,19 @@ func (s *LogService) SearchLogs(ctx context.Context, siteID string, from, to tim
 	}
 	defer release()
 
+	query, params := legacySearchQuery(siteID, fromMs, toMs, level, service, search, limit, offset)
+
+	out, err := nucleus.Query[Log](qctx, s.db.SQL(), query, params...)
+	if err != nil {
+		return nil, s.guard.DeadlineError(ctx, err)
+	}
+	return out, nil
+}
+
+// legacySearchQuery builds the SQL and parameters of the plain (no lq) log
+// search. It is its own function so a golden test can pin that adding the
+// query language did not change a byte of it.
+func legacySearchQuery(siteID, fromMs, toMs, level, service, search string, limit, offset int) (string, []any) {
 	where := "site_id = $1 AND timestamp >= $2 AND timestamp < $3"
 	params := []any{siteID, fromMs, toMs}
 	idx := 4
@@ -390,12 +403,7 @@ func (s *LogService) SearchLogs(ctx context.Context, siteID string, from, to tim
 		 WHERE %s
 		 ORDER BY timestamp DESC
 		 LIMIT %d OFFSET %d`, where, limit, offset)
-
-	out, err := nucleus.Query[Log](qctx, s.db.SQL(), query, params...)
-	if err != nil {
-		return nil, s.guard.DeadlineError(ctx, err)
-	}
-	return out, nil
+	return query, params
 }
 
 // LevelCount holds the count of logs for a single level.
