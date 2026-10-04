@@ -1,7 +1,9 @@
 package netsafe
 
 import (
+	"bufio"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -165,6 +167,9 @@ func TestClientWithAllowDialsWhatItWasTold(t *testing.T) {
 			if err != nil {
 				return
 			}
+			// Read the request first: answering before it arrives races the
+			// client's transport (flaky under -race).
+			_, _ = http.ReadRequest(bufio.NewReader(conn))
 			_, _ = conn.Write([]byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"))
 			conn.Close()
 		}
