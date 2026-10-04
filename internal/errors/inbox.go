@@ -49,6 +49,11 @@ var eventIDAlphabet = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
 // identity field that cannot be a stable key.
 var ErrInvalidEventID = errors.New("event_id/producer_id must match [A-Za-z0-9_-]{8,64}")
 
+// ErrBadTimestamp is a boundary rejection (400): the producer-captured
+// event time is more than 24h in the future — clock garbage that would
+// poison issue first/last-seen and retention windows if stored.
+var ErrBadTimestamp = errors.New("client timestamp rejected")
+
 // ErrEventIDConflict is the 409-class rejection (ADR §5.6): the same
 // (site, producer, event_id) was admitted with a DIFFERENT payload
 // digest. Conflicting reuse is a producer bug; it is counted, never
@@ -94,6 +99,9 @@ const (
 	InboxApplied  InboxOutcome = "applied"
 	InboxDeduped  InboxOutcome = "deduped"
 	InboxConflict InboxOutcome = "conflict"
+	// InboxSpikeDropped: thinned by spike protection (spike.go). The
+	// identified record still claims its ledger row so a retry dedupes.
+	InboxSpikeDropped InboxOutcome = "spike_dropped"
 )
 
 // ApplyInbox applies one error record under the inbox contract (ADR
@@ -116,9 +124,12 @@ const (
 // had, now bounded by retry instead of finalized by loss.
 func (s *Service) ApplyInbox(ctx context.Context, input ErrorInput, producerID, eventID, digest string) (InboxOutcome, string, error) {
 	if eventID == "" {
-		issueID, err := s.IngestErrorEvent(ctx, input)
+		issueID, dropped, err := s.ingestEvent(ctx, input)
 		if err != nil {
 			return "", "", err
+		}
+		if dropped {
+			return InboxSpikeDropped, "", nil
 		}
 		return InboxApplied, issueID, nil
 	}
@@ -153,7 +164,8 @@ func (s *Service) ApplyInbox(ctx context.Context, input ErrorInput, producerID, 
 	}
 
 	errorID, issueID, err := s.insertErrorEvent(ctx, tx.SQL(), input)
-	if err != nil {
+	dropped := errors.Is(err, ErrSpikeDropped)
+	if err != nil && !dropped {
 		_ = tx.Rollback(ctx)
 		return "", "", err
 	}
@@ -167,6 +179,10 @@ func (s *Service) ApplyInbox(ctx context.Context, input ErrorInput, producerID, 
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return "", "", fmt.Errorf("error inbox commit: %w", err)
+	}
+
+	if dropped {
+		return InboxSpikeDropped, "", nil
 	}
 
 	// FTS indexing stays non-fatal and post-commit (the legacy posture:

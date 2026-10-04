@@ -97,11 +97,11 @@ func isOpen(field string) bool {
 // units of `unit`, and reports false when the field names exactly one value
 // (in which case the period is set by a coarser field, not this one).
 //
-//	*      -> every unit
-//	*/n    -> every n units
-//	a,b,c  -> the widest gap between consecutive values (the conservative one)
-//	a-b    -> every unit across the range
-//	5      -> false, this field is pinned
+//   - -> every unit
+//     */n    -> every n units
+//     a,b,c  -> the widest gap between consecutive values (the conservative one)
+//     a-b    -> every unit across the range
+//     5      -> false, this field is pinned
 func fieldPeriod(field string, unit time.Duration) (time.Duration, bool) {
 	if isOpen(field) {
 		return unit, true

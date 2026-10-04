@@ -33,6 +33,10 @@ export interface PersonEvent {
 export interface PersonDetail {
   person: Person;
   timeline: PersonEvent[];
+  // C3: identify() traits (aliases merged, canonical wins), merged keys.
+  properties?: Record<string, string | number | boolean>;
+  aliases?: string[];
+  canonical_key?: string;
 }
 
 export interface PersonsListResult {
@@ -52,9 +56,16 @@ export interface CohortRule {
   value?: string;
 }
 
+// CohortDefinition is the stored rule. Three shapes share it: legacy flat
+// ({op:"and", rules}), a tree ({op:"and|or|not", children} with {leaf}
+// leaves, depth <= 4, <= 30 leaves) and static ({op:"static"}; the list
+// lives server-side). The form editor only builds the flat-AND shape; trees
+// are edited as JSON.
 export interface CohortDefinition {
-  op: "and";
-  rules: CohortRule[];
+  op: "and" | "or" | "not" | "static";
+  rules?: CohortRule[];
+  children?: CohortDefinition[];
+  leaf?: CohortRule;
 }
 
 export interface Cohort {
@@ -85,9 +96,17 @@ export function parseRule(raw: string): CohortDefinition {
   if (!raw) return { op: "and", rules: [] };
   try {
     const p = JSON.parse(raw);
-    if (p && p.op === "and" && Array.isArray(p.rules)) return p;
+    if (p && (p.op === "and" || p.op === "or" || p.op === "not" || p.op === "static" || p.leaf)) {
+      return p;
+    }
   } catch { /* fall through */ }
   return { op: "and", rules: [] };
+}
+
+// isFlatAnd reports whether a definition is the legacy shape the form
+// editor can round-trip.
+export function isFlatAnd(def: CohortDefinition): boolean {
+  return def.op === "and" && !def.children?.length && !def.leaf;
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +130,14 @@ export const personsApi = {
     if (opts?.includeAnonymous) q += `&include_anonymous=true`;
     return get<PersonsListResult>(`${BASE}/persons?${q}`);
   },
+  // C3: editor+ merge of fromKey into intoKey; admin-only erase. Keys go in
+  // the body so a raw identifier never appears in a URL/audit path.
+  merge: (siteId: string, fromKey: string, intoKey: string) =>
+    post<{ site_id: string; from_key: string; canonical_key: string }>(
+      `${BASE}/persons/merge`, { site_id: siteId, from_key: fromKey, into_key: intoKey }),
+  erase: (siteId: string, personKey: string) =>
+    post<{ site_id: string; erased_keys: string[]; events_deleted: boolean }>(
+      `${BASE}/persons/erase`, { site_id: siteId, person_key: personKey }),
   detail: (distinctId: string, siteId: string) =>
     get<PersonDetail>(`${BASE}/persons/${encodeURIComponent(distinctId)}?site_id=${encodeURIComponent(siteId)}`),
 };
@@ -134,6 +161,14 @@ export const cohortsApi = {
     post<Cohort>(`${BASE}/cohorts/${cohortId}/refresh?site_id=${encodeURIComponent(siteId)}`, {}),
   preview: (siteId: string, rule: CohortDefinition) =>
     post<CohortPreviewResult>(`${BASE}/cohorts/preview`, { site_id: siteId, rule }),
+  // Static cohorts (list-backed). Bodies are bounded server-side (8 MB,
+  // 100k distinct ids); the server answers 422 past the caps.
+  createStatic: (data: { site_id: string; name: string; description?: string; ids: string[] }) =>
+    post<Cohort>(`${BASE}/cohorts/static`, data),
+  addMembers: (cohortId: string, siteId: string, ids: string[]) =>
+    post<{ cohort: Cohort; changed: number }>(`${BASE}/cohorts/${cohortId}/members`, { site_id: siteId, ids }),
+  removeMembers: (cohortId: string, siteId: string, ids: string[]) =>
+    post<{ cohort: Cohort; changed: number }>(`${BASE}/cohorts/${cohortId}/members/remove`, { site_id: siteId, ids }),
   members: (cohortId: string, siteId: string, opts?: { limit?: number; offset?: number }) => {
     let q = `site_id=${encodeURIComponent(siteId)}`;
     if (opts?.limit) q += `&limit=${opts.limit}`;

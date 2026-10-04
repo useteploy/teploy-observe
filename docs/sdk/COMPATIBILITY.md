@@ -108,6 +108,79 @@ back to the shared global scope and **warns once** — in that mode, attribute
 per-request data through `withScope` (synchronous) or capture-call hints
 instead.
 
+## Sentry wire protocol (stock Sentry SDKs, no shim)
+
+Observe speaks the Sentry ingest protocol, so an unmodified Sentry SDK can
+send **error events** to Observe by changing only its DSN. This is separate
+from the shim above, which is an Observe-native client with a Sentry-shaped API.
+
+### DSN format
+
+```
+https://<observe_api_key>@<observe-host>/<site_id>
+```
+
+- `<observe_api_key>` is a **telemetry-scoped** Observe API key
+  (`obs_...`, Settings > API keys). A publish-only key is rejected (403).
+- `<site_id>` is the Observe site id. The key must belong to that site;
+  naming another site is rejected with 403 (BoundSite invariant).
+- The JavaScript SDKs reject a non-numeric project id in a DSN. For them (or
+  anyone) a numeric id of 1-12 digits is accepted as an **alias**: it names no
+  site, the key alone decides the site. `https://<key>@host/1` therefore works.
+
+Routes: `POST /api/<project>/envelope/` and `POST /api/<project>/store/`
+(trailing slash optional). The key is read from `sentry_key` (query),
+`X-Sentry-Auth`, or the `dsn` field of the envelope header, in that order.
+`gzip` and `deflate` bodies are accepted. Authentication happens before the
+body is decoded.
+
+```python
+import sentry_sdk
+sentry_sdk.init(dsn="https://obs_xxx@observe.example.com/1", release="v1.4.2")
+```
+```js
+import * as Sentry from "@sentry/browser"; // or @sentry/node
+Sentry.init({ dsn: "https://obs_xxx@observe.example.com/1", release: "v1.4.2" });
+```
+```go
+sentry.Init(sentry.ClientOptions{Dsn: "https://obs_xxx@observe.example.com/1"})
+```
+
+### What is accepted
+
+| Item | Status | Notes |
+|---|---|---|
+| `event` (exceptions, messages / `logentry`) | Accepted | Applied through the normal error pipeline: issues, grouping, FTS, source maps. |
+| `/store/` single-event JSON | Accepted | Same mapping. |
+| exception chain | Changed semantics | The last (outermost) exception is the event; earlier ones ride in `contexts.sentry.exception_chain`. |
+| stack frames incl. `in_app` | Accepted | python / node / browser / go frames. Reordered innermost-first. If no frame carries `in_app` (browser SDKs), it is inferred from the path. |
+| `release`, `environment`, `level`, `request.url` | Accepted | URL is stripped of query, fragment and credentials. |
+| tags, `contexts`, `extra`, `trace` ids | Accepted | Tags land in `contexts.tags`. Oversized values are replaced by a truncation marker. |
+| breadcrumbs | Accepted | Newest 100 kept. |
+| `user` | Changed semantics | Only `id` (else `username`, `email`) is used, as `distinct_id`, **hashed server-side** with the site salt. Email, IP and the raw user object are not stored. |
+| `fingerprint` | Changed semantics | Honored unless it uses `{{ default }}`, in which case Observe's default grouping applies. |
+| `event_id` | Accepted | Idempotency key (namespaced `sentry`); resending the same event applies once. |
+| event `timestamp` | Unsupported | Events are stamped at ingest time. |
+| `transaction`, `span`, `session`, `sessions`, `attachment`, `client_report`, `profile`, `replay_event`, `check_in`, `log`, and any unknown type | Acknowledged and dropped | 200, counted as `ignored_by_type`. Never an error, so SDKs do not retry. |
+
+### Status codes
+
+200 `{"id": "<event_id>"}` accepted (including dropped types and duplicates);
+400 malformed envelope; 401 missing or invalid key; 403 key lacks telemetry
+scope or names another site; 413 body over 5 MiB (compressed or decompressed)
+or only oversize items (limit 1 MiB per item); 415 unsupported
+`Content-Encoding`; 429 with `Retry-After` and `X-Sentry-Rate-Limits` when the
+site rate limit or error buffer is hit; 503 with `Retry-After` when error
+durability or the auth store is unavailable. At most 100 events are applied per
+envelope.
+
+### Operational notes
+
+- Not served on the separate ingest listener (`OBSERVE_INGEST_ADDR`) until its
+  allowlist gains the `/api/<project>/envelope|store` routes.
+- No CORS preflight route is registered; Sentry SDKs use simple requests.
+  Responses carry `Access-Control-Allow-Origin: *`.
+
 ## PostHog (`posthog-js` → `@teploy/observe-browser`)
 
 | posthog-js API | Status | Notes |

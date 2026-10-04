@@ -2,6 +2,7 @@ package observe
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 )
 
@@ -16,6 +17,29 @@ type SlogHandler struct {
 	level      slog.Level
 	groupAttrs []slog.Attr
 	groupName  string
+
+	// crumbLevel/crumbs enable breadcrumb recording (WithBreadcrumbs);
+	// noMirror suppresses log shipping for breadcrumb-only handlers.
+	crumbs     bool
+	crumbLevel slog.Level
+	noMirror   bool
+}
+
+// NewSlogBreadcrumbHandler returns a slog.Handler that records records at
+// or above level as breadcrumbs (attached to later CaptureException /
+// CaptureMessage calls) WITHOUT shipping them as Observe logs. If wrapped
+// is non-nil, records also flow through it.
+func (c *Client) NewSlogBreadcrumbHandler(level slog.Level, wrapped slog.Handler) *SlogHandler {
+	return &SlogHandler{client: c, wrapped: wrapped, crumbs: true, crumbLevel: level, noMirror: true}
+}
+
+// WithBreadcrumbs returns a copy that ALSO records records at or above
+// level as breadcrumbs, in addition to mirroring logs.
+func (h *SlogHandler) WithBreadcrumbs(level slog.Level) *SlogHandler {
+	clone := *h
+	clone.crumbs = true
+	clone.crumbLevel = level
+	return &clone
 }
 
 // NewSlogHandler returns a slog.Handler that mirrors records to Observe at
@@ -30,7 +54,10 @@ func (h *SlogHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	if h.wrapped != nil && h.wrapped.Enabled(ctx, level) {
 		return true
 	}
-	return level >= h.level
+	if h.crumbs && level >= h.crumbLevel {
+		return true
+	}
+	return !h.noMirror && level >= h.level
 }
 
 // Handle writes the record. Errors from Observe ingest are swallowed — the
@@ -43,7 +70,11 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 		wrapErr = h.wrapped.Handle(ctx, r)
 	}
 
-	if r.Level >= h.level {
+	if h.crumbs && r.Level >= h.crumbLevel {
+		h.recordBreadcrumb(r)
+	}
+
+	if !h.noMirror && r.Level >= h.level {
 		attrs := make(map[string]any)
 		// Include any group-scoped attrs added via WithAttrs.
 		for _, a := range h.groupAttrs {
@@ -71,6 +102,60 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 		h.client.admitLog(entry)
 	}
 	return wrapErr
+}
+
+// recordBreadcrumb records r as a breadcrumb; attrs become its data.
+func (h *SlogHandler) recordBreadcrumb(r slog.Record) {
+	defer func() { _ = recover() }()
+	data := make(map[string]any)
+	for _, a := range h.groupAttrs {
+		crumbAttr(data, "", a)
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		crumbAttr(data, "", a)
+		return true
+	})
+	lvl := "debug"
+	switch {
+	case r.Level >= slog.LevelError:
+		lvl = "error"
+	case r.Level >= slog.LevelWarn:
+		lvl = "warning"
+	case r.Level >= slog.LevelInfo:
+		lvl = "info"
+	}
+	h.client.AddBreadcrumb(Breadcrumb{
+		Type:      "log",
+		Category:  "slog",
+		Message:   r.Message,
+		Level:     lvl,
+		Data:      data,
+		Timestamp: r.Time.UnixMilli(),
+	})
+}
+
+// crumbAttr flattens an attr (groups become dotted keys) into data,
+// rendering errors and Stringers as text so they survive JSON.
+func crumbAttr(m map[string]any, prefix string, a slog.Attr) {
+	a.Value = a.Value.Resolve()
+	if a.Equal(slog.Attr{}) {
+		return
+	}
+	key := prefix + a.Key
+	if a.Value.Kind() == slog.KindGroup {
+		for _, g := range a.Value.Group() {
+			crumbAttr(m, key+".", g)
+		}
+		return
+	}
+	switch v := a.Value.Any().(type) {
+	case error:
+		m[key] = v.Error()
+	case fmt.Stringer:
+		m[key] = v.String()
+	default:
+		m[key] = v
+	}
 }
 
 // WithAttrs returns a handler whose records will have the given attrs added.

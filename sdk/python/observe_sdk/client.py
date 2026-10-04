@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import math
 import os
 import threading
@@ -16,6 +17,14 @@ from typing import Any, Dict, Iterator, List, Optional
 from urllib import request as urlrequest
 from urllib.error import URLError
 import uuid
+
+from .breadcrumbs import (
+    DEFAULT_MAX_BREADCRUMBS,
+    BeforeBreadcrumb,
+    BreadcrumbBuffer,
+    BreadcrumbHandler,
+)
+from . import flags as _flags
 
 # Wire protocol version this SDK speaks (F12/F19 idempotent delivery).
 PROTOCOL_VERSION = 2
@@ -51,6 +60,14 @@ class Options:
     # dropped and counted as a loss.
     max_send_attempts: int = 6
     retry_backoff: float = 1.0
+    # Breadcrumbs attached to captured exceptions/messages. Ring size, an
+    # optional scrub/drop hook (return None to drop; a raising hook drops
+    # the breadcrumb), and opt-in recording of ``logging`` records at or
+    # above ``logging_breadcrumb_level`` via a handler on the root logger.
+    max_breadcrumbs: int = DEFAULT_MAX_BREADCRUMBS
+    before_breadcrumb: Optional[BeforeBreadcrumb] = None
+    logging_breadcrumbs: bool = False
+    logging_breadcrumb_level: int = logging.WARNING
 
 
 # Server-side /logs/batch cap; entries beyond it are a 400.
@@ -105,6 +122,12 @@ def _validate_options(opts: "Options") -> None:
             raise ValueError(f"{name} must be a finite number in [{lower}, {upper}]")
     if type(opts.max_send_attempts) is not int or not 1 <= opts.max_send_attempts <= 100:
         raise ValueError("max_send_attempts must be an integer in [1, 100]")
+    if type(opts.max_breadcrumbs) is not int or not 1 <= opts.max_breadcrumbs <= 1000:
+        raise ValueError("max_breadcrumbs must be an integer in [1, 1000]")
+    if opts.before_breadcrumb is not None and not callable(opts.before_breadcrumb):
+        raise ValueError("before_breadcrumb must be callable")
+    if type(opts.logging_breadcrumb_level) is not int:
+        raise ValueError("logging_breadcrumb_level must be an int (a logging level)")
 
 
 class Client:
@@ -162,6 +185,14 @@ class Client:
         self._identity: ContextVar[Optional[str]] = ContextVar(
             f"observe_identity_{id(self)}", default=None
         )
+        self._crumbs = BreadcrumbBuffer(
+            self.opts.max_breadcrumbs,
+            self.opts.before_breadcrumb,
+            on_error=lambda exc: self.on_error(exc) if self.on_error else None,
+        )
+        self._crumb_handler: Optional[BreadcrumbHandler] = None
+        if self.opts.logging_breadcrumbs:
+            self.install_logging_breadcrumbs(self.opts.logging_breadcrumb_level)
         self._thread = threading.Thread(
             target=self._loop, name="observe-flush", daemon=True
         )
@@ -256,6 +287,98 @@ class Client:
         """Clear the active distinct_id for the current context (e.g. logout)."""
         self._identity.set(None)
 
+    def add_breadcrumb(
+        self,
+        message: str,
+        *,
+        category: str = "default",
+        type: str = "default",  # noqa: A002 - wire field name
+        level: str = "info",
+        data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record a breadcrumb attached to later captured errors. Never raises.
+
+        ``level`` is one of debug/info/warning/error. ``data`` must be
+        JSON-serializable (anything else is replaced; over 1 KiB is
+        truncated). The buffer is a process-wide ring (default 100).
+        """
+        self._crumbs.add(message, category=category, type=type, level=level, data=data)
+
+    def clear_breadcrumbs(self) -> None:
+        self._crumbs.clear()
+
+    def install_logging_breadcrumbs(
+        self, level: int = logging.WARNING, logger: Optional[logging.Logger] = None
+    ) -> logging.Handler:
+        """Record ``logging`` records >= ``level`` as breadcrumbs (opt-in).
+
+        Installs one handler on ``logger`` (default: the root logger).
+        Calling it again replaces the previous handler. ``close()`` removes
+        it. Records from the SDK's own ``observe_sdk`` logger are ignored.
+        """
+        self.remove_logging_breadcrumbs()
+        target = logger if logger is not None else logging.getLogger()
+        handler = BreadcrumbHandler(self._crumbs, level)
+        target.addHandler(handler)
+        self._crumb_handler = handler
+        self._crumb_logger = target
+        return handler
+
+    def remove_logging_breadcrumbs(self) -> None:
+        handler = self._crumb_handler
+        self._crumb_handler = None
+        if handler is not None:
+            try:
+                self._crumb_logger.removeHandler(handler)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def capture_message(
+        self,
+        message: str,
+        *,
+        level: str = "info",
+        release: Optional[str] = None,
+        trace_id: Optional[str] = None,
+        span_id: Optional[str] = None,
+    ) -> None:
+        """Submit a message (no exception) as an issue event. Sends immediately.
+
+        ``level`` is "error", "warning" or "info" (default). Breadcrumbs
+        recorded so far are attached.
+        """
+        if level not in ("error", "warning", "info"):
+            raise ValueError("level must be one of: error, warning, info")
+        payload = self._error_payload(
+            "Message", str(message), level, release, trace_id, span_id, []
+        )
+        payload["mechanism"] = "message"
+        self._post("/api/v1/errors", payload)
+
+    def evaluate_flag(
+        self,
+        key: str,
+        *,
+        user_id: Optional[str] = None,
+        attributes: Optional[Dict[str, Any]] = None,
+        default: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate a feature flag (POST /api/v1/flags/evaluate). Never raises.
+
+        Returns ``{"key", "enabled", "variant"?, "reason", "source", ...}``.
+        On any failure (network, timeout, non-2xx, malformed body, or a
+        server fail-safe answer) it returns ``default`` (a dict like
+        ``{"enabled": True, "variant": "control"}``; disabled when omitted)
+        with ``source == "default"`` and the cause in ``error``. ``user_id``
+        defaults to the current identity. ``timeout`` defaults to the
+        smaller of the client timeout and 3 seconds. This records no
+        exposure and sends no other telemetry.
+        """
+        return _flags.evaluate(
+            self, key, user_id=user_id, attributes=attributes, default=default, timeout=timeout
+        )
+
     def capture_exception(
         self,
         exc: BaseException,
@@ -273,14 +396,30 @@ class Client:
         error was captured inside a traced operation, enabling exact
         trace<->error correlation in the trace detail view.
         """
-        payload = {
+        payload = self._error_payload(
+            type(exc).__name__, str(exc) or type(exc).__name__, "error",
+            release, trace_id, span_id, _stack_frames(exc),
+        )
+        self._post("/api/v1/errors", payload)
+
+    def _error_payload(
+        self,
+        error_type: str,
+        error_value: str,
+        level: str,
+        release: Optional[str],
+        trace_id: Optional[str],
+        span_id: Optional[str],
+        stack: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
             "site_id": self.opts.site_id,
-            "error_type": type(exc).__name__,
-            "error_value": str(exc) or type(exc).__name__,
+            "error_type": error_type,
+            "error_value": error_value,
             "release_tag": release or self.opts.release or "",
             "environment": self.opts.environment or "",
-            "level": "error",
-            "stack_trace": _stack_frames(exc),
+            "level": level,
+            "stack_trace": stack,
         }
         ident = self._identity.get()
         if ident:
@@ -289,7 +428,10 @@ class Client:
             payload["trace_id"] = trace_id
         if span_id:
             payload["span_id"] = span_id
-        self._post("/api/v1/errors", payload)
+        crumbs = self._crumbs.snapshot()
+        if crumbs:
+            payload["breadcrumbs"] = crumbs
+        return payload
 
     def log(self, level: str, message: str, **fields: Any) -> None:
         entry = {
@@ -459,6 +601,7 @@ class Client:
                 if self._state == "closed":
                     return
                 self._state = "closing"
+            self.remove_logging_breadcrumbs()
             self._stop.set()
             join_timeout = (
                 timeout if timeout is not None
@@ -660,6 +803,49 @@ def capture_exception(
     span_id: Optional[str] = None,
 ) -> None:
     _require().capture_exception(exc, release=release, trace_id=trace_id, span_id=span_id)
+
+
+def capture_message(
+    message: str,
+    *,
+    level: str = "info",
+    release: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    span_id: Optional[str] = None,
+) -> None:
+    _require().capture_message(message, level=level, release=release, trace_id=trace_id, span_id=span_id)
+
+
+def add_breadcrumb(
+    message: str,
+    *,
+    category: str = "default",
+    type: str = "default",  # noqa: A002 - wire field name
+    level: str = "info",
+    data: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Record a breadcrumb on the default client; a no-op before init()."""
+    if _default is not None:
+        _default.add_breadcrumb(message, category=category, type=type, level=level, data=data)
+
+
+def clear_breadcrumbs() -> None:
+    if _default is not None:
+        _default.clear_breadcrumbs()
+
+
+def evaluate_flag(
+    key: str,
+    *,
+    user_id: Optional[str] = None,
+    attributes: Optional[Dict[str, Any]] = None,
+    default: Optional[Dict[str, Any]] = None,
+    timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Evaluate a flag on the default client; the default is returned before init()."""
+    if _default is None:
+        return _flags._fallback(key, default, "sdk not initialized")
+    return _default.evaluate_flag(key, user_id=user_id, attributes=attributes, default=default, timeout=timeout)
 
 
 def log(level: str, message: str, **fields: Any) -> None:

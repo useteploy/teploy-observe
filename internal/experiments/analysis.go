@@ -47,6 +47,10 @@ type PairwiseResult struct {
 	HolmAdjustedP float64 `json:"holm_adjusted_p"`
 	Significant   bool    `json:"significant"` // survives Holm at alphaOmnibus
 	UsedFisher    bool    `json:"used_fisher"`
+	// T and DF are set for continuous metrics (Welch's t statistic and its
+	// Welch-Satterthwaite degrees of freedom); absent for binary arms.
+	T  float64 `json:"t,omitempty"`
+	DF float64 `json:"df,omitempty"`
 }
 
 // AnalysisResult is the honest reporting layer: every gate that stands
@@ -63,6 +67,50 @@ type AnalysisResult struct {
 	SRM             SRMDiagnostic    `json:"srm"`
 	Pairwise        []PairwiseResult `json:"pairwise_vs_control"`
 	WinnerRule      string           `json:"winner_rule"`
+	// PlannedSamplePerArm is the design-time per-arm n from the MDE
+	// sample-size endpoint, when the experiment declares one. The horizon is
+	// the larger of it and min_sample unless HorizonOverridden.
+	PlannedSamplePerArm int `json:"planned_sample_per_arm,omitempty"`
+	// HorizonOverridden is true when the planned-sample part of the horizon
+	// was waived (explicit override). The min_sample floor is never waived.
+	HorizonOverridden bool `json:"horizon_overridden,omitempty"`
+}
+
+// horizonSpec is the fixed-horizon contract for one analysis: the winner gate
+// stays shut until every arm reaches Required().
+type horizonSpec struct {
+	MinSample int // experiment min_sample, per arm; never waived
+	Planned   int // design-time per-arm n (0 = none declared)
+	Floor     int // metric-kind floor (continuous metrics)
+	Override  bool
+}
+
+// Required is the per-arm n at which the horizon is met.
+func (h horizonSpec) Required() int {
+	n := h.MinSample
+	if h.Floor > n {
+		n = h.Floor
+	}
+	if !h.Override && h.Planned > n {
+		n = h.Planned
+	}
+	return n
+}
+
+// peekingWarning is the fixed-horizon anti-peeking message, empty once the
+// horizon is met or when no arm has data yet.
+func peekingWarning(minArm int64, anyData bool, h horizonSpec) string {
+	req := h.Required()
+	if !anyData || minArm >= int64(req) {
+		return ""
+	}
+	msg := fmt.Sprintf("results requested before the planned sample size (smallest arm %d of %d per arm). "+
+		"This analysis is fixed-horizon, not sequential: repeatedly checking p-values and stopping when one dips below 0.05 inflates the false-positive rate. "+
+		"Treat these numbers as a progress report and decide at the planned horizon.", minArm, req)
+	if h.Override {
+		msg += " The planned-sample gate is overridden; the min_sample floor still applies."
+	}
+	return msg
 }
 
 // analyze runs the full decided pipeline over per-arm counts, with the
@@ -73,7 +121,14 @@ type AnalysisResult struct {
 // badge before every arm reaches minSamplePerArm. Estimates and intervals
 // are always computed and displayed regardless.
 func analyze(arms []VariantResult, weights []float64, minSamplePerArm int) AnalysisResult {
-	res := AnalysisResult{MinSamplePerArm: minSamplePerArm, Test: "none"}
+	return analyzeWithHorizon(arms, weights, horizonSpec{MinSample: minSamplePerArm})
+}
+
+// analyzeWithHorizon is analyze with the full horizon contract (planned
+// sample size and its override).
+func analyzeWithHorizon(arms []VariantResult, weights []float64, h horizonSpec) AnalysisResult {
+	minSamplePerArm := h.Required()
+	res := AnalysisResult{MinSamplePerArm: minSamplePerArm, Test: "none", PlannedSamplePerArm: h.Planned, HorizonOverridden: h.Override && h.Planned > 0}
 	k := len(arms)
 	if k < 2 {
 		res.WinnerRule = "fewer than two arms have exposures"
@@ -86,23 +141,7 @@ func analyze(arms []VariantResult, weights []float64, minSamplePerArm int) Analy
 		exposures[i] = a.Exposures
 		conversions[i] = a.Conversions
 	}
-	res.MinArmExposures = exposures[0]
-	for _, n := range exposures {
-		if n < res.MinArmExposures {
-			res.MinArmExposures = n
-		}
-	}
-	res.HorizonMet = res.MinArmExposures >= int64(minSamplePerArm)
-
-	// SRM: goodness-of-fit against the declared allocation.
-	if w := append([]float64(nil), weights...); len(w) == k {
-		stat, p := srmGoodnessOfFit(exposures, w)
-		res.SRM = SRMDiagnostic{ChiSquare: stat, PValue: p}
-		if p < alphaSRM {
-			res.SRM.Detected = true
-			res.SRM.Note = "assignment is broken; do not trust these results"
-		}
-	}
+	applyHorizonAndSRM(&res, exposures, weights, minSamplePerArm)
 
 	// Omnibus test with Fisher fallback for two arms and small cells.
 	omni := chiSquareOmnibus(exposures, conversions)
@@ -178,18 +217,118 @@ func analyze(arms []VariantResult, weights []float64, minSamplePerArm int) Analy
 	return res
 }
 
+// applyHorizonAndSRM fills the per-arm horizon gate and the SRM diagnostic,
+// which depend only on the exposure counts (shared by binary and continuous).
+func applyHorizonAndSRM(res *AnalysisResult, exposures []int64, weights []float64, required int) {
+	k := len(exposures)
+	res.MinArmExposures = exposures[0]
+	for _, n := range exposures {
+		if n < res.MinArmExposures {
+			res.MinArmExposures = n
+		}
+	}
+	res.HorizonMet = res.MinArmExposures >= int64(required)
+
+	// SRM: goodness-of-fit against the declared allocation.
+	if w := append([]float64(nil), weights...); len(w) == k {
+		stat, p := srmGoodnessOfFit(exposures, w)
+		res.SRM = SRMDiagnostic{ChiSquare: stat, PValue: p}
+		if p < alphaSRM {
+			res.SRM.Detected = true
+			res.SRM.Note = "assignment is broken; do not trust these results"
+		}
+	}
+}
+
+// analyzeContinuous is the continuous-metric (count / mean) counterpart of
+// analyzeWithHorizon: the same horizon and SRM gates, then Welch's t-test of
+// every arm against the control (arms[0]) with Holm correction across the
+// arms. sums are the per-arm value summaries aligned with arms. There is no
+// omnibus test: Holm over the pairwise family already controls the
+// family-wise error, and the headline p_value is the smallest Holm-adjusted
+// p. Higher is better; the winner is the highest-mean arm whose comparison
+// survives Holm.
+func analyzeContinuous(arms []VariantResult, sums []contSummary, weights []float64, h horizonSpec) AnalysisResult {
+	h.Floor = minContinuousN
+	res := AnalysisResult{MinSamplePerArm: h.Required(), Test: "none", PlannedSamplePerArm: h.Planned, HorizonOverridden: h.Override && h.Planned > 0}
+	k := len(arms)
+	if k < 2 {
+		res.WinnerRule = "fewer than two arms have exposures"
+		return res
+	}
+	exposures := make([]int64, k)
+	for i, a := range arms {
+		exposures[i] = a.Exposures
+	}
+	applyHorizonAndSRM(&res, exposures, weights, res.MinSamplePerArm)
+	res.Test = "welch-t"
+
+	rawP := make([]float64, 0, k-1)
+	welch := make([]WelchResult, 0, k-1)
+	for i := 1; i < k; i++ {
+		w := welchTest(sums[0], sums[i], alphaOmnibus)
+		welch = append(welch, w)
+		rawP = append(rawP, w.PValue)
+	}
+	adj := holmAdjusted(rawP)
+	minAdj := 1.0
+	for i, w := range welch {
+		pr := PairwiseResult{
+			Variant:       arms[i+1].Variant,
+			LiftAbsolute:  w.Diff,
+			CiLow:         w.CILow,
+			CiHigh:        w.CIHigh,
+			PValue:        w.PValue,
+			HolmAdjustedP: adj[i],
+			Significant:   adj[i] <= alphaOmnibus,
+			T:             w.T,
+			DF:            w.DF,
+		}
+		if sums[0].Mean != 0 {
+			pr.LiftRelative = w.Diff / sums[0].Mean
+		}
+		if adj[i] < minAdj {
+			minAdj = adj[i]
+		}
+		res.Pairwise = append(res.Pairwise, pr)
+	}
+	res.PValue = minAdj
+
+	res.WinnerRule = "winner requires: per-arm horizon (min " + strconv.Itoa(res.MinSamplePerArm) +
+		" per arm), no SRM, winner's Welch t-test vs control surviving Holm at " + strconv.FormatFloat(alphaOmnibus, 'f', -1, 64)
+	switch {
+	case !res.HorizonMet:
+		res.WinnerRule += fmt.Sprintf(" - waiting for horizon (min arm %d of %d)", res.MinArmExposures, res.MinSamplePerArm)
+	case res.SRM.Detected:
+		res.WinnerRule += " - SRM detected: " + res.SRM.Note
+	case res.PValue > alphaOmnibus:
+		res.WinnerRule += fmt.Sprintf(" - no arm distinguishable from control (smallest Holm p=%.4g)", res.PValue)
+	}
+	return res
+}
+
 // winnerFrom returns the winner arm given the analysis and arms (control at
 // index 0): the best observed conversion-rate arm whose pairwise-vs-control
 // comparison survived Holm. Empty string when no winner may be claimed. If
 // the single best-rate arm fails Holm there is no winner: the omnibus fired
 // but no specific arm is distinguishable from control.
 func winnerFrom(res AnalysisResult, arms []VariantResult) string {
+	scores := make([]float64, len(arms))
+	for i, a := range arms {
+		scores[i] = a.ConversionRate
+	}
+	return winnerByScore(res, arms, scores)
+}
+
+// winnerByScore is winnerFrom over an arbitrary higher-is-better score per arm
+// (conversion rate for binary goals, the arm mean for continuous goals).
+func winnerByScore(res AnalysisResult, arms []VariantResult, scores []float64) string {
 	if !res.HorizonMet || res.SRM.Detected || res.Test == "none" || res.PValue >= alphaOmnibus {
 		return ""
 	}
 	bestIdx := -1
-	for i, v := range arms[1:] {
-		if bestIdx == -1 || v.ConversionRate > arms[1+bestIdx].ConversionRate {
+	for i := range arms[1:] {
+		if bestIdx == -1 || scores[1+i] > scores[1+bestIdx] {
 			bestIdx = i
 		}
 	}

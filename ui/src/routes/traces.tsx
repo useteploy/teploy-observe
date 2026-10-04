@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { tracesApi } from "../api/traces.js";
 import type { Service, Operation, Span, TraceSummary, TraceError, ServiceDependency, PerformanceIssue, FunnelStep, FunnelResult, SavedFunnel } from "../api/traces.js";
+import { ATTR_OPS, canAddChip, chipLabel, MAX_ATTR_FILTERS } from "../lib/traceSearch.js";
+import type { AttrChip, AttrOp } from "../lib/traceSearch.js";
 import SearchInput from "../components/shared/SearchInput.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
@@ -474,6 +476,11 @@ function TraceListView({ traces, onSelectTrace }: { traces: TraceSummary[]; onSe
               <span>{t.span_count} spans</span>
               <span style={{ fontVariantNumeric: "tabular-nums" }}>{formatDuration(t.duration_ms)}</span>
               {hasError && <StatusBadge status="error" size="sm" />}
+              {t.root_missing && (
+                <span data-testid="trace-root-missing"
+                  title="No root span was found; this row is the earliest span of the trace"
+                  style={{ fontSize: "11px", color: "var(--obs-text-muted)", border: "1px solid var(--obs-border)", borderRadius: "4px", padding: "0 4px" }}>root missing</span>
+              )}
               <span style={{ fontSize: "11px", color: "var(--obs-text-muted)" }}>{formatDate(t.start_time)}</span>
             </div>
           </div>
@@ -495,21 +502,43 @@ function SearchFilters({ siteId, from, to, services, onSelectTrace }: {
   const [filterMinDuration, setFilterMinDuration] = useState("");
   const [filterMaxDuration, setFilterMaxDuration] = useState("");
   const [results, setResults] = useState<TraceSummary[]>([]);
+  const [truncatedNote, setTruncatedNote] = useState("");
+  const [chips, setChips] = useState<AttrChip[]>([]);
+  const [chipKey, setChipKey] = useState("");
+  const [chipOp, setChipOp] = useState<AttrOp>("eq");
+  const [chipValue, setChipValue] = useState("");
+  const [chipError, setChipError] = useState("");
+  const [includeOrphans, setIncludeOrphans] = useState(false);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
+
+  const addChip = () => {
+    const chip: AttrChip = { key: chipKey.trim(), op: chipOp, value: chipOp === "exists" ? "" : chipValue };
+    const err = canAddChip(chips, chip);
+    if (err) { setChipError(err); return; }
+    setChips([...chips, chip]);
+    setChipKey(""); setChipValue(""); setChipError("");
+  };
 
   const handleSearch = async () => {
     setLoading(true);
     setSearched(true);
+    setTruncatedNote("");
     try {
-      const opts: any = {};
-      if (filterService) opts.service = filterService;
-      if (filterOperation) opts.operation = filterOperation;
-      if (filterStatus) opts.status = filterStatus;
-      if (filterMinDuration) opts.min_duration = parseInt(filterMinDuration);
-      if (filterMaxDuration) opts.max_duration = parseInt(filterMaxDuration);
-      const data = await tracesApi.search(siteId, from, to, opts);
-      setResults(data || []);
+      const data = await tracesApi.searchAdvanced({
+        siteId, from, to,
+        service: filterService || undefined,
+        operation: filterOperation || undefined,
+        status: filterStatus || undefined,
+        minDuration: filterMinDuration ? parseInt(filterMinDuration) : undefined,
+        maxDuration: filterMaxDuration ? parseInt(filterMaxDuration) : undefined,
+        attrs: chips,
+        includeOrphans,
+      });
+      setResults(data?.traces || []);
+      if (data?.truncated) {
+        setTruncatedNote(data.truncated_reason || "Results were cut by a search bound and may be incomplete");
+      }
     } catch { setResults([]); }
     finally { setLoading(false); }
   };
@@ -544,10 +573,51 @@ function SearchFilters({ siteId, from, to, services, onSelectTrace }: {
             onInput={(e) => setFilterMaxDuration((e.target as HTMLInputElement).value)}
             style={{ flex: 1 }} />
         </div>
+        <div data-testid="trace-attr-filters" style={{ marginTop: "8px" }}>
+          <div style={{ display: "flex", gap: "8px" }}>
+            <input class="obs-input" placeholder="Attribute key (http.route)" value={chipKey}
+              onInput={(e) => setChipKey((e.target as HTMLInputElement).value)}
+              style={{ flex: 2 }} />
+            <select class="obs-select" value={chipOp}
+              onChange={(e) => setChipOp((e.target as HTMLSelectElement).value as AttrOp)}>
+              {ATTR_OPS.map(op => <option key={op} value={op}>{op}</option>)}
+            </select>
+            {chipOp !== "exists" && (
+              <input class="obs-input" placeholder="Value" value={chipValue}
+                onInput={(e) => setChipValue((e.target as HTMLInputElement).value)}
+                style={{ flex: 2 }} />
+            )}
+            <button class="obs-btn" onClick={addChip} disabled={chips.length >= MAX_ATTR_FILTERS}>Add</button>
+          </div>
+          {chipError && <div style={{ fontSize: "12px", color: "var(--obs-danger)", marginTop: "4px" }}>{chipError}</div>}
+          {chips.length > 0 && (
+            <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
+              {chips.map((c, i) => (
+                <span key={i} data-testid="trace-attr-chip"
+                  style={{ fontSize: "12px", cursor: "pointer", border: "1px solid var(--obs-border)", borderRadius: "10px", padding: "1px 8px" }}
+                  title="Remove filter"
+                  onClick={() => setChips(chips.filter((_, j) => j !== i))}>
+                  {chipLabel(c)} x
+                </span>
+              ))}
+            </div>
+          )}
+          <label style={{ display: "flex", gap: "6px", alignItems: "center", fontSize: "12px", marginTop: "6px" }}>
+            <input type="checkbox" checked={includeOrphans}
+              onChange={(e) => setIncludeOrphans((e.target as HTMLInputElement).checked)} />
+            Include traces with a missing root span
+          </label>
+        </div>
         <button class="obs-btn obs-btn--primary" onClick={handleSearch} style={{ marginTop: "8px", width: "100%" }}>
           Search Traces
         </button>
       </div>
+
+      {truncatedNote && (
+        <div class="obs-empty-state" data-testid="trace-search-truncated" style={{ padding: "8px", fontSize: "12px" }}>
+          Truncated: {truncatedNote}
+        </div>
+      )}
 
       {loading ? <ListSkeleton /> : searched && results.length === 0 ? (
         <div class="obs-empty-state">No traces match the filters</div>

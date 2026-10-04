@@ -2,6 +2,7 @@ package errors
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -59,6 +60,16 @@ func TestErrorBufferPushFreezesInput(t *testing.T) {
 	if err := b.Push("s", in); err != nil {
 		t.Fatalf("push rejected: %v", err)
 	}
+	// A captured client timestamp more than 24h in the future is refused
+	// at admission (the producer gets a 400, not a silent flush failure).
+	future := time.Now().Add(48 * time.Hour).UnixMilli()
+	if err := b.Push("s", ErrorInput{SiteID: "s", ErrorType: "T", ClientTimestamp: future}); err == nil || !errors.Is(err, ErrBadTimestamp) {
+		t.Fatalf("future client timestamp must be refused with ErrBadTimestamp, got %v", err)
+	}
+	past := time.Now().Add(-2 * time.Hour).UnixMilli()
+	if err := b.Push("s", ErrorInput{SiteID: "s", ErrorType: "T", ClientTimestamp: past}); err != nil {
+		t.Fatalf("past client timestamp must be accepted: %v", err)
+	}
 	inner["k"] = "mutated"
 	in.ErrorType = "MutatedAfterCapture"
 
@@ -82,9 +93,27 @@ func TestErrorBufferPushFreezesInput(t *testing.T) {
 // ErrorInput cannot fail for plain fields, but a >cap record must reject).
 func TestErrorBufferRejectsOversizedRecord(t *testing.T) {
 	b := NewErrorBuffer(nil, 50000, 100, time.Hour, slog.New(slog.DiscardHandler))
-	huge := strings.Repeat("x", maxErrorRecordBytes+1)
-	if err := b.Push("s", ErrorInput{ErrorValue: huge}); err == nil {
+	// Each string stays under the scrubber's per-string bound (a single
+	// longer string is truncated, not rejected); the sum exceeds the cap.
+	part := strings.Repeat("x", 60<<10)
+	extra := map[string]any{}
+	for i := 0; i < 6; i++ {
+		extra[string(rune('a'+i))] = part
+	}
+	if err := b.Push("s", ErrorInput{ErrorValue: "v", Extra: extra}); err == nil {
 		t.Fatal("oversized record admitted")
+	}
+}
+
+// A single enormous string is bounded by the scrubber rather than rejected.
+func TestErrorBufferTruncatesHugeStringWhenScrubbing(t *testing.T) {
+	b := NewErrorBuffer(nil, 50000, 100, time.Hour, slog.New(slog.DiscardHandler))
+	huge := strings.Repeat("x", maxErrorRecordBytes+1)
+	if err := b.Push("s", ErrorInput{ErrorValue: huge}); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if len(b.events[0].Body) > maxErrorRecordBytes {
+		t.Fatal("frozen record not bounded")
 	}
 }
 

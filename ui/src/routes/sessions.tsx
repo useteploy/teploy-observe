@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "preact/hooks";
+import { useState, useEffect, useCallback, useMemo } from "preact/hooks";
 import { replaysApi } from "../api/replays.js";
 import type { ReplaySession, ReplayEvent } from "../api/replays.js";
 import type { Issue } from "../api/errors.js";
@@ -8,6 +8,7 @@ import EmptyState from "../components/shared/EmptyState.js";
 import { get } from "../api/helpers.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import CodeBlock from "../components/shared/CodeBlock.js";
+import { extractCaptured, upTo, formatOffset } from "../utils/replayCapture.js";
 import Pagination from "../components/shared/Pagination.js";
 import { useFilters } from "../hooks/useFilters.js";
 import "../styles/sessions.css";
@@ -64,6 +65,44 @@ function SessionsSkeleton() {
   );
 }
 
+// ─── Console / network panels (opt-in capture; synced to the player clock) ───
+
+function CapturePanels({ captured, elapsedMs }: { captured: ReturnType<typeof extractCaptured>; elapsedMs: number }) {
+  const logs = upTo(captured.console, elapsedMs);
+  const reqs = upTo(captured.network, elapsedMs);
+  const rowStyle = { display: "flex", gap: "10px", fontSize: "12px", padding: "3px 0", fontFamily: "var(--obs-font-mono, monospace)" };
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: "16px", marginBottom: "16px" }}>
+      <div>
+        <h2 style={{ fontSize: "13px", fontWeight: 600, marginBottom: "8px" }}>Console ({logs.length}/{captured.console.length})</h2>
+        <div style={{ maxHeight: "240px", overflow: "auto" }}>
+          {logs.map((c, i) => (
+            <div key={i} style={{ ...rowStyle, color: c.level === "error" ? "var(--obs-danger)" : "var(--obs-text)" }}>
+              <span style={{ color: "var(--obs-text-muted)" }}>{formatOffset(c.offsetMs)}</span>
+              <span>{c.level}</span>
+              <span style={{ wordBreak: "break-word" }}>{c.message}{c.truncated ? " ..." : ""}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div>
+        <h2 style={{ fontSize: "13px", fontWeight: 600, marginBottom: "8px" }}>Network ({reqs.length}/{captured.network.length})</h2>
+        <div style={{ maxHeight: "240px", overflow: "auto" }}>
+          {reqs.map((n, i) => (
+            <div key={i} style={{ ...rowStyle, color: n.status === 0 || n.status >= 400 ? "var(--obs-danger)" : "var(--obs-text)" }}>
+              <span style={{ color: "var(--obs-text-muted)" }}>{formatOffset(n.offsetMs)}</span>
+              <span>{n.method}</span>
+              <span>{n.status || "failed"}</span>
+              <span style={{ wordBreak: "break-all" }}>{n.url}</span>
+              <span style={{ color: "var(--obs-text-muted)" }}>{n.durationMs}ms</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Session Detail ───
 
 function SessionDetail({ session, onBack }: { session: ReplaySession; onBack: () => void }) {
@@ -73,6 +112,8 @@ function SessionDetail({ session, onBack }: { session: ReplaySession; onBack: ()
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [showPlayer, setShowPlayer] = useState(false);
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const captured = useMemo(() => extractCaptured(events), [events]);
 
   useEffect(() => {
     setLoading(true);
@@ -146,7 +187,12 @@ function SessionDetail({ session, onBack }: { session: ReplaySession; onBack: ()
           onClose={() => setShowPlayer(false)}
           siteId={session.site_id}
           url={session.url}
+          onTime={setElapsedMs}
         />
+      )}
+
+      {(captured.console.length > 0 || captured.network.length > 0) && (
+        <CapturePanels captured={captured} elapsedMs={showPlayer ? elapsedMs : Infinity} />
       )}
 
       {issues.length > 0 && (
@@ -285,13 +331,12 @@ export default function SessionsPage() {
   const fetchSessions = useCallback(async () => {
     setLoading(true);
     try {
-      let data = await replaysApi.list(siteId, from, to, {
+      const data = await replaysApi.list(siteId, from, to, {
         limit: PAGE_SIZE,
         offset: (page - 1) * PAGE_SIZE,
+        // Server-side filter so pagination counts only matching sessions.
+        hasErrors: errorOnly,
       });
-      if (errorOnly) {
-        data = (data || []).filter(s => s.has_error);
-      }
       setSessions(data || []);
     } catch { setSessions([]); }
     finally { setLoading(false); }

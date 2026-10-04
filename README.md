@@ -210,8 +210,14 @@ Declared limits, fixture-tested scale points, and where to read them live:
 ### APM / distributed tracing
 - OTLP ingest over HTTP for all three signals — traces, metrics and logs — in
   both wire formats (`application/x-protobuf`, which is what OTLP exporters send
-  by default, and `application/json`). gRPC is not served; point an exporter at
-  HTTP transport or put a Collector in front.
+  by default, and `application/json`). OTLP/gRPC is also supported, opt-in via
+  `OBSERVE_OTLP_GRPC_ADDR` (plaintext unless TLS is configured, so keep it
+  behind a proxy or tailnet); see `docs/operations/otlp-grpc.md`.
+- Trace search filters on service, operation, status, duration and up to five
+  span-attribute filters (`GET /api/v1/traces/search-advanced`), with an
+  opt-in mode that surfaces traces missing a root span; span links are stored.
+  Attribute filtering is verified in Go over a bounded candidate window — see
+  `docs/operations/trace-search.md`.
 - Service list with RED metrics, waterfall + flame-graph views,
   dependency map, p50/p95/p99 latency.
 
@@ -253,9 +259,22 @@ Declared limits, fixture-tested scale points, and where to read them live:
   a row.
 
 ### Product tools
-- Feature flags (boolean + multivariate, rollout %, user targeting).
-- A/B experiments (frequentist p-value + Bayesian probability-to-beat).
-- Surveys, custom dashboards with panels.
+- Feature flags (boolean + multivariate, ordered condition groups with
+  per-group rollout, more operators, per-variant JSON payloads), evaluated
+  over `POST /api/v1/flags/evaluate`; `GET /api/v1/flags/config` (API key)
+  serves definitions for local evaluation, with a reference evaluator and
+  conformance vectors (`docs/flags.md`). The browser, Python and Go SDKs ship
+  flag clients.
+- A/B experiments: binary, count and mean/revenue primary metrics (chi-square /
+  Fisher / Welch, Holm correction, SRM check), informational secondary
+  metrics, contaminated-user exclusion, Bayesian probability-to-beat, and a
+  fixed-horizon peeking guard (`docs/experiments.md`).
+- Surveys with server-side targeting and an on-page widget
+  (`/t/observe-surveys.js`, Shadow DOM, accessible; `docs/sdk/SURVEYS.md`),
+  custom dashboards with panels, and cohorts with AND/OR/NOT rule trees plus
+  static (imported) cohorts, usable in stats, funnels and retention.
+- Persons: stored identify traits, explicit alias/merge, and erasure
+  tombstones (events are not deleted; see `docs/IDENTITY_MODEL_ADR.md`).
 
 ### Platform
 - **RBAC** enforced — JWT carries a role claim (`admin` / `editor` /
@@ -295,10 +314,30 @@ Declared limits, fixture-tested scale points, and where to read them live:
 - **Per-site rate limiting** — each site has its own token bucket. One
   noisy site can't starve a quiet one. Admin-editable via
   `PUT /api/v1/sites/{id}/ratelimit`.
-- Alerting (threshold per metric, cooldown, silence). Alert-fire
-  auto-opens an incident marker.
-- Integrations (Jira, GitHub, PagerDuty, Slack, email) + webhooks.
-- SSO / SAML, email digests, data export (CSV/JSON).
+- Alerting (threshold rules on `pageviews`, `visitors`, error count/rate,
+  trace error rate, trace p95 latency, log error count and uptime failures,
+  with hysteresis, an explicit no-data state, a minimum-samples gate, cooldown
+  and silence). Trace, log and uptime rules are site-wide. Alert-fire
+  auto-opens an incident marker and delivers to webhooks; set
+  `OBSERVE_ALERTS_TO_INTEGRATIONS=true` to also send FIRE events to the
+  site's integrations (fire-only: recovery does not resolve tickets).
+- Integrations (Jira, GitHub, PagerDuty, Slack, email) are configured at
+  `/api/v1/integrations` and now fire for real on a **new issue** and on a
+  **regression** (resolved or snoozed issue reopened): asynchronous bounded
+  queue, SSRF-checked destinations, per-issue cooldown and a per-integration
+  and per-site hourly budget. Events are held in memory (lost if the process
+  stops) and every attempt is recorded in the delivery history. Email now
+  refuses non-public SMTP hosts.
+- Sentry-protocol ingest: stock Sentry SDKs can use an Observe DSN
+  (`https://<obs_key>@host/<site_id>`) for **error events**; transactions,
+  sessions, replays, profiles and attachments are acknowledged and dropped
+  (`docs/sdk/COMPATIBILITY.md`).
+- Error tracking: server-side secret/PII scrubbing before the WAL write,
+  issue merge/unmerge and assignment (editor+), and spike protection that
+  samples floods without dropping new issues or regressions.
+- SSO via OIDC (see below). SAML is not available: the SAML callback is
+  disabled and returns 501 (`internal/sso/sso.go`). Also email digests and
+  data export (CSV/JSON).
 - SQL query explorer with lexer-guarded read-only enforcement
   (rejects `/* comment */ INSERT ...` and stacked statements).
 - `POST /api/v1/query/explain` returns the Nucleus plan.
@@ -381,10 +420,30 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 | `OBSERVE_AUDIT_KEY` | | Audit-chain HMAC key: base64 (>=32 decoded bytes) or raw (>=32 bytes). Unset uses the persistent generated key at `$OBSERVE_DATA_DIR/audit.key`. |
 | `OBSERVE_AUDIT_KEYRING` | | Comma-separated `id:base64key` historical audit keys kept for verification through rotation (startup logs the ready-to-paste entry for the file key). |
 | `OBSERVE_REPLAY_ASSET_HOSTS` | | Comma-separated hostnames the replay asset proxy may fetch images from (empty disables proxied replay images). |
+| `OBSERVE_SMTP_PRIVATE_HOSTS` | | Comma-separated relay hostnames email integrations may dial even though they resolve to private addresses (internal/tailnet relays). Empty keeps the public-only SSRF posture. |
 | `OBSERVE_REQUIRE_WAL` | (unset) | Set to `true` (or `1`) to refuse to start when WAL-backed ingestion durability is unavailable, instead of degrading to memory-only. |
 | `OBSERVE_RAW_RETENTION_DAYS` | `30` | Raw event retention. Also the window over which visitor counts are exact from raw events; past it they are counted from the `sessions` table (90 days), and past both the dashboard says which window the figure covers. |
 | `OBSERVE_HOURLY_RETENTION_DAYS` | `365` | Hourly rollup retention. |
 | `OBSERVE_LLM_RETENTION_DAYS` | `30` | LLM trace retention, including stored prompts/completions. Must be at least 1. Cleanup runs daily; historical model-price catalog entries are retained. Logical expiry does not guarantee database files immediately shrink. |
+| `OBSERVE_METRICS_RETENTION_DAYS` | `30` | OTLP metric point (`metric_points`) retention. Must be at least 1. |
+| `OBSERVE_INFRA_RETENTION_DAYS` | `30` | Host metric (`host_metrics`) retention. Must be at least 1. |
+| `OBSERVE_UPTIME_RETENTION_DAYS` | `90` | Uptime check result (`uptime_results`) retention. Must be at least 1. Fixed windows on the same daily cleanup: `performance_issues` 90 days (by last detection), `service_dependencies` 30 days. |
+| `OBSERVE_ALERTS_TO_INTEGRATIONS` | (unset) | Set to `true` to also send alert FIRE events to the site's integrations (PagerDuty, Jira, GitHub, email, Slack). Recovery and repeat events are not sent. |
+| `OBSERVE_ISSUE_NOTIFY_PER_HOUR` | `10` | Max new-issue/regression notifications per integration and per site per hour (`0` = unlimited); excess is suppressed with one summary notification. |
+| `OBSERVE_SCRUB_KEYS` | | Extra comma-separated key fragments scrubbed from error events (defaults already cover password, token, secret, authorization, cookie, card, and similar). |
+| `OBSERVE_SCRUB_DISABLE` | (unset) | `true` turns server-side error scrubbing off. Default is on. |
+| `OBSERVE_ERROR_SPIKE_ISSUE_PER_MIN` | `1000` | Per-issue events per minute before sampling (`0` = off). |
+| `OBSERVE_ERROR_SPIKE_SITE_PER_MIN` | `10000` | Per-site events per minute before sampling (`0` = off). |
+| `OBSERVE_ERROR_SPIKE_NEW_ISSUE_CAP` | `300` | New-issue/regression admissions per site per minute (`0` = off). |
+| `OBSERVE_ERROR_SPIKE_SAMPLE` | `10` | Keep 1 in N events past a spike cap. |
+| `OBSERVE_ERROR_SPIKE_DISABLE` | (unset) | `true` disables spike protection. |
+| `OBSERVE_FLAG_EVAL_DEDUP_SECONDS` | `300` | Window in which repeated `/flags/evaluate` calls for the same (site, flag, variant, user) write one `flag_evaluations` row (`0` = write every evaluation). |
+| `OBSERVE_FLAG_EVAL_DEDUP_MAX` | `50000` | Max entries in the evaluation dedupe cache. |
+| `OBSERVE_OTLP_GRPC_ADDR` | (disabled) | OTLP/gRPC listener address, e.g. `127.0.0.1:4317`. Plaintext unless TLS is set. |
+| `OBSERVE_OTLP_GRPC_TLS_CERT` | | PEM certificate for the gRPC listener (set with KEY). |
+| `OBSERVE_OTLP_GRPC_TLS_KEY` | | PEM private key for the gRPC listener. |
+| `OBSERVE_OTLP_GRPC_MAX_RECV_MB` | `4` | Max gRPC message size in MiB (ceiling 10). |
+| `OBSERVE_OTLP_GRPC_MAX_CONNS` | `1024` | Concurrent connection cap for the gRPC listener. |
 | `OBSERVE_LOG_ROUTES` | `0` | Set to `1` to print route table at boot. |
 | `OBSERVE_SMTP_HOST` | | SMTP server for email reports. |
 | `OBSERVE_SMTP_PORT` | `587` | SMTP port. |

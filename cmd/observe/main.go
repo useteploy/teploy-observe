@@ -39,6 +39,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/feedback"
 	"github.com/useteploy/teploy-observe/internal/flags"
 	"github.com/useteploy/teploy-observe/internal/groups"
+	"github.com/useteploy/teploy-observe/internal/guardmap"
 	"github.com/useteploy/teploy-observe/internal/heatmaps"
 	"github.com/useteploy/teploy-observe/internal/incidents"
 	"github.com/useteploy/teploy-observe/internal/infra"
@@ -76,7 +77,6 @@ import (
 var (
 	version = "dev"
 	commit  = "unknown"
-	date    = "unknown"
 )
 
 // otlpMaxBodyBytes caps a single OTLP export request. Higher than the 2 MiB
@@ -104,6 +104,9 @@ func main() {
 			return
 		case "restore":
 			runRestore(cfg, logger)
+			return
+		case "migrate":
+			runMigrate(cfg, logger)
 			return
 		case "version":
 			fmt.Println("observe " + version)
@@ -374,6 +377,8 @@ func main() {
 	// they dedupe, processed outbox intents prune, dead letters never do.
 	retentionPolicies := append(jobs.DefaultPolicies(cfg.RawRetentionDays, cfg.HourlyRetentionDays, cfg.LLMRetentionDays),
 		jobs.DefaultLedgerPolicies(cfg.ErrorInboxRetentionDays, cfg.ReplayBatchesRetentionDays, cfg.DerivedOutboxRetentionDays)...)
+	retentionPolicies = append(retentionPolicies,
+		jobs.DefaultTelemetryPolicies(cfg.MetricsRetentionDays, cfg.InfraRetentionDays, cfg.UptimeRetentionDays)...)
 
 	// Stats service
 	statsSvc := query.NewStatsService(db).WithRetention(query.RetentionWindows{
@@ -433,7 +438,12 @@ func main() {
 
 	// Feature expansion services
 	reportSvc := reports.NewReportService(db, logger)
+	integrations.SetSMTPPrivateHosts(os.Getenv("OBSERVE_SMTP_PRIVATE_HOSTS"))
 	integrationSvc := integrations.NewIntegrationService(db, logger)
+	// New-issue and regression events fire the site's integrations. Wired
+	// after the demo seed above so seeded issues do not page anyone.
+	issueNotifier := wireIssueNotifications(issueSvc, integrationSvc, cfg.PublicURL)
+	wireAlertsToIntegrations(alertSvc, integrationSvc, logger)
 	feedbackSvc := feedback.NewFeedbackService(db)
 	viewSvc := views.NewViewService(db)
 	explorerSvc := explorer.NewExplorerService(db)
@@ -443,17 +453,24 @@ func main() {
 	groupSvc := groups.NewGroupService(db)
 	ssoSvc := sso.NewSSOService(db)
 	flagSvc := flags.NewFlagService(db)
-	experimentSvc := experiments.NewExperimentService(db)
+	flagSvc.WithEvalDedup(flags.LoadEvalDedupFromEnv(os.Getenv))
+	experimentSvc := experiments.NewExperimentService(db).WithPrivacy(siteSvc.PrivacyConfig, cfg.SessionSalt)
 	surveySvc := surveys.NewSurveyService(db, cfg.SessionSalt, siteSvc)
 	logSvc := logs.NewLogService(db)
 	logSvc.SetPipelines(pipelineSvc)
+	// The same limiter and budgets guard the log and metric read paths.
+	logSvc.WithQueryGuard(queryLimiter, queryBudgets)
+	metricsSvc.WithQueryGuard(queryLimiter, queryBudgets)
+	// O12: trace reads share the stats limiter and budgets.
+	traceQuery.WithQueryGuard(queryLimiter, queryBudgets)
 	uptimeSvc := monitoring.NewUptimeService(db, logger)
 	cronSvc := monitoring.NewCronService(db, logger)
 	linkSvc := tracking.NewLinkService(db)
 	dashSvc := dashboards.NewDashboardService(db).WithMetrics(metricsSvc)
 	replaySvc := replays.NewReplayService(db).
 		WithLogger(logger).
-		WithPrivacy(siteSvc.PrivacyConfig, cfg.SessionSalt)
+		WithPrivacy(siteSvc.PrivacyConfig, cfg.SessionSalt).
+		WithQueryGuard(queryLimiter, queryBudgets)
 	heatmapsSvc := heatmaps.NewService(db)
 	aiSvc := aiquery.NewService(db, logger)
 	aiSchema := aiquery.NewSchemaCard(db)
@@ -641,6 +658,15 @@ func main() {
 				return nil
 			},
 		}),
+		// Registered BEFORE error-buffer: hooks stop in reverse order, so the
+		// error buffer's final flush (which can raise new-issue and
+		// regression events) runs before the dispatcher shuts down.
+		neutron.WithLifecycle(neutron.LifecycleHook{
+			Name: "issue-notifications",
+			OnStop: func(ctx context.Context) error {
+				return shutdownIssueNotifications(issueNotifier)
+			},
+		}),
 		neutron.WithLifecycle(neutron.LifecycleHook{
 			Name: "error-buffer",
 			OnStart: func(ctx context.Context) error {
@@ -818,7 +844,11 @@ func main() {
 				return ingestSrv.Shutdown(ctx)
 			},
 		}),
+		// OTLP/gRPC receiver (OBSERVE_OTLP_GRPC_ADDR, default off); configured
+		// below once its dependencies exist. See otlpgrpc_wiring.go.
+		neutron.WithLifecycle(otlpGRPCHook(logger)),
 		neutron.WithMiddleware(ingest.RequestInfoMiddleware(ingest.ParseTrustedProxies(cfg.TrustedProxies))),
+		neutron.WithMiddleware(securityHeadersMiddleware(strings.HasPrefix(cfg.PublicURL, "https://"))),
 		neutron.WithMiddleware(config.DemoModeMiddleware(cfg.DemoMode)),
 		// Record every admin mutation to the audit trail (comprehensive
 		// "who did what" coverage without wiring each handler). Runs after
@@ -854,6 +884,7 @@ func main() {
 		rateLimit = 1000
 	}
 	rateLimiter := ingest.NewRateLimiter(rateLimit, time.Second, rateLimit*2)
+	configureOTLPGRPC(logger, authSvc, rateLimiter, traceIngest, metricsSvc, logSvc)
 	// Hydrate per-site caps from the sites table so the first ingest after
 	// a restart honors admin overrides.
 	if caps, err := siteSvc.ListRatelimits(ctx); err == nil {
@@ -877,8 +908,8 @@ func main() {
 	// and 204 — this covers /api/v1/events, /api/v1/events/batch, /api/v1/errors, etc.
 	r.HandleFunc("OPTIONS /api/v1/{path...}", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key, If-None-Match")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -888,6 +919,7 @@ func main() {
 	// (O01 ADR §5.2) stamps Retry-After on the durable-mode 503s (disk
 	// high-water refusal, WAL latch) — the OTLP handlers' convention.
 	apiKeyMW := auth.APIKeyAuthMiddleware(authSvc)
+	registerSentryRoutes(r, authSvc, errorBuf, rateLimiter, logger)
 	ingestGroup := r.Group("/api/v1", ingestCORS, apiKeyMW, rateLimiter.Middleware, neutron.BodyLimit(2<<20), ingest.RetryAfterOnUnavailable(5*time.Second))
 	neutron.Post(ingestGroup, "/events", ingest.Handler(buf, cfg.SessionSalt, siteSvc),
 		neutron.WithTags("ingest"),
@@ -1035,6 +1067,7 @@ func main() {
 		neutron.WithTags("traces"),
 		neutron.WithSummary("Get service dependency graph"),
 	)
+	RegisterTraceSearchRoutes(traceGroup, traceQuery)
 
 	// --- Platform API (JWT auth, admin-only for writes) ---
 	// AUD-008: the stream-ticket mint sits here (JWT-authed) rather than on
@@ -1393,6 +1426,7 @@ func main() {
 	// browser evaluation path.
 	flagEvalLimiter := ingest.NewRateLimiter(60, time.Minute, 120)
 	r.HandleFunc("POST /api/v1/flags/evaluate", flagEvaluateHandler(flagSvc, flagEvalLimiter))
+	r.Handle("GET /api/v1/flags/config", flagConfigRoute(apiKeyMW, rateLimiter.Middleware, flagSvc))
 
 	// --- Experiments (JWT auth; editor+ writes) ---
 	expGroup := r.Group("/api/v1/experiments", jwtMW)
@@ -1425,10 +1459,9 @@ func main() {
 		neutron.WithTags("surveys"), neutron.WithSummary("List survey responses"))
 	neutron.Get(surveyGroup, "/{survey_id}/stats", surveyStatsHandler(surveySvc),
 		neutron.WithTags("surveys"), neutron.WithSummary("Survey exposure/response stats"))
-	// Public: get active surveys, record exposure, submit response
-	r.HandleFunc("GET /api/v1/surveys/active", activeSurveysPublicHandler(surveySvc))
-	r.HandleFunc("POST /api/v1/surveys/expose", surveyExposeHandler(surveySvc))
-	r.HandleFunc("POST /api/v1/surveys/respond", surveyRespondHandler(surveySvc))
+	// Public: get active surveys, record exposure, submit response, and the
+	// widget script (surveys_routes.go).
+	registerSurveyPublicRoutes(r, surveySvc)
 
 	// --- Release health (JWT auth) ---
 	releaseHealthSvc := obserrors.NewReleaseHealthService(db)
@@ -1705,6 +1738,13 @@ func main() {
 		// conflicting-id / pending (plus the legacy queued/bytes backlog
 		// fields and replayed-on-restart).
 		health["errors"] = errorBuf.Stats()
+		// Source-map resolution outcomes per frame (hit / no map for the
+		// release+file / map without a covering mapping / read error).
+		health["sourcemaps"] = sourcemaps.Stats()
+		// New-issue / regression integration notifications: queue depth,
+		// delivered / failed / timed-out, and the overflow and cooldown
+		// suppression counters.
+		health["issue_notifications"] = issueNotifier.Stats()
 		// O08: flag-evaluation condition counters — how many evaluations
 		// could not read their config (unavailable) and how many flags
 		// were quarantined from evaluation by invalid stored config.
@@ -1802,13 +1842,21 @@ func main() {
 	// C2 Wave 4: aggregate over events.distinct_id. Read-only; no editor
 	// gating needed. Single-line wiring matches the metrics / boards
 	// convention above.
-	RegisterPersonsRoutes(r, jwtMW, personsSvc)
+	// C3: properties (telemetry key), merge (editor+), erase (admin).
+	RegisterPersonsRoutes(r, PersonsRouteDeps{
+		JWT: jwtMW, Editor: requireEditor, Admin: requireAdmin,
+		Ingest: ingestGroup, Svc: personsSvc,
+		Privacy: siteSvc, GlobalSalt: cfg.SessionSalt,
+		Actor: func(req *http.Request) string { return requestActor(authSvc, req) },
+	})
 
 	// --- Cohorts API ---
 	// C2 Wave 4: behavioural grouping. Owns its own table (migration 023)
 	// and exposes MembersForFilter to the stats service for ?cohort_id=
 	// filtering across every analytics chart.
 	RegisterCohortsRoutes(r, jwtMW, requireEditor, cohortsSvc)
+	RegisterIssueAdminRoutes(r, jwtMW, requireEditor, issueSvc, func(req *http.Request) string { return requestActor(authSvc, req) })
+	RegisterExperimentMetricRoutes(r, ingestGroup, jwtMW, requireEditor, experimentSvc)
 
 	// SPA catch-all: serve index.html for all non-API, non-asset GET requests.
 	// This must be registered last so API routes take precedence.
@@ -1862,6 +1910,7 @@ Usage:
   teploy-observe              Start the HTTP server (default).
   teploy-observe backup       Stream a tar archive of all tables to stdout.
   teploy-observe restore      Read a tar archive from stdin and insert into tables.
+  teploy-observe migrate      Apply migrations without seeding (restore runbook step).
   observe upgrade             Verify and install a release through systemd.
   observe reindex             Rebuild the FTS index from error_events.
   observe version             Print the Observe version.
@@ -1967,6 +2016,29 @@ func runBackup(cfg config.Config, logger *slog.Logger) {
 		fmt.Fprintf(os.Stderr, "backup completed with errors: %v\n", err)
 		os.Exit(2)
 	}
+}
+
+// runMigrate applies the migration ladder and exits without seeding. The
+// restore runbook needs it: `observe restore` refuses a non-empty target,
+// while the server seeds the default site and bootstrap admin at boot — so
+// a database the server has ever started against can never be restored
+// into. The isolated-restore procedure is: fresh database, `observe
+// migrate`, `observe restore`, then start the server (which finds the
+// restored admin and skips seeding).
+func runMigrate(cfg config.Config, logger *slog.Logger) {
+	db := connectForCLI(cfg, logger)
+	defer db.Close()
+
+	report, err := schema.ApplyWithAdoption(context.Background(), db)
+	if err != nil {
+		logger.Error("migrate failed", "err", err)
+		os.Exit(1)
+	}
+	if report != nil {
+		logger.Info("legacy migration history adopted",
+			"verified", len(report.Verified), "unverified", len(report.Unverified))
+	}
+	logger.Info("migrations complete")
 }
 
 func runRestore(cfg config.Config, logger *slog.Logger) {
@@ -2531,7 +2603,7 @@ func setSiteRatelimitHandler(siteSvc *sites.SiteService, rl *ingest.RateLimiter)
 			return setSiteRatelimitResult{}, err
 		}
 		rl.SetSiteCap(input.SiteID, input.RatePerSecond)
-		return setSiteRatelimitResult{SiteID: input.SiteID, RatePerSecond: input.RatePerSecond}, nil
+		return setSiteRatelimitResult(input), nil
 	}
 }
 
@@ -2777,6 +2849,8 @@ func errorIngestHandler(buf *obserrors.ErrorBuffer) neutron.HandlerFunc[obserror
 				return obserrors.ErrorResponse{}, neutron.ErrConflict(err.Error())
 			case errors.Is(err, obserrors.ErrInvalidEventID):
 				return obserrors.ErrorResponse{}, neutron.ErrBadRequest(err.Error())
+			case errors.Is(err, obserrors.ErrBadTimestamp):
+				return obserrors.ErrorResponse{}, neutron.ErrBadRequest(err.Error())
 			case errors.Is(err, obserrors.ErrErrorBufferFull):
 				return obserrors.ErrorResponse{}, neutron.ErrRateLimited("error buffer full")
 			default:
@@ -3015,6 +3089,11 @@ func llmPricesSetHandler(svc *llm.LLMService) neutron.HandlerFunc[llm.CatalogEnt
 
 // --- Infra handlers ---
 
+// infraReportHandler is deliberately kept in sync with the live raw route
+// even though only the raw handler is mounted (audit F07): if the typed
+// route is ever re-mounted, it must not reintroduce the site-binding gap.
+//
+//lint:ignore U1000 reference twin of the mounted raw route (audit F07)
 func infraReportHandler(svc *infra.InfraService) neutron.HandlerFunc[infra.MetricInput, map[string]string] {
 	return func(ctx context.Context, input infra.MetricInput) (map[string]string, error) {
 		// Audit F07: same site binding as the live raw route below — kept
@@ -3155,29 +3234,6 @@ type addMemberInput struct {
 func addGroupMemberHandler(svc *groups.GroupService) neutron.HandlerFunc[addMemberInput, neutron.Empty] {
 	return func(ctx context.Context, input addMemberInput) (neutron.Empty, error) {
 		return neutron.Empty{}, svc.AddMember(ctx, input.SiteID, input.GroupID, input.SessionID, input.UserID)
-	}
-}
-
-// --- Correlation handler ---
-
-type correlationInput struct {
-	SiteID string `query:"site_id"`
-	Target string `query:"target"`
-	From   string `query:"from"`
-	To     string `query:"to"`
-}
-
-func correlationHandler(svc *query.StatsService) neutron.HandlerFunc[correlationInput, []query.Correlation] {
-	return func(ctx context.Context, input correlationInput) ([]query.Correlation, error) {
-		from, to, err := parseTimeRange(input.From, input.To)
-		if err != nil {
-			return nil, neutron.ErrBadRequest(err.Error())
-		}
-		target := input.Target
-		if target == "" {
-			target = "signup"
-		}
-		return emptyOnNil(svc.CorrelationAnalysis(ctx, input.SiteID, target, from, to))
 	}
 }
 
@@ -3860,6 +3916,8 @@ func stopExperimentHandler(svc *experiments.ExperimentService) neutron.HandlerFu
 type experimentResultsInput struct {
 	ExperimentID string `path:"experiment_id"`
 	SiteID       string `query:"site_id"`
+	// AllowEarly=true waives the planned-sample winner gate for this request.
+	AllowEarly string `query:"allow_early"`
 }
 
 type experimentSampleSizeInput struct {
@@ -3915,7 +3973,8 @@ func experimentSampleSizeHandler() neutron.HandlerFunc[experimentSampleSizeInput
 
 func experimentResultsHandler(svc *experiments.ExperimentService) neutron.HandlerFunc[experimentResultsInput, experiments.ExperimentResults] {
 	return func(ctx context.Context, input experimentResultsInput) (experiments.ExperimentResults, error) {
-		r, err := svc.Results(ctx, input.ExperimentID, input.SiteID)
+		r, err := svc.ResultsWithOptions(ctx, input.ExperimentID, input.SiteID,
+			experiments.ResultsOptions{AllowEarly: input.AllowEarly == "true"})
 		if err != nil {
 			return experiments.ExperimentResults{}, err
 		}
@@ -4031,27 +4090,6 @@ func surveyResponsesHandler(svc *surveys.SurveyService) neutron.HandlerFunc[surv
 // form-style endpoints (survey responses, feedback) accept.
 const publicFormMaxBodyBytes = 64 << 10 // 64 KiB
 
-// OBS-004: GetActive's error was discarded (`_`), so a database outage looked
-// identical to "this site genuinely has no active surveys" — both rendered as
-// 200 []. Surface the failure as a real error instead.
-func activeSurveysPublicHandler(svc *surveys.SurveyService) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		siteID := r.URL.Query().Get("site_id")
-		active, err := svc.GetActive(r.Context(), siteID)
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		if err != nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(map[string]string{"error": "active surveys temporarily unavailable"})
-			return
-		}
-		if active == nil {
-			active = []surveys.Survey{}
-		}
-		json.NewEncoder(w).Encode(active)
-	}
-}
-
 type surveyRespondInput struct {
 	SurveyID   string         `json:"survey_id"`
 	SiteID     string         `json:"site_id"`
@@ -4095,8 +4133,7 @@ func surveyRespondHandler(svc *surveys.SurveyService) http.HandlerFunc {
 			input.ResponseID, input.Answers,
 			ingest.ClientIPFromContext(r.Context()), ingest.UserAgentFromContext(r.Context()))
 		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+			writeSurveyRespondError(w, err)
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"ok": true, "response_id": res.ResponseID, "deduped": res.Deduped})
@@ -4542,10 +4579,14 @@ type logSearchInput struct {
 	Query   string `query:"q"`
 	Limit   int    `query:"limit"`
 	Offset  int    `query:"offset"`
+	// LQ is the log query language expression and Cursor its keyset page
+	// token; see logs_ql_handlers.go. Absent LQ leaves the search untouched.
+	LQ     string `query:"lq"`
+	Cursor string `query:"cursor"`
 }
 
-func logSearchHandler(svc *logs.LogService) neutron.HandlerFunc[logSearchInput, []logs.Log] {
-	return func(ctx context.Context, input logSearchInput) ([]logs.Log, error) {
+func logSearchHandler(svc *logs.LogService) neutron.HandlerFunc[logSearchInput, any] {
+	return func(ctx context.Context, input logSearchInput) (any, error) {
 		if input.SiteID == "" {
 			return nil, neutron.ErrBadRequest("site_id required")
 		}
@@ -4553,7 +4594,11 @@ func logSearchHandler(svc *logs.LogService) neutron.HandlerFunc[logSearchInput, 
 		if err != nil {
 			return nil, neutron.ErrBadRequest(err.Error())
 		}
-		return emptyOnNil(svc.SearchLogs(ctx, input.SiteID, from, to, input.Level, input.Service, input.Query, input.Limit, input.Offset))
+		if strings.TrimSpace(input.LQ) != "" {
+			return logSearchQL(ctx, svc, input, from, to)
+		}
+		out, err := svc.SearchLogs(ctx, input.SiteID, from, to, input.Level, input.Service, input.Query, input.Limit, input.Offset)
+		return emptyOnNil(out, guardmap.HTTPError(err))
 	}
 }
 
@@ -4572,7 +4617,8 @@ func logStatsHandler(svc *logs.LogService) neutron.HandlerFunc[logStatsInput, []
 		if err != nil {
 			return nil, neutron.ErrBadRequest(err.Error())
 		}
-		return emptyOnNil(svc.LogStats(ctx, input.SiteID, from, to))
+		out, err := svc.LogStats(ctx, input.SiteID, from, to)
+		return emptyOnNil(out, guardmap.HTTPError(err))
 	}
 }
 
@@ -4592,7 +4638,8 @@ func logHistogramHandler(svc *logs.LogService) neutron.HandlerFunc[logHistogramI
 		if err != nil {
 			return nil, neutron.ErrBadRequest(err.Error())
 		}
-		return emptyOnNil(svc.Histogram(ctx, input.SiteID, from, to, input.BucketMs))
+		out, err := svc.Histogram(ctx, input.SiteID, from, to, input.BucketMs)
+		return emptyOnNil(out, guardmap.HTTPError(err))
 	}
 }
 
@@ -5235,6 +5282,11 @@ type listReplaysInput struct {
 	To     string `query:"to"`
 	Limit  int    `query:"limit"`
 	Offset int    `query:"offset"`
+	// Optional filters (see parseReplayFilter).
+	HasErrors   string `query:"has_errors"`
+	MinDuration string `query:"min_duration"`
+	URLContains string `query:"url_contains"`
+	DistinctID  string `query:"distinct_id"`
 }
 
 func listReplaysHandler(svc *replays.ReplayService) neutron.HandlerFunc[listReplaysInput, []replays.ReplaySession] {
@@ -5243,7 +5295,12 @@ func listReplaysHandler(svc *replays.ReplayService) neutron.HandlerFunc[listRepl
 		if err != nil {
 			return nil, neutron.ErrBadRequest(err.Error())
 		}
-		return emptyOnNil(svc.ListReplays(ctx, input.SiteID, from, to, input.Limit, input.Offset))
+		filter, err := parseReplayFilter(input.HasErrors, input.MinDuration, input.URLContains, input.DistinctID)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := svc.ListReplaysFiltered(ctx, input.SiteID, from, to, input.Limit, input.Offset, filter)
+		return emptyOnNil(rows, err)
 	}
 }
 
@@ -5589,9 +5646,7 @@ type createAlertRuleInput struct {
 	Cooldown      int     `json:"cooldown"`
 }
 
-var validAlertMetrics = map[string]struct{}{
-	"error_count": {}, "error_rate": {}, "pageviews": {}, "visitors": {},
-}
+var validAlertMetrics = platform.AlertMetricSet()
 
 var validAlertOperators = map[string]struct{}{
 	"gt": {}, "gte": {}, "lt": {}, "lte": {}, "eq": {},
@@ -5756,127 +5811,6 @@ func otlpTraceHandler(svc *tracing.IngestService) neutron.HandlerFunc[tracing.Ex
 	}
 }
 
-// --- Trace query handlers ---
-
-type listServicesInput struct {
-	SiteID string `query:"site_id"`
-	From   string `query:"from"`
-	To     string `query:"to"`
-}
-
-func listServicesHandler(svc *tracing.QueryService) neutron.HandlerFunc[listServicesInput, []tracing.ServiceSummary] {
-	return func(ctx context.Context, input listServicesInput) ([]tracing.ServiceSummary, error) {
-		if input.SiteID == "" {
-			return nil, neutron.ErrBadRequest("site_id required")
-		}
-		from, to, err := parseTimeRange(input.From, input.To)
-		if err != nil {
-			return nil, neutron.ErrBadRequest(err.Error())
-		}
-		return emptyOnNil(svc.ListServices(ctx, input.SiteID, from, to))
-	}
-}
-
-type listOpsInput struct {
-	SiteID  string `query:"site_id"`
-	Service string `path:"service"`
-	From    string `query:"from"`
-	To      string `query:"to"`
-}
-
-func listOperationsHandler(svc *tracing.QueryService) neutron.HandlerFunc[listOpsInput, []tracing.OperationSummary] {
-	return func(ctx context.Context, input listOpsInput) ([]tracing.OperationSummary, error) {
-		if input.SiteID == "" || input.Service == "" {
-			return nil, neutron.ErrBadRequest("site_id and service required")
-		}
-		from, to, err := parseTimeRange(input.From, input.To)
-		if err != nil {
-			return nil, neutron.ErrBadRequest(err.Error())
-		}
-		return emptyOnNil(svc.ListOperations(ctx, input.SiteID, input.Service, from, to))
-	}
-}
-
-type searchTracesInput struct {
-	SiteID      string `query:"site_id"`
-	From        string `query:"from"`
-	To          string `query:"to"`
-	Service     string `query:"service"`
-	Operation   string `query:"operation"`
-	Offset      int    `query:"offset"`
-	Status      string `query:"status"`
-	MinDuration int64  `query:"min_duration"`
-	MaxDuration int64  `query:"max_duration"`
-	Limit       int    `query:"limit"`
-}
-
-func searchTracesHandler(svc *tracing.QueryService) neutron.HandlerFunc[searchTracesInput, []tracing.TraceSummary] {
-	return func(ctx context.Context, input searchTracesInput) ([]tracing.TraceSummary, error) {
-		if input.SiteID == "" {
-			return nil, neutron.ErrBadRequest("site_id required")
-		}
-		from, to, err := parseTimeRange(input.From, input.To)
-		if err != nil {
-			return nil, neutron.ErrBadRequest(err.Error())
-		}
-		return emptyOnNil(svc.SearchTraces(ctx, input.SiteID, from, to, input.Service, input.Operation, input.Status, input.MinDuration, input.MaxDuration, input.Limit, input.Offset))
-	}
-}
-
-type getTraceInput struct {
-	TraceID string `path:"trace_id"`
-	SiteID  string `query:"site_id"`
-}
-
-func getTraceHandler(svc *tracing.QueryService) neutron.HandlerFunc[getTraceInput, []tracing.Span] {
-	return func(ctx context.Context, input getTraceInput) ([]tracing.Span, error) {
-		if input.SiteID == "" || input.TraceID == "" {
-			return nil, neutron.ErrBadRequest("site_id and trace_id required")
-		}
-		return emptyOnNil(svc.GetTrace(ctx, input.TraceID, input.SiteID))
-	}
-}
-
-type traceErrorsInput struct {
-	TraceID string `path:"trace_id"`
-	SiteID  string `query:"site_id"`
-}
-
-func traceErrorsHandler(svc *tracing.QueryService) neutron.HandlerFunc[traceErrorsInput, []tracing.TraceErrorHit] {
-	return func(ctx context.Context, input traceErrorsInput) ([]tracing.TraceErrorHit, error) {
-		if input.SiteID == "" || input.TraceID == "" {
-			return nil, neutron.ErrBadRequest("site_id and trace_id required")
-		}
-		hits, err := svc.TraceErrors(ctx, input.TraceID, input.SiteID)
-		if err != nil {
-			return nil, err
-		}
-		if hits == nil {
-			hits = []tracing.TraceErrorHit{}
-		}
-		return hits, nil
-	}
-}
-
-type serviceDepsInput struct {
-	SiteID string `query:"site_id"`
-	From   string `query:"from"`
-	To     string `query:"to"`
-}
-
-func serviceDepsHandler(svc *tracing.QueryService) neutron.HandlerFunc[serviceDepsInput, []tracing.Dependency] {
-	return func(ctx context.Context, input serviceDepsInput) ([]tracing.Dependency, error) {
-		if input.SiteID == "" {
-			return nil, neutron.ErrBadRequest("site_id required")
-		}
-		from, to, err := parseTimeRange(input.From, input.To)
-		if err != nil {
-			return nil, neutron.ErrBadRequest(err.Error())
-		}
-		return emptyOnNil(svc.ServiceDependencies(ctx, input.SiteID, from, to))
-	}
-}
-
 // parseTimeRange resolves a from/to window. Omitted values default (last 24
 // hours / now). R35 (round 4): an explicitly supplied but malformed timestamp
 // is a 400-grade error, not a silent fallback to the default window — the old
@@ -5953,6 +5887,32 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
+// securityHeadersMiddleware sets the baseline security headers the Go
+// server itself owes every response (the Caddy TLS profile duplicates the
+// set at the edge; behind a plain HTTP tailnet proxy this was the only
+// layer and it set nothing). Set-if-absent: handler-specific policies
+// (the share pages' R30 cache/referrer set, the replay CSP) win.
+func securityHeadersMiddleware(hsts bool) neutron.Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h := w.Header()
+			if h.Get("X-Content-Type-Options") == "" {
+				h.Set("X-Content-Type-Options", "nosniff")
+			}
+			if h.Get("Referrer-Policy") == "" {
+				h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+			}
+			if h.Get("X-Frame-Options") == "" {
+				h.Set("X-Frame-Options", "SAMEORIGIN")
+			}
+			if hsts && h.Get("Strict-Transport-Security") == "" {
+				h.Set("Strict-Transport-Security", "max-age=31536000")
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // ipRateLimitMW rate-limits by client IP alone (no site_id), for public,

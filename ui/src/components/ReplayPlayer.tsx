@@ -308,9 +308,12 @@ interface PlayerProps {
   // Falls back to local-session clicks if either is missing.
   siteId?: string;
   url?: string;
+  // Reports the playback clock (ms since the first event) so side panels
+  // (console/network) can stay synchronized to the timeline.
+  onTime?: (elapsedMs: number) => void;
 }
 
-export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerProps) {
+export default function ReplayPlayer({ events, onClose, siteId, url, onTime }: PlayerProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const cursorRef = useRef<HTMLDivElement>(null);
@@ -326,6 +329,7 @@ export default function ReplayPlayer({ events, onClose, siteId, url }: PlayerPro
   const [playing, setPlaying] = useState(true);
   const [speed, setSpeed] = useState(1);
   const [elapsed, setElapsed] = useState(0);
+  useEffect(() => { if (onTime) onTime(elapsed); }, [elapsed, onTime]);
   const [snapshotReady, setSnapshotReady] = useState(false);
   const [heatmapOn, setHeatmapOn] = useState(false);
   const [heatmapClicks, setHeatmapClicks] = useState<Click[]>([]);

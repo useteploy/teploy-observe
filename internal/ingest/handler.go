@@ -245,7 +245,7 @@ func prepareEvent(ctx context.Context, input IngestInput, salt string, siteSvc *
 	}
 	input.Title = truncateUTF8(input.Title, 512)
 	input.Referrer = truncateUTF8(input.Referrer, 2048)
-	if input.Properties != nil && len(input.Properties) > maxProperties {
+	if len(input.Properties) > maxProperties {
 		return nil, neutron.ErrBadRequest("too many properties (max 50)")
 	}
 	// AUD-015: reject unserializable properties at admission instead of

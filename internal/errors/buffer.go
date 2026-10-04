@@ -71,6 +71,8 @@ type ErrorBuffer struct {
 	adm *admissionCache
 	// quarantineDir hosts the poison spool when a queue is attached.
 	quarantineDir string
+	// scrub redacts secrets/PII before the record is frozen (scrub.go).
+	scrub *Scrubber
 	// O01 §5.10 counters (atomics — the admission path must not take a
 	// second lock for accounting).
 	accepted          atomic.Int64
@@ -78,6 +80,7 @@ type ErrorBuffer struct {
 	applied           atomic.Int64
 	deduped           atomic.Int64
 	conflicting       atomic.Int64
+	spikeDropped      atomic.Int64
 	quarantined       atomic.Int64
 	replayedOnRestart atomic.Int64
 }
@@ -134,8 +137,12 @@ func NewErrorBuffer(handler *ErrorHandler, maxSize, flushSize int, flushInterval
 		stopCh:        make(chan struct{}),
 		wake:          make(chan struct{}, 1),
 		adm:           newAdmissionCache(admissionCacheTTL, admissionCacheCapacity),
+		scrub:         NewScrubberFromEnv(),
 	}
 }
+
+// SetScrubber replaces the admission scrubber (tests, explicit wiring).
+func (b *ErrorBuffer) SetScrubber(s *Scrubber) { b.scrub = s }
 
 func (b *ErrorBuffer) Start() {
 	b.wg.Add(1)
@@ -324,6 +331,12 @@ func (b *ErrorBuffer) Push(siteID string, input ErrorInput) error {
 	if err := ValidateEventIdentity(input.EventID, input.ProducerID); err != nil {
 		return err
 	}
+	// A captured client timestamp is bounded at admission so the refusal
+	// reaches the producer as a 400; a flush-time failure would only log.
+	if input.ClientTimestamp != 0 && input.ClientTimestamp > time.Now().UnixMilli()+24*60*60*1000 {
+		return fmt.Errorf("%w: timestamp is too far in the future", ErrBadTimestamp)
+	}
+	input = b.prepareRecord(input)
 	raw, err := json.Marshal(input)
 	if err != nil || len(raw) > maxErrorRecordBytes {
 		return ErrErrorBufferFull
@@ -402,6 +415,27 @@ func (b *ErrorBuffer) Push(siteID string, input ErrorInput) error {
 	return nil
 }
 
+// prepareRecord is the pre-freeze step: discard any client-supplied
+// PreGroupHash, then (scrubbing on) pin the grouping hash from the RAW
+// input and replace the payload with its scrubbed copy. Runs before the
+// marshal so the digest and the WAL frame both see scrubbed bytes.
+func (b *ErrorBuffer) prepareRecord(input ErrorInput) ErrorInput {
+	input.PreGroupHash = ""
+	if b.scrub.Disabled() {
+		return input
+	}
+	raw := input
+	raw.URL = ingest.CapturedURL(raw.URL)
+	if raw.ErrorType == "" && raw.ErrorValue == "" {
+		// Same default insertErrorEvent applies before it hashes.
+		raw.ErrorType, raw.ErrorValue = "Error", "Unknown error"
+	}
+	if h, err := ComputeGroupHash(FingerprintVersion, raw); err == nil {
+		input.PreGroupHash = h
+	}
+	return b.scrub.ScrubInput(input)
+}
+
 // release retires a record's reservation on its FINAL disposition (R13):
 // applied, deduped, conflicting, or quarantined — never a PENDING requeue.
 func (b *ErrorBuffer) release(ev bufferedError) {
@@ -435,6 +469,8 @@ func (b *ErrorBuffer) applyOne(ctx context.Context, ev bufferedError) bool {
 		b.applied.Add(1)
 	case InboxDeduped:
 		b.deduped.Add(1)
+	case InboxSpikeDropped:
+		b.spikeDropped.Add(1)
 	case InboxConflict:
 		// A conflicting reuse that slipped past the admission cache
 		// (restart, TTL): counted, never applied, never merged.
@@ -552,15 +588,24 @@ func (b *ErrorBuffer) quarantineRaw(body []byte, reason error) {
 // exists — its counter, dropped_post_ack, would be identically zero and
 // is deliberately not carried).
 type ErrorBufferStats struct {
-	Accepted          int64 `json:"accepted"`
-	DurablyAcked      int64 `json:"durably_acked"`
-	Applied           int64 `json:"applied"`
-	Deduped           int64 `json:"deduped"`
-	Quarantined       int64 `json:"quarantined"`
-	ConflictingID     int64 `json:"conflicting_id"`
-	ReplayedOnRestart int64 `json:"replayed_on_restart"`
-	Pending           int   `json:"pending"`
-	FlushFailing      bool  `json:"flush_failing"`
+	Accepted      int64 `json:"accepted"`
+	DurablyAcked  int64 `json:"durably_acked"`
+	Applied       int64 `json:"applied"`
+	Deduped       int64 `json:"deduped"`
+	Quarantined   int64 `json:"quarantined"`
+	ConflictingID int64 `json:"conflicting_id"`
+	// SpikeDropped = records thinned by spike protection (final, labeled;
+	// part of the balance). ByReason splits it per cap that fired.
+	SpikeDropped      int64 `json:"spike_dropped"`
+	SpikeDroppedIssue int64 `json:"spike_dropped_issue"`
+	SpikeDroppedSite  int64 `json:"spike_dropped_site"`
+	// SpikeDroppedNewIssue = new-issue/regression admissions refused by the
+	// per-site new-issue cap; SpikeAdmittedNewIssue = admissions under it.
+	SpikeDroppedNewIssue  int64 `json:"spike_dropped_new_issue"`
+	SpikeAdmittedNewIssue int64 `json:"spike_admitted_new_issue"`
+	ReplayedOnRestart     int64 `json:"replayed_on_restart"`
+	Pending               int   `json:"pending"`
+	FlushFailing          bool  `json:"flush_failing"`
 	// Queued/Bytes keep the pre-O01 operator field names (R15 backlog
 	// visibility) — queued is the same number as pending.
 	Queued int   `json:"queued"`
@@ -571,17 +616,29 @@ type ErrorBufferStats struct {
 func (b *ErrorBuffer) Stats() ErrorBufferStats {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	var spIssue, spSite, spNew, spAdm int64
+	if b.handler == nil {
+		// stats-only buffers (tests) carry no service
+	} else if sp := b.handler.spike; sp != nil {
+		spIssue, spSite = sp.DroppedIssue.Load(), sp.DroppedSite.Load()
+		spNew, spAdm = sp.DroppedNewIssue.Load(), sp.AdmittedNewIssue.Load()
+	}
 	return ErrorBufferStats{
-		Accepted:          b.accepted.Load(),
-		DurablyAcked:      b.durablyAcked.Load(),
-		Applied:           b.applied.Load(),
-		Deduped:           b.deduped.Load(),
-		Quarantined:       b.quarantined.Load(),
-		ConflictingID:     b.conflicting.Load(),
-		ReplayedOnRestart: b.replayedOnRestart.Load(),
-		Pending:           len(b.events),
-		FlushFailing:      b.flushFail,
-		Queued:            len(b.events),
-		Bytes:             b.usedBytes,
+		SpikeDropped:          b.spikeDropped.Load(),
+		SpikeDroppedIssue:     spIssue,
+		SpikeDroppedSite:      spSite,
+		SpikeDroppedNewIssue:  spNew,
+		SpikeAdmittedNewIssue: spAdm,
+		Accepted:              b.accepted.Load(),
+		DurablyAcked:          b.durablyAcked.Load(),
+		Applied:               b.applied.Load(),
+		Deduped:               b.deduped.Load(),
+		Quarantined:           b.quarantined.Load(),
+		ConflictingID:         b.conflicting.Load(),
+		ReplayedOnRestart:     b.replayedOnRestart.Load(),
+		Pending:               len(b.events),
+		FlushFailing:          b.flushFail,
+		Queued:                len(b.events),
+		Bytes:                 b.usedBytes,
 	}
 }

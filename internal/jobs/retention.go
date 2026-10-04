@@ -19,11 +19,37 @@ import (
 // internal/metrics/metrics.go) exists to avoid.
 const retentionChunkSize = 5000
 
+// TimeUnit is the unit of a policy's BIGINT time column. The zero value is
+// epoch milliseconds, which is what nearly every table stores, so existing
+// policy literals keep their meaning.
+type TimeUnit int
+
+const (
+	// UnitMillis is epoch milliseconds (the default).
+	UnitMillis TimeUnit = iota
+	// UnitNanos is epoch nanoseconds (metric_points.ts_ns, OTLP TimeUnixNano).
+	// A millisecond cutoff compared against such a column is ~1e6 times too
+	// small, so the TTL would silently match nothing.
+	UnitNanos
+)
+
+// CutoffAt returns the cutoff for a retention window of days ending at now,
+// expressed in the unit of the column it will be compared against.
+func (u TimeUnit) CutoffAt(now time.Time, days int) int64 {
+	t := now.Add(-time.Duration(days) * 24 * time.Hour)
+	if u == UnitNanos {
+		return t.UnixNano()
+	}
+	return t.UnixMilli()
+}
+
 // RetentionPolicy defines the TTL (in days) for a table + the SQL column to compare against.
 type RetentionPolicy struct {
 	Table  string
-	Column string // BIGINT epoch-ms column, typically "timestamp", "start_time", or "ts_bucket"
+	Column string // BIGINT epoch column (see Unit), typically "timestamp", "start_time", or "ts_bucket"
 	Days   int
+	// Unit is the time unit of Column; the zero value is epoch milliseconds.
+	Unit TimeUnit
 	// ExtraWhere is an optional additional predicate ANDed into the
 	// chunk-boundary SELECT and the DELETE (e.g. "processed_at > 0" so the
 	// derived_outbox policy prunes processed intents but never dead
@@ -59,12 +85,42 @@ func DefaultPolicies(rawDays, hourlyDays, llmDays int) []RetentionPolicy {
 		{Table: "logs", Column: "timestamp", Days: 30},
 		{Table: "llm_traces", Column: "timestamp", Days: llmDays},
 		{Table: "spans", Column: "start_time", Days: 14},
+		{Table: "span_links", Column: "start_time", Days: 14},
+		{Table: "experiment_metric_events", Column: "timestamp", Days: 730},
 		{Table: "service_stats", Column: "ts_bucket", Days: 30},
 		{Table: "replay_sessions", Column: "start_time", Days: 14},
 		// O10: the evaluation ledger is a log, not a dedupe set - 14 days
 		// of transition edges is far beyond any operator investigation
 		// window while bounding the one-row-per-tick growth.
 		{Table: "alert_evaluations", Column: "evaluated_at", Days: 14},
+	}
+}
+
+// DefaultTelemetryPolicies returns retention for the telemetry tables that
+// DefaultPolicies historically did not cover and that therefore grew without
+// bound. Units and columns were verified against the writers:
+//
+//   - metric_points.ts_ns is epoch NANOSECONDS (OTLP TimeUnixNano), hence
+//     UnitNanos.
+//   - host_metrics.timestamp and uptime_results.timestamp are epoch ms
+//     (time.Now().UnixMilli() in internal/infra and internal/monitoring).
+//   - performance_issues is a replacing_mergetree keyed on (tenant, site,
+//     fingerprint) versioned by last_seen (span-time ms). Deleting
+//     last_seen < cutoff removes superseded versions and issues not
+//     re-detected within the window; a live issue keeps writing a newer
+//     last_seen, so it survives. Fixed 90 days, well beyond the 14-day span
+//     retention its trace_id drill-down depends on.
+//   - service_dependencies is a replacing_mergetree whose ORDER BY includes
+//     ts_bucket (ms), so each time bucket is its own key and a bucket is only
+//     ever rewritten with the same key. Deleting old buckets is the same shape
+//     as the existing service_stats policy and is aligned to it (30 days).
+func DefaultTelemetryPolicies(metricsDays, infraDays, uptimeDays int) []RetentionPolicy {
+	return []RetentionPolicy{
+		{Table: "metric_points", Column: "ts_ns", Days: metricsDays, Unit: UnitNanos},
+		{Table: "host_metrics", Column: "timestamp", Days: infraDays},
+		{Table: "uptime_results", Column: "timestamp", Days: uptimeDays},
+		{Table: "performance_issues", Column: "last_seen", Days: 90},
+		{Table: "service_dependencies", Column: "ts_bucket", Days: 30},
 	}
 }
 
@@ -138,7 +194,7 @@ func (r *RetentionService) RunCleanup(ctx context.Context) error {
 		if p.Days <= 0 {
 			continue
 		}
-		cutoff := now.Add(-time.Duration(p.Days) * 24 * time.Hour).UnixMilli()
+		cutoff := p.Unit.CutoffAt(now, p.Days)
 		// Bind the cutoff as an int64 and compare against the BIGINT column
 		// directly. The old form (quoted text literal vs CAST(col AS BIGINT))
 		// matched nothing — Nucleus compared the column's numeric value against
@@ -166,7 +222,7 @@ func (r *RetentionService) RunCleanup(ctx context.Context) error {
 // rollup facts keyed by a composite), so chunking can't key off "id IN
 // (SELECT id ... LIMIT N)" generically. Instead each iteration finds the
 // value of the chunkSize-th oldest surviving row in the policy's own cutoff
-// column (already BIGINT epoch-ms, already used for the WHERE bound) and
+// column (already BIGINT in the policy's Unit, already used for the WHERE bound) and
 // deletes everything up to and including it; once fewer than a full chunk
 // remain, one final small DELETE clears the rest.
 func (r *RetentionService) cleanupTable(ctx context.Context, sql *nucleus.SQLModel, p RetentionPolicy, cutoff int64) (int64, error) {

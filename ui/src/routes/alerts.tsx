@@ -17,6 +17,10 @@ const METRICS = [
   { value: "error_rate", label: "Error Rate (%)" },
   { value: "pageviews", label: "Pageviews" },
   { value: "visitors", label: "Visitors" },
+  { value: "trace_error_rate", label: "Trace Error Rate (% of spans)" },
+  { value: "trace_p95_ms", label: "Trace p95 Latency (ms, root spans)" },
+  { value: "log_error_count", label: "Log Errors (error/fatal count)" },
+  { value: "uptime_failures", label: "Uptime Failures (failed checks)" },
 ];
 
 const OPERATORS = [

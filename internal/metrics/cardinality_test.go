@@ -6,10 +6,6 @@ import (
 	"testing"
 )
 
-func kv(k, v string) KeyValue {
-	return KeyValue{Key: k, Value: AnyValue{StringValue: v}}
-}
-
 func TestTruncateAttrs_CountAndValueCaps(t *testing.T) {
 	g := newSeriesGuard(CardinalityLimits{MaxAttrsPerPoint: 3, MaxAttrValueBytes: 10, MaxPointsPerRequest: 100, MaxSeriesPerSite: 100})
 

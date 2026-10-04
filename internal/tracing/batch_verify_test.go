@@ -1,6 +1,9 @@
 package tracing
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestBuildSpanPlaceholders_Shape(t *testing.T) {
 	got := buildSpanPlaceholders(2)
@@ -19,7 +22,7 @@ func TestSpanArgs_MatchesColumnCount(t *testing.T) {
 }
 
 func TestInsertSpans_EmptyIsNoop(t *testing.T) {
-	n, err := insertSpans(nil, nil, "site1", nil)
+	n, err := insertSpans(context.Background(), nil, "site1", nil)
 	if err != nil || n != 0 {
 		t.Fatalf("insertSpans(empty) = (%d, %v), want (0, nil)", n, err)
 	}

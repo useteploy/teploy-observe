@@ -14,6 +14,8 @@ import (
 	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/guardmap"
+	"github.com/useteploy/teploy-observe/internal/queryguard"
 )
 
 // LogService handles log ingestion and querying.
@@ -22,6 +24,21 @@ type LogService struct {
 	Bx        *Broadcaster
 	pipelines *PipelineService
 	logger    *slog.Logger
+	// guard is the O12 read-path admission (concurrency slot + time and row
+	// budgets) for SearchLogs / LogStats / Histogram. nil = default budgets,
+	// no concurrency bound.
+	guard *guardmap.Guard
+
+	// queryHistogram is a test seam for the histogram read; nil in
+	// production.
+	queryHistogram func(ctx context.Context, query string, args ...any) ([]HistogramBucket, error)
+}
+
+// WithQueryGuard installs the O12 admission state on the read paths. A nil
+// limiter disables concurrency admission; budgets are always in force.
+func (s *LogService) WithQueryGuard(l *queryguard.Limiter, b queryguard.Budgets) *LogService {
+	s.guard = guardmap.NewGuard(l, b)
+	return s
 }
 
 func NewLogService(db *nucleus.Client) *LogService {
@@ -319,6 +336,9 @@ func (s *LogService) insertLogsBatch(ctx context.Context, batch []*preparedLog) 
 }
 
 // SearchLogs queries logs with optional filters.
+//
+// Guarded (O12): takes a concurrency slot, runs under the time budget, and
+// refuses (never truncates) a page that would reach past the row budget.
 func (s *LogService) SearchLogs(ctx context.Context, siteID string, from, to time.Time, level, service, search string, limit, offset int) ([]Log, error) {
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
@@ -328,7 +348,30 @@ func (s *LogService) SearchLogs(ctx context.Context, siteID string, from, to tim
 	if offset < 0 {
 		offset = 0
 	}
+	// The engine must walk offset+limit rows to serve the page; past the
+	// declared row budget that is a refusal, not a silently shortened page.
+	if int64(limit)+int64(offset) > s.guard.MaxRows() {
+		return nil, s.guard.RowRefusal()
+	}
+	qctx, release, err := s.guard.Begin(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
+	query, params := legacySearchQuery(siteID, fromMs, toMs, level, service, search, limit, offset)
+
+	out, err := nucleus.Query[Log](qctx, s.db.SQL(), query, params...)
+	if err != nil {
+		return nil, s.guard.DeadlineError(ctx, err)
+	}
+	return out, nil
+}
+
+// legacySearchQuery builds the SQL and parameters of the plain (no lq) log
+// search. It is its own function so a golden test can pin that adding the
+// query language did not change a byte of it.
+func legacySearchQuery(siteID, fromMs, toMs, level, service, search string, limit, offset int) (string, []any) {
 	where := "site_id = $1 AND timestamp >= $2 AND timestamp < $3"
 	params := []any{siteID, fromMs, toMs}
 	idx := 4
@@ -360,8 +403,7 @@ func (s *LogService) SearchLogs(ctx context.Context, siteID string, from, to tim
 		 WHERE %s
 		 ORDER BY timestamp DESC
 		 LIMIT %d OFFSET %d`, where, limit, offset)
-
-	return nucleus.Query[Log](ctx, s.db.SQL(), query, params...)
+	return query, params
 }
 
 // LevelCount holds the count of logs for a single level.
@@ -375,7 +417,13 @@ func (s *LogService) LogStats(ctx context.Context, siteID string, from, to time.
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
-	return nucleus.Query[LevelCount](ctx, s.db.SQL(),
+	qctx, release, err := s.guard.Begin(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	out, err := nucleus.Query[LevelCount](qctx, s.db.SQL(),
 		`SELECT level, COUNT(*) AS count
 		 FROM logs
 		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
@@ -383,6 +431,10 @@ func (s *LogService) LogStats(ctx context.Context, siteID string, from, to time.
 		 ORDER BY count DESC`,
 		siteID, fromMs, toMs,
 	)
+	if err != nil {
+		return nil, s.guard.DeadlineError(ctx, err)
+	}
+	return out, nil
 }
 
 // HistogramBucket represents log counts per level for a single time bucket.
@@ -402,7 +454,22 @@ func (s *LogService) Histogram(ctx context.Context, siteID string, from, to time
 	toMs := dbutil.IntParam(to.UnixMilli())
 	bucketStr := dbutil.IntParam(bucketMs)
 
-	return nucleus.Query[HistogramBucket](ctx, s.db.SQL(),
+	qctx, release, err := s.guard.Begin(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	// LIMIT budget+1: the result is one row per (bucket, level), so a tiny
+	// bucket over a long range could otherwise materialize millions of rows.
+	// One row past the ceiling is a refusal, never a truncated histogram.
+	run := s.queryHistogram
+	if run == nil {
+		run = func(ctx context.Context, query string, args ...any) ([]HistogramBucket, error) {
+			return nucleus.Query[HistogramBucket](ctx, s.db.SQL(), query, args...)
+		}
+	}
+	out, err := run(qctx,
 		`SELECT (CAST(timestamp AS BIGINT) / CAST($4 AS BIGINT)) * CAST($4 AS BIGINT) AS bucket,
 		        level,
 		        COUNT(*) AS count
@@ -411,9 +478,17 @@ func (s *LogService) Histogram(ctx context.Context, siteID string, from, to time
 		   AND timestamp >= $2
 		   AND timestamp < $3
 		 GROUP BY (CAST(timestamp AS BIGINT) / CAST($4 AS BIGINT)) * CAST($4 AS BIGINT), level
-		 ORDER BY bucket ASC`,
+		 ORDER BY bucket ASC
+		 LIMIT `+strconv.FormatInt(s.guard.MaxRows()+1, 10),
 		siteID, fromMs, toMs, bucketStr,
 	)
+	if err != nil {
+		return nil, s.guard.DeadlineError(ctx, err)
+	}
+	if int64(len(out)) > s.guard.MaxRows() {
+		return nil, s.guard.RowRefusal()
+	}
+	return out, nil
 }
 
 func generateID() (string, error) {

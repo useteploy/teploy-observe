@@ -1,19 +1,22 @@
 package experiments
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"math"
 	"math/rand"
 )
 
 // computeBayesianProbabilities fills in ProbBeatControl for each variant using
 // a Beta(1+conversions, 1+nonconversions) prior and 4000 Monte Carlo samples.
-// The first variant is treated as the control.
-func computeBayesianProbabilities(variants []VariantResult) {
+// The first variant is treated as the control. seed fixes the Monte Carlo
+// stream; see bayesianSeed.
+func computeBayesianProbabilities(variants []VariantResult, seed int64) {
 	if len(variants) < 2 {
 		return
 	}
 	const samples = 4000
-	rng := rand.New(rand.NewSource(42))
+	rng := rand.New(rand.NewSource(seed))
 
 	controlSamples := drawBeta(rng, float64(1+variants[0].Conversions), float64(1+variants[0].Exposures-variants[0].Conversions), samples)
 
@@ -30,6 +33,29 @@ func computeBayesianProbabilities(variants []VariantResult) {
 	}
 	// Control by convention: probability it "beats itself" is undefined.
 	variants[0].ProbBeatControl = 0
+}
+
+// bayesianSeed derives the Monte Carlo seed from the experiment id and a hash
+// of the arm counts. Identical calls on identical data return identical
+// probabilities (a page refresh never jitters the number), while different
+// experiments - and different data of the same experiment - draw independent
+// streams, so a shared constant seed cannot correlate the noise of every
+// experiment's estimate. The probability stays display-only: it never gates
+// the winner.
+func bayesianSeed(experimentID string, variants []VariantResult) int64 {
+	h := sha256.New()
+	h.Write([]byte(experimentID))
+	var buf [8]byte
+	for _, v := range variants {
+		h.Write([]byte{0})
+		h.Write([]byte(v.Variant))
+		binary.BigEndian.PutUint64(buf[:], uint64(v.Exposures))
+		h.Write(buf[:])
+		binary.BigEndian.PutUint64(buf[:], uint64(v.Conversions))
+		h.Write(buf[:])
+	}
+	sum := h.Sum(nil)
+	return int64(binary.BigEndian.Uint64(sum[:8]) & math.MaxInt64)
 }
 
 // drawBeta returns n samples from Beta(alpha, beta) via the ratio of two Gammas.

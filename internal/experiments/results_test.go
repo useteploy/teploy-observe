@@ -40,6 +40,15 @@ func expTestDB(t *testing.T) (*nucleus.Client, func()) {
 			site_id TEXT NOT NULL, user_id TEXT NOT NULL DEFAULT '', variant TEXT NOT NULL DEFAULT '',
 			timestamp BIGINT NOT NULL
 		) WITH (engine = 'mergetree') ORDER BY (tenant_id, site_id, experiment_id, user_id)`,
+		`CREATE TABLE IF NOT EXISTS experiment_settings (
+			setting_id TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT 'default', experiment_id TEXT NOT NULL,
+			site_id TEXT NOT NULL, config TEXT NOT NULL DEFAULT '{}', timestamp BIGINT NOT NULL
+		) WITH (engine = 'mergetree') ORDER BY (tenant_id, site_id, experiment_id, timestamp)`,
+		`CREATE TABLE IF NOT EXISTS experiment_metric_events (
+			event_id TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT 'default', experiment_id TEXT NOT NULL,
+			site_id TEXT NOT NULL, user_id TEXT NOT NULL DEFAULT '', metric TEXT NOT NULL DEFAULT 'primary',
+			value TEXT NOT NULL DEFAULT '0', timestamp BIGINT NOT NULL
+		) WITH (engine = 'mergetree') ORDER BY (tenant_id, site_id, experiment_id, metric, timestamp)`,
 	} {
 		if _, err := db.SQL().Exec(ctx, ddl); err != nil {
 			db.Close()
@@ -145,5 +154,46 @@ func TestResults_GatesOnMinSample(t *testing.T) {
 	}
 	if res.Significant || res.Winner != "" {
 		t.Fatalf("min_sample=1000 with 6 exposures must not be significant; got significant=%v winner=%q", res.Significant, res.Winner)
+	}
+}
+
+// TestResults_ContaminationAndMetricsLive exercises the SQL path (skipped
+// without a live Nucleus): a user exposed to two arms is excluded and
+// counted as contaminated, and a mean-metric primary reads metric events.
+func TestResults_ContaminationAndMetricsLive(t *testing.T) {
+	db, done := expTestDB(t)
+	defer done()
+	ctx := context.Background()
+	svc := NewExperimentService(db)
+
+	site := fmt.Sprintf("test-exp-contam-%d", time.Now().UnixNano())
+	exp, err := svc.Create(ctx, site, "Contam", "flag", "purchase", "",
+		`[{"key":"control"},{"key":"treatment"}]`, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SaveConfig(ctx, exp.ExperimentID, site, ExperimentConfig{MetricKind: KindMean}); err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range []string{"c1", "c2"} {
+		_ = svc.RecordExposure(ctx, exp.ExperimentID, site, u, "control")
+	}
+	_ = svc.RecordExposure(ctx, exp.ExperimentID, site, "t1", "treatment")
+	_ = svc.RecordExposure(ctx, exp.ExperimentID, site, "both", "control")
+	_ = svc.RecordExposure(ctx, exp.ExperimentID, site, "both", "treatment")
+	_ = svc.RecordMetric(ctx, exp.ExperimentID, site, "c1", PrimaryMetricKey, 20)
+	_ = svc.RecordMetric(ctx, exp.ExperimentID, site, "t1", PrimaryMetricKey, 30)
+	_ = svc.RecordMetric(ctx, exp.ExperimentID, site, "both", PrimaryMetricKey, 1000)
+	res, err := svc.Results(ctx, exp.ExperimentID, site)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ContaminatedUsers != 1 || res.MetricKind != KindMean {
+		t.Fatalf("contaminated=%d kind=%s", res.ContaminatedUsers, res.MetricKind)
+	}
+	for _, v := range res.Variants {
+		if v.Variant == "control" && (v.Exposures != 2 || v.Mean == nil || *v.Mean != 10) {
+			t.Fatalf("control: %+v", v)
+		}
 	}
 }

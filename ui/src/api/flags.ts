@@ -41,6 +41,9 @@ export interface VariantResult {
   prob_beat_control: number;
   wilson_low: number;
   wilson_high: number;
+  /** count/mean metrics only: per-exposed-user mean and sample std dev. */
+  mean?: number;
+  std_dev?: number;
 }
 
 export interface SRMDiagnostic {
@@ -60,6 +63,9 @@ export interface PairwiseResult {
   holm_adjusted_p: number;
   significant: boolean;
   used_fisher: boolean;
+  /** continuous metrics (Welch): t statistic and Welch-Satterthwaite df. */
+  t?: number;
+  df?: number;
 }
 
 export interface AnalysisResult {
@@ -74,6 +80,21 @@ export interface AnalysisResult {
   srm: SRMDiagnostic;
   pairwise_vs_control: PairwiseResult[];
   winner_rule: string;
+  planned_sample_per_arm?: number;
+  horizon_overridden?: boolean;
+}
+
+export type MetricKind = "binary" | "count" | "mean";
+
+export interface MetricResult {
+  key: string;
+  name?: string;
+  kind: MetricKind;
+  role: "primary" | "secondary";
+  gates_winner: boolean;
+  variants: VariantResult[];
+  analysis: AnalysisResult;
+  note?: string;
 }
 
 export interface ExperimentResults {
@@ -82,6 +103,13 @@ export interface ExperimentResults {
   significant: boolean;
   winner: string;
   analysis: AnalysisResult;
+  metric_kind?: MetricKind;
+  /** Users exposed to more than one variant; excluded from every count. */
+  contaminated_users?: number;
+  /** Fixed-horizon warning while any arm is below the planned sample. */
+  peeking_warning?: string;
+  secondary?: MetricResult[];
+  multiple_comparison_note?: string;
 }
 
 export interface FlagHistoryEntry {

@@ -14,6 +14,126 @@ report lives outside the repo) — remediation record below. Round 4: audit
 passes 1-5) are closed history; their one surviving item is folded into F16
 below.
 
+## S1 (2026-10-03/04) - Competitive-gap and hardening sweep: verified live 2026-10-04
+
+Scope: the full list is in CHANGELOG `[Unreleased]`. The sweep itself was
+built without Nucleus (the sandbox's network policy blocked the image),
+so 214 integration tests were skipped at commit time. The live
+verification ran 2026-10-04 against ghcr.io/neutron-build/nucleus:v1.1.1
+(docker, the CI shape; image digest f8d4362c, binary banner v1.0.2 - the
+known upstream tag/version mismatch), and was RE-RUN after the v1.2.1 pin
+merge against ghcr.io/neutron-build/nucleus:v1.2.1: fresh ladder boot plus
+the full serial suite, 53/53 packages green on both engines.
+
+**Live verification (2026-10-04, green):**
+- Migration ladder applies fresh (001-063) AND on a populated store
+  upgraded from 047 (`TestMigrationsUpgradePopulatedStore`, added this
+  session: the six ALTER-ADD tables rebuilt in their pre-048 shape,
+  populated, then upgraded; columns, backfills, row survival and the
+  write-shaped probe all checked).
+- Full serial suite green against live v1.1.1 (`OBSERVE_NUCLEUS_URL`,
+  `OBSERVE_REQUIRE_NUCLEUS=1`, `-p 1`), including the previously-skipped
+  integration coverage: span links, issue merge/assign/unmerge, static
+  cohorts + cohort_id on funnels/retention, persons
+  properties/alias/erase, experiment metrics, replay list filters, log
+  `lq` (keyset paging + attribute terms), trace attribute filters +
+  orphan traces, the new alert metrics, retention incl. the
+  `metric_points` nanosecond cutoff, and backup/restore round-trips.
+- `scripts/audit.sh` 121/121 against a seeded live server.
+- UI rebuilt from the pinned submodule revision (pnpm 9.15.4, the `.ci`
+  pin) and committed; the delta-recorder bundle rebuilt with
+  console/network capture. The four node CI legs green (ui unit, tracker
+  contracts, replay-delta sanitizer fixtures, tracker tests - the last
+  confirmed wired into ci.yml).
+- govulncheck clean after the dep bumps; staticcheck clean after its
+  first full triage; `go vet` clean; `helm lint` + full `helm template`
+  green on their first-ever run (the chart's own secrets guard refuses
+  an unconfigured render - by design).
+
+**Defects the live run surfaced (fixed in this session):**
+- surveys `ValidateAnswers` rejected Go-native `int` values (only
+  `float64`, the JSON-wire type); the sweep's own Nucleus-gated tests
+  were the first to exercise the path and failed.
+- The legacy-results golden is architecture-sensitive: gc fuses
+  multiply-add on arm64 but not amd64, so p-values differ by 1 ULP and
+  the byte-exact pin failed - including on the arm64 CI job. Compared
+  with 1e-12 relative tolerance on float leaves now.
+- The committed delta-recorder bundle was stale relative to its
+  sources.
+- `audit.sh` was a pre-reorg artifact (absolute paths into the old
+  checkout, a pre-policy credential, expectations for retired
+  behaviors); modernized and green.
+- Dependency advisories were symbol-reachable: grpc GO-2026-6443 and
+  GO-2026-6348 (otlpgrpc.Serve), pgx GO-2026-5004 (explorer queries);
+  bumped to grpc v1.83.2 / pgx v5.9.2, vendor regenerated from the pin.
+
+**Closed this session (was open in the sweep's close-out):** the UI
+build and `ui-freshness` expectations; the restore gap (`observe
+migrate` applies the ladder without seeding - isolated-restore runbook
+is migrate -> restore -> start, verified against a fresh database); a
+global security-header middleware (nosniff, referrer-policy,
+X-Frame-Options SAMEORIGIN, conditional HSTS when the public URL is
+https; set-if-absent so handler policies win); `OBSERVE_SMTP_PRIVATE_HOSTS`
+for internal email relays (resolve-once dial-IP retained); the Sentry
+wire `timestamp` honored (client time stored; more than 24h of future
+skew refused at admission with a 400).
+
+**Open items (owner decisions, upstream, or documented posture):**
+- L9 remains open, reframed by the runner contract - see the L9 entry:
+  applied migrations are checksum-frozen, so in-place conversion of
+  048-056/010 is refused on every store that already ran them. The live
+  `llm_traces` repair on infra-home is still the owner call.
+- Surveys unique index on (site_id, survey_id, client_id): UPSTREAM-
+  BLOCKED - Nucleus v1.1.1 parses `CREATE UNIQUE INDEX` but does not
+  enforce it (duplicate keys accepted; logged in the umbrella
+  `_internal/UPSTREAM_BUGS.md`, 2026-10-04). Single-process dedupe
+  stays via the submit lock; `once` stays client-side; authoring UI has
+  no targeting editor.
+- Integrations: issue-fire delivery rides the in-memory queue (the
+  alert path has the durable outbox); alert recovery cannot resolve
+  PagerDuty/Jira/GitHub tickets (senders are create-only); no issue
+  deep link in payloads.
+- Notification buckets, spike windows, persons-properties limiter and
+  survey limiters stay per-process (reset on restart, per replica) -
+  the standing single-process posture (AUD-018).
+- `NUCLEUS_ALLOW_NO_AUTH=1` posture unchanged (network isolation is the
+  control; engine auth is an upstream question).
+- Persons residuals unchanged: erase writes a tombstone but event rows
+  are not deleted (no verified per-key DELETE), ingest does not check
+  tombstones, browser `identify()` is not wired to the properties
+  endpoint, no un-merge endpoint, and the properties route's 404-vs-200
+  reveals whether a guessed id has events.
+- Replay: per-session capture caps are enforced client-side only.
+- Trace/log attribute filters still verify in Go over a bounded
+  candidate window (the engine has no JSONB extraction on TEXT and no
+  bind parameters in JSON operands - upstream notes).
+- Experiments: fixed-horizon only; auto-exposure from /flags/evaluate
+  not wired; secondary metrics not multiplicity corrected;
+  `RecordMetricKeyed` dedupe is check-then-insert. Flags: `/flags/config`
+  exposes full targeting rules to any telemetry key (product decision);
+  modulo bias documented; per-flag fail-open override deferred.
+- Sentry endpoint: `timestamp` now honored; no OPTIONS route (SDKs send
+  simple requests).
+- Alerts: no per-service filter and no `metric_value` metric (need an
+  `alert_rules` schema change); `uptime_failures` is a window count, not
+  consecutive failures; query slots (global 8 / site 4) are shared by
+  stats, logs, metrics, traces and cohorts, so a dashboard firing many
+  heavy panels at once can see 429s - tune
+  `OBSERVE_QUERY_SITE_CONCURRENCY`.
+- `experiment_settings` and `cohort_members` are deliberately excluded
+  from backup version-collapsing (tie semantics).
+- Multi-tenancy/orgs/SCIM, per-site RBAC, SAML, HA/clustering, PromQL:
+  design notes only (docs/design/); owner decisions.
+- Helm chart linted and fully rendered for the first time (2026-10-04,
+  0 failures); the Nucleus container user/filesystem layout inside a
+  real cluster remains unverified.
+- Watch item: legacy ORDER BY on an aliased text cast in `logs.go`
+  legacySearchQuery and `tracing/query.go` - if a live run shows a
+  textual sort, log the Nucleus conformance bug upstream.
+- Flaky once under load: `internal/ingest`
+  TestDiskQueue_AppendAfterCheckpointIsStillFlushed (125 ms sleep vs
+  25 ms fsync loop) - passed 20/20 alone.
+
 ## L10 (2026-09-27) — Fixed in source: LLM traces omitted from retention
 
 LLM traces, including prompt/completion payloads, were never expired by the
@@ -46,18 +166,30 @@ regenerable LLM traces - owner call), (b) whether new ALTER-ADD migrations
 should be refused by a test, and (c) a migration test against a populated,
 upgraded store rather than a fresh one.
 
+**Update 2026-10-04 (close-out session):** (b) and (c) are DONE - the guard
+test refuses ALTER-ADD from 057 on, and
+`TestMigrationsUpgradePopulatedStore` replays the populated upgrade path.
+The "convert 048/049/051/052/054/056 and 010 in place" plan is additionally
+REFUSED BY THE RUNNER: every applied script is checksum-verified at each
+Migrate (`migration %d has been modified since it was applied ... restore
+the applied script or write a new migration`), pinned executably by
+`TestAppliedMigrationsAreChecksumFrozen`. Rewriting those files would break
+the boot of every store that already applied them (infra-home included).
+
 Upstream resolution (2026-10-04): the engine defect is fixed in Nucleus
 v1.2.1 (atomic ALTER rewrites; half-applied ALTERs no longer recorded as
 applied; a new engine-side refusal rejects ALTERs that follow writes to the
 same table in one transaction). This repo pins v1.2.1 in teploy.yml, CI
 (NUCLEUS_VERSION) and docker-compose; observe's full suite plus a fresh
 migration boot verified against that image. Re-scoped: (b) is no longer
-needed for correctness on v1.2.1+ — the engine itself enforces the unsafe
-ordering; (c) is satisfied by `TestMigrationsUpgradePopulatedStore` on the
-S1 branch; (a) remains open as an owner op and now has an in-place path
-(the `catalog.json` repair in Neutron's
+needed for correctness on v1.2.1+ - the engine itself enforces the unsafe
+ordering (the guard test stays as belt-and-braces and for older engines);
+(c) is satisfied by `TestMigrationsUpgradePopulatedStore` on this branch;
+(a) remains open as an owner op and now has an in-place path (the
+`catalog.json` repair in Neutron's
 `nucleus/docs/HANDOVER_TEPLOY_OBSERVE_ADD_COLUMN.md`) that preserves the
-rows instead of losing regenerable traces.
+rows instead of losing regenerable traces - the rename-aside fallback that
+loses the 12,080 traces stays documented above as the last resort.
 
 ## Round-4 register (2026-09-19 audit, 45 findings R01..R45)
 

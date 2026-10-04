@@ -20,6 +20,8 @@ import (
 	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/guardmap"
+	"github.com/useteploy/teploy-observe/internal/queryguard"
 )
 
 // Service writes OTLP metric points and answers list / query requests.
@@ -29,6 +31,24 @@ type Service struct {
 	db     *nucleus.Client
 	logger *slog.Logger
 	guard  *seriesGuard
+	// qguard is the O12 READ-path admission (concurrency slot + time and
+	// row budgets) for ListMetrics / QuerySeries. Distinct from guard
+	// above, which bounds INGEST cardinality. nil = default budgets, no
+	// concurrency bound.
+	qguard *guardmap.Guard
+
+	// Read-query seams: nil in production (the engine is queried
+	// directly); tests inject row sets and blocking reads so the budget
+	// refusals are exercised without a store.
+	queryPointRows  func(ctx context.Context, query string, args ...any) ([]pointRow, error)
+	queryMetricRows func(ctx context.Context, query string, args ...any) ([]metricRow, error)
+}
+
+// WithQueryGuard installs the O12 read-path admission state. A nil limiter
+// disables concurrency admission; budgets are always in force.
+func (s *Service) WithQueryGuard(l *queryguard.Limiter, b queryguard.Budgets) *Service {
+	s.qguard = guardmap.NewGuard(l, b)
+	return s
 }
 
 func NewService(db *nucleus.Client) *Service {

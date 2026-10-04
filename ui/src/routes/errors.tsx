@@ -10,6 +10,7 @@ import ExportButton from "../components/shared/ExportButton.js";
 import EmptyState from "../components/shared/EmptyState.js";
 import "../styles/errors.css";
 import { useFilters } from "../hooks/useFilters.js";
+import { normalizeAssignee, canMerge } from "../lib/issueAdmin.js";
 
 export const config = { mode: "app" };
 
@@ -163,6 +164,35 @@ function IssueDetail({ issue, siteId, onBack }: { issue: Issue; siteId: string; 
     finally { setUpdatingStatus(false); }
   };
 
+  const [assignee, setAssignee] = useState(issue.assignee ?? "");
+  const [mergeTarget, setMergeTarget] = useState("");
+  const [adminMsg, setAdminMsg] = useState("");
+
+  const handleAssign = async () => {
+    const v = normalizeAssignee(assignee);
+    if (v === null) { setAdminMsg("Invalid assignee"); return; }
+    try {
+      await errorsApi.setAssignee(issue.issue_id, siteId, v);
+      setAssignee(v);
+      setAdminMsg(v ? `Assigned to ${v}` : "Unassigned");
+    } catch (err) { setAdminMsg(String(err)); }
+  };
+
+  const handleMerge = async () => {
+    if (!canMerge(issue.issue_id, mergeTarget)) { setAdminMsg("Enter another issue id to merge into"); return; }
+    try {
+      await errorsApi.mergeIssue(issue.issue_id, siteId, mergeTarget.trim());
+      setAdminMsg("Merged. This issue now resolves to the target.");
+    } catch (err) { setAdminMsg(String(err)); }
+  };
+
+  const handleUnmerge = async (sourceId: string) => {
+    try {
+      await errorsApi.unmergeIssue(sourceId, siteId);
+      setAdminMsg("Unmerged " + sourceId);
+    } catch (err) { setAdminMsg(String(err)); }
+  };
+
   const handleSnooze = async () => {
     const until = new Date(Date.now() + 7 * 86400000).toISOString();
     await handleStatusChange("resolved", until);
@@ -215,6 +245,19 @@ function IssueDetail({ issue, siteId, onBack }: { issue: Issue; siteId: string; 
               onClick={() => handleStatusChange("open")}>Reopen</button>
           )}
         </div>
+      </div>
+
+      <div class="errors-detail-admin">
+        <input class="obs-input" placeholder="Assignee" value={assignee} maxLength={128}
+          onInput={(e) => setAssignee((e.target as HTMLInputElement).value)} />
+        <button class="obs-btn obs-btn--sm" onClick={handleAssign}>Assign</button>
+        <input class="obs-input" placeholder="Merge into issue id" value={mergeTarget}
+          onInput={(e) => setMergeTarget((e.target as HTMLInputElement).value)} />
+        <button class="obs-btn obs-btn--sm" onClick={handleMerge}>Merge</button>
+        {(issue.merged_sources ?? []).map(src => (
+          <button key={src} class="obs-btn obs-btn--sm" onClick={() => handleUnmerge(src)}>Unmerge {src.slice(0, 8)}</button>
+        ))}
+        {adminMsg && <span class="errors-detail-admin-msg">{adminMsg}</span>}
       </div>
 
       <div class="errors-detail-stats">

@@ -1,6 +1,9 @@
 package metrics
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestBuildMetricPlaceholders_Shape(t *testing.T) {
 	got := buildMetricPlaceholders(2)
@@ -19,7 +22,7 @@ func TestMetricArgs_MatchesColumnCount(t *testing.T) {
 }
 
 func TestInsertMetricRows_EmptyIsNoop(t *testing.T) {
-	n, err := insertMetricRows(nil, nil, "site1", nil)
+	n, err := insertMetricRows(context.Background(), nil, "site1", nil)
 	if err != nil || n != 0 {
 		t.Fatalf("insertMetricRows(empty) = (%d, %v), want (0, nil)", n, err)
 	}

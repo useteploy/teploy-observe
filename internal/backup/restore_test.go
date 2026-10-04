@@ -297,11 +297,11 @@ func TestRestore_RejectsNegativeRowCount(t *testing.T) {
 // mid-apply, after earlier tables had committed.
 func TestRestore_RejectsMalformedRowShapes(t *testing.T) {
 	for name, line := range map[string]string{
-		"null row":        "null\n",
-		"empty object":    "{}\n",
-		"trailing doc":    `{"site_id":"a"} {"site_id":"b"}` + "\n",
-		"array row":       `[1,2]` + "\n",
-		"unsafe column":   `{"site_id\":\"a\",\"x-y\":1}` + "\n",
+		"null row":      "null\n",
+		"empty object":  "{}\n",
+		"trailing doc":  `{"site_id":"a"} {"site_id":"b"}` + "\n",
+		"array row":     `[1,2]` + "\n",
+		"unsafe column": `{"site_id\":\"a\",\"x-y\":1}` + "\n",
 	} {
 		archive := writeTarArchive(t, map[string][]byte{
 			manifestName:  miniManifest(t, "sites"),

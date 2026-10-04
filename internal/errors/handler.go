@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -62,6 +63,19 @@ type ErrorInput struct {
 	EventID string `json:"event_id,omitempty"`
 	// ProducerID optionally namespaces EventID (scoped inbox key).
 	ProducerID string `json:"producer_id,omitempty"`
+	// PreGroupHash is SERVER-SET: ErrorBuffer.Push overwrites it (a client
+	// value is discarded) with the grouping hash derived from the raw
+	// input before scrubbing, so redaction can never move an event to a
+	// different issue. Empty = derive at insert (seed, scrub disabled).
+	PreGroupHash string `json:"_pre_group_hash,omitempty"`
+	// ClientTimestamp is the producer-captured event time (unix
+	// milliseconds; the Sentry endpoint maps the wire `timestamp` into
+	// it). Zero means "not captured" and the server arrival time is
+	// stored. A value more than 24h in the future is refused: clock
+	// garbage that would poison issue first/last-seen and retention
+	// windows. The past is accepted as-is — offline batching is a
+	// legitimate producer pattern.
+	ClientTimestamp int64 `json:"timestamp,omitempty"`
 }
 
 // Breadcrumb is a user action that preceded the error.
@@ -114,6 +128,8 @@ type Service struct {
 	// fallbackSalt is the global session salt used when a per-site lookup
 	// returns ok=false. Empty means "do not hash" — leave distinct_id raw.
 	fallbackSalt string
+	// spike is the per-site/per-issue rate guard (spike.go); nil = off.
+	spike *SpikeLimiter
 }
 
 // WithPrivacy installs the per-site distinct_id hashing lookup and
@@ -130,7 +146,7 @@ type ErrorHandler = Service
 
 // NewService constructs the canonical ingest service.
 func NewService(db *nucleus.Client, issueSvc *IssueService, searchSvc *SearchService, srcmapSvc *sourcemaps.SourceMapService) *Service {
-	return &Service{db: db, issueSvc: issueSvc, searchSvc: searchSvc, srcmapSvc: srcmapSvc}
+	return &Service{db: db, issueSvc: issueSvc, searchSvc: searchSvc, srcmapSvc: srcmapSvc, spike: NewSpikeLimiterFromEnv()}
 }
 
 // NewErrorHandler is the legacy constructor, kept so existing callers
@@ -148,9 +164,19 @@ func NewErrorHandler(db *nucleus.Client, issueSvc *IssueService, searchSvc *Sear
 //
 // Returns the issue_id so callers can present a link to the user.
 func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (string, error) {
+	issueID, _, err := s.ingestEvent(ctx, input)
+	return issueID, err
+}
+
+// ingestEvent is IngestErrorEvent that also reports a spike-sampled drop
+// (dropped=true, no error: a labeled final disposition, not a failure).
+func (s *Service) ingestEvent(ctx context.Context, input ErrorInput) (issueID string, dropped bool, err error) {
 	errorID, issueID, err := s.insertErrorEvent(ctx, s.db.SQL(), input)
+	if errors.Is(err, ErrSpikeDropped) {
+		return "", true, nil
+	}
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if s.searchSvc != nil {
 		if err := s.searchSvc.IndexError(ctx, input.SiteID, errorID, input.ErrorType, input.ErrorValue); err != nil {
@@ -158,7 +184,7 @@ func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (strin
 				"site", input.SiteID, "error_id", errorID, "err", err)
 		}
 	}
-	return issueID, nil
+	return issueID, false, nil
 }
 
 // insertErrorEvent is steps 1-4 of IngestErrorEvent on an explicit SQL
@@ -168,6 +194,19 @@ func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (strin
 // transaction; see ApplyInbox for why that exposure self-heals.
 func (s *Service) insertErrorEvent(ctx context.Context, sqlc *nucleus.SQLModel, input ErrorInput) (errorID, issueID string, err error) {
 	now := time.Now().UTC()
+	// Event time: the producer's own when captured (bounded — anything
+	// past a day of future skew is clock garbage, refused rather than
+	// clamped), else server arrival.
+	ts := now.UnixMilli()
+	if input.ClientTimestamp != 0 {
+		// Admission (ErrorBuffer.Push) refuses future skew with a 400; this
+		// is the same rule on the replay/apply paths, where a refusal can
+		// only surface as a flush error.
+		if input.ClientTimestamp > ts+24*60*60*1000 {
+			return "", "", fmt.Errorf("client timestamp %d is too far in the future", input.ClientTimestamp)
+		}
+		ts = input.ClientTimestamp
+	}
 
 	// Accept either `release` or `release_tag` for the release identifier so a
 	// wire-field mismatch doesn't silently drop it.
@@ -193,19 +232,32 @@ func (s *Service) insertErrorEvent(ctx context.Context, sqlc *nucleus.SQLModel, 
 	// derivation (O05). The issue records the version at create; a
 	// future v2 cutover is a new case in ComputeGroupHash, documented in
 	// grouping.go — existing issues are never rewritten.
-	groupHash, err := ComputeGroupHash(FingerprintVersion, input)
-	if err != nil {
-		return "", "", fmt.Errorf("group fingerprint: %w", err)
+	groupHash := input.PreGroupHash
+	if groupHash == "" {
+		groupHash, err = ComputeGroupHash(FingerprintVersion, input)
+		if err != nil {
+			return "", "", fmt.Errorf("group fingerprint: %w", err)
+		}
 	}
 
 	title := IssueTitle(input.ErrorType, input.ErrorValue)
 	culprit := IssueCulprit(input.StackTrace)
 
+	// Spike protection (spike.go): thin an over-cap flood, but never the
+	// first event of a new issue or a regression.
+	if s.spike.spikeCheck(input.SiteID, groupHash, func() bool {
+		return s.issueSvc.spikeExempt(ctx, input.SiteID, groupHash)
+	}) {
+		return "", "", ErrSpikeDropped
+	}
+
 	// Resolve or create issue
-	issueID, err = s.issueSvc.ResolveIssue(ctx, input.SiteID, groupHash, title, culprit, input.Level, input.ReleaseTag, now.UnixMilli())
+	issueID, err = s.issueSvc.ResolveIssue(ctx, input.SiteID, groupHash, title, culprit, input.Level, input.ReleaseTag, ts)
 	if err != nil {
 		return "", "", fmt.Errorf("resolve issue: %w", err)
 	}
+	// ResolveIssue already attributed a merged source to its target
+	// (merge_read.go attributeMerged).
 
 	// Serialize JSONB fields
 	stackJSON := jsonOrEmpty(input.StackTrace)
@@ -261,7 +313,7 @@ func (s *Service) insertErrorEvent(ctx context.Context, sqlc *nucleus.SQLModel, 
 			stack_trace, breadcrumbs, contexts, extra, distinct_id, trace_id, span_id
 		) VALUES ($1,'default',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
 		errorID, input.SiteID, input.SessionID, input.ReplayID, issueID, groupHash,
-		now.UnixMilli(), input.ErrorType, input.ErrorValue, input.Mechanism, handled, input.Level,
+		ts, input.ErrorType, input.ErrorValue, input.Mechanism, handled, input.Level,
 		input.ReleaseTag, input.Environment, input.URL, input.Browser, input.OS, input.Device,
 		stackJSON, breadcrumbsJSON, contextsJSON, extraJSON, distinctID, input.TraceID, input.SpanID,
 	)

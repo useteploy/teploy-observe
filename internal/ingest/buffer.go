@@ -302,7 +302,7 @@ func existingEventKeys(ctx context.Context, sqlc *nucleus.SQLModel, events []Eve
 			return nil
 		}
 		for _, r := range rows {
-			existing[eventKey{SiteID: r.SiteID, EventID: r.EventID}] = struct{}{}
+			existing[eventKey(r)] = struct{}{}
 		}
 	}
 	return existing

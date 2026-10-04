@@ -22,11 +22,11 @@ import (
 // faultMode drives one o11 fault server. kind is one of:
 // ok, status, failN, partial, slow, reset.
 type faultMode struct {
-	kind   string
-	code   int
-	n      int
-	ack    string // JSON body for partial
-	delay  time.Duration
+	kind  string
+	code  int
+	n     int
+	ack   string // JSON body for partial
+	delay time.Duration
 }
 
 type o11Server struct {

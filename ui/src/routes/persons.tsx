@@ -86,6 +86,22 @@ function PersonDetailPanel({ distinctID, siteID, onBack }:
             </div>
           </div>
 
+          {data.properties && Object.keys(data.properties).length > 0 && (
+            <div style={{ marginBottom: "20px" }}>
+              <h2 style={{ fontSize: "13px", fontWeight: 600, marginBottom: "8px" }}>Properties</h2>
+              <div style={{ fontSize: "12px", fontFamily: "var(--obs-font-mono, monospace)" }}>
+                {Object.entries(data.properties).map(([k, v]) => (
+                  <div key={k}><span style={{ color: "var(--obs-text-muted)" }}>{k}</span>: {String(v)}</div>
+                ))}
+              </div>
+            </div>
+          )}
+          {data.aliases && data.aliases.length > 0 && (
+            <div style={{ marginBottom: "20px", fontSize: "12px", color: "var(--obs-text-muted)" }}>
+              Merged identities ({data.aliases.length}): {data.aliases.map(truncateID).join(", ")}
+            </div>
+          )}
+
           <div>
             <h2 style={{ fontSize: "13px", fontWeight: 600, marginBottom: "12px" }}>
               Recent activity ({data.timeline.length})

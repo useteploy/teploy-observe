@@ -11,6 +11,8 @@ import (
 	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/guardmap"
+	"github.com/useteploy/teploy-observe/internal/queryguard"
 )
 
 // servicesCacheTTL is how long a services rollup stays servable. The RED
@@ -41,6 +43,22 @@ type QueryService struct {
 	// so the map stays bounded by the windows queried within one TTL.
 	servicesMu    sync.Mutex
 	servicesCache map[string]servicesEntry
+
+	// qguard is the O12 read-path admission (concurrency slot + time/row
+	// budgets). The nil Guard is valid: no concurrency bound, default budgets.
+	qguard *guardmap.Guard
+
+	// Test seams for the search pipeline; nil means query the database.
+	querySpans     func(ctx context.Context, sql string, args ...any) ([]Span, error)
+	querySummaries func(ctx context.Context, sql string, args ...any) ([]TraceSummary, error)
+	queryCounts    func(ctx context.Context, sql string, args ...any) ([]spanCountRow, error)
+}
+
+// WithQueryGuard installs the O12 read-path admission state. A nil limiter
+// disables concurrency admission but keeps the budgets.
+func (q *QueryService) WithQueryGuard(l *queryguard.Limiter, b queryguard.Budgets) *QueryService {
+	q.qguard = guardmap.NewGuard(l, b)
+	return q
 }
 
 func NewQueryService(db *nucleus.Client) *QueryService {
@@ -98,7 +116,10 @@ type ServiceSummary struct {
 // Frustrated > 4T; tolerated > T && <= 4T; satisfied <= T. SigNoz parity.
 const apdexThresholdMs int64 = 500
 
-// apdex computes the Apdex score (0..1) for a slice of durations.
+// apdex computes the Apdex score (0..1) for a slice of durations. Retained
+// as the reference formula apdexFromCounts (the SQL-side pre-bucketed form
+// in production use) and query_test.go pin it against; production reads
+// go through the bucketed path.
 //
 //	satisfied = duration <= t
 //	tolerated = t < duration <= 4t
@@ -106,6 +127,8 @@ const apdexThresholdMs int64 = 500
 //	score = (satisfied + tolerated/2) / total
 //
 // Returns 0 for an empty input.
+//
+//lint:ignore U1000 pinned by TestApdex_Formula in query_test.go
 func apdex(durations []int64, t int64) float64 {
 	if len(durations) == 0 || t <= 0 {
 		return 0
@@ -130,6 +153,14 @@ func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to
 	}
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
+
+	// O12: a cache hit above costs nothing and takes no slot; the scan below
+	// does, and runs under the time budget.
+	qctx, release, err := q.qguard.Begin(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
 	// Compute RED metrics from raw spans, NOT the service_stats rollup. The
 	// rollup is written once per ingest batch with that batch's counts into a
@@ -158,7 +189,7 @@ func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to
 	}
 	satisfiedMs := dbutil.IntParam(apdexThresholdMs)
 	toleratedMs := dbutil.IntParam(4 * apdexThresholdMs)
-	rows, err := nucleus.Query[rawStat](ctx, q.db.SQL(),
+	rows, err := nucleus.Query[rawStat](qctx, q.db.SQL(),
 		`SELECT service_name,
 			COUNT(*) AS request_count,
 			SUM(CASE WHEN status_code = 'error' THEN 1 ELSE 0 END) AS error_count,
@@ -175,7 +206,7 @@ func (q *QueryService) ListServices(ctx context.Context, siteID string, from, to
 		siteID, fromMs, toMs, satisfiedMs, toleratedMs,
 	)
 	if err != nil {
-		return nil, err
+		return nil, q.qguard.DeadlineError(ctx, err)
 	}
 
 	result := make([]ServiceSummary, 0, len(rows))
@@ -219,6 +250,12 @@ func (q *QueryService) ListOperations(ctx context.Context, siteID, service strin
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
+	qctx, release, err := q.qguard.Begin(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	// RED per operation from raw spans (see ListServices for why the
 	// service_stats rollup is not the source of truth).
 	type rawStat struct {
@@ -230,7 +267,7 @@ func (q *QueryService) ListOperations(ctx context.Context, siteID, service strin
 		P95         int64  `db:"p95_ms"`
 		P99         int64  `db:"p99_ms"`
 	}
-	rows, err := nucleus.Query[rawStat](ctx, q.db.SQL(),
+	rows, err := nucleus.Query[rawStat](qctx, q.db.SQL(),
 		`SELECT operation_name,
 			COUNT(*) AS request_count,
 			SUM(CASE WHEN status_code = 'error' THEN 1 ELSE 0 END) AS error_count,
@@ -244,7 +281,7 @@ func (q *QueryService) ListOperations(ctx context.Context, siteID, service strin
 		siteID, service, fromMs, toMs,
 	)
 	if err != nil {
-		return nil, err
+		return nil, q.qguard.DeadlineError(ctx, err)
 	}
 
 	result := make([]OperationSummary, 0, len(rows))
@@ -275,88 +312,20 @@ type TraceSummary struct {
 	DurationMs  int64     `json:"duration_ms"`
 	SpanCount   int64     `json:"span_count"`
 	StatusCode  string    `json:"status_code"`
+	// RootMissing marks a trace listed by include_orphans: it has no root
+	// span and the row shown is its earliest span. Omitted otherwise.
+	RootMissing bool `json:"root_missing,omitempty"`
 }
 
-// SearchTraces finds traces matching filters.
+// SearchTraces finds root-span traces matching filters. Guarded (O12); the
+// attribute and orphan modes live on SearchTracesEx.
 func (q *QueryService) SearchTraces(ctx context.Context, siteID string, from, to time.Time, service, operation, status string, minDuration, maxDuration int64, limit, offset int) ([]TraceSummary, error) {
-	fromMs := dbutil.IntParam(from.UnixMilli())
-	toMs := dbutil.IntParam(to.UnixMilli())
-	if limit <= 0 {
-		limit = 20
-	}
-	if offset < 0 {
-		offset = 0
-	}
-
-	// start_time is stored as TEXT (digit-string) and Nucleus doesn't coerce it
-	// to BIGINT for the comparison — both sides need an explicit cast.
-	where := "site_id = $1 AND start_time >= $2 AND start_time < $3"
-	params := []any{siteID, fromMs, toMs}
-	// Site+time-only filter for the span-count aggregate, so a status/service
-	// filter on the root-span search doesn't undercount a trace's total spans.
-	baseWhere := where
-	baseParams := []any{siteID, fromMs, toMs}
-	idx := 4
-
-	if service != "" {
-		where += fmt.Sprintf(" AND service_name = $%d", idx)
-		params = append(params, service)
-		idx++
-	}
-	if operation != "" {
-		where += fmt.Sprintf(" AND operation_name = $%d", idx)
-		params = append(params, operation)
-		idx++
-	}
-	if status != "" {
-		where += fmt.Sprintf(" AND status_code = $%d", idx)
-		params = append(params, status)
-		idx++
-	}
-	if minDuration > 0 {
-		where += fmt.Sprintf(" AND CAST(duration_ms AS BIGINT) >= %d", minDuration)
-	}
-	if maxDuration > 0 {
-		where += fmt.Sprintf(" AND CAST(duration_ms AS BIGINT) <= %d", maxDuration)
-	}
-
-	q2 := fmt.Sprintf(`SELECT trace_id,
-			service_name AS root_service,
-			operation_name AS root_op,
-			CAST(start_time AS TEXT) AS start_time,
-			CAST(duration_ms AS TEXT) AS duration_ms,
-			'0' AS span_count,
-			status_code
-		 FROM spans
-		 WHERE %s AND parent_span_id = ''
-		 ORDER BY start_time DESC
-		 LIMIT %d OFFSET %d`, where, limit, offset)
-
-	summaries, err := nucleus.Query[TraceSummary](ctx, q.db.SQL(), q2, params...)
-	if err != nil || len(summaries) == 0 {
-		return summaries, err
-	}
-
-	// span_count was previously hardcoded to 1. Compute the real per-trace span
-	// count with a second aggregate and fold it in by trace_id (Nucleus rejects
-	// some single-query aggregate shapes, hence the separate pass).
-	type spanCountRow struct {
-		TraceID string `db:"trace_id"`
-		N       int64  `db:"n"`
-	}
-	counts, cErr := nucleus.Query[spanCountRow](ctx, q.db.SQL(),
-		fmt.Sprintf(`SELECT trace_id, COUNT(*) AS n FROM spans WHERE %s GROUP BY trace_id`, baseWhere),
-		baseParams...)
-	if cErr == nil {
-		byTrace := make(map[string]int64, len(counts))
-		for _, c := range counts {
-			byTrace[c.TraceID] = c.N
-		}
-		for i := range summaries {
-			summaries[i].SpanCount = byTrace[summaries[i].TraceID]
-		}
-	}
-	return summaries, nil
+	res, err := q.SearchTracesEx(ctx, siteID, from, to, SearchOptions{
+		Service: service, Operation: operation, Status: status,
+		MinDuration: minDuration, MaxDuration: maxDuration,
+		Limit: limit, Offset: offset,
+	})
+	return res.Traces, err
 }
 
 // Span is a stored span for the waterfall view.
@@ -375,10 +344,26 @@ type Span struct {
 	Attributes    string    `json:"attributes"`
 	Resource      string    `json:"resource"`
 	Events        string    `json:"events"`
+	// Links is additive: omitted when the span has none.
+	Links []StoredSpanLink `json:"links,omitempty"`
 }
 
 // GetTrace returns all spans for a trace, ordered for waterfall rendering.
 func (q *QueryService) GetTrace(ctx context.Context, traceID, siteID string) ([]Span, error) {
+	qctx, release, err := q.qguard.Begin(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	spans, err := q.getTraceSpans(qctx, traceID, siteID)
+	if err != nil {
+		return nil, q.qguard.DeadlineError(ctx, err)
+	}
+	q.attachLinks(qctx, traceID, siteID, spans)
+	return spans, nil
+}
+
+func (q *QueryService) getTraceSpans(ctx context.Context, traceID, siteID string) ([]Span, error) {
 	return nucleus.Query[Span](ctx, q.db.SQL(),
 		`SELECT trace_id, span_id, parent_span_id, service_name, operation_name,
 			span_kind,
@@ -415,6 +400,12 @@ func (q *QueryService) ServiceDependencies(ctx context.Context, siteID string, f
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
+	qctx, release, err := q.qguard.Begin(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	// Dependency edges from raw spans (parent span's service -> child span's
 	// service) via self-join, NOT the service_dependencies rollup — that is
 	// written per ingest batch and deduped to the newest version per edge, so
@@ -426,7 +417,7 @@ func (q *QueryService) ServiceDependencies(ctx context.Context, siteID string, f
 		ErrorCount  int64  `db:"error_count"`
 		DurationSum int64  `db:"duration_sum"`
 	}
-	rows, err := nucleus.Query[rawDep](ctx, q.db.SQL(),
+	rows, err := nucleus.Query[rawDep](qctx, q.db.SQL(),
 		`SELECT p.service_name AS src_service, c.service_name AS dst_service,
 			COUNT(*) AS call_count,
 			SUM(CASE WHEN c.status_code = 'error' THEN 1 ELSE 0 END) AS error_count,
@@ -438,7 +429,7 @@ func (q *QueryService) ServiceDependencies(ctx context.Context, siteID string, f
 		siteID, fromMs, toMs,
 	)
 	if err != nil {
-		return nil, err
+		return nil, q.qguard.DeadlineError(ctx, err)
 	}
 
 	out := make([]Dependency, 0, len(rows))

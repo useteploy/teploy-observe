@@ -5,10 +5,15 @@
 // package is the read layer that turns the column into a "Persons" UI.
 //
 // Design choices:
-//   - No table of its own. Persons are an aggregate over events; the
-//     refresh is implicit on every read. Materialization is a phase-2
-//     concern (cohort_members table + periodic refresh per the design
-//     doc); v1 keeps the contract simple.
+//   - Persons are an aggregate over events; the refresh is implicit on
+//     every read. Materialization is a phase-2 concern (cohort_members
+//     table + periodic refresh per the design doc); v1 keeps the contract
+//     simple.
+//   - C3 (migration 061) adds SIDE tables keyed by the same person_key:
+//     person_properties (identify traits), person_aliases (explicit
+//     merge, resolved at read time in Go) and person_tombstones (erasure).
+//     See identity.go and docs/IDENTITY_MODEL_ADR.md. Events are never
+//     rewritten.
 //   - Anonymous rows (distinct_id = ”) are excluded by default. The
 //     caller can opt them in with a flag — useful for ops who haven't
 //     wired identify() yet and want to see traffic shape.
@@ -19,22 +24,29 @@ package persons
 
 import (
 	"context"
-	"fmt"
+	"sync"
 	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
-
-	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
 // Service exposes person aggregation queries.
 type Service struct {
 	db *nucleus.Client
+	ev EventSource
+	st IdentityStore
+	mu sync.Mutex // serializes the read-modify-write paths (single-process boundary)
 }
 
 // NewService constructs a persons.Service backed by the shared nucleus client.
 func NewService(db *nucleus.Client) *Service {
-	return &Service{db: db}
+	return &Service{db: db, ev: &nucleusEvents{db: db}, st: &nucleusIdentity{db: db}}
+}
+
+// NewServiceFromParts builds a Service over explicit stores (tests and the
+// in-memory implementation in memory.go).
+func NewServiceFromParts(ev EventSource, st IdentityStore) *Service {
+	return &Service{ev: ev, st: st}
 }
 
 // Person is the aggregate returned by ListPersons. Counts are int64 so
@@ -60,17 +72,25 @@ type PersonEvent struct {
 }
 
 // PersonDetail bundles a person's aggregate row with its event timeline.
+//
+// C3: Properties holds the identify() traits (merged across the person's
+// aliases, canonical wins), Aliases lists the person keys merged into this
+// one, and CanonicalKey is the key the requested id resolved to.
 type PersonDetail struct {
-	Person   Person        `json:"person"`
-	Timeline []PersonEvent `json:"timeline"`
+	Person       Person         `json:"person"`
+	Timeline     []PersonEvent  `json:"timeline"`
+	Properties   map[string]any `json:"properties"`
+	Aliases      []string       `json:"aliases"`
+	CanonicalKey string         `json:"canonical_key,omitempty"`
 }
 
 // ListPersons returns one row per distinct_id observed in the time
-// window for siteID, ordered by last activity descending. Anonymous
-// (empty distinct_id) rows are excluded unless includeAnonymous=true —
-// most operators want the identified-users view, but a fresh install
-// without identify() wired needs the all-traffic view to verify the
-// page is even rendering.
+// window for siteID, ordered by last activity descending, WITHOUT alias
+// resolution or erasure filtering (use ListResolved for the user-facing
+// view). Anonymous (empty distinct_id) rows are excluded unless
+// includeAnonymous=true — most operators want the identified-users view,
+// but a fresh install without identify() wired needs the all-traffic view
+// to verify the page is even rendering.
 func (s *Service) ListPersons(ctx context.Context, siteID string, fromMs, toMs int64, limit, offset int, includeAnonymous bool) ([]Person, error) {
 	if siteID == "" {
 		return []Person{}, nil
@@ -84,42 +104,9 @@ func (s *Service) ListPersons(ctx context.Context, siteID string, fromMs, toMs i
 	if offset < 0 {
 		offset = 0
 	}
-
-	from := dbutil.IntParam(fromMs)
-	to := dbutil.IntParam(toMs)
-
-	// Inner aggregate computes the per-distinct_id summary. The outer
-	// scan is plain so we can sort + paginate in SQL. argMax(country,
-	// timestamp) picks the most recent country/browser per person —
-	// nucleus doesn't expose argMax yet, so we approximate with MAX
-	// over a tuple-style hack: pick by timestamp using a subquery.
-	// Simpler portable form: use a window-style MAX(country) and
-	// accept that for ties we get the last grouped value, which is
-	// good enough for a "where they're connecting from" hint.
-	anonClause := "AND distinct_id != ''"
-	if includeAnonymous {
-		anonClause = ""
-	}
-
-	q := fmt.Sprintf(`SELECT distinct_id,
-	        MIN(CAST(timestamp AS BIGINT)) AS first_seen_ms,
-	        MAX(CAST(timestamp AS BIGINT)) AS last_seen_ms,
-	        COUNT(*) AS event_count,
-	        COUNT(DISTINCT session_id) AS session_count,
-	        argMax(country, CAST(timestamp AS BIGINT)) AS top_country,
-	        argMax(browser, CAST(timestamp AS BIGINT)) AS top_browser
-	 FROM events
-	 WHERE site_id = $1
-	   AND timestamp >= $2
-	   AND timestamp < $3
-	   %s
-	 GROUP BY distinct_id
-	 ORDER BY last_seen_ms DESC
-	 LIMIT %d OFFSET %d`, anonClause, limit, offset)
-
-	rows, err := nucleus.Query[Person](ctx, s.db.SQL(), q, siteID, from, to)
+	rows, err := s.ev.List(ctx, siteID, fromMs, toMs, limit, offset, includeAnonymous)
 	if err != nil {
-		return nil, fmt.Errorf("list persons: %w", err)
+		return nil, err
 	}
 	if rows == nil {
 		rows = []Person{}
@@ -127,92 +114,14 @@ func (s *Service) ListPersons(ctx context.Context, siteID string, fromMs, toMs i
 	return rows, nil
 }
 
-// PersonDetail returns the aggregate row for distinctID plus the most
-// recent 100 events as a vertical timeline. distinctID = ” returns an
-// empty result on purpose — anonymous-aggregated detail makes no sense.
-func (s *Service) PersonDetail(ctx context.Context, siteID, distinctID string) (PersonDetail, error) {
-	if siteID == "" || distinctID == "" {
-		return PersonDetail{}, nil
-	}
-
-	// Aggregate over the full history of this distinct_id (no time
-	// window — the detail view always shows the lifetime summary).
-	aggQ := `SELECT distinct_id,
-	        MIN(CAST(timestamp AS BIGINT)) AS first_seen_ms,
-	        MAX(CAST(timestamp AS BIGINT)) AS last_seen_ms,
-	        COUNT(*) AS event_count,
-	        COUNT(DISTINCT session_id) AS session_count,
-	        argMax(country, CAST(timestamp AS BIGINT)) AS top_country,
-	        argMax(browser, CAST(timestamp AS BIGINT)) AS top_browser
-	 FROM events
-	 WHERE site_id = $1 AND distinct_id = $2
-	 GROUP BY distinct_id`
-
-	aggRows, err := nucleus.Query[Person](ctx, s.db.SQL(), aggQ, siteID, distinctID)
-	if err != nil {
-		return PersonDetail{}, fmt.Errorf("person aggregate: %w", err)
-	}
-
-	var p Person
-	if len(aggRows) > 0 {
-		p = aggRows[0]
-	} else {
-		p = Person{DistinctID: distinctID}
-	}
-
-	tlQ := `SELECT event_id, event_type,
-	        COALESCE(url, '') AS url,
-	        COALESCE(pathname, '') AS pathname,
-	        CAST(timestamp AS BIGINT) AS timestamp
-	 FROM events
-	 WHERE site_id = $1 AND distinct_id = $2
-	 ORDER BY CAST(timestamp AS BIGINT) DESC
-	 LIMIT 100`
-
-	tl, err := nucleus.Query[PersonEvent](ctx, s.db.SQL(), tlQ, siteID, distinctID)
-	if err != nil {
-		// Non-fatal: aggregate is the load-bearing part. Return what we have.
-		return PersonDetail{Person: p, Timeline: []PersonEvent{}}, nil
-	}
-	if tl == nil {
-		tl = []PersonEvent{}
-	}
-	return PersonDetail{Person: p, Timeline: tl}, nil
-}
-
-// CountPersons returns the total distinct_id count in the window.
-// Cheap helper used by the UI to render pagination totals without
-// pulling a second page.
+// CountPersons returns the total distinct_id count in the window (raw: no
+// alias resolution or erasure filtering). Cheap helper used by the UI to
+// render pagination totals without pulling a second page.
 func (s *Service) CountPersons(ctx context.Context, siteID string, fromMs, toMs int64, includeAnonymous bool) (int64, error) {
 	if siteID == "" {
 		return 0, nil
 	}
-	from := dbutil.IntParam(fromMs)
-	to := dbutil.IntParam(toMs)
-
-	anonClause := "AND distinct_id != ''"
-	if includeAnonymous {
-		anonClause = ""
-	}
-
-	type countRow struct {
-		Total int64 `db:"total"`
-	}
-	q := fmt.Sprintf(`SELECT COUNT(DISTINCT distinct_id) AS total
-	 FROM events
-	 WHERE site_id = $1
-	   AND timestamp >= $2
-	   AND timestamp < $3
-	   %s`, anonClause)
-
-	rows, err := nucleus.Query[countRow](ctx, s.db.SQL(), q, siteID, from, to)
-	if err != nil {
-		return 0, fmt.Errorf("count persons: %w", err)
-	}
-	if len(rows) == 0 {
-		return 0, nil
-	}
-	return rows[0].Total, nil
+	return s.ev.Count(ctx, siteID, fromMs, toMs, includeAnonymous)
 }
 
 // DefaultWindow returns the default 30-day query window when the caller

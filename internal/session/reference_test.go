@@ -879,7 +879,7 @@ func TestReference_SaltEras(t *testing.T) {
 	month := currentMonthKey()
 
 	// 1. Fixed salt: deterministic across independent calls ("restarts").
-	if monthKeyedID(site, ip, ua, "fixed-salt", month) != monthKeyedID(site, ip, ua, "fixed-salt", month) {
+	if a, b := monthKeyedID(site, ip, ua, "fixed-salt", month), monthKeyedID(site, ip, ua, "fixed-salt", month); a != b {
 		t.Fatal("fixed salt must derive stable session ids")
 	}
 	if got1, got2 := ID(site, ip, ua, "fixed-salt"), ID(site, ip, ua, "fixed-salt"); got1 != got2 {
@@ -897,15 +897,14 @@ func TestReference_SaltEras(t *testing.T) {
 		t.Fatal("rotating the global salt must change visit ids (via the session id)")
 	}
 	// ... but the persons entity on a site-backed install does not.
-	if distinctIDOf(raw, siteSalt) != distinctIDOf(raw, siteSalt) ||
-		distinctIDOf(raw, siteSalt) != identity.HashDistinctID(raw, siteSalt) {
+	if a, b := distinctIDOf(raw, siteSalt), distinctIDOf(raw, siteSalt); a != b || a != identity.HashDistinctID(raw, siteSalt) {
 		t.Fatal("distinct_id derivation must be deterministic under the per-site salt")
 	}
 	if distinctIDOf(raw, siteSalt) == "" {
 		t.Fatal("distinct_id must not be empty for a non-empty raw value")
 	}
 	// The global salt never touches the per-site HMAC: era change leaves it identical.
-	if identity.HashDistinctID(raw, siteSalt) != identity.HashDistinctID(raw, siteSalt) {
+	if a, b := identity.HashDistinctID(raw, siteSalt), identity.HashDistinctID(raw, siteSalt); a != b {
 		t.Fatal("per-site-salt HMAC must not depend on the global salt")
 	}
 

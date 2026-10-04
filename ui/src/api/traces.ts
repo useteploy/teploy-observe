@@ -1,6 +1,8 @@
 // Distributed tracing API — services, operations, waterfall, dependencies.
 
 import { get, post, del } from "./helpers.js";
+import { buildTraceSearchQuery } from "../lib/traceSearch.js";
+import type { TraceSearchParams } from "../lib/traceSearch.js";
 
 const BASE = "/api/v1/traces";
 
@@ -33,6 +35,16 @@ export interface TraceSummary {
   duration_ms: number;
   span_count: number;
   status_code: string;
+  /** Set by include_orphans: no root span; the row is the trace's earliest span. */
+  root_missing?: boolean;
+}
+
+/** Response of /search-advanced. `truncated` means a bound cut the candidates. */
+export interface TraceSearchResult {
+  traces: TraceSummary[];
+  truncated: boolean;
+  truncated_reason?: string;
+  candidate_cap?: number;
 }
 
 export interface Span {
@@ -117,6 +129,8 @@ export const tracesApi = {
     if (opts?.max_duration) q += `&max_duration=${opts.max_duration}`;
     return get<TraceSummary[]>(`${BASE}/search?${q}`);
   },
+  searchAdvanced: (params: TraceSearchParams) =>
+    get<TraceSearchResult>(`${BASE}/search-advanced?${buildTraceSearchQuery(params)}`),
   trace: (traceId: string, siteId: string) =>
     get<Span[]>(`${BASE}/${traceId}?site_id=${siteId}`),
   traceErrors: (traceId: string, siteId: string) =>

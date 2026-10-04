@@ -10,14 +10,16 @@ on:
 # and a superseded push to the same branch cancels its own stale run.
 permissions:
   contents: read
+# One Nucleus image version for every job, the staticcheck pin, and the
+# concurrency policy. NUCLEUS_VERSION is the engine version CI tests
+# against and production runs (teploy.yml pins the same tag;
+# docker-compose.yml defaults to it). One place to bump.
+env:
+  NUCLEUS_VERSION: v1.2.1
+  STATICCHECK_VERSION: 2025.1.1
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
-# The engine version CI tests against and production runs (teploy.yml pins
-# the same tag; docker-compose.yml defaults to it). One place to bump.
-env:
-  NUCLEUS_VERSION: v1.2.1
 
 # This repo embeds the built UI at cmd/observe/ui/dist/ as part of the
 # repo (single-binary story). CI only needs to build + test the Go code
@@ -39,14 +41,61 @@ jobs:
         run: go vet ./...
       - name: Validate installer
         run: sh -n scripts/install.sh
+      - name: gofmt
+        # Non-vendor, non-Neutron Go files only; any output fails the job.
+        run: |
+          out=$(git ls-files '*.go' | grep -v -e '^vendor/' -e '^Neutron/' | xargs gofmt -l)
+          if [ -n "$out" ]; then
+            echo "unformatted files (run gofmt -w):" >&2
+            echo "$out" >&2
+            exit 1
+          fi
       - name: Test
         run: go test ./...
-      # AUD-056 (round 2): the concurrency-heavy packages get the race
-      # detector — the batch-admission, WAL, replay-lock, and audit-head
-      # regressions from this audit series are exactly the class of bug a
-      # plain `go test` passes.
-      - name: Race regression tests
-        run: go test -race ./internal/ingest/... ./internal/audit/... ./internal/replays/... ./internal/auth/... ./internal/backup/...
+
+  # Full race detector over the main module (supersedes the old partial
+  # list in the go job). Separate job so it runs in parallel with the plain
+  # suite; DB-backed tests skip here (no Nucleus), which keeps it bounded.
+  go-race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Race
+        run: go test -race ./...
+
+  # Known-vulnerability scan over the module graph. Separate job so a new
+  # advisory is its own red check rather than hiding in `go`. Intended to
+  # be BLOCKING once the first run is triaged (stdlib findings clear by
+  # bumping the Go toolchain, dependency findings by go.mod).
+  govulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  staticcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@${{ env.STATICCHECK_VERSION }}
+          staticcheck ./...
 
   # AUD-056 (round 2): the classic replay tracker is a separately shipped
   # surface; these contract tests execute the real served script in a vm
@@ -64,6 +113,21 @@ jobs:
       # dependency-free pure modules — pinned here without an npm install.
       # (smoke.mjs / player-smoke.mjs need system Chrome and stay manual.)
       - run: node --test cmd/observe/tracker/replay-delta/test/sanitizer.test.mjs
+      # Survey widget and replay-capture contract tests (vm sandbox, no deps).
+      - run: node --test cmd/observe/tracker/test/*.test.mjs
+
+  # Pure-logic UI unit tests (helpers, API shapes). Needs Node >= 22.6 for
+  # --experimental-strip-types; no npm install required.
+  ui-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - working-directory: ui
+        run: node --test --experimental-strip-types 'src/**/*.test.ts'
 
   sdk-go:
     runs-on: ubuntu-latest
@@ -235,7 +299,7 @@ jobs:
           go-version: '1.25'
       - name: Start pinned Nucleus
         run: |
-          docker run -d --name nucleus -p 55432:5432 \
+          docker run -d --name nucleus -p 127.0.0.1:55432:5432 \
             -e NUCLEUS_ALLOW_NO_AUTH=1 \
             -e NUCLEUS_ALLOW_INSECURE_CLUSTER=1 \
             -e NUCLEUS_ALLOW_INSECURE_REPLICATION=1 \
@@ -283,7 +347,7 @@ jobs:
           go-version: '1.25'
       - name: Start pinned Nucleus
         run: |
-          docker run -d --name nucleus -p 55432:5432 \
+          docker run -d --name nucleus -p 127.0.0.1:55432:5432 \
             -e NUCLEUS_ALLOW_NO_AUTH=1 \
             -e NUCLEUS_ALLOW_INSECURE_CLUSTER=1 \
             -e NUCLEUS_ALLOW_INSECURE_REPLICATION=1 \
@@ -340,11 +404,11 @@ jobs:
           node-version: '20'
       - name: Start pinned Nucleus
         run: |
-          docker run -d --name nucleus -p 55432:5432 \
+          docker run -d --name nucleus -p 127.0.0.1:55432:5432 \
             -e NUCLEUS_ALLOW_NO_AUTH=1 \
             -e NUCLEUS_ALLOW_INSECURE_CLUSTER=1 \
             -e NUCLEUS_ALLOW_INSECURE_REPLICATION=1 \
-            ghcr.io/neutron-build/nucleus:v1.1.0 \
+            ghcr.io/neutron-build/nucleus:${{ env.NUCLEUS_VERSION }} \
             start --host 0.0.0.0 --port 5432 --cluster-port 5433 --data /data --max-memory 512
           for i in $(seq 1 60); do
             if (exec 3<>/dev/tcp/127.0.0.1/55432) 2>/dev/null; then exec 3>&-; exit 0; fi

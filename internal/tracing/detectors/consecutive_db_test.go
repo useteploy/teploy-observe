@@ -9,8 +9,8 @@ func TestConsecutiveDB(t *testing.T) {
 		return Span{
 			TraceID: trace, SpanID: id, ParentSpanID: parent,
 			ServiceName: "api", OperationName: "db.query",
-			SpanKind:   "client",
-			StartMs:    start, EndMs: end, DurationMs: end - start,
+			SpanKind: "client",
+			StartMs:  start, EndMs: end, DurationMs: end - start,
 			Attributes: map[string]string{"db.statement": stmt, "db.system": "postgres"},
 		}
 	}
@@ -30,7 +30,7 @@ func TestConsecutiveDB(t *testing.T) {
 	t.Run("three parallel spans do not fire", func(t *testing.T) {
 		spans := []Span{
 			mkSpan("a", 0, 50, "SELECT * FROM users"),
-			mkSpan("b", 10, 60, "SELECT * FROM orders"), // overlaps a
+			mkSpan("b", 10, 60, "SELECT * FROM orders"),   // overlaps a
 			mkSpan("c", 20, 70, "SELECT * FROM payments"), // overlaps a, b
 		}
 		got := NewConsecutiveDB().Detect(spans)

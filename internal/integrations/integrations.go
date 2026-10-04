@@ -6,12 +6,15 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/mail"
 	"net/smtp"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -145,8 +148,10 @@ func (s *IntegrationService) fireAndRecord(ctx context.Context, i Integration, p
 	errMsg := ""
 	if err != nil {
 		status = "failed"
-		errMsg = err.Error()
-		s.logger.Error("integration fire failed", "type", i.IntType, "name", i.Name, "err", err)
+		// Transport errors embed the request URL, and for Slack the URL is
+		// the credential. Redact before the message is logged or stored.
+		errMsg = redactDeliveryError(err, i.Config)
+		s.logger.Error("integration fire failed", "type", i.IntType, "name", i.Name, "err", errMsg)
 	}
 	body, _ := json.Marshal(payload)
 	_, recErr := s.db.SQL().Exec(ctx,
@@ -161,6 +166,34 @@ func (s *IntegrationService) fireAndRecord(ctx context.Context, i Integration, p
 		s.logger.Warn("integration delivery record failed", "err", recErr)
 	}
 	return err
+}
+
+// secretConfigKeys are the config fields that carry credentials; their values
+// are scrubbed from any error text.
+var secretConfigKeys = []string{"webhook_url", "api_token", "token", "routing_key", "password"}
+
+// redactDeliveryError renders err without credentials: a *url.Error is
+// reduced to scheme://host (path and query, where webhook tokens live, are
+// dropped), and any secret config value that still appears is masked.
+func redactDeliveryError(err error, configJSON string) string {
+	msg := err.Error()
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		dest := "[url]"
+		if u, perr := url.Parse(ue.URL); perr == nil && u.Host != "" {
+			dest = u.Scheme + "://" + u.Host + "/[redacted]"
+		}
+		msg = fmt.Sprintf("%s %s: %v", ue.Op, dest, ue.Err)
+	}
+	var cfg map[string]any
+	if json.Unmarshal([]byte(configJSON), &cfg) == nil {
+		for _, k := range secretConfigKeys {
+			if v, ok := cfg[k].(string); ok && len(v) >= 4 {
+				msg = strings.ReplaceAll(msg, v, "[redacted]")
+			}
+		}
+	}
+	return msg
 }
 
 func boolStr(b bool) string {
@@ -298,6 +331,9 @@ func (s *IntegrationService) fireJira(configJSON string, p AlertPayload) error {
 	if cfg.BaseURL == "" || cfg.Project == "" {
 		return fmt.Errorf("jira: missing base_url or project")
 	}
+	if netsafe.ValidateURL(cfg.BaseURL) != nil {
+		return fmt.Errorf("jira: base_url must be an http(s) URL without userinfo")
+	}
 	body, _ := json.Marshal(map[string]any{
 		"fields": map[string]any{
 			"project":     map[string]string{"key": cfg.Project},
@@ -385,9 +421,64 @@ func (s *IntegrationService) fireEmail(configJSON string, p AlertPayload) error 
 	}
 	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: [Observe Alert] %s\r\n\r\n%s\r\n\r\nMetric: %s = %s (threshold: %s)",
 		cfg.From, strings.Join(recipients, ", "), p.Title, p.Message, p.Metric, p.Value, p.Threshold)
+	// SSRF guard: resolve once, refuse non-public addresses, and dial the
+	// resolved IP so the name cannot re-resolve to a private address between
+	// the check and the connect (DNS rebinding). The host name is still what
+	// TLS and AUTH are bound to.
+	dialIP, err := publicSMTPAddr(cfg.SMTPHost, lookupIP)
+	if err != nil {
+		return err
+	}
 	auth := smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.SMTPHost)
 	// Timeout-bounded send so a hung relay can't block the alert dispatch path.
-	return mailx.SendMail(cfg.SMTPHost+":"+port, cfg.SMTPHost, auth, cfg.From, recipients, []byte(msg), 0)
+	return mailx.SendMail(net.JoinHostPort(dialIP, port), cfg.SMTPHost, auth, cfg.From, recipients, []byte(msg), 0)
+}
+
+// lookupIP is the resolver used by the SMTP guard (replaceable in tests).
+var lookupIP = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+	return net.DefaultResolver.LookupIPAddr(ctx, host)
+}
+
+// smtpPrivateHosts is the operator-declared set of relay hostnames that may
+// resolve to private addresses (an internal/tailnet relay). Empty means the
+// public-only posture: every smtp_host must resolve public (SSRF guard).
+var smtpPrivateHosts = map[string]bool{}
+
+// SetSMTPPrivateHosts parses the OBSERVE_SMTP_PRIVATE_HOSTS csv (exact
+// hostnames, case-insensitive) into the allowlist. Called once at startup.
+func SetSMTPPrivateHosts(csv string) {
+	set := map[string]bool{}
+	for _, h := range strings.Split(csv, ",") {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			set[h] = true
+		}
+	}
+	smtpPrivateHosts = set
+}
+
+// publicSMTPAddr resolves host and returns one address to dial. Every
+// resolved address must be public unless the host is operator-allowlisted:
+// a name that resolves to ANY blocked address is refused, so a mixed answer
+// cannot be used to steer the dial. The dial still goes to the resolved IP,
+// so an allowlisted relay cannot be re-pointed by DNS after the check.
+func publicSMTPAddr(host string, lookup func(context.Context, string) ([]net.IPAddr, error)) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	addrs, err := lookup(ctx, host)
+	if err != nil {
+		return "", fmt.Errorf("email: resolving smtp_host: %w", err)
+	}
+	if len(addrs) == 0 {
+		return "", fmt.Errorf("email: smtp_host did not resolve")
+	}
+	if !smtpPrivateHosts[strings.ToLower(host)] {
+		for _, a := range addrs {
+			if netsafe.IsBlockedIP(a.IP) {
+				return "", fmt.Errorf("email: smtp_host resolves to a non-public address; refusing to connect (allowlist internal relays via OBSERVE_SMTP_PRIVATE_HOSTS)")
+			}
+		}
+	}
+	return addrs[0].IP.String(), nil
 }
 
 // parseRecipients splits and validates a comma-separated recipient list,
@@ -422,13 +513,31 @@ func (s *IntegrationService) fireSlack(configJSON string, p AlertPayload) error 
 	if cfg.WebhookURL == "" {
 		return fmt.Errorf("slack: missing webhook_url")
 	}
-	text := fmt.Sprintf("*%s*\n%s\nMetric: %s = %s (threshold: %s)", p.Title, p.Message, p.Metric, p.Value, p.Threshold)
+	if netsafe.ValidateURL(cfg.WebhookURL) != nil {
+		// Do not echo the URL or the parse error (which quotes it): the URL
+		// is the credential.
+		return fmt.Errorf("slack: webhook_url must be an http(s) URL without userinfo")
+	}
+	text := fmt.Sprintf("*%s*\n%s\nMetric: %s = %s (threshold: %s)",
+		slackEscape(p.Title, 300), slackEscape(p.Message, 3000), slackEscape(p.Metric, 100), slackEscape(p.Value, 100), slackEscape(p.Threshold, 100))
 	body, _ := json.Marshal(map[string]string{"text": text})
 	resp, err := s.client.Post(cfg.WebhookURL, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	return checkResp("slack", resp)
+}
+
+// slackEscape neutralises attacker-influenced text for Slack mrkdwn: Slack
+// only treats <...> as control syntax (<!channel>, <!here>, <@U123>,
+// <https://x|label> links), and documents &, < and > as the characters to
+// escape. Backticks are swapped so text cannot open a code span, and the
+// length is capped.
+func slackEscape(s string, max int) string {
+	if r := []rune(s); len(r) > max {
+		s = string(r[:max]) + "..."
+	}
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "`", "'").Replace(s)
 }
 
 func genID() string {

@@ -33,8 +33,8 @@ const otlpMaxDecompressedBytes = 10 * 1024 * 1024
 // wire format (application/x-protobuf or protobuf-JSON) so a stock exporter
 // can parse what it gets back.
 //
-// gRPC is not served here. Point an exporter at HTTP, or put a Collector in
-// front — every major exporter supports HTTP transport.
+// gRPC is served by internal/otlpgrpc (opt-in), which reuses the decoders in
+// this package.
 type OTLPHandler struct {
 	svc traceIngester
 }

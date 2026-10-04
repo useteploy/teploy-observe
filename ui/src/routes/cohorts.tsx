@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useMemo } from "preact/hooks";
-import { cohortsApi, parseRule } from "../api/persons.js";
+import { cohortsApi, parseRule, isFlatAnd } from "../api/persons.js";
 import type { Cohort, CohortDefinition, CohortRule } from "../api/persons.js";
 import Modal from "../components/shared/Modal.js";
 import EmptyState from "../components/shared/EmptyState.js";
 import { useFilters } from "../hooks/useFilters.js";
+import { validateRuleJson, describeRule, parseIdList } from "../lib/cohortRule.js";
 
 export const config = { mode: "app" };
 
@@ -25,7 +26,8 @@ function fmtDate(ms: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Rule editor — builds CohortDefinition (op="and"; v1 doesn't expose OR / nesting)
+// Rule editor — builds the flat-AND CohortDefinition; OR / NOT / nesting are
+// edited as JSON (see the JSON toggle in CohortBuilder).
 // ---------------------------------------------------------------------------
 
 function emptyEventRule(): CohortRule {
@@ -146,26 +148,63 @@ function CohortBuilder({ open, onClose, onSave, siteId, initial }:
   const [name, setName] = useState(initial?.name || "");
   const [description, setDescription] = useState(initial?.description || "");
   const [rules, setRules] = useState<CohortRule[]>(
-    initial ? parseRule(initial.rule).rules : [emptyEventRule()]
+    initial ? (parseRule(initial.rule).rules || []) : [emptyEventRule()]
   );
   const [previewCount, setPreviewCount] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // JSON mode edits the full rule tree (OR / NOT / nesting). It starts on
+  // for a saved cohort whose rule the form cannot represent.
+  const startsJson = (c?: Cohort | null) => !!c && !isFlatAnd(parseRule(c.rule));
+  const [jsonMode, setJsonMode] = useState(startsJson(initial));
+  const [jsonText, setJsonText] = useState(
+    initial ? JSON.stringify(parseRule(initial.rule), null, 2) : ""
+  );
 
   // Reset state when re-opened with a different cohort.
   useEffect(() => {
     if (!open) return;
     setName(initial?.name || "");
     setDescription(initial?.description || "");
-    setRules(initial ? parseRule(initial.rule).rules : [emptyEventRule()]);
+    setRules(initial ? (parseRule(initial.rule).rules || []) : [emptyEventRule()]);
+    setJsonMode(startsJson(initial));
+    setJsonText(initial ? JSON.stringify(parseRule(initial.rule), null, 2) : "");
     setPreviewCount(null);
     setError(null);
   }, [open, initial]);
 
-  const def = useMemo<CohortDefinition>(() => ({ op: "and", rules }), [rules]);
+  const flatDef = useMemo<CohortDefinition>(() => ({ op: "and", rules }), [rules]);
+
+  // currentDef returns the definition to send, or null with `error` set when
+  // the JSON text does not pass the client-side check (the server re-checks).
+  const currentDef = (): CohortDefinition | null => {
+    if (!jsonMode) return flatDef;
+    const r = validateRuleJson(jsonText);
+    if (!r.ok) { setError(r.error); return null; }
+    return r.def as CohortDefinition;
+  };
+
+  const toggleJson = () => {
+    setError(null);
+    if (!jsonMode) {
+      setJsonText(JSON.stringify(flatDef, null, 2));
+      setJsonMode(true);
+      return;
+    }
+    // Back to the form only when the JSON is the flat-AND shape.
+    const r = validateRuleJson(jsonText);
+    if (r.ok && isFlatAnd(r.def as CohortDefinition)) {
+      setRules(((r.def as CohortDefinition).rules || []) as CohortRule[]);
+      setJsonMode(false);
+    } else {
+      setError("This rule uses OR / NOT / nesting and can only be edited as JSON.");
+    }
+  };
 
   const preview = async () => {
     setError(null);
+    const def = currentDef();
+    if (!def) return;
     try {
       const r = await cohortsApi.preview(siteId, def);
       setPreviewCount(r.count);
@@ -177,7 +216,9 @@ function CohortBuilder({ open, onClose, onSave, siteId, initial }:
   const save = async () => {
     setError(null);
     if (!name.trim()) { setError("Name required"); return; }
-    if (rules.length === 0) { setError("Add at least one condition"); return; }
+    if (!jsonMode && rules.length === 0) { setError("Add at least one condition"); return; }
+    const def = currentDef();
+    if (!def) return;
     setSaving(true);
     try {
       const saved = initial
@@ -209,8 +250,21 @@ function CohortBuilder({ open, onClose, onSave, siteId, initial }:
       </div>
 
       <div class="obs-form-group">
-        <label class="obs-label">Conditions (all must match)</label>
-        <RuleEditor rules={rules} onChange={setRules} />
+        <label class="obs-label">
+          {jsonMode ? "Rule (JSON: op and|or|not, children, leaf; max depth 4, 30 conditions)" : "Conditions (all must match)"}
+        </label>
+        {jsonMode ? (
+          <textarea class="obs-input" rows={12} spellcheck={false} value={jsonText}
+            style={{ width: "100%", fontFamily: "var(--obs-font-mono, monospace)", fontSize: "12px" }}
+            data-testid="cohort-json-input"
+            onInput={(e) => setJsonText((e.target as HTMLTextAreaElement).value)} />
+        ) : (
+          <RuleEditor rules={rules} onChange={setRules} />
+        )}
+        <button class="obs-btn obs-btn--sm" type="button" onClick={toggleJson}
+          style={{ marginTop: "8px" }} data-testid="cohort-json-toggle">
+          {jsonMode ? "Use form" : "Edit as JSON (OR / NOT / nesting)"}
+        </button>
       </div>
 
       {error && (
@@ -233,6 +287,139 @@ function CohortBuilder({ open, onClose, onSave, siteId, initial }:
         </div>
       </div>
     </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Static cohorts — a pasted / CSV-imported list of ids (max 100,000)
+// ---------------------------------------------------------------------------
+
+// IdListInput is a textarea plus a file picker; both feed one pasted-text
+// value, parsed by parseIdList (first CSV column, header and dups skipped).
+function IdListInput({ value, onChange }:
+  { value: string; onChange: (v: string) => void }) {
+  const onFile = async (e: Event) => {
+    const f = (e.target as HTMLInputElement).files?.[0];
+    if (f) onChange(await f.text());
+  };
+  const { ids, error } = parseIdList(value);
+  return (
+    <div>
+      <textarea class="obs-input" rows={8} spellcheck={false} value={value}
+        placeholder="One id per line, or paste a CSV (first column is used)"
+        style={{ width: "100%", fontFamily: "var(--obs-font-mono, monospace)", fontSize: "12px" }}
+        data-testid="cohort-ids-input"
+        onInput={(e) => onChange((e.target as HTMLTextAreaElement).value)} />
+      <div style={{ display: "flex", gap: "8px", alignItems: "center", marginTop: "6px",
+        fontSize: "12px", color: error ? "var(--obs-danger)" : "var(--obs-text-muted)" }}>
+        <input type="file" accept=".csv,.txt,text/csv,text/plain" onChange={onFile} />
+        <span>{error || `${ids.length.toLocaleString()} distinct ids`}</span>
+      </div>
+    </div>
+  );
+}
+
+function StaticBuilder({ open, onClose, onSave, siteId }:
+  { open: boolean; onClose: () => void; onSave: (saved: Cohort) => void; siteId: string }) {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [text, setText] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setName(""); setDescription(""); setText(""); setError(null);
+  }, [open]);
+
+  const save = async () => {
+    setError(null);
+    if (!name.trim()) { setError("Name required"); return; }
+    const { ids, error: parseErr } = parseIdList(text);
+    if (parseErr) { setError(parseErr); return; }
+    if (ids.length === 0) { setError("Add at least one id"); return; }
+    setSaving(true);
+    try {
+      const saved = await cohortsApi.createStatic({ site_id: siteId, name, description, ids });
+      onSave(saved);
+      onClose();
+    } catch (e: any) {
+      setError(e?.message || "Import failed");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal open={open} onClose={onClose} title="New static cohort">
+      <div class="obs-form-group">
+        <label class="obs-label">Name</label>
+        <input class="obs-input" value={name} data-testid="static-name-input"
+          onInput={(e) => setName((e.target as HTMLInputElement).value)} />
+      </div>
+      <div class="obs-form-group">
+        <label class="obs-label">Description (optional)</label>
+        <input class="obs-input" value={description}
+          onInput={(e) => setDescription((e.target as HTMLInputElement).value)} />
+      </div>
+      <div class="obs-form-group">
+        <label class="obs-label">Members (distinct ids)</label>
+        <IdListInput value={text} onChange={setText} />
+      </div>
+      {error && (
+        <div style={{ color: "var(--obs-danger)", fontSize: "12px", marginBottom: "8px" }}>{error}</div>
+      )}
+      <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end", marginTop: "12px" }}>
+        <button class="obs-btn" onClick={onClose} type="button">Cancel</button>
+        <button class="obs-btn obs-btn--primary" onClick={save} type="button" disabled={saving}
+          data-testid="static-save-btn">
+          {saving ? "Importing…" : "Create"}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+// StaticEditor adds or removes ids on an existing static cohort.
+function StaticEditor({ cohort, siteId, onChanged }:
+  { cohort: Cohort; siteId: string; onChanged: (c: Cohort) => void }) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const run = async (kind: "add" | "remove") => {
+    setMsg(null);
+    const { ids, error } = parseIdList(text);
+    if (error) { setMsg(error); return; }
+    if (ids.length === 0) { setMsg("Enter at least one id"); return; }
+    setBusy(true);
+    try {
+      const r = kind === "add"
+        ? await cohortsApi.addMembers(cohort.cohort_id, siteId, ids)
+        : await cohortsApi.removeMembers(cohort.cohort_id, siteId, ids);
+      setMsg(`${r.changed.toLocaleString()} ${kind === "add" ? "added" : "removed"}`);
+      setText("");
+      onChanged(r.cohort);
+    } catch (e: any) {
+      setMsg(e?.message || "Update failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: "12px" }}>
+      <IdListInput value={text} onChange={setText} />
+      <div style={{ display: "flex", gap: "8px", marginTop: "8px", alignItems: "center" }}>
+        <button class="obs-btn obs-btn--sm" type="button" disabled={busy} onClick={() => run("add")}>
+          Add to cohort
+        </button>
+        <button class="obs-btn obs-btn--sm" type="button" disabled={busy} onClick={() => run("remove")}>
+          Remove from cohort
+        </button>
+        {msg && <span style={{ fontSize: "12px", color: "var(--obs-text-muted)" }}>{msg}</span>}
+      </div>
+    </div>
   );
 }
 
@@ -282,6 +469,7 @@ function CohortDetail({ cohort, siteId, onClose, onChanged }:
   };
 
   const def = parseRule(current.rule);
+  const isStatic = def.op === "static";
   const useAsFilter = `/insights?site_id=${encodeURIComponent(siteId)}&cohort_id=${encodeURIComponent(current.cohort_id)}`;
 
   return (
@@ -308,15 +496,11 @@ function CohortDetail({ cohort, siteId, onClose, onChanged }:
       <div style={{ marginTop: "16px" }}>
         <div style={{ fontSize: "11px", color: "var(--obs-text-muted)",
           textTransform: "uppercase", marginBottom: "6px" }}>Rule</div>
-        <ul style={{ margin: 0, paddingLeft: "20px", fontSize: "13px" }}>
-          {def.rules.map((r, i) => (
-            <li key={i}>
-              {r.type === "event"
-                ? `did "${r.name}" at least ${r.min_count ?? 1} time(s) in ${r.window || "30d"}`
-                : `${r.key} ${r.operator || "="} ${r.value || ""}`}
-            </li>
-          ))}
-        </ul>
+        <pre style={{ margin: 0, fontSize: "13px", whiteSpace: "pre-wrap" }}>
+          {describeRule(def).join("\n")}
+        </pre>
+        {isStatic && <StaticEditor cohort={current} siteId={siteId}
+          onChanged={(c) => { setCurrent(c); onChanged(); }} />}
       </div>
 
       <div style={{ display: "flex", gap: "8px", marginTop: "16px", flexWrap: "wrap" }}>
@@ -324,7 +508,8 @@ function CohortDetail({ cohort, siteId, onClose, onChanged }:
           data-testid="cohort-refresh-btn">
           {refreshing ? "Refreshing…" : "Refresh"}
         </button>
-        <button class="obs-btn obs-btn--sm" onClick={() => setEditing(true)}>Edit</button>
+        <button class="obs-btn obs-btn--sm" onClick={() => setEditing(true)} disabled={isStatic}
+          title={isStatic ? "Static cohorts are edited by adding / removing members" : undefined}>Edit</button>
         <button class="obs-btn obs-btn--sm" onClick={loadMembers}>View members</button>
         <a class="obs-btn obs-btn--sm obs-btn--primary" href={useAsFilter}
           data-testid="cohort-use-as-filter">
@@ -380,6 +565,7 @@ export default function CohortsPage() {
   const [cohorts, setCohorts] = useState<Cohort[]>([]);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
+  const [creatingStatic, setCreatingStatic] = useState(false);
   const [selectedID, setSelectedID] = useState<string | null>(null);
 
   const fetchCohorts = useCallback(async () => {
@@ -405,7 +591,11 @@ export default function CohortsPage() {
     <div>
       <div class="obs-page-header" style={{ display: "flex", alignItems: "center" }}>
         <h1 class="obs-page-title">Cohorts</h1>
-        <div style={{ marginLeft: "auto" }}>
+        <div style={{ marginLeft: "auto", display: "flex", gap: "8px" }}>
+          <button class="obs-btn" onClick={() => setCreatingStatic(true)}
+            data-testid="cohort-new-static-btn">
+            + Static list
+          </button>
           <button class="obs-btn obs-btn--primary" onClick={() => setCreating(true)}
             data-testid="cohort-new-btn">
             + New cohort
@@ -458,6 +648,16 @@ export default function CohortsPage() {
           onClose={() => setSelectedID(null)}
           onChanged={fetchCohorts} />
       )}
+
+      <StaticBuilder
+        open={creatingStatic}
+        onClose={() => setCreatingStatic(false)}
+        siteId={siteId}
+        onSave={(saved) => {
+          setSelectedID(saved.cohort_id);
+          fetchCohorts();
+        }}
+      />
 
       <CohortBuilder
         open={creating}

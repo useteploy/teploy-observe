@@ -2,7 +2,6 @@ package errors
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
@@ -172,14 +171,6 @@ func (s *SearchService) SearchIssues(ctx context.Context, siteID, query string, 
 	}
 
 	return issues, nil
-}
-
-// helper used by json scanning
-func unmarshalJSON(data string, v any) error {
-	if data == "" {
-		return nil
-	}
-	return json.Unmarshal([]byte(data), v)
 }
 
 // ReindexProgress reports how much of the reindex pass has run.
