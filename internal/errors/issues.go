@@ -53,6 +53,10 @@ type IssueService struct {
 	notifier atomic.Pointer[IssueNotifier]
 	// merge holds issue merge/assignment state (merge.go).
 	merge *mergeState
+	// store overrides the live lifecycle storage (tests); nil = Nucleus.
+	store lifecycleStore
+	// counts caches merged-scope event counts (merge_read.go).
+	counts scopeCountCache
 }
 
 func NewIssueService(db *nucleus.Client) *IssueService {
@@ -192,42 +196,120 @@ type cachedIssue struct {
 	Resolved bool `json:"rs,omitempty"`
 }
 
+// lifecycleStore is the storage the ingest-time issue lifecycle needs. The
+// live implementation is sqlLifecycle (Nucleus KV + SQL); the seam exists so
+// the notify/regression/merge decisions are unit-testable without Nucleus.
+type lifecycleStore interface {
+	cacheGet(ctx context.Context, siteID, groupHash string) (cachedIssue, bool)
+	cacheSet(ctx context.Context, siteID, groupHash string, ci cachedIssue)
+	findByHash(ctx context.Context, siteID, groupHash string) (*Issue, error)
+	issueByID(ctx context.Context, siteID, issueID string) (*Issue, error)
+	bump(ctx context.Context, issueID, siteID string, lastSeen, newCount int64) error
+	create(ctx context.Context, issueID, siteID, groupHash, title, culprit, level, release string, ts int64) error
+	scopeCount(ctx context.Context, siteID string, ids []string) int64
+}
+
+func (s *IssueService) lifecycle() lifecycleStore {
+	if s.store != nil {
+		return s.store
+	}
+	return sqlLifecycle{s}
+}
+
+type sqlLifecycle struct{ s *IssueService }
+
+func (l sqlLifecycle) cacheGet(ctx context.Context, siteID, groupHash string) (cachedIssue, bool) {
+	var ci cachedIssue
+	data, err := l.s.db.KV().Get(ctx, kvCacheKey(siteID, groupHash))
+	if err != nil || data == nil || json.Unmarshal(data, &ci) != nil || ci.IssueID == "" {
+		return cachedIssue{}, false
+	}
+	return ci, true
+}
+
+func (l sqlLifecycle) cacheSet(ctx context.Context, siteID, groupHash string, ci cachedIssue) {
+	if raw, err := json.Marshal(ci); err == nil {
+		_ = l.s.db.KV().Set(ctx, kvCacheKey(siteID, groupHash), raw)
+	}
+}
+
+func (l sqlLifecycle) findByHash(ctx context.Context, siteID, groupHash string) (*Issue, error) {
+	return l.s.findIssueByHash(ctx, siteID, groupHash)
+}
+
+func (l sqlLifecycle) issueByID(ctx context.Context, siteID, issueID string) (*Issue, error) {
+	rows, err := nucleus.Query[issueScan](ctx, l.s.db.SQL(),
+		`SELECT `+issueSelectCols+`
+		 FROM `+issuesLatest("issue_id = $1 AND site_id = $2"),
+		issueID, siteID,
+	)
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	issue := rows[0].toIssue(time.Now().UTC())
+	return &issue, nil
+}
+
+func (l sqlLifecycle) bump(ctx context.Context, issueID, siteID string, lastSeen, newCount int64) error {
+	return l.s.bumpIssue(ctx, issueID, siteID, lastSeen, newCount)
+}
+
+func (l sqlLifecycle) create(ctx context.Context, issueID, siteID, groupHash, title, culprit, level, release string, ts int64) error {
+	// The grouping derivation version is recorded ON the issue and never
+	// rewritten (the migration policy in grouping.go's FingerprintVersion doc).
+	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
+	tsStr := strconv.FormatInt(ts, 10)
+	_, err := l.s.db.SQL().Exec(ctx,
+		`INSERT INTO issues (issue_id, tenant_id, site_id, group_hash, title, culprit, level, status, first_seen, last_seen, event_count, user_count, release_tag, fingerprint_version, version)
+		 VALUES ($1, 'default', $2, $3, $4, $5, $6, 'open', $7, $8, '1', '0', $9, $10, $11)`,
+		issueID, siteID, groupHash, title, culprit, level, tsStr, tsStr, release,
+		strconv.Itoa(FingerprintVersion), now,
+	)
+	return err
+}
+
+func (l sqlLifecycle) scopeCount(ctx context.Context, siteID string, ids []string) int64 {
+	return l.s.eventCount(ctx, siteID, ids)
+}
+
 // ResolveIssue looks up or creates an issue for the given grouphash.
 // Uses KV cache for O(1) hot-path lookups. Returns the issue_id.
+//
+// A fingerprint that maps to a MERGED source is resolved to the merge
+// target BEFORE anything is bumped or notified: the source is hidden, so
+// lifecycle (reopen, regression notification) is judged against the target
+// row, and no notification is ever sent for a hidden source id.
 func (s *IssueService) ResolveIssue(ctx context.Context, siteID, groupHash, title, culprit, level, release string, ts int64) (string, error) {
-	kv := s.db.KV()
-	cacheKey := kvCacheKey(siteID, groupHash)
+	lc := s.lifecycle()
 
 	// 1. Check KV cache
-	data, err := kv.Get(ctx, cacheKey)
-	if err == nil && data != nil {
-		var ci cachedIssue
-		if json.Unmarshal(data, &ci) == nil && ci.IssueID != "" {
-			newCount := ci.EventCount + 1
-			_ = s.bumpIssue(ctx, ci.IssueID, siteID, ts, newCount)
-			ci.EventCount = newCount
-			if ci.Resolved {
-				// bumpIssue reopened it (resolved -> open).
-				ci.Resolved = false
-				s.notify(ctx, IssueEvent{Kind: IssueEventRegression, SiteID: siteID, IssueID: ci.IssueID,
-					Title: title, Culprit: culprit, Level: level, Release: release, EventCount: newCount})
-			}
-			if raw, err := json.Marshal(ci); err == nil {
-				_ = kv.Set(ctx, cacheKey, raw)
-			}
-			return ci.IssueID, nil
+	if ci, ok := lc.cacheGet(ctx, siteID, groupHash); ok {
+		if target := s.ResolveMerged(ctx, siteID, ci.IssueID); target != ci.IssueID {
+			return s.attributeMerged(ctx, siteID, target, release, ts), nil
 		}
+		newCount := ci.EventCount + 1
+		_ = lc.bump(ctx, ci.IssueID, siteID, ts, newCount)
+		ci.EventCount = newCount
+		if ci.Resolved {
+			// bumpIssue reopened it (resolved -> open).
+			ci.Resolved = false
+			s.notify(ctx, IssueEvent{Kind: IssueEventRegression, SiteID: siteID, IssueID: ci.IssueID,
+				Title: title, Culprit: culprit, Level: level, Release: release, EventCount: newCount})
+		}
+		lc.cacheSet(ctx, siteID, groupHash, ci)
+		return ci.IssueID, nil
 	}
 
-	// 2. Cache miss — check DB
-	existing, err := s.findIssueByHash(ctx, siteID, groupHash)
+	// 2. Cache miss: check DB
+	existing, err := lc.findByHash(ctx, siteID, groupHash)
 	if err == nil && existing != nil {
-		newCount := existing.EventCount + 1
-		_ = s.bumpIssue(ctx, existing.IssueID, siteID, ts, newCount)
-		ci := cachedIssue{IssueID: existing.IssueID, EventCount: newCount}
-		if raw, err := json.Marshal(ci); err == nil {
-			_ = kv.Set(ctx, cacheKey, raw)
+		if target := s.ResolveMerged(ctx, siteID, existing.IssueID); target != existing.IssueID {
+			lc.cacheSet(ctx, siteID, groupHash, cachedIssue{IssueID: existing.IssueID, EventCount: existing.EventCount})
+			return s.attributeMerged(ctx, siteID, target, release, ts), nil
 		}
+		newCount := existing.EventCount + 1
+		_ = lc.bump(ctx, existing.IssueID, siteID, ts, newCount)
+		lc.cacheSet(ctx, siteID, groupHash, cachedIssue{IssueID: existing.IssueID, EventCount: newCount})
 		if existing.Status == "resolved" {
 			s.notify(ctx, IssueEvent{Kind: IssueEventRegression, SiteID: siteID, IssueID: existing.IssueID,
 				Title: existing.Title, Culprit: existing.Culprit, Level: existing.Level, Release: release, EventCount: newCount})
@@ -235,27 +317,12 @@ func (s *IssueService) ResolveIssue(ctx context.Context, siteID, groupHash, titl
 		return existing.IssueID, nil
 	}
 
-	// 3. New issue — create. The grouping derivation version is
-	// recorded ON the issue and never rewritten (the migration policy in
-	// grouping.go's FingerprintVersion doc).
+	// 3. New issue: create.
 	issueID := generateID()
-	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
-	tsStr := strconv.FormatInt(ts, 10)
-	sql := s.db.SQL()
-	_, err = sql.Exec(ctx,
-		`INSERT INTO issues (issue_id, tenant_id, site_id, group_hash, title, culprit, level, status, first_seen, last_seen, event_count, user_count, release_tag, fingerprint_version, version)
-		 VALUES ($1, 'default', $2, $3, $4, $5, $6, 'open', $7, $8, '1', '0', $9, $10, $11)`,
-		issueID, siteID, groupHash, title, culprit, level, tsStr, tsStr, release,
-		strconv.Itoa(FingerprintVersion), now,
-	)
-	if err != nil {
+	if err := lc.create(ctx, issueID, siteID, groupHash, title, culprit, level, release, ts); err != nil {
 		return "", fmt.Errorf("create issue: %w", err)
 	}
-
-	ci := cachedIssue{IssueID: issueID, EventCount: 1}
-	if raw, err := json.Marshal(ci); err == nil {
-		_ = kv.Set(ctx, cacheKey, raw)
-	}
+	lc.cacheSet(ctx, siteID, groupHash, cachedIssue{IssueID: issueID, EventCount: 1})
 
 	s.notify(ctx, IssueEvent{Kind: IssueEventNew, SiteID: siteID, IssueID: issueID,
 		Title: title, Culprit: culprit, Level: level, Release: release, EventCount: 1})

@@ -25,22 +25,38 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/tap"
 
 	logspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 
 	"github.com/useteploy/teploy-observe/internal/auth"
+	"github.com/useteploy/teploy-observe/internal/authguard"
 	"github.com/useteploy/teploy-observe/internal/ingest"
 )
 
 const (
-	// DefaultMaxRecvMsgSize matches the OTLP/HTTP body cap (otlpMaxBodyBytes in
-	// cmd/observe). grpc applies it to the decompressed message as well, so it
-	// also bounds gzip expansion.
-	DefaultMaxRecvMsgSize = 10 << 20
+	// DefaultMaxRecvMsgSize is the per-message cap. grpc applies it to the
+	// decompressed message as well, so it also bounds gzip expansion. It is
+	// below the OTLP/HTTP cap (10 MiB) on purpose: a batch exporter's default
+	// is far smaller, and every byte up to the cap is buffered per RPC.
+	DefaultMaxRecvMsgSize = 4 << 20
+	// MaxRecvMsgSizeLimit is the ceiling an operator may raise it to (the old
+	// default, matching OTLP/HTTP's otlpMaxBodyBytes).
+	MaxRecvMsgSizeLimit = 10 << 20
 	// DefaultMaxConcurrentStreams bounds in-flight RPCs per connection.
-	DefaultMaxConcurrentStreams = 256
+	DefaultMaxConcurrentStreams = 128
+	// DefaultMaxHeaderListSize bounds the uncompressed request header list
+	// (grpc's own default is 16 MiB).
+	DefaultMaxHeaderListSize = 16 << 10
+	// DefaultMaxConnections / DefaultMaxConnsPerIP cap concurrent TCP
+	// connections in total and per remote address.
+	DefaultMaxConnections = 1024
+	DefaultMaxConnsPerIP  = 64
+	// authTimeout bounds the key lookup run from the tap handle (which runs
+	// on the connection's reader goroutine, so it must not block for long).
+	authTimeout = 3 * time.Second
 
 	// retryDelay is advertised in RetryInfo on retryable refusals.
 	retryDelay = 5 * time.Second
@@ -74,8 +90,11 @@ type Config struct {
 	Addr                 string
 	TLSCertFile          string
 	TLSKeyFile           string
-	MaxRecvMsgSize       int
+	MaxRecvMsgSize       int // clamped to MaxRecvMsgSizeLimit
 	MaxConcurrentStreams uint32
+	MaxHeaderListSize    uint32
+	MaxConnections       int // < 0 disables
+	MaxConnsPerIP        int // < 0 disables
 	Logger               *slog.Logger
 	// OnServeError is called if the accept loop dies after a healthy start.
 	OnServeError func(error)
@@ -118,8 +137,20 @@ func New(cfg Config, deps Deps) (*Server, error) {
 	if cfg.MaxRecvMsgSize <= 0 {
 		cfg.MaxRecvMsgSize = DefaultMaxRecvMsgSize
 	}
+	if cfg.MaxRecvMsgSize > MaxRecvMsgSizeLimit {
+		cfg.MaxRecvMsgSize = MaxRecvMsgSizeLimit
+	}
 	if cfg.MaxConcurrentStreams == 0 {
 		cfg.MaxConcurrentStreams = DefaultMaxConcurrentStreams
+	}
+	if cfg.MaxHeaderListSize == 0 {
+		cfg.MaxHeaderListSize = DefaultMaxHeaderListSize
+	}
+	if cfg.MaxConnections == 0 {
+		cfg.MaxConnections = DefaultMaxConnections
+	}
+	if cfg.MaxConnsPerIP == 0 {
+		cfg.MaxConnsPerIP = DefaultMaxConnsPerIP
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -129,6 +160,10 @@ func New(cfg Config, deps Deps) (*Server, error) {
 	opts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(cfg.MaxRecvMsgSize),
 		grpc.MaxConcurrentStreams(cfg.MaxConcurrentStreams),
+		grpc.MaxHeaderListSize(cfg.MaxHeaderListSize),
+		// Authenticate from the request headers BEFORE the message is read
+		// and decoded: an unauthenticated peer's payload is never buffered.
+		grpc.InTapHandle(s.tapAuth),
 		grpc.ChainUnaryInterceptor(s.recoverInterceptor, s.authInterceptor),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             30 * time.Second,
@@ -172,6 +207,9 @@ func (s *Server) Start() error {
 // Serve serves on an existing listener in the background (tests use this).
 func (s *Server) Serve(ln net.Listener) {
 	s.ln = ln
+	if s.cfg.MaxConnections > 0 || s.cfg.MaxConnsPerIP > 0 {
+		ln = newLimitListener(ln, s.cfg.MaxConnections, s.cfg.MaxConnsPerIP)
+	}
 	go func() {
 		if err := s.gs.Serve(ln); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			if s.cfg.OnServeError != nil {
@@ -242,17 +280,37 @@ func apiKeyFrom(md metadata.MD) string {
 	return ""
 }
 
-// authInterceptor applies the same rules as auth.APIKeyAuthMiddleware (key
-// valid, site exists, telemetry scope) followed by ingest.RateLimiter's
-// (site, ip) admission, mirroring the otlpChain order in cmd/observe.
-func (s *Server) authInterceptor(ctx context.Context, req any, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
-	md, _ := metadata.FromIncomingContext(ctx)
-	key := apiKeyFrom(md)
+// ipKeyValidator is implemented by *authguard.Guard: key validation that also
+// takes the client IP for failed-attempt limiting.
+type ipKeyValidator interface {
+	Validate(ctx context.Context, key, clientIP string) (auth.ValidatedKey, error)
+}
+
+// tapAuth applies the same rules as auth.APIKeyAuthMiddleware (key valid, site
+// exists, telemetry scope) followed by ingest.RateLimiter's (site, ip)
+// admission, mirroring the otlpChain order in cmd/observe. It runs as a
+// grpc.InTapHandle, i.e. on the request HEADERS, before the message is read,
+// decompressed or unmarshalled, so a caller without a valid key cannot make
+// the server buffer or decode its payload. The validated site travels in the
+// returned context; authInterceptor refuses any RPC that arrives without it.
+func (s *Server) tapAuth(ctx context.Context, info *tap.Info) (context.Context, error) {
+	key := apiKeyFrom(info.Header)
 	if key == "" {
 		return nil, status.Error(codes.Unauthenticated, "missing API key")
 	}
-	validated, err := s.deps.Keys.ValidateAPIKey(ctx, key)
+	vctx, cancel := context.WithTimeout(ctx, authTimeout)
+	defer cancel()
+	var validated auth.ValidatedKey
+	var err error
+	if gk, ok := s.deps.Keys.(ipKeyValidator); ok {
+		validated, err = gk.Validate(vctx, key, peerIP(ctx))
+	} else {
+		validated, err = s.deps.Keys.ValidateAPIKey(vctx, key)
+	}
 	if err != nil {
+		if errors.Is(err, authguard.ErrTooManyAttempts) {
+			return nil, retryable(codes.ResourceExhausted, "too many failed authentication attempts", retryDelay)
+		}
 		if errors.Is(err, auth.ErrAuthUnavailable) {
 			return nil, retryable(codes.Unavailable, "authentication temporarily unavailable", retryDelay)
 		}
@@ -266,7 +324,17 @@ func (s *Server) authInterceptor(ctx context.Context, req any, _ *grpc.UnaryServ
 	if s.deps.Limiter != nil && !s.deps.Limiter.Allow(validated.SiteID, peerIP(ctx)) {
 		return nil, retryable(codes.ResourceExhausted, "rate limited", rateLimitRetryDelay)
 	}
-	return h(context.WithValue(ctx, siteKey{}, validated.SiteID), req)
+	return context.WithValue(ctx, siteKey{}, validated.SiteID), nil
+}
+
+// authInterceptor is the backstop for tapAuth: no authenticated site in the
+// context means the tap did not run for this RPC, which must never reach a
+// sink.
+func (s *Server) authInterceptor(ctx context.Context, req any, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
+	if siteFrom(ctx) == "" {
+		return nil, status.Error(codes.Unauthenticated, "unauthenticated")
+	}
+	return h(ctx, req)
 }
 
 func peerIP(ctx context.Context) string {

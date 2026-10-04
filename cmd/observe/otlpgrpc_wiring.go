@@ -5,11 +5,13 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/neutron-build/neutron/go/neutron"
 
 	"github.com/useteploy/teploy-observe/internal/auth"
+	"github.com/useteploy/teploy-observe/internal/authguard"
 	"github.com/useteploy/teploy-observe/internal/ingest"
 	"github.com/useteploy/teploy-observe/internal/logs"
 	"github.com/useteploy/teploy-observe/internal/metrics"
@@ -29,7 +31,10 @@ import (
 // OBSERVE_OTLP_GRPC_TLS_KEY enable TLS (both or neither); without them the
 // listener is plaintext h2c and should sit behind a TLS-terminating proxy or a
 // tailnet. Auth is the same API key as the HTTP receivers, sent as gRPC
-// metadata `x-api-key: <key>` or `authorization: Bearer <key>`.
+// metadata `x-api-key: <key>` or `authorization: Bearer <key>`; it is checked
+// on the request headers, before the message is read or decoded.
+// OBSERVE_OTLP_GRPC_MAX_RECV_MB (default 4, ceiling 10) caps one message and
+// OBSERVE_OTLP_GRPC_MAX_CONNS (default 1024) the concurrent connections.
 //
 // The lifecycle hook is registered in the neutron options (before the app
 // dependencies exist) and configured later by configureOTLPGRPC, so it stops
@@ -84,10 +89,12 @@ func configureOTLPGRPC(logger *slog.Logger, authSvc *auth.AuthService, limiter *
 		logger.Warn("otlp grpc listener is plaintext; keep it behind a TLS proxy or tailnet, or set OBSERVE_OTLP_GRPC_TLS_CERT/KEY")
 	}
 	srv, err := otlpgrpc.New(otlpgrpc.Config{
-		Addr:        addr,
-		TLSCertFile: cert,
-		TLSKeyFile:  os.Getenv("OBSERVE_OTLP_GRPC_TLS_KEY"),
-		Logger:      logger,
+		Addr:           addr,
+		MaxRecvMsgSize: otlpGRPCEnvMB("OBSERVE_OTLP_GRPC_MAX_RECV_MB"),
+		MaxConnections: otlpGRPCEnvInt("OBSERVE_OTLP_GRPC_MAX_CONNS"),
+		TLSCertFile:    cert,
+		TLSKeyFile:     os.Getenv("OBSERVE_OTLP_GRPC_TLS_KEY"),
+		Logger:         logger,
 		OnServeError: func(err error) {
 			// Same posture as the ingest listener: a dead accept loop means
 			// telemetry is unreachable while health stays green.
@@ -95,7 +102,9 @@ func configureOTLPGRPC(logger *slog.Logger, authSvc *auth.AuthService, limiter *
 			os.Exit(1)
 		},
 	}, otlpgrpc.Deps{
-		Keys:    authSvc,
+		// The guard adds a negative cache and a per-IP failed-attempt limit in
+		// front of the two-query key lookup.
+		Keys:    authguard.New(authSvc, authguard.Config{}),
 		Limiter: limiter,
 		Ingester: otlpgrpc.Ingesters{
 			Traces: func(ctx context.Context, siteID string, req *tracepb.ExportTraceServiceRequest) error {
@@ -111,6 +120,20 @@ func configureOTLPGRPC(logger *slog.Logger, authSvc *auth.AuthService, limiter *
 		},
 	})
 	otlpGRPC = otlpGRPCRunner{srv: srv, err: err}
+}
+
+// otlpGRPCEnvMB reads a size in MiB (0 = unset -> package default of 4 MiB;
+// otlpgrpc clamps anything above its 10 MiB ceiling).
+func otlpGRPCEnvMB(name string) int {
+	return otlpGRPCEnvInt(name) << 20
+}
+
+func otlpGRPCEnvInt(name string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
+	if err != nil || n < 0 || n > 1<<20 {
+		return 0
+	}
+	return n
 }
 
 // classifyOTLPErr marks the permanent (non-retryable) refusals the HTTP

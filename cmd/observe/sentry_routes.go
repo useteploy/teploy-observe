@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/useteploy/teploy-observe/internal/auth"
+	"github.com/useteploy/teploy-observe/internal/authguard"
 	obserrors "github.com/useteploy/teploy-observe/internal/errors"
 	"github.com/useteploy/teploy-observe/internal/ingest"
 	"github.com/useteploy/teploy-observe/internal/sentrycompat"
@@ -25,7 +26,7 @@ func registerSentryRoutes(r interface {
 	Handle(pattern string, handler http.Handler)
 }, authSvc *auth.AuthService, buf *obserrors.ErrorBuffer, limiter *ingest.RateLimiter, logger *slog.Logger) {
 	h := &sentrycompat.Handler{
-		Keys:       authSvc,
+		Keys:       authguard.New(authSvc, authguard.Config{}),
 		Sink:       buf,
 		Limiter:    limiter,
 		Logger:     logger,

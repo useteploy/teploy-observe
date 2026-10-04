@@ -594,9 +594,13 @@ type ErrorBufferStats struct {
 	SpikeDropped      int64 `json:"spike_dropped"`
 	SpikeDroppedIssue int64 `json:"spike_dropped_issue"`
 	SpikeDroppedSite  int64 `json:"spike_dropped_site"`
-	ReplayedOnRestart int64 `json:"replayed_on_restart"`
-	Pending           int   `json:"pending"`
-	FlushFailing      bool  `json:"flush_failing"`
+	// SpikeDroppedNewIssue = new-issue/regression admissions refused by the
+	// per-site new-issue cap; SpikeAdmittedNewIssue = admissions under it.
+	SpikeDroppedNewIssue  int64 `json:"spike_dropped_new_issue"`
+	SpikeAdmittedNewIssue int64 `json:"spike_admitted_new_issue"`
+	ReplayedOnRestart     int64 `json:"replayed_on_restart"`
+	Pending               int   `json:"pending"`
+	FlushFailing          bool  `json:"flush_failing"`
 	// Queued/Bytes keep the pre-O01 operator field names (R15 backlog
 	// visibility) — queued is the same number as pending.
 	Queued int   `json:"queued"`
@@ -607,26 +611,29 @@ type ErrorBufferStats struct {
 func (b *ErrorBuffer) Stats() ErrorBufferStats {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	var spIssue, spSite int64
+	var spIssue, spSite, spNew, spAdm int64
 	if b.handler == nil {
 		// stats-only buffers (tests) carry no service
 	} else if sp := b.handler.spike; sp != nil {
 		spIssue, spSite = sp.DroppedIssue.Load(), sp.DroppedSite.Load()
+		spNew, spAdm = sp.DroppedNewIssue.Load(), sp.AdmittedNewIssue.Load()
 	}
 	return ErrorBufferStats{
-		SpikeDropped:      b.spikeDropped.Load(),
-		SpikeDroppedIssue: spIssue,
-		SpikeDroppedSite:  spSite,
-		Accepted:          b.accepted.Load(),
-		DurablyAcked:      b.durablyAcked.Load(),
-		Applied:           b.applied.Load(),
-		Deduped:           b.deduped.Load(),
-		Quarantined:       b.quarantined.Load(),
-		ConflictingID:     b.conflicting.Load(),
-		ReplayedOnRestart: b.replayedOnRestart.Load(),
-		Pending:           len(b.events),
-		FlushFailing:      b.flushFail,
-		Queued:            len(b.events),
-		Bytes:             b.usedBytes,
+		SpikeDropped:          b.spikeDropped.Load(),
+		SpikeDroppedIssue:     spIssue,
+		SpikeDroppedSite:      spSite,
+		SpikeDroppedNewIssue:  spNew,
+		SpikeAdmittedNewIssue: spAdm,
+		Accepted:              b.accepted.Load(),
+		DurablyAcked:          b.durablyAcked.Load(),
+		Applied:               b.applied.Load(),
+		Deduped:               b.deduped.Load(),
+		Quarantined:           b.quarantined.Load(),
+		ConflictingID:         b.conflicting.Load(),
+		ReplayedOnRestart:     b.replayedOnRestart.Load(),
+		Pending:               len(b.events),
+		FlushFailing:          b.flushFail,
+		Queued:                len(b.events),
+		Bytes:                 b.usedBytes,
 	}
 }

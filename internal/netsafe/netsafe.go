@@ -114,6 +114,9 @@ func IsBlockedIPWith(ip net.IP, allow Allow) bool {
 	}
 	// Never allowlistable, whatever the operator says: link-local covers cloud
 	// instance metadata, and multicast/unspecified are not destinations.
+	if v6 := ip.To16(); v6 != nil && ip.To4() == nil && nat64.Contains(v6) && net.IP(v6[12:16]).IsLinkLocalUnicast() {
+		return true // NAT64-embedded cloud metadata: never allowlistable
+	}
 	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
 		return true
 	}
@@ -126,7 +129,34 @@ func IsBlockedIPWith(ip net.IP, allow Allow) bool {
 	if v4 := ip.To4(); v4 != nil && v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
 		return true // 100.64.0.0/10 CGNAT / Tailscale
 	}
+	for _, n := range extraBlocked {
+		if n.Contains(ip) {
+			return true
+		}
+	}
 	return false
+}
+
+var (
+	nat64 = mustCIDR("64:ff9b::/96")
+	// Ranges that are never legitimate public destinations. Checked after the
+	// operator allowlist so OBSERVE_WEBHOOK_ALLOW_CIDRS can still name them.
+	extraBlocked = []*net.IPNet{
+		// NAT64 well-known prefix: the low 32 bits are an IPv4 destination
+		// (possibly 169.254.169.254 or RFC1918) the gateway will reach.
+		mustCIDR("64:ff9b::/96"),
+		mustCIDR("198.18.0.0/15"), // benchmarking (RFC 2544)
+		mustCIDR("192.0.0.0/24"),  // IETF protocol assignments
+		mustCIDR("240.0.0.0/4"),   // reserved + limited broadcast
+	}
+)
+
+func mustCIDR(s string) *net.IPNet {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		panic(err)
+	}
+	return n
 }
 
 // Client returns an http.Client that blocks connections to non-public addresses
