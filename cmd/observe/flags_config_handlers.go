@@ -30,7 +30,14 @@ type flagConfigSource interface {
 // flagConfigRoute wraps the handler in the ingest chain: API key (resolves
 // the site into the context) then the per-site rate limiter.
 func flagConfigRoute(apiKeyMW func(http.Handler) http.Handler, rl func(http.Handler) http.Handler, src flagConfigSource) http.Handler {
-	return apiKeyMW(rl(flagConfigHandler(src)))
+	inner := apiKeyMW(rl(flagConfigHandler(src)))
+	// Browsers read this with X-API-Key and If-None-Match, and need ETag
+	// exposed. The wildcard OPTIONS handler allows the preflight headers.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Expose-Headers", "ETag")
+		inner.ServeHTTP(w, r)
+	})
 }
 
 func flagConfigHandler(src flagConfigSource) http.HandlerFunc {

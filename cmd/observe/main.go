@@ -654,6 +654,15 @@ func main() {
 				return nil
 			},
 		}),
+		// Registered BEFORE error-buffer: hooks stop in reverse order, so the
+		// error buffer's final flush (which can raise new-issue and
+		// regression events) runs before the dispatcher shuts down.
+		neutron.WithLifecycle(neutron.LifecycleHook{
+			Name: "issue-notifications",
+			OnStop: func(ctx context.Context) error {
+				return shutdownIssueNotifications(issueNotifier)
+			},
+		}),
 		neutron.WithLifecycle(neutron.LifecycleHook{
 			Name: "error-buffer",
 			OnStart: func(ctx context.Context) error {
@@ -667,12 +676,6 @@ func main() {
 		}),
 		// R22 (round 4): webhook delivery drains on shutdown instead of
 		// dying with the process mid-alert.
-		neutron.WithLifecycle(neutron.LifecycleHook{
-			Name: "issue-notifications",
-			OnStop: func(ctx context.Context) error {
-				return shutdownIssueNotifications(issueNotifier)
-			},
-		}),
 		neutron.WithLifecycle(neutron.LifecycleHook{
 			Name: "webhook-delivery",
 			OnStop: func(ctx context.Context) error {
@@ -900,8 +903,8 @@ func main() {
 	// and 204 — this covers /api/v1/events, /api/v1/events/batch, /api/v1/errors, etc.
 	r.HandleFunc("OPTIONS /api/v1/{path...}", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key, If-None-Match")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 		w.WriteHeader(http.StatusNoContent)
 	})

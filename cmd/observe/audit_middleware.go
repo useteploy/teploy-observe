@@ -45,6 +45,11 @@ var auditSkipPrefixes = []string{
 // prefix (AUD-054).
 var auditSkipExact = map[string]bool{
 	"POST /api/v1/surveys/respond": true,
+	// Public per-pageview widget exposure and API-key telemetry writes: same
+	// flood the respond skip avoids, with an empty or key-only actor.
+	"POST /api/v1/surveys/expose":     true,
+	"POST /api/v1/experiments/metric": true,
+	"POST /api/v1/persons/properties": true,
 }
 
 // parseActorFunc resolves the acting username from a bearer token. It returns

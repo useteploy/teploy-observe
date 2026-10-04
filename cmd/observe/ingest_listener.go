@@ -48,6 +48,8 @@ var ingestRoutes = map[string]bool{
 	// rate-limited. Same trust level as PostHog's /decide.
 	"POST /api/v1/experiments/expose":  true,
 	"POST /api/v1/experiments/convert": true,
+	"POST /api/v1/experiments/metric":  true, // API-key authenticated metric events
+	"POST /api/v1/persons/properties":  true, // API-key authenticated identify traits
 	"POST /api/v1/flags/evaluate":      true,
 	"GET /api/v1/flags/config":         true, // API-key authenticated (flag_config handler)
 	"GET /api/v1/surveys/active":       true,
@@ -69,7 +71,14 @@ func isIngestPath(method, p string) bool {
 		return true
 	}
 	switch {
-	// OTLP. /v1/traces today; /v1/metrics and /v1/logs when they land. The
+	// Sentry wire protocol: POST /api/<project>/envelope/ and /store/. Stock
+	// Sentry SDKs post here with the DSN public key, so it must be reachable
+	// on the public ingest host. Matched by exact segments, not a prefix, so
+	// it can never cover a dashboard route (those live under /api/v1/ and the
+	// project segment cannot be "v1").
+	case method == http.MethodPost && isSentryIngestPath(p):
+		return true
+	// OTLP: /v1/traces, /v1/metrics and /v1/logs. The
 	// whole /v1/ namespace is OTLP writes (the SPA catch-all already excludes
 	// it), so a prefix keeps new OTLP signals working without editing this
 	// list — and it stays writes-only because it is POST-scoped.
@@ -91,6 +100,18 @@ func isIngestPath(method, p string) bool {
 		return true
 	}
 	return false
+}
+
+// isSentryIngestPath reports whether p is /api/<project>/envelope or
+// /api/<project>/store with exactly those segments. p is already cleaned, so
+// a trailing slash is gone. The project segment must not be "v1" so this can
+// never shadow the /api/v1 route tree.
+func isSentryIngestPath(p string) bool {
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	if len(parts) != 3 || parts[0] != "api" || parts[1] == "" || parts[1] == "v1" {
+		return false
+	}
+	return parts[2] == "envelope" || parts[2] == "store"
 }
 
 // ingestOnly wraps the full app handler so only ingest routes are reachable.
