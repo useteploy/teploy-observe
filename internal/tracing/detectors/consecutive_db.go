@@ -21,8 +21,8 @@ const ConsecutiveDBMinTotalMs int64 = 100
 // statements to share a fingerprint — three different SELECTs in a row are
 // also worth flagging because they should be parallelized or batched.
 type ConsecutiveDB struct {
-	MinSpans     int
-	MinTotalMs   int64
+	MinSpans   int
+	MinTotalMs int64
 }
 
 func NewConsecutiveDB() *ConsecutiveDB {

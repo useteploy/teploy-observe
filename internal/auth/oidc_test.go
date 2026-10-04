@@ -298,10 +298,10 @@ func TestNewOIDCAuth_PolicyOnlyConfigIsError(t *testing.T) {
 func TestValidateOIDCRedirect(t *testing.T) {
 	const cb = "https://observe.example.com/api/v1/auth/oidc/callback"
 	cases := []struct {
-		name         string
-		raw          string
-		allowLocal   bool
-		wantErr      bool
+		name       string
+		raw        string
+		allowLocal bool
+		wantErr    bool
 	}{
 		{"valid https callback", cb, false, false},
 		{"wrong path", "https://observe.example.com/callback", false, true},

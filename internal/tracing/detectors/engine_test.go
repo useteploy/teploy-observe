@@ -88,7 +88,7 @@ func dbSpan(id, parent, trace, stmt string, start, end int64) Span {
 	return Span{
 		TraceID: trace, SpanID: id, ParentSpanID: parent,
 		ServiceName: "api", OperationName: "db.query", SpanKind: "client",
-		StartMs:    start, EndMs: end, DurationMs: end - start,
+		StartMs: start, EndMs: end, DurationMs: end - start,
 		Attributes: map[string]string{"db.statement": stmt, "db.system": "postgres"},
 	}
 }

@@ -48,7 +48,7 @@ func o10Site(t *testing.T) string {
 }
 
 // o10Cleanup removes this test's rows from the tables keyed by site_id.
-// maintenance_windows also sweeps GLOBAL windows (site_id '') - a leftover
+// maintenance_windows also sweeps GLOBAL windows (site_id ”) - a leftover
 // global window from an earlier run suppresses every later test's
 // deliveries. Incidents and their events are keyed by per-test
 // rule/incident ids and are asserted only through those ids, so they need
@@ -157,15 +157,15 @@ func (r *o10Receiver) body(i int) string {
 // notifier (plain client so httptest's 127.0.0.1 is diallable - the same
 // swap webhooks_test makes), and the site's webhook pointed at the receiver.
 type o10Engine struct {
-	db      *nucleus.Client
-	site    string
-	clock   *o10Clock
-	alerts  *AlertService
-	inc     *incidents.Service
-	notify  *Notifier
-	hooks   *WebhookService
-	recv    *o10Receiver
-	server  *httptest.Server
+	db     *nucleus.Client
+	site   string
+	clock  *o10Clock
+	alerts *AlertService
+	inc    *incidents.Service
+	notify *Notifier
+	hooks  *WebhookService
+	recv   *o10Receiver
+	server *httptest.Server
 }
 
 // o10Bind builds a fresh service set over the engine (the "restarted

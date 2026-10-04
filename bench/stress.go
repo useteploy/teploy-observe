@@ -28,12 +28,12 @@ import (
 //   1%  session replay / infra / feedback
 
 type StressConfig struct {
-	Target      string
-	APIKey      string
-	JWTToken    string
-	SiteID      string
-	Duration    time.Duration
-	Concurrency int
+	Target             string
+	APIKey             string
+	JWTToken           string
+	SiteID             string
+	Duration           time.Duration
+	Concurrency        int
 	CheckpointInterval time.Duration
 }
 
@@ -249,7 +249,7 @@ func pageviewPayload(siteID string, rng *rand.Rand) []byte {
 	pages := []string{"/", "/about", "/pricing", "/docs", "/blog", "/signup", "/login", "/dashboard", "/settings"}
 	b, _ := json.Marshal(map[string]any{
 		"site_id": siteID, "event_type": "pageview",
-		"url": "https://app.example.com" + pages[rng.Intn(len(pages))],
+		"url":   "https://app.example.com" + pages[rng.Intn(len(pages))],
 		"title": "Page", "language": "en", "screen": "1920x1080",
 	})
 	return b
@@ -259,7 +259,7 @@ func customEventPayload(siteID string, rng *rand.Rand) []byte {
 	events := []string{"click_cta", "form_submit", "video_play", "download", "share", "add_to_cart"}
 	b, _ := json.Marshal(map[string]any{
 		"site_id": siteID, "event_type": events[rng.Intn(len(events))],
-		"url": "https://app.example.com/",
+		"url":        "https://app.example.com/",
 		"properties": map[string]any{"button": "primary", "value": rng.Intn(100)},
 	})
 	return b
@@ -271,7 +271,7 @@ func errorStressPayload(siteID string, rng *rand.Rand) []byte {
 	b, _ := json.Marshal(map[string]any{
 		"site_id": siteID, "error_type": types[rng.Intn(len(types))],
 		"error_value": msgs[rng.Intn(len(msgs))],
-		"url": "https://app.example.com/dashboard",
+		"url":         "https://app.example.com/dashboard",
 		"stack_trace": []map[string]any{
 			{"filename": "/app/src/App.tsx", "function": "render", "lineno": rng.Intn(200), "in_app": true},
 		},

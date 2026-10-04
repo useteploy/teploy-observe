@@ -127,7 +127,7 @@ func NewNotifier(db *nucleus.Client, logger *slog.Logger, maintenance *Maintenan
 	}
 }
 
-func (n *Notifier) WithMaxAttempts(v int) *Notifier        { n.maxAttempts = v; return n }
+func (n *Notifier) WithMaxAttempts(v int) *Notifier           { n.maxAttempts = v; return n }
 func (n *Notifier) WithBackoffBase(d time.Duration) *Notifier { n.backoffBase = d; return n }
 func (n *Notifier) WithBackoffCap(d time.Duration) *Notifier  { n.backoffCap = d; return n }
 func (n *Notifier) WithPollInterval(d time.Duration) *Notifier {
@@ -343,7 +343,7 @@ func (n *Notifier) DrainDue(ctx context.Context) (int, error) {
 }
 
 // maintenanceMatch reports whether an active window covers the site
-// (site_id '' covers every site).
+// (site_id ” covers every site).
 func maintenanceMatch(windows []MaintenanceWindow, siteID string) bool {
 	for _, w := range windows {
 		if w.SiteID == "" || w.SiteID == siteID {
@@ -636,20 +636,20 @@ func (n *Notifier) failedCount(kind string) *atomic.Int64 {
 // It is self-describing without any AI layer: what broke, where, how badly,
 // the measured value against the threshold, and the incident to group by.
 type NotificationPayload struct {
-	Kind        string `json:"kind"`
-	IncidentID  string `json:"incident_id"`
-	RuleID      string `json:"rule_id"`
-	RuleName    string `json:"rule_name"`
-	Metric      string `json:"metric"`
+	Kind        string  `json:"kind"`
+	IncidentID  string  `json:"incident_id"`
+	RuleID      string  `json:"rule_id"`
+	RuleName    string  `json:"rule_name"`
+	Metric      string  `json:"metric"`
 	Value       float64 `json:"value"`
-	Threshold   string `json:"threshold"`
-	SiteID      string `json:"site_id"`
-	Severity    string `json:"severity"`
-	Samples     int64  `json:"samples"`
-	StateFrom   string `json:"state_from"`
-	StateTo     string `json:"state_to"`
-	EvaluatedAt string `json:"evaluated_at"`
-	Message     string `json:"message"`
+	Threshold   string  `json:"threshold"`
+	SiteID      string  `json:"site_id"`
+	Severity    string  `json:"severity"`
+	Samples     int64   `json:"samples"`
+	StateFrom   string  `json:"state_from"`
+	StateTo     string  `json:"state_to"`
+	EvaluatedAt string  `json:"evaluated_at"`
+	Message     string  `json:"message"`
 }
 
 // BuildNotificationPayload freezes the payload for one intent.
@@ -658,7 +658,7 @@ func BuildNotificationPayload(kind string, rule AlertRule, value float64, sample
 		Kind: kind, IncidentID: incidentID, RuleID: rule.RuleID, RuleName: rule.Name,
 		Metric: rule.Metric, Value: value,
 		Threshold: strconv.FormatFloat(rule.Threshold, 'f', -1, 64),
-		SiteID: rule.SiteID, Severity: rule.Severity, Samples: samples,
+		SiteID:    rule.SiteID, Severity: rule.Severity, Samples: samples,
 		StateFrom: from, StateTo: to, EvaluatedAt: at.UTC().Format(time.RFC3339),
 	}
 	switch kind {

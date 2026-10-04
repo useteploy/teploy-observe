@@ -36,7 +36,7 @@ func TestAggregate_Buckets(t *testing.T) {
 		{
 			name: "clicks across bucket boundary land in distinct buckets",
 			events: []ClickEvent{
-				{X: 19, Y: 9, ViewportWidth: 1280}, // bucket (1, 0)
+				{X: 19, Y: 9, ViewportWidth: 1280},  // bucket (1, 0)
 				{X: 20, Y: 10, ViewportWidth: 1280}, // bucket (2, 1)
 			},
 			expect: map[bucketKey]int64{
@@ -98,9 +98,9 @@ func TestExtractClicks(t *testing.T) {
 	events := []RawEvent{
 		{Type: "click", Data: map[string]any{"x": float64(100), "y": float64(50)}, ViewportWidth: 1280},
 		{Type: "click", Data: map[string]any{"x": "200", "y": "75"}, ViewportWidth: 1280},
-		{Type: "click", Data: map[string]any{"x": float64(300)}, ViewportWidth: 1280},   // missing y
-		{Type: "mousemove", Data: map[string]any{"x": float64(0), "y": float64(0)}},     // wrong type
-		{Type: "click", Data: "not even a map"},                                          // garbage
+		{Type: "click", Data: map[string]any{"x": float64(300)}, ViewportWidth: 1280}, // missing y
+		{Type: "mousemove", Data: map[string]any{"x": float64(0), "y": float64(0)}},   // wrong type
+		{Type: "click", Data: "not even a map"},                                       // garbage
 	}
 
 	clicks := ExtractClicks(events)
@@ -126,8 +126,8 @@ func TestAggregateScales(t *testing.T) {
 	events := make([]ClickEvent, 0, 1000)
 	for i := 0; i < 1000; i++ {
 		events = append(events, ClickEvent{
-			X:             i % 200,         // cycle 200 px wide
-			Y:             (i * 7) % 200,    // cycle 200 px tall
+			X:             i % 200,       // cycle 200 px wide
+			Y:             (i * 7) % 200, // cycle 200 px tall
 			ViewportWidth: 1280,
 		})
 	}

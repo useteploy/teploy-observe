@@ -1,3 +1,4 @@
+//go:build ignore
 // +build ignore
 
 // Generates geo_ranges.bin — a binary file of sorted (start_u32, end_u32, cc[2]) records.

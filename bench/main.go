@@ -25,28 +25,28 @@ type Config struct {
 }
 
 type Results struct {
-	Mode         string        `json:"mode"`
-	Target       string        `json:"target"`
-	Duration     string        `json:"duration"`
-	Concurrency  int           `json:"concurrency"`
-	TotalReqs    int64         `json:"total_requests"`
-	SuccessReqs  int64         `json:"success_requests"`
-	FailedReqs   int64         `json:"failed_requests"`
-	Throughput   float64       `json:"throughput_rps"`
-	LatencyP50   float64       `json:"latency_p50_ms"`
-	LatencyP95   float64       `json:"latency_p95_ms"`
-	LatencyP99   float64       `json:"latency_p99_ms"`
-	LatencyAvg   float64       `json:"latency_avg_ms"`
-	LatencyMin   float64       `json:"latency_min_ms"`
-	LatencyMax   float64       `json:"latency_max_ms"`
-	BytesSent    int64         `json:"bytes_sent"`
+	Mode        string  `json:"mode"`
+	Target      string  `json:"target"`
+	Duration    string  `json:"duration"`
+	Concurrency int     `json:"concurrency"`
+	TotalReqs   int64   `json:"total_requests"`
+	SuccessReqs int64   `json:"success_requests"`
+	FailedReqs  int64   `json:"failed_requests"`
+	Throughput  float64 `json:"throughput_rps"`
+	LatencyP50  float64 `json:"latency_p50_ms"`
+	LatencyP95  float64 `json:"latency_p95_ms"`
+	LatencyP99  float64 `json:"latency_p99_ms"`
+	LatencyAvg  float64 `json:"latency_avg_ms"`
+	LatencyMin  float64 `json:"latency_min_ms"`
+	LatencyMax  float64 `json:"latency_max_ms"`
+	BytesSent   int64   `json:"bytes_sent"`
 }
 
 var (
-	paths     = []string{"/", "/about", "/pricing", "/docs", "/blog", "/signup", "/login", "/dashboard", "/settings", "/contact"}
-	browsers  = []string{"Chrome", "Firefox", "Safari", "Edge"}
-	oses      = []string{"Windows", "macOS", "Linux", "iOS", "Android"}
-	countries = []string{"US", "GB", "DE", "FR", "JP", "BR", "IN", "CA", "AU", "NL"}
+	paths      = []string{"/", "/about", "/pricing", "/docs", "/blog", "/signup", "/login", "/dashboard", "/settings", "/contact"}
+	browsers   = []string{"Chrome", "Firefox", "Safari", "Edge"}
+	oses       = []string{"Windows", "macOS", "Linux", "iOS", "Android"}
+	countries  = []string{"US", "GB", "DE", "FR", "JP", "BR", "IN", "CA", "AU", "NL"}
 	errorTypes = []string{"TypeError", "ReferenceError", "SyntaxError", "RangeError", "NetworkError"}
 	errorMsgs  = []string{
 		"Cannot read property 'id' of undefined",

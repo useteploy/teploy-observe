@@ -26,11 +26,11 @@ const (
 // append-only record every incident action lands on; 'ack' comes from the
 // API, the rest from the alerting engine and notifier.
 const (
-	EventOpened    = "opened"
-	EventRecovered = "recovered"
-	EventNotified  = "notified"
+	EventOpened     = "opened"
+	EventRecovered  = "recovered"
+	EventNotified   = "notified"
 	EventSuppressed = "suppressed"
-	EventAck       = "ack"
+	EventAck        = "ack"
 )
 
 type Incident struct {
@@ -51,11 +51,11 @@ type Incident struct {
 
 // TimelineEvent is one entry of an incident's append-only timeline.
 type TimelineEvent struct {
-	EventID   string `json:"event_id" db:"event_id"`
-	At        int64  `json:"at" db:"at"`
-	Kind      string `json:"kind" db:"kind"`
-	Actor     string `json:"actor" db:"actor"`
-	Detail    string `json:"detail" db:"detail"`
+	EventID string `json:"event_id" db:"event_id"`
+	At      int64  `json:"at" db:"at"`
+	Kind    string `json:"kind" db:"kind"`
+	Actor   string `json:"actor" db:"actor"`
+	Detail  string `json:"detail" db:"detail"`
 }
 
 type Service struct {
