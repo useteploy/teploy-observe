@@ -380,17 +380,20 @@ func TestMigrationsUpgradePopulatedStore(t *testing.T) {
 	// An interrupted earlier run may have left aside copies behind; the
 	// rebuild below refuses to rename onto one. Restore the copy when the
 	// main table is missing, drop it when both exist (the main table is
-	// then the full-shape one and the aside is a stale duplicate).
+	// then the full-shape one and the aside is a stale duplicate). Stale
+	// marker rows are cleared for the same reason.
 	for _, ta := range l9AffectedTables {
-		if !l9TableExists(ctx, db, ta.table+"_l9pre") {
-			continue
-		}
-		if !l9TableExists(ctx, db, ta.table) {
-			if _, err := db.Pool().Exec(ctx, "ALTER TABLE "+ta.table+"_l9pre RENAME TO "+ta.table); err != nil {
-				t.Fatalf("restore stale aside copy of %s: %v", ta.table, err)
+		if l9TableExists(ctx, db, ta.table+"_l9pre") {
+			if !l9TableExists(ctx, db, ta.table) {
+				if _, err := db.Pool().Exec(ctx, "ALTER TABLE "+ta.table+"_l9pre RENAME TO "+ta.table); err != nil {
+					t.Fatalf("restore stale aside copy of %s: %v", ta.table, err)
+				}
+			} else if _, err := db.Pool().Exec(ctx, "DROP TABLE "+ta.table+"_l9pre"); err != nil {
+				t.Fatalf("drop stale aside copy of %s: %v", ta.table, err)
 			}
-		} else if _, err := db.Pool().Exec(ctx, "DROP TABLE "+ta.table+"_l9pre"); err != nil {
-			t.Fatalf("drop stale aside copy of %s: %v", ta.table, err)
+		}
+		if _, err := db.Pool().Exec(ctx, "DELETE FROM "+ta.table+" WHERE "+ta.keyCol+" LIKE 'l9up-%'"); err != nil {
+			t.Fatalf("clear stale markers in %s: %v", ta.table, err)
 		}
 	}
 
