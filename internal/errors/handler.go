@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -119,6 +120,8 @@ type Service struct {
 	// fallbackSalt is the global session salt used when a per-site lookup
 	// returns ok=false. Empty means "do not hash" — leave distinct_id raw.
 	fallbackSalt string
+	// spike is the per-site/per-issue rate guard (spike.go); nil = off.
+	spike *SpikeLimiter
 }
 
 // WithPrivacy installs the per-site distinct_id hashing lookup and
@@ -135,7 +138,7 @@ type ErrorHandler = Service
 
 // NewService constructs the canonical ingest service.
 func NewService(db *nucleus.Client, issueSvc *IssueService, searchSvc *SearchService, srcmapSvc *sourcemaps.SourceMapService) *Service {
-	return &Service{db: db, issueSvc: issueSvc, searchSvc: searchSvc, srcmapSvc: srcmapSvc}
+	return &Service{db: db, issueSvc: issueSvc, searchSvc: searchSvc, srcmapSvc: srcmapSvc, spike: NewSpikeLimiterFromEnv()}
 }
 
 // NewErrorHandler is the legacy constructor, kept so existing callers
@@ -153,9 +156,19 @@ func NewErrorHandler(db *nucleus.Client, issueSvc *IssueService, searchSvc *Sear
 //
 // Returns the issue_id so callers can present a link to the user.
 func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (string, error) {
+	issueID, _, err := s.ingestEvent(ctx, input)
+	return issueID, err
+}
+
+// ingestEvent is IngestErrorEvent that also reports a spike-sampled drop
+// (dropped=true, no error: a labeled final disposition, not a failure).
+func (s *Service) ingestEvent(ctx context.Context, input ErrorInput) (issueID string, dropped bool, err error) {
 	errorID, issueID, err := s.insertErrorEvent(ctx, s.db.SQL(), input)
+	if errors.Is(err, ErrSpikeDropped) {
+		return "", true, nil
+	}
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if s.searchSvc != nil {
 		if err := s.searchSvc.IndexError(ctx, input.SiteID, errorID, input.ErrorType, input.ErrorValue); err != nil {
@@ -163,7 +176,7 @@ func (s *Service) IngestErrorEvent(ctx context.Context, input ErrorInput) (strin
 				"site", input.SiteID, "error_id", errorID, "err", err)
 		}
 	}
-	return issueID, nil
+	return issueID, false, nil
 }
 
 // insertErrorEvent is steps 1-4 of IngestErrorEvent on an explicit SQL
@@ -208,6 +221,14 @@ func (s *Service) insertErrorEvent(ctx context.Context, sqlc *nucleus.SQLModel, 
 
 	title := IssueTitle(input.ErrorType, input.ErrorValue)
 	culprit := IssueCulprit(input.StackTrace)
+
+	// Spike protection (spike.go): thin an over-cap flood, but never the
+	// first event of a new issue or a regression.
+	if s.spike.spikeCheck(input.SiteID, groupHash, func() bool {
+		return s.issueSvc.spikeExempt(ctx, input.SiteID, groupHash)
+	}) {
+		return "", "", ErrSpikeDropped
+	}
 
 	// Resolve or create issue
 	issueID, err = s.issueSvc.ResolveIssue(ctx, input.SiteID, groupHash, title, culprit, input.Level, input.ReleaseTag, now.UnixMilli())
