@@ -8,6 +8,8 @@ import Pagination from "../components/shared/Pagination.js";
 import ExportButton from "../components/shared/ExportButton.js";
 import EmptyState from "../components/shared/EmptyState.js";
 import { streamTicketQuery } from "../api/helpers.js";
+import { LOG_QUERY_HELP, LOG_QUERY_LIMITS_NOTE, caretLine, parseQuerySyntaxError, queryTooLong } from "../lib/logQuery.js";
+import type { QuerySyntaxError } from "../lib/logQuery.js";
 import "../styles/logs.css";
 import { useFilters } from "../hooks/useFilters.js";
 
@@ -220,6 +222,11 @@ export default function LogsPage() {
   const [service, setService] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [page, setPage] = useState(1);
+  // Query-language pages are keyset-paged: cursors[n] fetches page n + 2.
+  const [cursors, setCursors] = useState<string[]>([]);
+  const [truncated, setTruncated] = useState(false);
+  const [syntaxError, setSyntaxError] = useState<QuerySyntaxError | null>(null);
+  const [helpOpen, setHelpOpen] = useState(false);
   const [live, setLive] = useState(false);
   // R38: live entries are their own capped list — a historical refresh can
   // no longer overwrite the tail the user is watching.
@@ -234,7 +241,7 @@ export default function LogsPage() {
   // R38: any filter/site change resets pagination — applying a restrictive
   // filter while on page five used to render "no results" for a query that
   // HAD results on page one.
-  useEffect(() => { setPage(1); }, [siteId, query, activeLevel, service]);
+  useEffect(() => { setPage(1); setCursors([]); }, [siteId, query, activeLevel, service]);
 
   // R38: the live stream cannot evaluate text search (the server filters
   // live by site only); disable it rather than implying a filtered tail.
@@ -244,17 +251,27 @@ export default function LogsPage() {
     const generation = ++requestGeneration.current;
     setLoading(true);
     setError(null);
+    setSyntaxError(null);
+    if (queryTooLong(query)) {
+      setLoading(false);
+      setSyntaxError({ position: 0, message: "query is longer than 1024 bytes" });
+      return;
+    }
     const now = new Date();
     const from = new Date(now.getTime() - 86400000);
     const fromStr = from.toISOString();
     const toStr = now.toISOString();
 
     try {
-      const opts: { query?: string; level?: string; service?: string; limit?: number; offset?: number } = {
+      const opts: { query?: string; level?: string; service?: string; limit?: number; offset?: number; cursor?: string } = {
         limit: PAGE_SIZE,
-        offset: (page - 1) * PAGE_SIZE,
       };
-      if (query.trim()) opts.query = query.trim();
+      if (query.trim()) {
+        opts.query = query.trim();
+        if (page > 1) opts.cursor = cursors[page - 2];
+      } else {
+        opts.offset = (page - 1) * PAGE_SIZE;
+      }
       if (activeLevel !== "ALL") opts.level = activeLevel;
       if (service.trim()) opts.service = service.trim();
 
@@ -265,19 +282,31 @@ export default function LogsPage() {
       ]);
       if (generation !== requestGeneration.current) return;
 
-      setLogs(logData || []);
+      setLogs(logData.logs);
+      setTruncated(logData.truncated);
+      if (logData.nextCursor) {
+        setCursors((prev) => { const n = prev.slice(0, page - 1); n[page - 1] = logData.nextCursor; return n; });
+      }
       setStats(statData || []);
       setHistogram(histData || []);
     } catch (err) {
       console.error("Failed to fetch logs:", err);
       if (generation !== requestGeneration.current) return;
+      // A bad query is the user's to fix: show it under the search box with
+      // the position, not as a load failure.
+      const syn = err instanceof Error ? parseQuerySyntaxError(err.message) : null;
+      if (syn) {
+        setSyntaxError(syn);
+        setLogs([]);
+        return;
+      }
       // R37: a failed request is an ERROR, not "no data" — an outage used to
       // render the same "No logs yet" empty state as a healthy empty site.
       setError(err instanceof Error ? err.message : "Unable to load logs");
     } finally {
       if (generation === requestGeneration.current) setLoading(false);
     }
-  }, [siteId, query, activeLevel, service, page]);
+  }, [siteId, query, activeLevel, service, page, cursors]);
 
   useEffect(() => {
     fetchLogs();
