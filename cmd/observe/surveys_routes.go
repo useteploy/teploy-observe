@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/useteploy/teploy-observe/internal/ingest"
@@ -43,6 +47,7 @@ type surveyRouter interface {
 //	/respond  per IP 10/min (burst 20),  per site 120/min (burst 60) - a
 //	          human submits a handful of times; this is the write-flood gate.
 func registerSurveyPublicRoutes(r surveyRouter, svc *surveys.SurveyService) {
+	known := newSiteKnownCache(svc.SiteKnown)
 	activeIP := ingest.NewRateLimiter(60, time.Minute, 120)
 	activeSite := ingest.NewRateLimiter(1200, time.Minute, 600)
 	exposeIP := ingest.NewRateLimiter(30, time.Minute, 60)
@@ -51,11 +56,11 @@ func registerSurveyPublicRoutes(r surveyRouter, svc *surveys.SurveyService) {
 	respondSite := ingest.NewRateLimiter(120, time.Minute, 60)
 
 	r.Handle("GET /api/v1/surveys/active",
-		surveyCORS(ipRateLimitMW(activeIP)(surveysActiveHandler(svc, activeSite))))
+		surveyCORS(ipRateLimitMW(activeIP)(surveysActiveHandler(svc, activeSite, known))))
 	r.Handle("POST /api/v1/surveys/expose",
-		surveyCORS(ipRateLimitMW(exposeIP)(surveySiteLimitMW(exposeSite)(surveyExposeHandler(svc)))))
+		surveyCORS(ipRateLimitMW(exposeIP)(surveySiteLimitMW(exposeSite, known)(surveyExposeHandler(svc)))))
 	r.Handle("POST /api/v1/surveys/respond",
-		surveyCORS(ipRateLimitMW(respondIP)(surveySiteLimitMW(respondSite)(surveyRespondHandler(svc)))))
+		surveyCORS(ipRateLimitMW(respondIP)(surveySiteLimitMW(respondSite, known)(surveyRespondHandler(svc)))))
 	r.Handle("GET /t/observe-surveys.js", http.HandlerFunc(serveSurveysWidget))
 }
 
@@ -75,7 +80,7 @@ func surveyCORS(next http.Handler) http.Handler {
 // named in the body, so it peeks (bounded) and restores the body for the real
 // handler. An oversized body is refused here with 413 before it is buffered
 // past the cap.
-func surveySiteLimitMW(rl *ingest.RateLimiter) func(http.Handler) http.Handler {
+func surveySiteLimitMW(rl *ingest.RateLimiter, known func(context.Context, string) bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, publicFormMaxBodyBytes))
@@ -89,7 +94,14 @@ func surveySiteLimitMW(rl *ingest.RateLimiter) func(http.Handler) http.Handler {
 			// A body that does not decode falls through: the real handler owns
 			// the 400, and the IP limiter already charged this request.
 			if json.Unmarshal(raw, &peek) == nil && peek.SiteID != "" {
-				if len(peek.SiteID) > maxSurveySiteIDLen || !rl.Allow(peek.SiteID, "") {
+				// Only real sites get a per-site bucket: attacker-chosen ids
+				// must not fill the limiter's bucket budget. Unknown sites
+				// were already charged against the per-IP limit.
+				if len(peek.SiteID) > maxSurveySiteIDLen || !known(r.Context(), peek.SiteID) {
+					writeJSONError(w, http.StatusNotFound, "unknown site")
+					return
+				}
+				if !rl.Allow(peek.SiteID, "") {
 					w.Header().Set("Retry-After", "60")
 					writeJSONError(w, http.StatusTooManyRequests, "too many requests")
 					return
@@ -114,12 +126,20 @@ var surveyRefHostPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-
 //
 // A store failure is a 503 (never an empty 200 that looks like "no surveys",
 // OBS-004). The response is never cached: sampling is per visitor.
-func surveysActiveHandler(svc *surveys.SurveyService, siteLimiter *ingest.RateLimiter) http.HandlerFunc {
+func surveysActiveHandler(svc *surveys.SurveyService, siteLimiter *ingest.RateLimiter, known func(context.Context, string) bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		siteID := q.Get("site_id")
 		if siteID == "" || len(siteID) > maxSurveySiteIDLen {
 			writeJSONError(w, http.StatusBadRequest, "site_id required")
+			return
+		}
+		if !known(r.Context(), siteID) {
+			// Unknown site: per-IP limit only, empty answer (the widget
+			// treats it as "no surveys"), no per-site bucket created.
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			w.Write([]byte("[]\n"))
 			return
 		}
 		if !siteLimiter.Allow(siteID, "") {
@@ -147,4 +167,64 @@ func surveysActiveHandler(svc *surveys.SurveyService, siteLimiter *ingest.RateLi
 		}
 		json.NewEncoder(w).Encode(active)
 	}
+}
+
+// siteKnownCache wraps a site-existence lookup with a short TTL so a flood
+// of unknown site ids costs one lookup per id per TTL, not one per request.
+// Entries are capped; at the cap the map is reset, which only costs
+// re-lookups.
+type siteKnownCache struct {
+	lookup func(context.Context, string) bool
+	ttl    time.Duration
+	max    int
+	now    func() time.Time
+	mu     sync.Mutex
+	m      map[string]siteKnownEntry
+}
+
+type siteKnownEntry struct {
+	ok  bool
+	exp time.Time
+}
+
+func newSiteKnownCache(lookup func(context.Context, string) bool) func(context.Context, string) bool {
+	return newSiteKnownCacheSized(lookup, 30*time.Second, 4096, time.Now).known
+}
+
+func newSiteKnownCacheSized(lookup func(context.Context, string) bool, ttl time.Duration, max int, now func() time.Time) *siteKnownCache {
+	return &siteKnownCache{lookup: lookup, ttl: ttl, max: max, now: now, m: map[string]siteKnownEntry{}}
+}
+
+func (c *siteKnownCache) known(ctx context.Context, siteID string) bool {
+	now := c.now()
+	c.mu.Lock()
+	if e, hit := c.m[siteID]; hit && now.Before(e.exp) {
+		c.mu.Unlock()
+		return e.ok
+	}
+	c.mu.Unlock()
+	ok := c.lookup(ctx, siteID)
+	c.mu.Lock()
+	if len(c.m) >= c.max {
+		c.m = map[string]siteKnownEntry{}
+	}
+	c.m[siteID] = siteKnownEntry{ok: ok, exp: now.Add(c.ttl)}
+	c.mu.Unlock()
+	return ok
+}
+
+// writeSurveyRespondError maps a SubmitResponse failure to an HTTP answer
+// for anonymous callers. Only surveys.PublicError carries fixed, safe text
+// (400); everything else may wrap store text, so it is logged server-side
+// and answered with a generic 500.
+func writeSurveyRespondError(w http.ResponseWriter, err error) {
+	var pe *surveys.PublicError
+	if errors.As(err, &pe) {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": pe.Msg})
+		return
+	}
+	slog.Error("survey respond failed", "error", err)
+	w.WriteHeader(http.StatusInternalServerError)
+	json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "could not record response"})
 }

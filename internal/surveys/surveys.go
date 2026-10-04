@@ -6,9 +6,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"strconv"
+	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/neutron-build/neutron/go/nucleus"
 
@@ -21,6 +25,63 @@ type SurveyService struct {
 	db      *nucleus.Client
 	salt    string
 	siteSvc *sites.SiteService
+	// submitLocks serializes the dedupe check-then-insert per
+	// (site, survey, client) in this process. Striped so memory is fixed.
+	submitLocks [submitLockStripes]sync.Mutex
+}
+
+const submitLockStripes = 64
+
+// MaxUserIDLen bounds the caller-supplied identify value on public survey
+// endpoints.
+const MaxUserIDLen = 128
+
+// PublicError is a validation or gate failure whose message is fixed text
+// that is safe to show an anonymous caller. Every other error from this
+// package may wrap store text and must not be echoed.
+type PublicError struct{ Msg string }
+
+func (e *PublicError) Error() string { return e.Msg }
+
+func publicErr(format string, a ...any) error { return &PublicError{Msg: fmt.Sprintf(format, a...)} }
+
+// ValidateUserID checks the optional identify value: bounded, valid UTF-8,
+// no control characters.
+func ValidateUserID(u string) error {
+	if len(u) > MaxUserIDLen {
+		return publicErr("user_id too long (max %d bytes)", MaxUserIDLen)
+	}
+	if !utf8.ValidString(u) {
+		return publicErr("user_id must be valid UTF-8")
+	}
+	for _, r := range u {
+		if unicode.IsControl(r) {
+			return publicErr("user_id must not contain control characters")
+		}
+	}
+	return nil
+}
+
+func (s *SurveyService) submitLock(siteID, surveyID, clientID string) *sync.Mutex {
+	h := fnv.New32a()
+	h.Write([]byte(siteID))
+	h.Write([]byte{0})
+	h.Write([]byte(surveyID))
+	h.Write([]byte{0})
+	h.Write([]byte(clientID))
+	return &s.submitLocks[h.Sum32()%submitLockStripes]
+}
+
+// SiteKnown reports whether siteID names a real site, via the cached site
+// lookup (PrivacyConfig: positives are cached in-process). A nil site
+// service (tests) answers true. A store error reads as unknown, which only
+// means the per-site bucket is skipped for that request.
+func (s *SurveyService) SiteKnown(ctx context.Context, siteID string) bool {
+	if s == nil || s.siteSvc == nil {
+		return true
+	}
+	_, _, ok := s.siteSvc.PrivacyConfig(ctx, siteID)
+	return ok
 }
 
 // NewSurveyService wires the survey store. salt is the global session salt
@@ -176,14 +237,17 @@ func (s *SurveyService) gateSurvey(ctx context.Context, surveyID, siteID string)
 	}
 	sv, err := nucleus.Query[svRow](ctx, s.db.SQL(),
 		"SELECT site_id, status FROM "+surveysLatest("survey_id = $1"), surveyID)
-	if err != nil || len(sv) == 0 {
-		return fmt.Errorf("survey not found")
+	if err != nil {
+		return fmt.Errorf("gate survey: %w", err)
+	}
+	if len(sv) == 0 {
+		return publicErr("survey not found")
 	}
 	if sv[0].SiteID != siteID {
-		return fmt.Errorf("survey does not belong to this site")
+		return publicErr("survey does not belong to this site")
 	}
 	if sv[0].Status != "active" {
-		return fmt.Errorf("survey is not active")
+		return publicErr("survey is not active")
 	}
 	return nil
 }
@@ -218,31 +282,38 @@ func (s *SurveyService) RecordExposure(ctx context.Context, surveyID, siteID, us
 // response the same way exposures are attributed, so the response-rate
 // numerator counts the same kind of unit as its denominator.
 //
-// Residual, documented: the dedupe is a check-then-insert on a synchronous
-// path - two identical client_ids submitted in the same instant can both
-// insert. The covered case is the retry (seconds apart, the real-world
-// duplicate); a same-millisecond concurrent double-submit is the same
-// window class the events admission cache documents pre-serialization.
+// The dedupe key is (site, survey, client): a client id reused against a
+// different survey is a different response. The check-then-insert is
+// serialized per key by a striped in-process mutex, which closes the race
+// inside one process. Residual, documented: there is no unique index (no
+// schema change), so two replicas receiving the same client id in the same
+// instant can both insert.
 func (s *SurveyService) SubmitResponse(ctx context.Context, surveyID, siteID, userID string, clientID string, answers map[string]any, ip, userAgent string) (SubmitResult, error) {
 	if err := ValidateAnswers(answers); err != nil {
-		return SubmitResult{}, err
+		return SubmitResult{}, &PublicError{Msg: err.Error()}
 	}
-	if err := s.gateSurvey(ctx, surveyID, siteID); err != nil {
+	if err := ValidateUserID(userID); err != nil {
 		return SubmitResult{}, err
 	}
 	if clientID != "" && !clientIDPattern.MatchString(clientID) {
-		return SubmitResult{}, fmt.Errorf("invalid response identity (must match [A-Za-z0-9_-]{8,64})")
+		return SubmitResult{}, publicErr("invalid response identity (must match [A-Za-z0-9_-]{8,64})")
+	}
+	if err := s.gateSurvey(ctx, surveyID, siteID); err != nil {
+		return SubmitResult{}, err
 	}
 
 	// Response-identity dedupe: a retry of an already-recorded client id
 	// acks the original row instead of inserting again.
 	if clientID != "" {
+		mu := s.submitLock(siteID, surveyID, clientID)
+		mu.Lock()
+		defer mu.Unlock()
 		existing, err := nucleus.Query[struct {
 			ResponseID string `db:"response_id"`
 		}](ctx, s.db.SQL(),
 			`SELECT response_id FROM survey_responses
-			 WHERE site_id = $1 AND client_id = $2 LIMIT 1`,
-			siteID, clientID)
+			 WHERE site_id = $1 AND survey_id = $2 AND client_id = $3 LIMIT 1`,
+			siteID, surveyID, clientID)
 		if err != nil {
 			return SubmitResult{}, fmt.Errorf("submit response: dedupe lookup: %w", err)
 		}
@@ -258,7 +329,7 @@ func (s *SurveyService) SubmitResponse(ctx context.Context, surveyID, siteID, us
 		answersJSON = string(raw)
 	}
 	if len(answersJSON) > 16384 {
-		return SubmitResult{}, fmt.Errorf("answers payload too large")
+		return SubmitResult{}, publicErr("answers payload too large")
 	}
 	entityType, entityID := s.entity(ctx, siteID, userID, ip, userAgent)
 	_, err := s.db.SQL().Exec(ctx,

@@ -4142,8 +4142,7 @@ func surveyRespondHandler(svc *surveys.SurveyService) http.HandlerFunc {
 			input.ResponseID, input.Answers,
 			ingest.ClientIPFromContext(r.Context()), ingest.UserAgentFromContext(r.Context()))
 		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+			writeSurveyRespondError(w, err)
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"ok": true, "response_id": res.ResponseID, "deduped": res.Deduped})
