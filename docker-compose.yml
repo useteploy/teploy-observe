@@ -41,7 +41,7 @@ services:
   nucleus:
     # Pinned (was :latest). Keep in sync with NUCLEUS_VERSION in
     # .github/workflows/ci.yml; override with NUCLEUS_VERSION=... to upgrade.
-    image: ghcr.io/neutron-build/nucleus:${NUCLEUS_VERSION:-v1.1.1}
+    image: ghcr.io/neutron-build/nucleus:${NUCLEUS_VERSION:-v1.2.1}
     restart: unless-stopped
     networks:
       # R43 (round 4): database on the internal backend network only — the

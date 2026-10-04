@@ -19,6 +19,11 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The engine version CI tests against and production runs (teploy.yml pins
+# the same tag; docker-compose.yml defaults to it). One place to bump.
+env:
+  NUCLEUS_VERSION: v1.2.1
+
 # This repo embeds the built UI at cmd/observe/ui/dist/ as part of the
 # repo (single-binary story). CI only needs to build + test the Go code
 # — no pnpm, no Rust toolchain, no Nucleus build. Local devs run
@@ -242,7 +247,7 @@ jobs:
   # 027) was fixed upstream on 2026-09-18 (Neutron 6286531a) and
   # repo-built engines pass the full migration ladder again — the
   # lease-capability job below builds from the pin and relies on it. This
-  # Supported-release coverage now uses v1.1.1 on both architectures.
+  # Supported-release coverage uses NUCLEUS_VERSION on both architectures.
   # v0.1.8 no longer satisfies the full suite (leases, parameterized paging,
   # and committed upserts); its failing run is recorded in AUDIT_OPEN.md.
   # X01: the vendor/ tree is what actually compiles, but go.mod's replace
@@ -281,7 +286,8 @@ jobs:
           fi
 
   # X01 compatibility matrix: the same suite against the engine version
-  # production actually runs (v1.1.1) on arm64. This combination found two
+  # production actually runs (NUCLEUS_VERSION, kept in sync with teploy.yml)
+  # on arm64. This combination found two
   # real defects the v0.1.8 job structurally cannot see (the version-tie
   # ambiguity — fast native runs collide at millisecond granularity while
   # slower CI engines never do — and the v0.1.8 arm64 image is broken
@@ -328,7 +334,7 @@ jobs:
           echo "observe did not become healthy" >&2
           kill "$OBS_PID" 2>/dev/null || true
           exit 1
-      - name: Full suite against live Nucleus v1.1.1
+      - name: Full suite against pinned Nucleus
         env:
           OBSERVE_NUCLEUS_URL: postgres://nucleus@127.0.0.1:55432/observe?sslmode=disable
           OBSERVE_REQUIRE_NUCLEUS: "1"

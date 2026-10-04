@@ -167,19 +167,27 @@ upgraded store rather than a fresh one.
 **Update 2026-10-04 (close-out session):** (b) and (c) are DONE - the guard
 test refuses ALTER-ADD from 057 on, and
 `TestMigrationsUpgradePopulatedStore` replays the populated upgrade path.
-The "convert 048/049/051/052/054/056 and 010 in place" plan is REFUSED BY
-THE RUNNER: every applied script is checksum-verified at each Migrate
-(`migration %d has been modified since it was applied ... restore the
-applied script or write a new migration`), pinned executably by
+The "convert 048/049/051/052/054/056 and 010 in place" plan is additionally
+REFUSED BY THE RUNNER: every applied script is checksum-verified at each
+Migrate (`migration %d has been modified since it was applied ... restore
+the applied script or write a new migration`), pinned executably by
 `TestAppliedMigrationsAreChecksumFrozen`. Rewriting those files would break
 the boot of every store that already applied them (infra-home included).
-Remaining options are owner-led: either coordinated ledger surgery on a
-quiesced store (rewrite the recorded checksums, or delete the rows and let
-the edited rename-aside forms re-run - which is also the llm_traces repair
-path, at the cost of the 12,080 regenerable traces), or accept the
-grandfather (fresh installs never see the risk on current engines; the
-pre-045 populated upgrade path is protected only by the engine fix, which
-is upstream - Neutron thread).
+
+Upstream resolution (2026-10-04): the engine defect is fixed in Nucleus
+v1.2.1 (atomic ALTER rewrites; half-applied ALTERs no longer recorded as
+applied; a new engine-side refusal rejects ALTERs that follow writes to the
+same table in one transaction). This repo pins v1.2.1 in teploy.yml, CI
+(NUCLEUS_VERSION) and docker-compose; observe's full suite plus a fresh
+migration boot verified against that image. Re-scoped: (b) is no longer
+needed for correctness on v1.2.1+ - the engine itself enforces the unsafe
+ordering (the guard test stays as belt-and-braces and for older engines);
+(c) is satisfied by `TestMigrationsUpgradePopulatedStore` on this branch;
+(a) remains open as an owner op and now has an in-place path (the
+`catalog.json` repair in Neutron's
+`nucleus/docs/HANDOVER_TEPLOY_OBSERVE_ADD_COLUMN.md`) that preserves the
+rows instead of losing regenerable traces - the rename-aside fallback that
+loses the 12,080 traces stays documented above as the last resort.
 
 ## Round-4 register (2026-09-19 audit, 45 findings R01..R45)
 

@@ -111,7 +111,23 @@ accessories:
     # v1.1.0's arm64 layer was built with a drifting cross toolchain (needed
     # GLIBC_2.38); v1.1.1 pins cross 0.2.5 and loads on bookworm. Verified:
     # observe's full suite (44 packages, -p 1) green against the v1.1.x image.
-    image: ghcr.io/neutron-build/nucleus:v1.1.1
+    #
+    # v1.2.1 (2026-10-04), up from v1.1.1. Atomic ALTER rewrites: ADD/DROP
+    # COLUMN and ALTER COLUMN TYPE now adopt the new layout, rewrite every
+    # row, rebuild the indexes and verify every tuple decodes as one
+    # all-or-nothing step; any failure restores the pre-change state. Fixes
+    # the L9 live-store corruption (llm_traces undecodable after several
+    # in-transaction ALTER ADDs; half-applied ALTERs recorded as migrated —
+    # the token_source-yes/cost_source-no state on infra-home). The live
+    # store still needs the in-place catalog repair from
+    # Neutron's nucleus/docs/HANDOVER_TEPLOY_OBSERVE_ADD_COLUMN.md before
+    # migration 054 can re-run. New refusal to respect in migration files:
+    # ALTER on a table this transaction has already written to errors —
+    # order ALTERs before DML. CREATE UNIQUE INDEX now enforces uniqueness
+    # on populated tables. Verified: observe's full suite (48 packages,
+    # -p 1) green against the v1.2.1 image, plus a fresh migration boot
+    # (001-056).
+    image: ghcr.io/neutron-build/nucleus:v1.2.1
     port: 5432
     # Hard cgroup cap, and the only bound the kernel enforces.
     # NUCLEUS_MAX_MEMORY_MB below is the engine's accounting of its OWN
