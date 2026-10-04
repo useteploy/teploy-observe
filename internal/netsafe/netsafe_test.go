@@ -184,3 +184,33 @@ func TestClientWithAllowDialsWhatItWasTold(t *testing.T) {
 	}
 	resp.Body.Close()
 }
+
+func TestIsBlockedIPExtraRanges(t *testing.T) {
+	blocked := []string{"64:ff9b::808:808", "64:ff9b::a9fe:a9fe", "64:ff9b::7f00:1", "198.18.0.1", "198.19.255.254", "192.0.0.8", "240.0.0.1", "255.255.255.255"}
+	for _, s := range blocked {
+		if !IsBlockedIP(net.ParseIP(s)) {
+			t.Errorf("%s must be blocked", s)
+		}
+	}
+	open := []string{"8.8.8.8", "198.17.255.255", "198.20.0.1", "192.0.1.1", "2606:4700:4700::1111"}
+	for _, s := range open {
+		if IsBlockedIP(net.ParseIP(s)) {
+			t.Errorf("%s must not be blocked", s)
+		}
+	}
+	// Tailnet handling unchanged.
+	if !IsBlockedIP(net.ParseIP("100.64.1.1")) {
+		t.Error("tailnet blocked by default")
+	}
+	allow, _ := ParseAllow("100.64.0.0/10, 198.18.0.0/15, 64:ff9b::808:808/128")
+	for _, s := range []string{"100.64.1.1", "198.18.0.1", "64:ff9b::808:808"} {
+		if IsBlockedIPWith(net.ParseIP(s), allow) {
+			t.Errorf("%s allowlisted must pass", s)
+		}
+	}
+	// Link-local embedded in NAT64 is never allowlistable.
+	a2, _ := ParseAllow("64:ff9b::/96")
+	if !IsBlockedIPWith(net.ParseIP("64:ff9b::a9fe:a9fe"), a2) {
+		t.Error("NAT64-embedded metadata must stay blocked")
+	}
+}
