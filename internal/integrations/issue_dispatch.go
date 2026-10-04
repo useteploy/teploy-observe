@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +40,17 @@ const (
 	// is the backstop that frees the worker regardless).
 	IssueNotifyDeliveryTimeout = 30 * time.Second
 
+	// DefaultIssueNotifyPerHour is the default per-integration AND per-site
+	// token-bucket rate (and burst) for issue notifications; override with
+	// OBSERVE_ISSUE_NOTIFY_PER_HOUR (0 = unlimited). The per-(integration,
+	// issue) cooldown alone does not bound a producer that varies the
+	// fingerprint: every event would be a distinct "new issue".
+	DefaultIssueNotifyPerHour = 10
+	// issueNotifySummaryEvery bounds how often a scope may emit its
+	// "rate limited" summary notification.
+	issueNotifySummaryEvery = time.Hour
+	issueNotifyBucketCap    = 10000
+
 	issueNotifyListTimeout   = 10 * time.Second
 	issueNotifyCooldownCap   = 10000
 	issueNotifyMaxTitleChars = 200
@@ -66,6 +78,8 @@ type IssueDispatcherStats struct {
 	TimedOut        int64 `json:"timed_out"`
 	DroppedOverflow int64 `json:"dropped_overflow"`
 	Suppressed      int64 `json:"suppressed_cooldown"`
+	SuppressedRate  int64 `json:"suppressed_rate"`
+	RateSummaries   int64 `json:"rate_summaries"`
 	ListErrors      int64 `json:"list_errors"`
 }
 
@@ -91,11 +105,92 @@ type IssueDispatcher struct {
 	q       []IssueEvent
 	stopped bool
 	cool    map[string]time.Time
-	sem     chan struct{}
-	wg      sync.WaitGroup
+	// perHour is the bucket rate and burst (0 = unlimited).
+	perHour  int
+	siteBkts map[string]*bucket
+	intgBkts map[string]*bucket
+	sem      chan struct{}
+	wg       sync.WaitGroup
 
 	enqueued, delivered, failed, timedOut atomic.Int64
 	dropped, suppressed, listErrors       atomic.Int64
+	suppressedRate, rateSummaries         atomic.Int64
+}
+
+// bucket is a token bucket with the bookkeeping for one bounded "rate
+// limited" summary per suppression episode.
+type bucket struct {
+	tokens      float64
+	last        time.Time
+	suppressing bool
+	lastSummary time.Time
+}
+
+// take consumes one token. summary is true exactly when this denial starts a
+// suppression episode and the hourly summary allowance is available.
+func (b *bucket) take(now time.Time, perHour int) (ok, summary bool) {
+	rate := float64(perHour) / 3600.0
+	if b.last.IsZero() {
+		b.tokens = float64(perHour)
+	} else if dt := now.Sub(b.last).Seconds(); dt > 0 {
+		b.tokens += dt * rate
+		if b.tokens > float64(perHour) {
+			b.tokens = float64(perHour)
+		}
+	}
+	b.last = now
+	if b.tokens >= 1 {
+		b.tokens--
+		b.suppressing = false
+		return true, false
+	}
+	if !b.suppressing && (b.lastSummary.IsZero() || now.Sub(b.lastSummary) >= issueNotifySummaryEvery) {
+		b.suppressing = true
+		b.lastSummary = now
+		return false, true
+	}
+	b.suppressing = true
+	return false, false
+}
+
+func (d *IssueDispatcher) takeBucket(m map[string]*bucket, key string) (ok, summary bool) {
+	if d.perHour <= 0 {
+		return true, false
+	}
+	now := d.now()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	b := m[key]
+	if b == nil {
+		if len(m) >= issueNotifyBucketCap {
+			// Bounded: forget idle, full buckets first, then everything.
+			for k, v := range m {
+				if now.Sub(v.last) >= time.Hour {
+					delete(m, k)
+				}
+			}
+			if len(m) >= issueNotifyBucketCap {
+				for k := range m {
+					delete(m, k)
+				}
+			}
+		}
+		b = &bucket{}
+		m[key] = b
+	}
+	return b.take(now, d.perHour)
+}
+
+func issueNotifyPerHourFromEnv() int {
+	v := strings.TrimSpace(os.Getenv("OBSERVE_ISSUE_NOTIFY_PER_HOUR"))
+	if v == "" {
+		return DefaultIssueNotifyPerHour
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return DefaultIssueNotifyPerHour
+	}
+	return n
 }
 
 // NewIssueDispatcher builds a dispatcher backed by this service. publicURL
@@ -120,6 +215,9 @@ func newIssueDispatcher(
 		now:            time.Now,
 		deliverTimeout: IssueNotifyDeliveryTimeout,
 		cool:           make(map[string]time.Time),
+		perHour:        issueNotifyPerHourFromEnv(),
+		siteBkts:       make(map[string]*bucket),
+		intgBkts:       make(map[string]*bucket),
 		sem:            make(chan struct{}, IssueNotifyWorkers),
 	}
 }
@@ -184,12 +282,58 @@ func (d *IssueDispatcher) process(ev IssueEvent) {
 		return
 	}
 	payload := d.payload(ev)
+	// siteState memoises the per-site bucket decision: one token per event
+	// that reaches a delivery, however many integrations the site has.
+	siteState := 0 // 0 undecided, 1 allowed, 2 denied
 	for _, intg := range intgs {
 		if !d.claim(intg.IntegrationID, ev.IssueID) {
 			d.suppressed.Add(1)
 			continue
 		}
+		if siteState == 0 {
+			ok, summary := d.takeBucket(d.siteBkts, ev.SiteID)
+			siteState = 2
+			if ok {
+				siteState = 1
+			}
+			if summary {
+				d.sendSummary(intgs, ev.SiteID, "site")
+			}
+		}
+		if siteState == 2 {
+			d.suppressedRate.Add(1)
+			continue
+		}
+		if ok, summary := d.takeBucket(d.intgBkts, intg.IntegrationID); !ok {
+			d.suppressedRate.Add(1)
+			if summary {
+				d.sendSummary([]Integration{intg}, ev.SiteID, "integration")
+			}
+			continue
+		}
 		d.deliverOne(intg, payload)
+	}
+}
+
+// sendSummary delivers the single "rate limited" notice for a scope. It
+// bypasses the buckets by design and is itself bounded to one per scope per
+// issueNotifySummaryEvery.
+func (d *IssueDispatcher) sendSummary(to []Integration, siteID, scope string) {
+	d.rateSummaries.Add(1)
+	d.logger.Warn("issue notifications rate limited", "site", siteID, "scope", scope, "per_hour", d.perHour)
+	p := AlertPayload{
+		Title: "Issue notifications rate limited",
+		Message: fmt.Sprintf("More than %d new-issue or regression notifications per hour for this %s. "+
+			"Further ones are suppressed (counted at /healthz as suppressed_rate) until the rate drops. "+
+			"Review the issue inbox: a producer emitting many distinct fingerprints looks like this.", d.perHour, scope),
+		Severity: "warning",
+		SiteID:   siteID,
+		RuleName: "issue_rate_limited",
+		Metric:   "issue_notifications",
+		Value:    strconv.Itoa(d.perHour),
+	}
+	for _, i := range to {
+		d.deliverOne(i, p)
 	}
 }
 
@@ -319,6 +463,10 @@ func clean(s string, max int) string {
 		if r < 0x20 || r == 0x7f {
 			return ' '
 		}
+		// Invisible / bidi-control characters used to disguise text.
+		if (r >= 0x200b && r <= 0x200f) || (r >= 0x202a && r <= 0x202e) || (r >= 0x2060 && r <= 0x2069) || r == 0xfeff {
+			return -1
+		}
 		return r
 	}, s)
 	s = strings.TrimSpace(s)
@@ -341,6 +489,8 @@ func (d *IssueDispatcher) Stats() IssueDispatcherStats {
 		TimedOut:        d.timedOut.Load(),
 		DroppedOverflow: d.dropped.Load(),
 		Suppressed:      d.suppressed.Load(),
+		SuppressedRate:  d.suppressedRate.Load(),
+		RateSummaries:   d.rateSummaries.Load(),
 		ListErrors:      d.listErrors.Load(),
 	}
 }

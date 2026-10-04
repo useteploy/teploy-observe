@@ -497,13 +497,26 @@ func (s *IntegrationService) fireSlack(configJSON string, p AlertPayload) error 
 		// is the credential.
 		return fmt.Errorf("slack: webhook_url must be an http(s) URL without userinfo")
 	}
-	text := fmt.Sprintf("*%s*\n%s\nMetric: %s = %s (threshold: %s)", p.Title, p.Message, p.Metric, p.Value, p.Threshold)
+	text := fmt.Sprintf("*%s*\n%s\nMetric: %s = %s (threshold: %s)",
+		slackEscape(p.Title, 300), slackEscape(p.Message, 3000), slackEscape(p.Metric, 100), slackEscape(p.Value, 100), slackEscape(p.Threshold, 100))
 	body, _ := json.Marshal(map[string]string{"text": text})
 	resp, err := s.client.Post(cfg.WebhookURL, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	return checkResp("slack", resp)
+}
+
+// slackEscape neutralises attacker-influenced text for Slack mrkdwn: Slack
+// only treats <...> as control syntax (<!channel>, <!here>, <@U123>,
+// <https://x|label> links), and documents &, < and > as the characters to
+// escape. Backticks are swapped so text cannot open a code span, and the
+// length is capped.
+func slackEscape(s string, max int) string {
+	if r := []rune(s); len(r) > max {
+		s = string(r[:max]) + "..."
+	}
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "`", "'").Replace(s)
 }
 
 func genID() string {
