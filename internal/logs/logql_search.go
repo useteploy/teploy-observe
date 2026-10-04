@@ -107,16 +107,7 @@ func (s *LogService) SearchLogsQL(ctx context.Context, siteID string, from, to t
 	}
 	defer release()
 
-	query := `SELECT log_id, tenant_id, site_id,
-			CAST(timestamp AS TEXT) AS timestamp,
-			level, message, service_name,
-			COALESCE(trace_id, '') AS trace_id,
-			COALESCE(span_id, '') AS span_id,
-			COALESCE(attributes, '') AS attributes
-		 FROM logs
-		 WHERE ` + where + `
-		 ORDER BY timestamp DESC, log_id DESC
-		 LIMIT ` + strconv.FormatInt(fetch, 10)
+	query := buildLogQLSearchSQL(where, fetch)
 
 	rows, err := nucleus.Query[Log](qctx, s.db.SQL(), query, params...)
 	if err != nil {
@@ -172,4 +163,21 @@ func ParseQueryParam(raw string) (ast *Node, ok bool, err error) {
 	}
 	ast, err = ParseQuery(raw)
 	return ast, err == nil, err
+}
+
+// buildLogQLSearchSQL is the keyset-paged search statement. The select list
+// aliases CAST(timestamp AS TEXT) AS timestamp, so ORDER BY must name the
+// numeric expression: a bare "timestamp" could bind to the text output alias
+// and sort lexically while the keyset cursor compares numerically.
+func buildLogQLSearchSQL(where string, fetch int64) string {
+	return `SELECT log_id, tenant_id, site_id,
+			CAST(timestamp AS TEXT) AS timestamp,
+			level, message, service_name,
+			COALESCE(trace_id, '') AS trace_id,
+			COALESCE(span_id, '') AS span_id,
+			COALESCE(attributes, '') AS attributes
+		 FROM logs
+		 WHERE ` + where + `
+		 ORDER BY CAST(timestamp AS BIGINT) DESC, log_id DESC
+		 LIMIT ` + strconv.FormatInt(fetch, 10)
 }

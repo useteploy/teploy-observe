@@ -495,3 +495,10 @@ func FuzzParseQuery(f *testing.F) {
 		_ = evalQuery(n, &rowView{l: l})
 	})
 }
+
+func TestLogQLSearchSQLOrdersNumerically(t *testing.T) {
+	q := buildLogQLSearchSQL("site_id = $1", 51)
+	if !strings.Contains(q, "ORDER BY CAST(timestamp AS BIGINT) DESC, log_id DESC") || !strings.HasSuffix(q, "LIMIT 51") {
+		t.Errorf("search SQL: %s", q)
+	}
+}

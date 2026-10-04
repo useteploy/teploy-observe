@@ -248,7 +248,7 @@ func buildRootCandidateSQL(where string, cap int) string {
 	return fmt.Sprintf(`SELECT %s
 		 FROM spans
 		 WHERE %s AND parent_span_id = ''
-		 ORDER BY start_time DESC
+		 ORDER BY CAST(start_time AS BIGINT) DESC
 		 LIMIT %d`, spanSelectCols, where, cap+1)
 }
 
@@ -257,21 +257,29 @@ func buildOrphanCandidateSQL(cap int) string {
 	return fmt.Sprintf(`SELECT trace_id
 		 FROM spans
 		 WHERE site_id = $1 AND start_time >= $2 AND start_time < $3 AND parent_span_id <> ''
-		 ORDER BY start_time DESC
+		 ORDER BY CAST(start_time AS BIGINT) DESC
 		 LIMIT %d`, cap+1)
 }
 
-// buildTraceSpansSQL loads the spans of the given trace ids ($2..). Ordered by
-// trace so a row-cap cut only ever splits the final trace.
+// orphanWindowSlack widens the search window when loading the full span set of
+// a candidate trace: spans of one trace start close together, but a span can
+// start slightly before the earliest in-window span or after the window end.
+// The spans table is ordered by (tenant, site, start_time, trace_id), so an
+// unbounded trace_id IN (...) lookup would scan the whole retention window.
+const orphanWindowSlack = time.Hour
+
+// buildTraceSpansSQL loads the spans of the given trace ids ($4..) inside
+// [$2, $3) for site $1. Ordered by trace so a row-cap cut only ever splits the
+// final trace.
 func buildTraceSpansSQL(n, cap int) string {
 	ph := make([]string, n)
 	for i := range ph {
-		ph[i] = fmt.Sprintf("$%d", i+2)
+		ph[i] = fmt.Sprintf("$%d", i+4)
 	}
 	return fmt.Sprintf(`SELECT %s
 		 FROM spans
-		 WHERE site_id = $1 AND trace_id IN (%s)
-		 ORDER BY trace_id, start_time ASC
+		 WHERE site_id = $1 AND start_time >= CAST($2 AS BIGINT) AND start_time < CAST($3 AS BIGINT) AND trace_id IN (%s)
+		 ORDER BY trace_id, CAST(start_time AS BIGINT) ASC
 		 LIMIT %d`, spanSelectCols, strings.Join(ph, ","), cap+1)
 }
 
@@ -481,7 +489,7 @@ func (q *QueryService) searchRootsPaged(ctx context.Context, siteID string, from
 			status_code
 		 FROM spans
 		 WHERE %s AND parent_span_id = ''
-		 ORDER BY start_time DESC
+		 ORDER BY CAST(start_time AS BIGINT) DESC
 		 LIMIT %d OFFSET %d`, where, o.Limit, o.Offset)
 	page, err := q.runSummaries(ctx, sql, params...)
 	if err != nil || len(page) == 0 {
@@ -572,7 +580,9 @@ func (q *QueryService) findOrphans(ctx context.Context, siteID string, from, to 
 	if len(ids) == 0 {
 		return nil, truncated, reason, nil
 	}
-	params := []any{siteID}
+	params := []any{siteID,
+		dbutil.IntParam(from.Add(-orphanWindowSlack).UnixMilli()),
+		dbutil.IntParam(to.Add(orphanWindowSlack).UnixMilli())}
 	for _, id := range ids {
 		params = append(params, id)
 	}
