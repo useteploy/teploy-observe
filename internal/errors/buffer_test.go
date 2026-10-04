@@ -82,9 +82,27 @@ func TestErrorBufferPushFreezesInput(t *testing.T) {
 // ErrorInput cannot fail for plain fields, but a >cap record must reject).
 func TestErrorBufferRejectsOversizedRecord(t *testing.T) {
 	b := NewErrorBuffer(nil, 50000, 100, time.Hour, slog.New(slog.DiscardHandler))
-	huge := strings.Repeat("x", maxErrorRecordBytes+1)
-	if err := b.Push("s", ErrorInput{ErrorValue: huge}); err == nil {
+	// Each string stays under the scrubber's per-string bound (a single
+	// longer string is truncated, not rejected); the sum exceeds the cap.
+	part := strings.Repeat("x", 60<<10)
+	extra := map[string]any{}
+	for i := 0; i < 6; i++ {
+		extra[string(rune('a'+i))] = part
+	}
+	if err := b.Push("s", ErrorInput{ErrorValue: "v", Extra: extra}); err == nil {
 		t.Fatal("oversized record admitted")
+	}
+}
+
+// A single enormous string is bounded by the scrubber rather than rejected.
+func TestErrorBufferTruncatesHugeStringWhenScrubbing(t *testing.T) {
+	b := NewErrorBuffer(nil, 50000, 100, time.Hour, slog.New(slog.DiscardHandler))
+	huge := strings.Repeat("x", maxErrorRecordBytes+1)
+	if err := b.Push("s", ErrorInput{ErrorValue: huge}); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if len(b.events[0].Body) > maxErrorRecordBytes {
+		t.Fatal("frozen record not bounded")
 	}
 }
 

@@ -1,6 +1,6 @@
 // Error tracking API — issues, events, search, releases.
 
-import { get, post } from "./helpers.js";
+import { get, post, put } from "./helpers.js";
 
 const BASE = "/api/v1";
 
@@ -25,6 +25,11 @@ export interface Issue {
   snooze_active?: boolean;
   // Per-release event counts, detail reads only.
   releases?: IssueRelease[];
+  // Merge/assignment (additive).
+  resolved_from?: string;
+  merged_sources?: string[];
+  assignee?: string;
+  assigned_at?: number;
 }
 
 export interface IssueRelease {
@@ -109,6 +114,12 @@ export const errorsApi = {
     post<{ ok: boolean }>(`${BASE}/issues/${issueId}/status`, {
       site_id: siteId, status, ...(until ? { until } : {}),
     }),
+  mergeIssue: (issueId: string, siteId: string, targetId: string) =>
+    post<unknown>(`${BASE}/issues/${issueId}/merge`, { site_id: siteId, target_id: targetId }),
+  unmergeIssue: (issueId: string, siteId: string) =>
+    post<unknown>(`${BASE}/issues/${issueId}/unmerge`, { site_id: siteId }),
+  setAssignee: (issueId: string, siteId: string, assignee: string) =>
+    put<unknown>(`${BASE}/issues/${issueId}/assignee`, { site_id: siteId, assignee }),
   search: (siteId: string, query: string) =>
     get<Issue[]>(`${BASE}/issues/search?site_id=${siteId}&q=${encodeURIComponent(query)}`),
   releases: (siteId: string) =>

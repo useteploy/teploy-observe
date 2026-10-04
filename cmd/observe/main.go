@@ -1841,6 +1841,7 @@ func main() {
 	// and exposes MembersForFilter to the stats service for ?cohort_id=
 	// filtering across every analytics chart.
 	RegisterCohortsRoutes(r, jwtMW, requireEditor, cohortsSvc)
+	RegisterIssueAdminRoutes(r, jwtMW, requireEditor, issueSvc, func(req *http.Request) string { return requestActor(authSvc, req) })
 
 	// SPA catch-all: serve index.html for all non-API, non-asset GET requests.
 	// This must be registered last so API routes take precedence.
