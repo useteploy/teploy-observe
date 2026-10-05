@@ -127,7 +127,19 @@ accessories:
     # on populated tables. Verified: observe's full suite (48 packages,
     # -p 1) green against the v1.2.1 image, plus a fresh migration boot
     # (001-056).
-    image: ghcr.io/neutron-build/nucleus:v1.2.1
+    #
+    # v1.2.2 (2026-10-04), up from v1.2.1. Closes the L9-era gap this repo
+    # hit in the wild: 1.2.1 enforced CREATE UNIQUE INDEX only on the
+    # parsed path — simple-protocol autocommit statements (wire-level
+    # INSERT/UPDATE) took the SQL OLTP fast path, which bypassed the check,
+    # so duplicates landed under a unique index (neutron#69). The fast path
+    # now declines unique-indexed tables (fail-closed) and violations come
+    # back Postgres-shaped (23505, against the index name) — cross-replica
+    # survey-response dedupe can move from upstream-blocked to engine-
+    # enforced. Also boxes the statement dispatcher's futures (-27% debug
+    # stack). Verified: observe's full suite green against the v1.2.2
+    # image, fresh migration boot included.
+    image: ghcr.io/neutron-build/nucleus:v1.2.2
     port: 5432
     # Hard cgroup cap, and the only bound the kernel enforces.
     # NUCLEUS_MAX_MEMORY_MB below is the engine's accounting of its OWN
