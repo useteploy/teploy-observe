@@ -15,7 +15,7 @@ permissions:
 # against and production runs (teploy.yml pins the same tag;
 # docker-compose.yml defaults to it). One place to bump.
 env:
-  NUCLEUS_VERSION: v1.2.1
+  NUCLEUS_VERSION: v1.2.2
   STATICCHECK_VERSION: 2025.1.1
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
