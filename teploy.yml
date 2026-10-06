@@ -200,9 +200,9 @@ env:
   # Ship moved to infra-home 2026-08-27 (its sandboxes run on compute-1, which
   # is what lets its control plane sit beside the forge).
   TEPLOY_NAV_SHIP_URL: "http://100.108.123.49:7460"
-  # Resolved from the teploy secret store at deploy (includes the
-  # SCRAM password; set with `teploy secret set OBSERVE_NUCLEUS_URL=...`).
-  OBSERVE_NUCLEUS_URL: "secret:OBSERVE_NUCLEUS_URL"
+  # The teploy secret OBSERVE_NUCLEUS_URL (with SCRAM password) overrides
+  # this default at deploy time via the env-file merge.
+  OBSERVE_NUCLEUS_URL: "postgres://observe-nucleus:5432/observe"
   OBSERVE_SITE_ID: "default"
   OBSERVE_SESSION_SALT: "${TEPLOY_OBSERVE_SESSION_SALT}"
   OBSERVE_JWT_SECRET: "${TEPLOY_OBSERVE_JWT_SECRET}"
