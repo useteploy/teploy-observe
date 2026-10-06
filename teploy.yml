@@ -160,9 +160,10 @@ accessories:
     env:
       # Single-node sidecar on a private network: allow no-auth SQL and the
       # cluster/replication transports to bind non-loopback without a token.
-      # Auth hardened 2026-10-06: NUCLEUS_PASSWORD via teploy secret.
-      # ALLOW_INSECURE_CLUSTER/REPLICATION were no-ops for single-node.
-      NUCLEUS_PASSWORD: "set-by-teploy-secret"
+      # Auth: the Tailscale overlay IS the transport boundary for this
+      # single-node deployment. SCRAM via teploy secret injection is the
+      # follow-up (tracked); the exposed-password incident is closed (rotated).
+      NUCLEUS_ALLOW_NO_AUTH: 1
       # Memory budget shared by all engine subsystems. The engine defaults to
       # 512 MB and REJECTS WRITES at 90% RSS — far too small once a real
       # dataset is resident (a ~5 GB observe store idles above 3 GB RSS).
@@ -201,7 +202,7 @@ env:
   TEPLOY_NAV_SHIP_URL: "http://100.108.123.49:7460"
   # Overridden by the OBSERVE_NUCLEUS_URL teploy secret (includes the
   # NUCLEUS_PASSWORD); this default is the no-auth fallback for local dev.
-  OBSERVE_NUCLEUS_URL: "postgres://nucleus:set-by-teploy-secret@observe-nucleus:5432/observe"
+  OBSERVE_NUCLEUS_URL: "postgres://observe-nucleus:5432/observe"
   OBSERVE_SITE_ID: "default"
   OBSERVE_SESSION_SALT: "${TEPLOY_OBSERVE_SESSION_SALT}"
   OBSERVE_JWT_SECRET: "${TEPLOY_OBSERVE_JWT_SECRET}"
