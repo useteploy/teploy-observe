@@ -201,7 +201,7 @@ env:
   TEPLOY_NAV_SHIP_URL: "http://100.108.123.49:7460"
   # Overridden by the OBSERVE_NUCLEUS_URL teploy secret (includes the
   # NUCLEUS_PASSWORD); this default is the no-auth fallback for local dev.
-  OBSERVE_NUCLEUS_URL: "postgres://observe-nucleus:5432/observe"
+  OBSERVE_NUCLEUS_URL: "postgres://nucleus:@observe-nucleus:5432/observe"
   OBSERVE_SITE_ID: "default"
   OBSERVE_SESSION_SALT: "${TEPLOY_OBSERVE_SESSION_SALT}"
   OBSERVE_JWT_SECRET: "${TEPLOY_OBSERVE_JWT_SECRET}"
