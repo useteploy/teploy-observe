@@ -162,7 +162,6 @@ accessories:
       # cluster/replication transports to bind non-loopback without a token.
       # Auth hardened 2026-10-06: NUCLEUS_PASSWORD via teploy secret.
       # ALLOW_INSECURE_CLUSTER/REPLICATION were no-ops for single-node.
-      NUCLEUS_PASSWORD: ""
       # Memory budget shared by all engine subsystems. The engine defaults to
       # 512 MB and REJECTS WRITES at 90% RSS — far too small once a real
       # dataset is resident (a ~5 GB observe store idles above 3 GB RSS).
