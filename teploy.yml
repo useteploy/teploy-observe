@@ -162,7 +162,7 @@ accessories:
       # cluster/replication transports to bind non-loopback without a token.
       # Auth hardened 2026-10-06: NUCLEUS_PASSWORD via teploy secret.
       # ALLOW_INSECURE_CLUSTER/REPLICATION were no-ops for single-node.
-      NUCLEUS_PASSWORD: "c280df3bfcd5094398ddf9db278691a3ad0e1df147e5c137"
+      NUCLEUS_PASSWORD: ""
       # Memory budget shared by all engine subsystems. The engine defaults to
       # 512 MB and REJECTS WRITES at 90% RSS — far too small once a real
       # dataset is resident (a ~5 GB observe store idles above 3 GB RSS).
@@ -201,7 +201,7 @@ env:
   TEPLOY_NAV_SHIP_URL: "http://100.108.123.49:7460"
   # Overridden by the OBSERVE_NUCLEUS_URL teploy secret (includes the
   # NUCLEUS_PASSWORD); this default is the no-auth fallback for local dev.
-  OBSERVE_NUCLEUS_URL: "postgres://nucleus:c280df3bfcd5094398ddf9db278691a3ad0e1df147e5c137@observe-nucleus:5432/observe"
+  OBSERVE_NUCLEUS_URL: "postgres://observe-nucleus:5432/observe"
   OBSERVE_SITE_ID: "default"
   OBSERVE_SESSION_SALT: "${TEPLOY_OBSERVE_SESSION_SALT}"
   OBSERVE_JWT_SECRET: "${TEPLOY_OBSERVE_JWT_SECRET}"
