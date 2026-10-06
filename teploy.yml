@@ -163,7 +163,7 @@ accessories:
       # Auth: the Tailscale overlay IS the transport boundary for this
       # single-node deployment. SCRAM via teploy secret injection is the
       # follow-up (tracked); the exposed-password incident is closed (rotated).
-      NUCLEUS_ALLOW_NO_AUTH: 1
+      NUCLEUS_PASSWORD: "secret:NUCLEUS_PASSWORD"
       # Memory budget shared by all engine subsystems. The engine defaults to
       # 512 MB and REJECTS WRITES at 90% RSS — far too small once a real
       # dataset is resident (a ~5 GB observe store idles above 3 GB RSS).
@@ -200,9 +200,9 @@ env:
   # Ship moved to infra-home 2026-08-27 (its sandboxes run on compute-1, which
   # is what lets its control plane sit beside the forge).
   TEPLOY_NAV_SHIP_URL: "http://100.108.123.49:7460"
-  # Overridden by the OBSERVE_NUCLEUS_URL teploy secret (includes the
-  # NUCLEUS_PASSWORD); this default is the no-auth fallback for local dev.
-  OBSERVE_NUCLEUS_URL: "postgres://observe-nucleus:5432/observe"
+  # Resolved from the teploy secret store at deploy (includes the
+  # SCRAM password; set with `teploy secret set OBSERVE_NUCLEUS_URL=...`).
+  OBSERVE_NUCLEUS_URL: "secret:OBSERVE_NUCLEUS_URL"
   OBSERVE_SITE_ID: "default"
   OBSERVE_SESSION_SALT: "${TEPLOY_OBSERVE_SESSION_SALT}"
   OBSERVE_JWT_SECRET: "${TEPLOY_OBSERVE_JWT_SECRET}"
