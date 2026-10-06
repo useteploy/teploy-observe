@@ -139,7 +139,15 @@ accessories:
     # enforced. Also boxes the statement dispatcher's futures (-27% debug
     # stack). Verified: observe's full suite green against the v1.2.2
     # image, fresh migration boot included.
-    image: ghcr.io/neutron-build/nucleus:v1.2.2
+        #
+    # v1.3.0 (2026-10-06), up from v1.2.2. The polyglot release: DROP SCHEMA
+    # (RESTRICT) — cleanupResidue schemas can now be dropped; TEXT columns
+    # advertise PostgreSQL's OID 25 (strict clients that verify wire type
+    # identity now pass); quoted-identifier role names stored by value;
+    # BS.1770-4 loudness + GCC-PHAT sync; qualified ORM SDKs in all three
+    # languages. Verified: observe's full suite green against the v1.3.0
+    # image, fresh migration boot included.
+    image: ghcr.io/neutron-build/nucleus:v1.3.0
     port: 5432
     # Hard cgroup cap, and the only bound the kernel enforces.
     # NUCLEUS_MAX_MEMORY_MB below is the engine's accounting of its OWN
