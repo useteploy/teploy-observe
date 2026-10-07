@@ -2571,3 +2571,13 @@ verification have **not run** in this environment. Compiled UI assets are
 unchanged, so the served dashboard is not yet fixed. Do not close this item
 until those gates pass against the final source and rebuilt assets. No remote
 publication or deployment has been performed.
+
+## 2026-10-07 — OBS26-03 compiled-UI rebuild executed
+
+Served dashboard rebuilt through the supported path (pinned pnpm 9.15.4,
+pinned Neutron submodule at eb19df63, scripts/ui-sync.sh): the share
+revocation UI is now embedded, not just source-fixed. 152 dist files
+replaced; go test ./cmd/observe ./internal/share green post-embed.
+Note: the representation-Vary framework fix (Neutron TS-33) is NOT in this
+build — propagating it requires a submodule pin bump plus vendor/ parity
+(X01), tracked with the @neutron-build/core 0.3.2 release wave.
