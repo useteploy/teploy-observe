@@ -43,10 +43,12 @@ func TestShare_CreateResolveRevoke(t *testing.T) {
 		t.Fatalf("resolve: got %q err %v, want %q", got, err, site)
 	}
 
-	// Revoke must not error. (Note: DELETE visibility on the underlying engine
-	// is eventually-consistent, so we don't assert immediate non-resolution.)
+	// Revoke confirms the stored state before reporting success.
 	if err := svc.Revoke(ctx, link.Token); err != nil {
 		t.Fatalf("revoke: %v", err)
+	}
+	if _, err := svc.Resolve(ctx, link.Token); err == nil {
+		t.Fatal("a successfully revoked link must no longer resolve")
 	}
 }
 
@@ -92,10 +94,8 @@ func TestShare_CreateSetsExpiry(t *testing.T) {
 }
 
 // TestShare_ResolveRejectsExpired proves an expired link's token no longer
-// resolves. Unlike revoke-then-resolve (see the eventual-consistency note on
-// TestShare_CreateResolveRevoke), this isn't a write-visibility race: the row
-// commits at creation time, and expiry is a pure time comparison evaluated
-// fresh on each Resolve call.
+// resolves. Expiry is a pure time comparison evaluated fresh on each Resolve
+// call; revocation is separately tested through its stored-state confirmation.
 func TestShare_ResolveRejectsExpired(t *testing.T) {
 	db, done := shareTestDB(t)
 	defer done()

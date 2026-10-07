@@ -1118,6 +1118,11 @@ func main() {
 		neutron.WithTags("share"),
 		neutron.WithSummary("List share links for a site"),
 	)
+	neutron.Delete(shareEditor, "/sites/{site_id}/share/{id}", revokeShareByIDHandler(shareSvc),
+		neutron.WithTags("share"),
+		neutron.WithSummary("Revoke a share link by its non-secret ID"),
+	)
+	// Legacy raw-token route, retained for existing API clients.
 	neutron.Delete(shareEditor, "/share/{token}", revokeShareHandler(shareSvc),
 		neutron.WithTags("share"),
 		neutron.WithSummary("Revoke a share link"),
@@ -2808,9 +2813,30 @@ func revokeShareHandler(shareSvc *share.ShareService) neutron.HandlerFunc[revoke
 			return neutron.Empty{}, neutron.ErrBadRequest("token is required")
 		}
 		if err := shareSvc.Revoke(ctx, input.Token); err != nil {
+			if errors.Is(err, share.ErrNotFound) {
+				return neutron.Empty{}, neutron.ErrNotFound("share link not found")
+			}
 			return neutron.Empty{}, err
 		}
 		return neutron.Empty{}, nil
+	}
+}
+
+type revokeShareByIDInput struct {
+	SiteID string `path:"site_id"`
+	ID     string `path:"id"`
+}
+
+func revokeShareByIDHandler(shareSvc *share.ShareService) neutron.HandlerFunc[revokeShareByIDInput, share.ShareLink] {
+	return func(ctx context.Context, input revokeShareByIDInput) (share.ShareLink, error) {
+		if input.SiteID == "" || input.ID == "" {
+			return share.ShareLink{}, neutron.ErrBadRequest("site_id and id are required")
+		}
+		link, err := shareSvc.RevokeByID(ctx, input.SiteID, input.ID)
+		if errors.Is(err, share.ErrNotFound) {
+			return share.ShareLink{}, neutron.ErrNotFound("share link not found")
+		}
+		return link, err
 	}
 }
 

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "preact/hooks";
+import { useState, useEffect, useRef } from "preact/hooks";
 import { settingsApi } from "../api/settings.js";
 import type { Site, Webhook, User, ShareLink, APIKeyInfo, MCPToken } from "../api/settings.js";
 import { get } from "../api/helpers.js";
@@ -61,6 +61,146 @@ function SettingsSkeleton() {
   );
 }
 
+// This keyed panel unmounts on close/site switch. Raw tokens are deliberately
+// kept only here, until dismissal or navigation; list rows are display-only.
+function ShareLinksPanel({ siteId }: { siteId: string }) {
+  const [shareLinks, setShareLinks] = useState<ShareLink[]>([]);
+  const [newShareLink, setNewShareLink] = useState<ShareLink | null>(null);
+  const [shareTtlDays, setShareTtlDays] = useState(365);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const mounted = useRef(true);
+  const pending = useRef(false);
+
+  const loadShareLinks = async () => {
+    if (pending.current) return;
+    pending.current = true;
+    setLoading(true);
+    setError("");
+    try {
+      const links = await settingsApi.shareLinks(siteId);
+      if (mounted.current) {
+        setShareLinks(links || []);
+        setNewShareLink(current => current && links?.some(link => link.id === current.id && link.status === "active") ? current : null);
+      }
+    } catch {
+      if (mounted.current) setError("Could not load share links. Please retry.");
+    } finally {
+      pending.current = false;
+      if (mounted.current) setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    mounted.current = true;
+    void loadShareLinks();
+    return () => { mounted.current = false; };
+  }, [siteId]);
+
+  const handleCreateShareLink = async () => {
+    if (pending.current || newShareLink) return;
+    pending.current = true;
+    setBusy(true);
+    setError("");
+    try {
+      const link = await settingsApi.createShareLink(siteId, shareTtlDays);
+      if (!link?.id || link.site_id !== siteId || !/^[a-f0-9]{32}$/.test(link.token)) {
+        throw new Error("Invalid share creation response");
+      }
+      if (!mounted.current) return;
+      // Save the one-time response before any list refresh can mask it.
+      setNewShareLink(link);
+      setShareLinks(prev => [{ ...link, token: `${link.token.slice(0, 8)}…` }, ...prev]);
+    } catch {
+      if (mounted.current) setError("Could not confirm link creation. Check the list before retrying; a link may have been created.");
+    } finally {
+      pending.current = false;
+      if (mounted.current) setBusy(false);
+    }
+  };
+
+  const handleRevokeShareLink = async (id: string) => {
+    if (pending.current) return;
+    pending.current = true;
+    setBusy(true);
+    setError("");
+    try {
+      const link = await settingsApi.revokeShareLink(siteId, id);
+      // Only the confirmed backend result can replace a visible row. Never
+      // turn an empty/old endpoint response into a local success indication.
+      if (!link || link.id !== id || link.site_id !== siteId || link.status !== "revoked" || !link.revoked_at) {
+        throw new Error("Revocation was not confirmed");
+      }
+      if (!mounted.current) return;
+      setShareLinks(prev => prev.map(current => current.id === id ? link : current));
+      setNewShareLink(current => current?.id === id ? null : current);
+    } catch {
+      if (mounted.current) setError("Could not confirm revocation. The link may still work. Refresh the list or retry.");
+    } finally {
+      pending.current = false;
+      if (mounted.current) setBusy(false);
+    }
+  };
+
+  const expiryLabel = (link: ShareLink): string => {
+    if (link.status === "revoked") return "revoked";
+    if (!link.expires_at) return "no expiry";
+    const days = Math.round((link.expires_at - Date.now()) / 86_400_000);
+    if (link.status === "expired" || link.expires_at <= Date.now()) return "expired";
+    return `expires ${formatDate(link.expires_at)} · ${days}d left`;
+  };
+
+  return (
+    <div style={{ padding: "8px 16px 16px", borderBottom: "1px solid var(--obs-border-subtle)" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
+        <span style={{ fontSize: "12px", fontWeight: 600 }}>Share Links ({shareLinks.length})</span>
+        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          <select class="obs-input" style={{ width: "auto" }} value={String(shareTtlDays)}
+            onChange={(e) => setShareTtlDays(Number((e.target as HTMLSelectElement).value))}
+            aria-label="Share link lifetime" disabled={busy || loading}>
+            <option value="30">30 days</option>
+            <option value="90">90 days</option>
+            <option value="365">1 year</option>
+            <option value="3650">10 years</option>
+          </select>
+          <button class="obs-btn obs-btn--sm" onClick={handleCreateShareLink}
+            disabled={busy || loading || !!newShareLink}>Create Link</button>
+        </div>
+      </div>
+      {newShareLink && (
+        <div class="settings-key-display" style={{ flexWrap: "wrap" }}>
+          <div class="settings-key-note" style={{ width: "100%" }}>
+            Save this link now. Its token is shown only once and disappears when you dismiss or leave this panel.
+          </div>
+          <code class="settings-key-value">{shareUrl(newShareLink.token)}</code>
+          <span class="settings-row-date">{expiryLabel(newShareLink)}</span>
+          <button class="obs-btn obs-btn--sm" onClick={() => copyToClipboard(shareUrl(newShareLink.token))}>Copy Link</button>
+          <button class="obs-btn obs-btn--sm" onClick={() => copyToClipboard(newShareLink.token)}>Copy Token</button>
+          <button class="obs-btn obs-btn--sm" onClick={() => setNewShareLink(null)}>Done</button>
+        </div>
+      )}
+      {error && (
+        <div role="alert">
+          {error} <button class="obs-btn obs-btn--sm" disabled={busy || loading} onClick={loadShareLinks}>Refresh</button>
+        </div>
+      )}
+      {loading ? <div>Loading share links...</div> : shareLinks.length === 0 ? (error ? null : <div>No share links</div>) : (
+        shareLinks.map(link => (
+          <div key={link.id} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "4px 0", fontSize: "12px" }}>
+            <code style={{ flex: 1 }}>{link.token}</code>
+            <span class="settings-row-date">{expiryLabel(link)}</span>
+            <button class="obs-btn obs-btn--sm obs-btn--danger"
+              disabled={busy || link.status === "revoked"}
+              onClick={() => handleRevokeShareLink(link.id)}>Revoke</button>
+          </div>
+        ))
+      )}
+      <div class="settings-key-note">Existing tokens are masked. Create a new link if you no longer have the original.</div>
+    </div>
+  );
+}
+
 // ─── Sites ───
 
 function SitesSection() {
@@ -70,14 +210,12 @@ function SitesSection() {
   const [creating, setCreating] = useState(false);
   const [newKey, setNewKey] = useState<{ key: string; siteId: string } | null>(null);
   const [publicUrl, setPublicUrl] = useState("");
-  const [shareTtlDays, setShareTtlDays] = useState(365);
   const [formName, setFormName] = useState("");
   const [formDomain, setFormDomain] = useState("");
   const [deletingSiteId, setDeletingSiteId] = useState<string | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
 
   // Share links
-  const [shareLinks, setShareLinks] = useState<ShareLink[]>([]);
   const [selectedSiteId, setSelectedSiteId] = useState<string | null>(null);
 
   const refresh = async () => {
@@ -124,38 +262,8 @@ function SitesSection() {
     } catch (err) { console.error("Failed to generate API key:", err); }
   };
 
-  const handleShowShareLinks = async (siteId: string) => {
-    if (selectedSiteId === siteId) { setSelectedSiteId(null); return; }
-    setSelectedSiteId(siteId);
-    try {
-      const data = await settingsApi.shareLinks(siteId);
-      setShareLinks(data || []);
-    } catch { setShareLinks([]); }
-  };
-
-  const handleCreateShareLink = async (siteId: string) => {
-    try {
-      await settingsApi.createShareLink(siteId, shareTtlDays);
-      const data = await settingsApi.shareLinks(siteId);
-      setShareLinks(data || []);
-    } catch (err) { console.error("Failed to create share link:", err); }
-  };
-
-  // A token wired into another service dies quietly when it lapses — the reads
-  // just stop returning data. Both the lifetime and the expiry date have to be
-  // visible at the point of creation.
-  const expiryLabel = (link: ShareLink): string => {
-    if (!link.expires_at) return "no expiry";
-    const days = Math.round((link.expires_at - Date.now()) / 86_400_000);
-    if (days < 0) return "expired";
-    return `expires ${formatDate(link.expires_at)} · ${days}d left`;
-  };
-
-  const handleRevokeShareLink = async (token: string) => {
-    try {
-      await settingsApi.revokeShareLink(token);
-      setShareLinks(prev => prev.filter(l => l.token !== token));
-    } catch (err) { console.error("Failed to revoke share link:", err); }
+  const handleShowShareLinks = (siteId: string) => {
+    setSelectedSiteId(current => current === siteId ? null : siteId);
   };
 
   return (
@@ -186,45 +294,7 @@ function SitesSection() {
                 <span class="settings-row-date">{formatDate(s.created_at)}</span>
               </div>
               {selectedSiteId === s.site_id && (
-                <div style={{ padding: "8px 16px 16px", borderBottom: "1px solid var(--obs-border-subtle)" }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
-                    <span style={{ fontSize: "12px", fontWeight: 600, color: "var(--obs-text-secondary)" }}>
-                      Share Links ({shareLinks.length})
-                    </span>
-                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                      <select
-                        class="obs-input"
-                        style={{ width: "auto", fontSize: "12px", padding: "2px 6px" }}
-                        value={String(shareTtlDays)}
-                        onChange={(e) => setShareTtlDays(Number((e.target as HTMLSelectElement).value))}
-                        aria-label="Share link lifetime"
-                      >
-                        <option value="30">30 days</option>
-                        <option value="90">90 days</option>
-                        <option value="365">1 year</option>
-                        <option value="3650">10 years</option>
-                      </select>
-                      <button class="obs-btn obs-btn--sm" onClick={() => handleCreateShareLink(s.site_id)}>Create Link</button>
-                    </div>
-                  </div>
-                  {shareLinks.length === 0 ? (
-                    <div style={{ fontSize: "12px", color: "var(--obs-text-muted)" }}>No share links</div>
-                  ) : (
-                    shareLinks.map(l => (
-                      <div key={l.token} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "4px 0", fontSize: "12px" }}>
-                        <code style={{ flex: 1, color: "var(--obs-text)", fontSize: "11px", overflowWrap: "anywhere" }}>
-                          {shareUrl(l.token)}
-                        </code>
-                        <span class="settings-row-date">{expiryLabel(l)}</span>
-                        {/* The token alone is what API clients send as
-                            X-Share-Token; the URL is for opening the dashboard. */}
-                        <button class="obs-btn obs-btn--sm" onClick={() => copyToClipboard(shareUrl(l.token))}>Copy Link</button>
-                        <button class="obs-btn obs-btn--sm" onClick={() => copyToClipboard(l.token)}>Copy Token</button>
-                        <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => handleRevokeShareLink(l.token)}>Revoke</button>
-                      </div>
-                    ))
-                  )}
-                </div>
+                <ShareLinksPanel key={s.site_id} siteId={s.site_id} />
               )}
             </div>
           ))}

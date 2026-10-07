@@ -35,8 +35,10 @@ export interface MCPToken {
 
 export interface ShareLink {
   // Timestamps are epoch milliseconds on the wire, not ISO strings.
-  token: string; site_id: string; created_at: number;
-  expires_at: number; revoked_at: number; last_used_at: number;
+  id: string; token: string; site_id: string; created_at: number;
+  expires_at: number; revoked_at?: number; last_used_at?: number;
+  status: "active" | "expired" | "revoked";
+  // token is raw only in the creation response; list/revoke responses mask it.
 }
 
 export const settingsApi = {
@@ -58,8 +60,8 @@ export const settingsApi = {
     get<ShareLink[]>(`${BASE}/sites/${siteId}/share`),
   createShareLink: (siteId: string, ttlDays?: number) =>
     post<ShareLink>(`${BASE}/sites/${siteId}/share`, ttlDays ? { ttl_days: ttlDays } : {}),
-  revokeShareLink: (token: string) =>
-    del(`${BASE}/share/${token}`),
+  revokeShareLink: (siteId: string, id: string) =>
+    del<ShareLink>(`${BASE}/sites/${encodeURIComponent(siteId)}/share/${encodeURIComponent(id)}`),
 
   // Webhooks
   webhooks: (siteId: string) =>

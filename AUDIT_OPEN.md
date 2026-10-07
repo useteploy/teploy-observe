@@ -2538,3 +2538,36 @@ adapter wall-clock timestamps. ui-sync normalizes those metadata timestamps
 and their compressed policy/size counts before embedding; all application
 assets remain byte-checked. Upstream report: private UPSTREAM_BUGS.md entry
 2026-09-27. Two local builds and normalization idempotence verified.
+
+
+
+## OBS26-03 (2026-10-06) — share-link creation and revocation contract
+
+**Source fix prepared; acceptance still open.** Based on audit revision
+`c5416fa888ff65d65df1ecb376787d52d2287d11`. Settings previously discarded
+the one-time raw creation response, then copied and revoked the masked List
+token; zero-row revocation updates were acknowledged as success.
+
+- Preserve the creation response only in the current keyed share panel; show
+  Copy Link/Token only for that one-time reveal. Close, site switch, dismissal,
+  and successful revocation discard it. Masked list rows are display-only.
+- Add editor-authorized `DELETE /api/v1/sites/{site_id}/share/{id}` using the
+  existing stable non-secret ID. No schema migration or ID changes. Resolve
+  within the site and refuse an ambiguous short-ID collision.
+- Keep the legacy raw-token DELETE route for known-token callers. Both paths
+  require read-back of revoked state before success; unknown/zero-row targets
+  return not found. Already revoked known links remain idempotent.
+- Confirmed ID revocation returns a masked revoked record, retained in the UI
+  history. Failure or an unconfirmed response leaves the row visible with a
+  warning. In-flight actions are guarded; stale panel responses are ignored.
+- Added dependency-free Node tests executing actual UI handlers and API
+  definitions, plus Go unit and Nucleus-backed HTTP/service regressions for
+  zero-row results, list-to-ID revocation, masking, site scoping, retries, and
+  immediate original-token rejection.
+
+Local Node UI tests pass. Go/gofmt/build/vet/race, Nucleus integration,
+TypeScript checking, pinned UI rebuild/freshness, and rendered-browser flow
+verification have **not run** in this environment. Compiled UI assets are
+unchanged, so the served dashboard is not yet fixed. Do not close this item
+until those gates pass against the final source and rebuilt assets. No remote
+publication or deployment has been performed.
