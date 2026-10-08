@@ -296,7 +296,7 @@ func flatToDetectorSpans(req ExportTraceRequest, flat []flatSpan) []detectors.Sp
 	for _, rs := range req.ResourceSpans {
 		for _, ss := range rs.ScopeSpans {
 			for _, sp := range ss.Spans {
-				attrsByID[sp.SpanID] = AttrsToMap(sp.Attributes)
+				attrsByID[sp.TraceID+"\x00"+sp.SpanID] = AttrsToMap(sp.Attributes)
 			}
 		}
 	}
@@ -314,7 +314,7 @@ func flatToDetectorSpans(req ExportTraceRequest, flat []flatSpan) []detectors.Sp
 			EndMs:         sp.EndMs,
 			DurationMs:    sp.DurationMs,
 			StatusCode:    sp.StatusCode,
-			Attributes:    attrsByID[sp.SpanID],
+			Attributes:    attrsByID[sp.TraceID+"\x00"+sp.SpanID],
 		})
 	}
 	return out
@@ -513,7 +513,7 @@ func aggregateRollups(spans []flatSpan) (map[ServiceBucket]*Aggregate, map[Servi
 	idToService := make(map[string]string, len(spans))
 	for _, sp := range spans {
 		if sp.SpanID != "" {
-			idToService[sp.SpanID] = sp.ServiceName
+			idToService[sp.TraceID+"\x00"+sp.SpanID] = sp.ServiceName
 		}
 	}
 
@@ -545,7 +545,7 @@ func aggregateRollups(spans []flatSpan) (map[ServiceBucket]*Aggregate, map[Servi
 		if sp.ParentSpanID == "" {
 			continue
 		}
-		parentSvc, ok := idToService[sp.ParentSpanID]
+		parentSvc, ok := idToService[sp.TraceID+"\x00"+sp.ParentSpanID]
 		if !ok || parentSvc == "" || parentSvc == sp.ServiceName {
 			continue
 		}

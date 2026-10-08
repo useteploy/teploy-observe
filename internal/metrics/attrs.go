@@ -3,6 +3,7 @@ package metrics
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 )
 
@@ -71,7 +72,7 @@ func UnmarshalAttrs(raw string) map[string]string {
 // without pushing the predicate into SQL (Nucleus has no JSONB extract).
 func MatchLabels(have, want map[string]string) bool {
 	for k, v := range want {
-		if have[k] != v {
+		if got, ok := have[k]; !ok || got != v {
 			return false
 		}
 	}
@@ -125,12 +126,17 @@ func UnmarshalHistogram(raw string) HistogramShape {
 	if raw == "" {
 		return out
 	}
-	_ = json.Unmarshal([]byte(raw), &out)
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return HistogramShape{Bounds: []float64{}, Counts: []int64{}}
+	}
 	if out.Bounds == nil {
 		out.Bounds = []float64{}
 	}
 	if out.Counts == nil {
 		out.Counts = []int64{}
+	}
+	if !validHistogramShape(out) {
+		return HistogramShape{Bounds: []float64{}, Counts: []int64{}}
 	}
 	return out
 }
@@ -150,4 +156,42 @@ func parseInt64(s string) (int64, error) {
 	}
 	_, err := fmt.Sscanf(s, "%d", &n)
 	return n, err
+}
+
+// Explicit histograms have one overflow bucket beyond their finite bounds.
+// This reducer supports nonnegative finite bounds only. Signed finite
+// bounds cannot justify a zero first-bucket lower edge; refuse before storage
+// acknowledgement, including legacy decoding, rather than inventing a median.
+func validHistogramShape(h HistogramShape) bool {
+	if len(h.Bounds) == 0 || len(h.Counts) != len(h.Bounds)+1 || h.Count < 0 || h.Sum < 0 || math.IsNaN(h.Sum) || math.IsInf(h.Sum, 0) {
+		return false
+	}
+	for i, b := range h.Bounds {
+		if b < 0 || math.IsNaN(b) || math.IsInf(b, 0) || (i > 0 && b <= h.Bounds[i-1]) {
+			return false
+		}
+	}
+	var total int64
+	for _, c := range h.Counts {
+		if c < 0 || c > math.MaxInt64-total {
+			return false
+		}
+		total += c
+	}
+	return total == h.Count
+}
+func validHistogramPoint(dp HistogramDataPoint) bool {
+	total, err := parseInt64(string(dp.Count))
+	if err != nil {
+		return false
+	}
+	h := HistogramShape{Bounds: dp.ExplicitBounds, Sum: dp.Sum, Count: total}
+	for _, c := range dp.BucketCounts {
+		n, err := parseInt64(string(c))
+		if err != nil {
+			return false
+		}
+		h.Counts = append(h.Counts, n)
+	}
+	return validHistogramShape(h)
 }

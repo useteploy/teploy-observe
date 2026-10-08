@@ -17,9 +17,10 @@ import (
 )
 
 type LLMService struct {
-	db     *nucleus.Client
-	logger *slog.Logger
-	cat    catalogCache
+	db            *nucleus.Client
+	logger        *slog.Logger
+	cat           catalogCache
+	aggregateRead func(context.Context, string, ...any) (aggregateRows, error)
 }
 
 func NewLLMService(db *nucleus.Client) *LLMService {
@@ -181,6 +182,7 @@ func (s *LLMService) Ingest(ctx context.Context, input LLMInput) (LLMResponse, e
 // derived from the catalog - an estimated number must be labelable
 // everywhere it renders, so the split rides every surface that sums cost.
 type LLMStats struct {
+	ProvenanceStats
 	TotalCalls   string `json:"total_calls" db:"total_calls"`
 	TotalTokens  string `json:"total_tokens" db:"total_tokens"`
 	TotalCostUSD string `json:"total_cost_usd" db:"total_cost_usd"`
@@ -195,11 +197,14 @@ type LLMStats struct {
 }
 
 type ModelStats struct {
-	Model        string `json:"model" db:"model"`
-	Provider     string `json:"provider" db:"provider"`
-	CallCount    string `json:"call_count" db:"call_count"`
-	TotalTokens  string `json:"total_tokens" db:"total_tokens"`
-	TotalCostUSD string `json:"total_cost_usd" db:"total_cost_usd"`
+	ProvenanceStats
+	ReportedCostUSD  string `json:"reported_cost_usd"`
+	CostUnattributed string `json:"cost_unattributed"`
+	Model            string `json:"model" db:"model"`
+	Provider         string `json:"provider" db:"provider"`
+	CallCount        string `json:"call_count" db:"call_count"`
+	TotalTokens      string `json:"total_tokens" db:"total_tokens"`
+	TotalCostUSD     string `json:"total_cost_usd" db:"total_cost_usd"`
 	// EstimatedCostUSD: the catalog-derived subset of TotalCostUSD.
 	EstimatedCostUSD string `json:"estimated_cost_usd" db:"estimated_cost_usd"`
 	AvgLatencyMs     string `json:"avg_latency_ms" db:"avg_latency_ms"`
@@ -209,36 +214,59 @@ func (s *LLMService) Stats(ctx context.Context, siteID string, from, to time.Tim
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
-	// Scan as native ints/floats and stringify in Go.
-	//
-	// Nucleus (per dogfood findings #6, #23, #24) currently:
-	//   - returns ZERO rows for `SELECT CAST(COUNT(*) AS TEXT)` against
-	//     an empty filtered result set (should be one row, value 0),
-	//   - emits the empty string when stringifying any BIGINT aggregate.
-	//
-	// COALESCE alone doesn't help — the cast-to-text layer is what's
-	// broken. So we scan into native types (which Nucleus serializes
-	// correctly via the binary protocol), then format on the way out.
-	// Empty result sets fall through to the zero-value LLMStats below
-	// with explicit "0" strings.
+	// Preserve raw result presence and text at the owned scanner boundary.
+	// Invalid/missing aggregate cells refuse before constructing a success DTO.
 	type rawRow struct {
-		Calls        int64   `db:"calls"`
-		Tokens       int64   `db:"tokens"`
-		Cost         float64 `db:"cost"`
-		Estimated    float64 `db:"estimated"`
-		Reported     float64 `db:"reported"`
-		Unattributed int64   `db:"unattributed"`
-		Latency      float64 `db:"latency"`
-		Errors       int64   `db:"errors"`
+		InvalidNumericRows   int64   `db:"invalid_numeric_rows"`
+		LegacyCostUSD        float64 `db:"legacy_cost_usd"`
+		ReportedTokensIn     int64   `db:"reported_tokens_in"`
+		ReportedTokensOut    int64   `db:"reported_tokens_out"`
+		ReportedTokensTotal  int64   `db:"reported_tokens_total"`
+		ReportedCostCalls    int64   `db:"reported_cost_calls"`
+		ReportedTokenCalls   int64   `db:"reported_token_calls"`
+		EstimatedTokensIn    int64   `db:"estimated_tokens_in"`
+		EstimatedTokensOut   int64   `db:"estimated_tokens_out"`
+		EstimatedTokensTotal int64   `db:"estimated_tokens_total"`
+		EstimatedCostCalls   int64   `db:"estimated_cost_calls"`
+		EstimatedTokenCalls  int64   `db:"estimated_token_calls"`
+		LegacyTokensIn       int64   `db:"legacy_tokens_in"`
+		LegacyTokensOut      int64   `db:"legacy_tokens_out"`
+		LegacyTokensTotal    int64   `db:"legacy_tokens_total"`
+		LegacyCostCalls      int64   `db:"legacy_cost_calls"`
+		LegacyTokenCalls     int64   `db:"legacy_token_calls"`
+		Calls                int64   `db:"calls"`
+		Tokens               int64   `db:"tokens"`
+		Cost                 float64 `db:"cost"`
+		Estimated            float64 `db:"estimated"`
+		Reported             float64 `db:"reported"`
+		Unattributed         int64   `db:"unattributed"`
+		Latency              float64 `db:"latency"`
+		Errors               int64   `db:"errors"`
 	}
 
-	rows, err := nucleus.Query[rawRow](ctx, s.db.SQL(),
-		`SELECT COUNT(*) AS calls,
+	rows, err := queryAggregate[rawRow](ctx, s,
+		`SELECT `+invalidLLMNumericsSQL+`COALESCE(SUM(CASE WHEN COALESCE(cost_source,'') NOT IN ('reported','estimated') THEN CAST(cost_usd AS DOUBLE) ELSE 0 END),0) AS legacy_cost_usd,
+COALESCE(SUM(CASE WHEN token_source = 'reported' THEN CAST(prompt_tokens AS BIGINT) ELSE 0 END),0) AS reported_tokens_in,
+COALESCE(SUM(CASE WHEN token_source = 'reported' THEN CAST(completion_tokens AS BIGINT) ELSE 0 END),0) AS reported_tokens_out,
+COALESCE(SUM(CASE WHEN token_source = 'reported' THEN CAST(total_tokens AS BIGINT) ELSE 0 END),0) AS reported_tokens_total,
+COALESCE(SUM(CASE WHEN cost_source = 'reported' THEN 1 ELSE 0 END),0) AS reported_cost_calls,
+COALESCE(SUM(CASE WHEN token_source = 'reported' THEN 1 ELSE 0 END),0) AS reported_token_calls,
+COALESCE(SUM(CASE WHEN token_source = 'estimated' THEN CAST(prompt_tokens AS BIGINT) ELSE 0 END),0) AS estimated_tokens_in,
+COALESCE(SUM(CASE WHEN token_source = 'estimated' THEN CAST(completion_tokens AS BIGINT) ELSE 0 END),0) AS estimated_tokens_out,
+COALESCE(SUM(CASE WHEN token_source = 'estimated' THEN CAST(total_tokens AS BIGINT) ELSE 0 END),0) AS estimated_tokens_total,
+COALESCE(SUM(CASE WHEN cost_source = 'estimated' THEN 1 ELSE 0 END),0) AS estimated_cost_calls,
+COALESCE(SUM(CASE WHEN token_source = 'estimated' THEN 1 ELSE 0 END),0) AS estimated_token_calls,
+COALESCE(SUM(CASE WHEN COALESCE(token_source,'') NOT IN ('reported','estimated') THEN CAST(prompt_tokens AS BIGINT) ELSE 0 END),0) AS legacy_tokens_in,
+COALESCE(SUM(CASE WHEN COALESCE(token_source,'') NOT IN ('reported','estimated') THEN CAST(completion_tokens AS BIGINT) ELSE 0 END),0) AS legacy_tokens_out,
+COALESCE(SUM(CASE WHEN COALESCE(token_source,'') NOT IN ('reported','estimated') THEN CAST(total_tokens AS BIGINT) ELSE 0 END),0) AS legacy_tokens_total,
+COALESCE(SUM(CASE WHEN COALESCE(cost_source,'') NOT IN ('reported','estimated') THEN 1 ELSE 0 END),0) AS legacy_cost_calls,
+COALESCE(SUM(CASE WHEN COALESCE(token_source,'') NOT IN ('reported','estimated') THEN 1 ELSE 0 END),0) AS legacy_token_calls,
+COUNT(*) AS calls,
 			COALESCE(SUM(CAST(total_tokens AS BIGINT)), 0) AS tokens,
 			COALESCE(SUM(CAST(cost_usd AS DOUBLE)), 0) AS cost,
 			COALESCE(SUM(CASE WHEN cost_source = 'estimated' THEN CAST(cost_usd AS DOUBLE) ELSE 0 END), 0) AS estimated,
 			COALESCE(SUM(CASE WHEN cost_source = 'reported' THEN CAST(cost_usd AS DOUBLE) ELSE 0 END), 0) AS reported,
-			COALESCE(SUM(CASE WHEN cost_source = '' THEN 1 ELSE 0 END), 0) AS unattributed,
+			COALESCE(SUM(CASE WHEN COALESCE(cost_source,'') NOT IN ('reported','estimated') THEN 1 ELSE 0 END), 0) AS unattributed,
 			COALESCE(AVG(CAST(latency_ms AS BIGINT)), 0) AS latency,
 			COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) AS errors
 		 FROM llm_traces WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
@@ -248,19 +276,27 @@ func (s *LLMService) Stats(ctx context.Context, siteID string, from, to time.Tim
 		return &LLMStats{}, err
 	}
 
-	// Empty filter result: dogfood #24 means Nucleus may return zero rows
-	// even though COUNT(*) is a scalar aggregate. Synthesize the zeros so
-	// the UI renders "0" not blanks.
 	if len(rows) == 0 {
+		if err := s.confirmEmptyWindow(ctx, siteID, fromMs, toMs); err != nil {
+			return nil, err
+		}
 		return &LLMStats{
-			TotalCalls: "0", TotalTokens: "0",
+			ProvenanceStats: (provenanceRow{}).dto(),
+			TotalCalls:      "0", TotalTokens: "0",
 			TotalCostUSD: "0", EstimatedCostUSD: "0", ReportedCostUSD: "0", CostUnattributed: "0",
 			AvgLatencyMs: "0", ErrorCount: "0",
 		}, nil
 	}
 
+	if len(rows) != 1 {
+		return nil, fmt.Errorf("llm stats: expected one aggregate row")
+	}
 	r := rows[0]
+	if r.InvalidNumericRows != 0 {
+		return nil, fmt.Errorf("llm stats: invalid legacy numeric rows (%d)", r.InvalidNumericRows)
+	}
 	return &LLMStats{
+		ProvenanceStats:  (provenanceRow{LegacyCostUSD: r.LegacyCostUSD, ReportedTokensIn: r.ReportedTokensIn, ReportedTokensOut: r.ReportedTokensOut, ReportedTokensTotal: r.ReportedTokensTotal, ReportedCostCalls: r.ReportedCostCalls, ReportedTokenCalls: r.ReportedTokenCalls, EstimatedTokensIn: r.EstimatedTokensIn, EstimatedTokensOut: r.EstimatedTokensOut, EstimatedTokensTotal: r.EstimatedTokensTotal, EstimatedCostCalls: r.EstimatedCostCalls, EstimatedTokenCalls: r.EstimatedTokenCalls, LegacyTokensIn: r.LegacyTokensIn, LegacyTokensOut: r.LegacyTokensOut, LegacyTokensTotal: r.LegacyTokensTotal, LegacyCostCalls: r.LegacyCostCalls, LegacyTokenCalls: r.LegacyTokenCalls}).dto(),
 		TotalCalls:       strconv.FormatInt(r.Calls, 10),
 		TotalTokens:      strconv.FormatInt(r.Tokens, 10),
 		TotalCostUSD:     strconv.FormatFloat(r.Cost, 'f', -1, 64),
@@ -276,23 +312,60 @@ func (s *LLMService) ModelBreakdown(ctx context.Context, siteID string, from, to
 	fromMs := dbutil.IntParam(from.UnixMilli())
 	toMs := dbutil.IntParam(to.UnixMilli())
 
-	// Scan natively for the same dogfood reason as Stats() — CAST(... AS
-	// TEXT) over an aggregate returns the empty string from Nucleus.
+	// Use the same required raw-text aggregate boundary as Stats().
 	type rawRow struct {
-		Model        string  `db:"model"`
-		Provider     string  `db:"provider"`
-		CallCount    int64   `db:"call_count"`
-		TotalTokens  int64   `db:"total_tokens"`
-		TotalCostUSD float64 `db:"total_cost_usd"`
-		Estimated    float64 `db:"estimated_cost_usd"`
-		AvgLatencyMs float64 `db:"avg_latency_ms"`
+		InvalidNumericRows   int64   `db:"invalid_numeric_rows"`
+		LegacyCostUSD        float64 `db:"legacy_cost_usd"`
+		ReportedTokensIn     int64   `db:"reported_tokens_in"`
+		ReportedTokensOut    int64   `db:"reported_tokens_out"`
+		ReportedTokensTotal  int64   `db:"reported_tokens_total"`
+		ReportedCostCalls    int64   `db:"reported_cost_calls"`
+		ReportedTokenCalls   int64   `db:"reported_token_calls"`
+		EstimatedTokensIn    int64   `db:"estimated_tokens_in"`
+		EstimatedTokensOut   int64   `db:"estimated_tokens_out"`
+		EstimatedTokensTotal int64   `db:"estimated_tokens_total"`
+		EstimatedCostCalls   int64   `db:"estimated_cost_calls"`
+		EstimatedTokenCalls  int64   `db:"estimated_token_calls"`
+		LegacyTokensIn       int64   `db:"legacy_tokens_in"`
+		LegacyTokensOut      int64   `db:"legacy_tokens_out"`
+		LegacyTokensTotal    int64   `db:"legacy_tokens_total"`
+		LegacyCostCalls      int64   `db:"legacy_cost_calls"`
+		LegacyTokenCalls     int64   `db:"legacy_token_calls"`
+		Model                string  `db:"model"`
+		Provider             string  `db:"provider"`
+		CallCount            int64   `db:"call_count"`
+		TotalTokens          int64   `db:"total_tokens"`
+		TotalCostUSD         float64 `db:"total_cost_usd"`
+		Estimated            float64 `db:"estimated_cost_usd"`
+		Reported             float64 `db:"reported_cost_usd"`
+		Unattributed         int64   `db:"unattributed"`
+		AvgLatencyMs         float64 `db:"avg_latency_ms"`
 	}
-	rows, err := nucleus.Query[rawRow](ctx, s.db.SQL(),
-		`SELECT model, provider,
+	rows, err := queryAggregate[rawRow](ctx, s,
+		`SELECT model, provider, `+invalidLLMNumericsSQL+`
+COALESCE(SUM(CASE WHEN COALESCE(cost_source,'') NOT IN ('reported','estimated') THEN CAST(cost_usd AS DOUBLE) ELSE 0 END),0) AS legacy_cost_usd,
+COALESCE(SUM(CASE WHEN token_source = 'reported' THEN CAST(prompt_tokens AS BIGINT) ELSE 0 END),0) AS reported_tokens_in,
+COALESCE(SUM(CASE WHEN token_source = 'reported' THEN CAST(completion_tokens AS BIGINT) ELSE 0 END),0) AS reported_tokens_out,
+COALESCE(SUM(CASE WHEN token_source = 'reported' THEN CAST(total_tokens AS BIGINT) ELSE 0 END),0) AS reported_tokens_total,
+COALESCE(SUM(CASE WHEN cost_source = 'reported' THEN 1 ELSE 0 END),0) AS reported_cost_calls,
+COALESCE(SUM(CASE WHEN token_source = 'reported' THEN 1 ELSE 0 END),0) AS reported_token_calls,
+COALESCE(SUM(CASE WHEN token_source = 'estimated' THEN CAST(prompt_tokens AS BIGINT) ELSE 0 END),0) AS estimated_tokens_in,
+COALESCE(SUM(CASE WHEN token_source = 'estimated' THEN CAST(completion_tokens AS BIGINT) ELSE 0 END),0) AS estimated_tokens_out,
+COALESCE(SUM(CASE WHEN token_source = 'estimated' THEN CAST(total_tokens AS BIGINT) ELSE 0 END),0) AS estimated_tokens_total,
+COALESCE(SUM(CASE WHEN cost_source = 'estimated' THEN 1 ELSE 0 END),0) AS estimated_cost_calls,
+COALESCE(SUM(CASE WHEN token_source = 'estimated' THEN 1 ELSE 0 END),0) AS estimated_token_calls,
+COALESCE(SUM(CASE WHEN COALESCE(token_source,'') NOT IN ('reported','estimated') THEN CAST(prompt_tokens AS BIGINT) ELSE 0 END),0) AS legacy_tokens_in,
+COALESCE(SUM(CASE WHEN COALESCE(token_source,'') NOT IN ('reported','estimated') THEN CAST(completion_tokens AS BIGINT) ELSE 0 END),0) AS legacy_tokens_out,
+COALESCE(SUM(CASE WHEN COALESCE(token_source,'') NOT IN ('reported','estimated') THEN CAST(total_tokens AS BIGINT) ELSE 0 END),0) AS legacy_tokens_total,
+COALESCE(SUM(CASE WHEN COALESCE(cost_source,'') NOT IN ('reported','estimated') THEN 1 ELSE 0 END),0) AS legacy_cost_calls,
+COALESCE(SUM(CASE WHEN COALESCE(token_source,'') NOT IN ('reported','estimated') THEN 1 ELSE 0 END),0) AS legacy_token_calls,
+
 			COUNT(*) AS call_count,
 			COALESCE(SUM(CAST(total_tokens AS BIGINT)), 0) AS total_tokens,
 			COALESCE(SUM(CAST(cost_usd AS DOUBLE)), 0) AS total_cost_usd,
 			COALESCE(SUM(CASE WHEN cost_source = 'estimated' THEN CAST(cost_usd AS DOUBLE) ELSE 0 END), 0) AS estimated_cost_usd,
+ COALESCE(SUM(CASE WHEN cost_source = 'reported' THEN CAST(cost_usd AS DOUBLE) ELSE 0 END),0) AS reported_cost_usd,
+ COALESCE(SUM(CASE WHEN COALESCE(cost_source,'') NOT IN ('reported','estimated') THEN 1 ELSE 0 END),0) AS unattributed,
 			COALESCE(AVG(CAST(latency_ms AS BIGINT)), 0) AS avg_latency_ms
 		 FROM llm_traces WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		 GROUP BY model, provider
@@ -302,9 +375,20 @@ func (s *LLMService) ModelBreakdown(ctx context.Context, siteID string, from, to
 	if err != nil {
 		return nil, err
 	}
+	if len(rows) == 0 {
+		if err := s.confirmEmptyWindow(ctx, siteID, fromMs, toMs); err != nil {
+			return nil, err
+		}
+	}
 	out := make([]ModelStats, 0, len(rows))
 	for _, r := range rows {
+		if r.InvalidNumericRows != 0 {
+			return nil, fmt.Errorf("llm model %q: invalid legacy numeric rows (%d)", r.Model, r.InvalidNumericRows)
+		}
 		out = append(out, ModelStats{
+			ProvenanceStats:  (provenanceRow{LegacyCostUSD: r.LegacyCostUSD, ReportedTokensIn: r.ReportedTokensIn, ReportedTokensOut: r.ReportedTokensOut, ReportedTokensTotal: r.ReportedTokensTotal, ReportedCostCalls: r.ReportedCostCalls, ReportedTokenCalls: r.ReportedTokenCalls, EstimatedTokensIn: r.EstimatedTokensIn, EstimatedTokensOut: r.EstimatedTokensOut, EstimatedTokensTotal: r.EstimatedTokensTotal, EstimatedCostCalls: r.EstimatedCostCalls, EstimatedTokenCalls: r.EstimatedTokenCalls, LegacyTokensIn: r.LegacyTokensIn, LegacyTokensOut: r.LegacyTokensOut, LegacyTokensTotal: r.LegacyTokensTotal, LegacyCostCalls: r.LegacyCostCalls, LegacyTokenCalls: r.LegacyTokenCalls}).dto(),
+			ReportedCostUSD:  strconv.FormatFloat(r.Reported, 'f', -1, 64),
+			CostUnattributed: strconv.FormatInt(r.Unattributed, 10),
 			Model:            r.Model,
 			Provider:         r.Provider,
 			CallCount:        strconv.FormatInt(r.CallCount, 10),
@@ -340,4 +424,65 @@ func genID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// ProvenanceStats partitions cost and tokens independently by their stored
+// sources. Empty/NULL/unrecognized sources remain legacy/unattributed; amounts
+// never infer provenance. All successful values are explicit decimal strings.
+type ProvenanceStats struct {
+	LegacyCostUSD        string `json:"legacy_cost_usd"`
+	ReportedTokensIn     string `json:"reported_tokens_in"`
+	ReportedTokensOut    string `json:"reported_tokens_out"`
+	ReportedTokensTotal  string `json:"reported_tokens_total"`
+	ReportedCostCalls    string `json:"reported_cost_calls"`
+	ReportedTokenCalls   string `json:"reported_token_calls"`
+	EstimatedTokensIn    string `json:"estimated_tokens_in"`
+	EstimatedTokensOut   string `json:"estimated_tokens_out"`
+	EstimatedTokensTotal string `json:"estimated_tokens_total"`
+	EstimatedCostCalls   string `json:"estimated_cost_calls"`
+	EstimatedTokenCalls  string `json:"estimated_token_calls"`
+	LegacyTokensIn       string `json:"legacy_tokens_in"`
+	LegacyTokensOut      string `json:"legacy_tokens_out"`
+	LegacyTokensTotal    string `json:"legacy_tokens_total"`
+	LegacyCostCalls      string `json:"legacy_cost_calls"`
+	LegacyTokenCalls     string `json:"legacy_token_calls"`
+}
+type provenanceRow struct {
+	LegacyCostUSD        float64 `db:"legacy_cost_usd"`
+	ReportedTokensIn     int64   `db:"reported_tokens_in"`
+	ReportedTokensOut    int64   `db:"reported_tokens_out"`
+	ReportedTokensTotal  int64   `db:"reported_tokens_total"`
+	ReportedCostCalls    int64   `db:"reported_cost_calls"`
+	ReportedTokenCalls   int64   `db:"reported_token_calls"`
+	EstimatedTokensIn    int64   `db:"estimated_tokens_in"`
+	EstimatedTokensOut   int64   `db:"estimated_tokens_out"`
+	EstimatedTokensTotal int64   `db:"estimated_tokens_total"`
+	EstimatedCostCalls   int64   `db:"estimated_cost_calls"`
+	EstimatedTokenCalls  int64   `db:"estimated_token_calls"`
+	LegacyTokensIn       int64   `db:"legacy_tokens_in"`
+	LegacyTokensOut      int64   `db:"legacy_tokens_out"`
+	LegacyTokensTotal    int64   `db:"legacy_tokens_total"`
+	LegacyCostCalls      int64   `db:"legacy_cost_calls"`
+	LegacyTokenCalls     int64   `db:"legacy_token_calls"`
+}
+
+func (r provenanceRow) dto() ProvenanceStats {
+	return ProvenanceStats{
+		LegacyCostUSD:        strconv.FormatFloat(r.LegacyCostUSD, 'f', -1, 64),
+		ReportedTokensIn:     strconv.FormatInt(r.ReportedTokensIn, 10),
+		ReportedTokensOut:    strconv.FormatInt(r.ReportedTokensOut, 10),
+		ReportedTokensTotal:  strconv.FormatInt(r.ReportedTokensTotal, 10),
+		ReportedCostCalls:    strconv.FormatInt(r.ReportedCostCalls, 10),
+		ReportedTokenCalls:   strconv.FormatInt(r.ReportedTokenCalls, 10),
+		EstimatedTokensIn:    strconv.FormatInt(r.EstimatedTokensIn, 10),
+		EstimatedTokensOut:   strconv.FormatInt(r.EstimatedTokensOut, 10),
+		EstimatedTokensTotal: strconv.FormatInt(r.EstimatedTokensTotal, 10),
+		EstimatedCostCalls:   strconv.FormatInt(r.EstimatedCostCalls, 10),
+		EstimatedTokenCalls:  strconv.FormatInt(r.EstimatedTokenCalls, 10),
+		LegacyTokensIn:       strconv.FormatInt(r.LegacyTokensIn, 10),
+		LegacyTokensOut:      strconv.FormatInt(r.LegacyTokensOut, 10),
+		LegacyTokensTotal:    strconv.FormatInt(r.LegacyTokensTotal, 10),
+		LegacyCostCalls:      strconv.FormatInt(r.LegacyCostCalls, 10),
+		LegacyTokenCalls:     strconv.FormatInt(r.LegacyTokenCalls, 10),
+	}
 }

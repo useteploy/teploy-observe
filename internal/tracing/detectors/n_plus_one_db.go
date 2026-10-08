@@ -36,7 +36,7 @@ func (d *NPlusOneDB) Detect(spans []Span) []Issue {
 		if s.ParentSpanID == "" || !isDBSpan(s) {
 			continue
 		}
-		byParent[s.ParentSpanID] = append(byParent[s.ParentSpanID], s)
+		byParent[s.TraceID+"\x00"+s.ParentSpanID] = append(byParent[s.TraceID+"\x00"+s.ParentSpanID], s)
 	}
 
 	// Iterating a map is non-deterministic and we want stable test output;
@@ -103,7 +103,7 @@ func (d *NPlusOneDB) Detect(spans []Span) []Issue {
 		// trace_id is taken from a span in the run rather than the parent
 		// (the parent might be in a different batch).
 		traceID := first.TraceID
-		fp := hashFingerprint("n_plus_one_db", parentID, bestFP)
+		fp := hashFingerprint("n_plus_one_db", first.ParentSpanID, bestFP)
 		title := fmt.Sprintf("N+1 query: %d repeated DB calls", len(bestRun))
 		desc := fmt.Sprintf("%s — %s", first.ServiceName, truncate(bestFP, 200))
 

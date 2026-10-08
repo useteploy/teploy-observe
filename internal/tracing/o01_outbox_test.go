@@ -429,8 +429,9 @@ func TestO01_TraceWorkerDeadLettersFailingDerive(t *testing.T) {
 				severity       TEXT NOT NULL DEFAULT 'warning',
 				count          BIGINT NOT NULL DEFAULT 1,
 				first_seen     BIGINT NOT NULL,
-				last_seen      BIGINT NOT NULL
-			) WITH (engine = 'replacing_mergetree', version_column = 'last_seen')
+				last_seen      BIGINT NOT NULL,
+				version        BIGINT NOT NULL DEFAULT 0
+			) WITH (engine = 'replacing_mergetree', version_column = 'version')
 			ORDER BY (tenant_id, site_id, fingerprint)`,
 		} {
 			if _, err := db.SQL().Exec(context.Background(), ddl); err != nil {

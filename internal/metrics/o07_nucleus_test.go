@@ -205,12 +205,19 @@ func TestO07_CumulativeHistogramQuantileEndToEnd(t *testing.T) {
 	const base int64 = 1_700_000_000_000_000_000
 	ts := func(sec int) string { return fmt.Sprintf("%d", base+int64(sec)*1_000_000_000) }
 	hdp := func(sec int, counts []string, instance string) HistogramDataPoint {
-		bc := make([]jsonInt, len(counts))
+		bc := make([]jsonInt, len(counts)+1)
+		total := int64(0)
 		for i, c := range counts {
 			bc[i] = jsonInt(c)
+			n, err := parseInt64(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			total += n
 		}
+		bc[len(counts)] = "0"
 		return HistogramDataPoint{
-			TimeUnixNano: ts(sec), BucketCounts: bc, ExplicitBounds: []float64{10, 50, 100},
+			TimeUnixNano: ts(sec), Count: jsonInt(fmt.Sprint(total)), BucketCounts: bc, ExplicitBounds: []float64{10, 50, 100},
 			Attributes: []KeyValue{{Key: "instance", Value: AnyValue{StringValue: instance}}},
 		}
 	}
@@ -237,17 +244,57 @@ func TestO07_CumulativeHistogramQuantileEndToEnd(t *testing.T) {
 	if math.Abs(p.Value-10) > 1e-9 {
 		t.Errorf("p50 = %v, want 10 (boundary-exact)", p.Value)
 	}
-	if p.Estimate == nil || !*p.Estimate || p.Method != "histogram-quantile/linear-interpolation" {
+	if p.Estimate == nil || !*p.Estimate || p.Method != "histogram-quantile/linear-interpolation+nonnegative-bounds+underflow-upper-bound" {
 		t.Errorf("p50 labels = %+v %q, want estimate=true", p.Estimate, p.Method)
 	}
 
 	// Single-series view: series a's window is [1,0,0] total 1 → p95
-	// rank 0.95 is interior to bucket 0 [0..10] → 0 + 10*0.95 = 9.5.
+	// rank 0.95 is in (-Inf,10]; only upper bound 10 is identifiable.
 	series = o07Query(t, svc, site, "o07.rt.latency", map[string]string{"instance": "a"}, fromMs, toMs, AggP95, 60_000, nil)
 	if len(series) != 1 || len(series[0].Points) != 1 {
 		t.Fatalf("histogram p95 a: got %+v", series)
 	}
-	if math.Abs(series[0].Points[0].Value-9.5) > 1e-9 {
-		t.Errorf("series a p95 = %v, want 9.5 (interior interpolation)", series[0].Points[0].Value)
+	if math.Abs(series[0].Points[0].Value-10) > 1e-9 {
+		t.Errorf("series a p95 = %v, want 10 (first-tail upper bound)", series[0].Points[0].Value)
+	}
+}
+
+// OBS26-05/06: producer resource identity survives the real INSERT/SELECT
+// boundary, and cardinality loss is accurately counted before OTLP response.
+func TestOBS05StreamIdentityEndToEnd(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	db, err := nucleus.Connect(ctx, nucleustest.DSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := schema.Apply(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	site := fmt.Sprintf("obs05_%d", time.Now().UnixNano())
+	svc := NewService(db)
+	const base int64 = 1700000000000000000
+	request := ExportMetricsRequest{}
+	for i, instance := range []string{"a", "b"} {
+		start := base + int64(i)*1000000000
+		initial := float64(i) * 1000
+		request.ResourceMetrics = append(request.ResourceMetrics, ResourceMetrics{Resource: Resource{Attributes: []KeyValue{{Key: "service.name", Value: stringAny("shared-service")}, {Key: "service.instance.id", Value: stringAny(instance)}}}, ScopeMetrics: []ScopeMetrics{{Scope: InstrumentationScope{Name: "instrumentation"}, Metrics: []OTLPMetric{{Name: "counter", Sum: &Sum{IsMonotonic: true, AggregationTemporality: 2, DataPoints: []NumberDataPoint{{TimeUnixNano: fmt.Sprint(start), AsDouble: initial}, {TimeUnixNano: fmt.Sprint(start + 10000000000), AsDouble: initial + 10}}}}}}}})
+	}
+	result, err := svc.Ingest(ctx, site, request)
+	if err != nil || result.Points != 4 || result.Rejected != 0 {
+		t.Fatalf("ingest %+v %v", result, err)
+	}
+	points, err := svc.Query(ctx, site, "counter", nil, base/1000000, (base+12000000000)/1000000, "rate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 || math.Abs(points[0].Value-2) > 1e-12 {
+		t.Fatalf("stream identity lost across storage: %+v", points)
+	}
+	capped := NewService(db).WithCardinalityLimits(CardinalityLimits{MaxSeriesPerSite: 1})
+	result, err = capped.Ingest(ctx, site+"capped", request)
+	if err != nil || result.Points != 2 || result.Rejected != 2 {
+		t.Fatalf("cardinality accounting %+v %v", result, err)
 	}
 }

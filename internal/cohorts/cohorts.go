@@ -32,11 +32,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/queryguard"
 )
 
 // MaxFilterMembers is the largest cohort MembersForFilter will hand to the
@@ -58,12 +60,21 @@ var ErrTooLarge = errors.New("cohort too large for chart filtering")
 
 // Service exposes cohort CRUD and evaluation.
 type Service struct {
-	db *nucleus.Client
+	mutationMu sync.Mutex
+	db         *nucleus.Client
+	guard      *queryguard.Limiter
+	budgets    queryguard.Budgets
+	// Nil in production; narrow durable-store/clock seams for mutation fault tests.
+	memberRead   func(context.Context, string, string) ([]memberRecord, error)
+	memberWrite  func(context.Context, string, string, []memberRow, int64) error
+	summaryRead  func(context.Context, string, string) (*Cohort, error)
+	summaryWrite func(context.Context, Cohort) error
+	clock        func() int64
 }
 
 // NewService constructs a cohorts.Service backed by the shared nucleus client.
 func NewService(db *nucleus.Client) *Service {
-	return &Service{db: db}
+	return &Service{db: db, budgets: queryguard.DefaultBudgets()}
 }
 
 // Rule is a single condition in a cohort definition.
@@ -136,6 +147,11 @@ func ParseDefinition(rule string) (Definition, error) {
 // from cohort membership; a cohort of "anonymous users" is not a
 // useful concept.
 func (s *Service) EvaluateCohort(ctx context.Context, siteID string, def Definition) ([]string, error) {
+	ctx, finish, admissionErr := s.beginRead(ctx, siteID)
+	if admissionErr != nil {
+		return nil, admissionErr
+	}
+	defer finish()
 	if siteID == "" {
 		return []string{}, nil
 	}
@@ -188,9 +204,12 @@ func (s *Service) loadUniverse(ctx context.Context, siteID string) ([]string, er
 	type idRow struct {
 		DistinctID string `db:"distinct_id"`
 	}
-	rows, err := nucleus.Query[idRow](ctx, s.db.SQL(), propertyUniverseSQL()+leafLimitSQL(), siteID)
+	rows, err := nucleus.Query[idRow](ctx, s.db.SQL(), propertyUniverseSQL()+s.leafLimitSQL(), siteID)
 	if err != nil {
 		return nil, fmt.Errorf("cohort universe query: %w", err)
+	}
+	if err := s.accountRows(ctx, len(rows)); err != nil {
+		return nil, err
 	}
 	if len(rows) > MaxLeafRows {
 		return nil, fmt.Errorf("%w: more than %d identified users", ErrTooLarge, MaxLeafRows)
@@ -238,7 +257,13 @@ func (s *Service) evalEventRule(ctx context.Context, siteID string, r Rule) ([]s
 	if min <= 0 {
 		min = 1
 	}
-	windowDur := parseWindow(r.Window)
+	windowDur, err := checkedWindow(r.Window)
+	if err != nil {
+		return nil, err
+	}
+	if s.budgets.MaxWindow > 0 && windowDur > s.budgets.MaxWindow {
+		return nil, fmt.Errorf("cohort window exceeds supported maximum %s", s.budgets.MaxWindow)
+	}
 	fromMs := time.Now().UTC().Add(-windowDur).UnixMilli()
 	from := dbutil.IntParam(fromMs)
 
@@ -252,10 +277,13 @@ func (s *Service) evalEventRule(ctx context.Context, siteID string, r Rule) ([]s
 	   AND event_type = $2
 	   AND timestamp >= $3
 	   AND distinct_id != ''
-	 GROUP BY distinct_id` + leafLimitSQL()
+	 GROUP BY distinct_id` + s.leafLimitSQL()
 	rows, err := nucleus.Query[countedRow](ctx, s.db.SQL(), q, siteID, r.Name, from)
 	if err != nil {
 		return nil, fmt.Errorf("event rule query: %w", err)
+	}
+	if err := s.accountRows(ctx, len(rows)); err != nil {
+		return nil, err
 	}
 	if len(rows) > MaxLeafRows {
 		return nil, fmt.Errorf("%w: event rule matched more than %d users", ErrTooLarge, MaxLeafRows)
@@ -291,9 +319,12 @@ func (s *Service) evalPropertyRule(ctx context.Context, siteID string, r Rule) (
 	type idRow struct {
 		DistinctID string `db:"distinct_id"`
 	}
-	matched, err := nucleus.Query[idRow](ctx, s.db.SQL(), propertyMatchSQL(r.Key)+leafLimitSQL(), siteID, r.Value)
+	matched, err := nucleus.Query[idRow](ctx, s.db.SQL(), propertyMatchSQL(r.Key)+s.leafLimitSQL(), siteID, r.Value)
 	if err != nil {
 		return nil, fmt.Errorf("property rule query: %w", err)
+	}
+	if err := s.accountRows(ctx, len(matched)); err != nil {
+		return nil, err
 	}
 	if len(matched) > MaxLeafRows {
 		return nil, fmt.Errorf("%w: property rule matched more than %d users", ErrTooLarge, MaxLeafRows)
@@ -381,28 +412,37 @@ func isAllowedPropertyKey(key string) bool {
 // parseWindow turns "30d" / "7d" / "24h" into a Duration. Unknown /
 // empty defaults to 30 days, which is the PostHog default cohort
 // window.
-func parseWindow(w string) time.Duration {
+func checkedWindow(w string) (time.Duration, error) {
 	w = strings.TrimSpace(strings.ToLower(w))
 	if w == "" {
-		return 30 * 24 * time.Hour
+		return 30 * 24 * time.Hour, nil
 	}
 	if len(w) < 2 {
-		return 30 * 24 * time.Hour
+		return 0, fmt.Errorf("invalid cohort window")
 	}
-	n, err := strconv.Atoi(w[:len(w)-1])
-	if err != nil || n <= 0 {
-		return 30 * 24 * time.Hour
-	}
+	n, err := strconv.ParseInt(w[:len(w)-1], 10, 64)
+	unit := time.Duration(0)
 	switch w[len(w)-1] {
 	case 'd':
-		return time.Duration(n) * 24 * time.Hour
+		unit = 24 * time.Hour
 	case 'h':
-		return time.Duration(n) * time.Hour
+		unit = time.Hour
 	case 'm':
-		return time.Duration(n) * time.Minute
-	default:
+		unit = time.Minute
+	}
+	if err != nil || n <= 0 || unit == 0 || n > int64((1<<63-1)/unit) {
+		return 0, fmt.Errorf("invalid or unrepresentable cohort window")
+	}
+	return time.Duration(n) * unit, nil
+}
+
+// Compatibility helper for callers/tests; evaluation always uses checkedWindow.
+func parseWindow(w string) time.Duration {
+	d, err := checkedWindow(w)
+	if err != nil {
 		return 30 * 24 * time.Hour
 	}
+	return d
 }
 
 // ---------------------------------------------------------------------------
@@ -431,7 +471,10 @@ func (s *Service) Create(ctx context.Context, siteID, name, description string, 
 	nowMs := time.Now().UTC().UnixMilli()
 
 	// Evaluate up front so the saved row has a meaningful count.
-	members, _ := s.EvaluateCohort(ctx, siteID, def)
+	members, evalErr := s.EvaluateCohort(ctx, siteID, def)
+	if evalErr != nil {
+		return nil, evalErr
+	}
 	count := int64(len(members))
 
 	_, err = s.db.SQL().Exec(ctx,
@@ -454,6 +497,9 @@ func (s *Service) Create(ctx context.Context, siteID, name, description string, 
 // ReplacingMergeTree's PK dedup is unreliable in Nucleus today, so we
 // pick the row with the highest updated_at when multiple appear.
 func (s *Service) Get(ctx context.Context, siteID, cohortID string) (*Cohort, error) {
+	if s.summaryRead != nil {
+		return s.summaryRead(ctx, siteID, cohortID)
+	}
 	rows, err := nucleus.Query[Cohort](ctx, s.db.SQL(),
 		`SELECT cohort_id, tenant_id, site_id, name,
 		        COALESCE(description, '') AS description,
@@ -515,6 +561,11 @@ func (s *Service) List(ctx context.Context, siteID string) ([]Cohort, error) {
 // ReplacingMergeTree merge wins on max(updated_at) (with read-side
 // dedup per finding #10 as belt-and-braces). Re-evaluates member_count.
 func (s *Service) Update(ctx context.Context, siteID, cohortID, name, description string, def Definition) (*Cohort, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	return s.update(ctx, siteID, cohortID, name, description, def)
+}
+func (s *Service) update(ctx context.Context, siteID, cohortID, name, description string, def Definition) (*Cohort, error) {
 	existing, err := s.Get(ctx, siteID, cohortID)
 	if err != nil {
 		return nil, err
@@ -546,7 +597,10 @@ func (s *Service) Update(ctx context.Context, siteID, cohortID, name, descriptio
 		if err := ValidateDefinition(def); err != nil {
 			return nil, err
 		}
-		members, _ := s.EvaluateCohort(ctx, siteID, def)
+		members, evalErr := s.EvaluateCohort(ctx, siteID, def)
+		if evalErr != nil {
+			return nil, evalErr
+		}
 		count = int64(len(members))
 	}
 	raw, err := json.Marshal(def)
@@ -580,6 +634,8 @@ func (s *Service) Update(ctx context.Context, siteID, cohortID, name, descriptio
 // member_count row. Used by the "Refresh" button in the UI when the
 // user wants to recompute without changing the definition.
 func (s *Service) Refresh(ctx context.Context, siteID, cohortID string) (*Cohort, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	existing, err := s.Get(ctx, siteID, cohortID)
 	if err != nil {
 		return nil, err
@@ -591,7 +647,7 @@ func (s *Service) Refresh(ctx context.Context, siteID, cohortID string) (*Cohort
 	if err != nil {
 		return nil, err
 	}
-	return s.Update(ctx, siteID, cohortID, existing.Name, existing.Description, def)
+	return s.update(ctx, siteID, cohortID, existing.Name, existing.Description, def)
 }
 
 // Delete soft-deletes a cohort by writing a tombstone row (name=”).
@@ -602,6 +658,8 @@ func (s *Service) Refresh(ctx context.Context, siteID, cohortID string) (*Cohort
 // Go-side dedup in List/Get picks the tombstone even when wall-clock
 // hasn't ticked since the previous write (test-suite race).
 func (s *Service) Delete(ctx context.Context, siteID, cohortID string) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	existing, err := s.Get(ctx, siteID, cohortID)
 	if err != nil {
 		return err
@@ -628,6 +686,11 @@ func (s *Service) Delete(ctx context.Context, siteID, cohortID string) error {
 // Members returns a paginated slice of cohort distinct_ids. Re-evaluates
 // the rule each call (v1 has no cohort_members table — see package doc).
 func (s *Service) Members(ctx context.Context, siteID, cohortID string, limit, offset int) ([]string, error) {
+	ctx, finish, admissionErr := s.beginRead(ctx, siteID)
+	if admissionErr != nil {
+		return nil, admissionErr
+	}
+	defer finish()
 	c, err := s.Get(ctx, siteID, cohortID)
 	if err != nil {
 		return nil, err
@@ -661,6 +724,11 @@ func (s *Service) Members(ctx context.Context, siteID, cohortID string, limit, o
 // another site - is ErrNotFound, so the API answers 404 rather than
 // charting an empty or foreign cohort.
 func (s *Service) MembersForFilter(ctx context.Context, siteID, cohortID string) ([]string, error) {
+	ctx, finish, admissionErr := s.beginRead(ctx, siteID)
+	if admissionErr != nil {
+		return nil, admissionErr
+	}
+	defer finish()
 	c, err := s.Get(ctx, siteID, cohortID)
 	if err != nil {
 		return nil, err

@@ -125,7 +125,8 @@ func (h *OTLPHandler) handle(w http.ResponseWriter, r *http.Request, siteID stri
 		return
 	}
 
-	if _, err := h.svc.Ingest(r.Context(), siteID, req); err != nil {
+	result, err := h.svc.Ingest(r.Context(), siteID, req)
+	if err != nil {
 		// O12 cardinality refusal is PERMANENT for this batch — the
 		// exporter must split it, retrying cannot help, so it gets a 413
 		// with the remedy in the body. Everything else keeps the F13
@@ -142,9 +143,7 @@ func (h *OTLPHandler) handle(w http.ResponseWriter, r *http.Request, siteID stri
 		return
 	}
 
-	// Full success is the zero-value ExportMetricsServiceResponse — metrics
-	// ingest is all-or-nothing, so there is no partial-success shape here.
-	writeExportResponse(w, isProto, &metricspb.ExportMetricsServiceResponse{})
+	writeExportResponse(w, isProto, exportMetricsResponse(result.Rejected))
 }
 
 // writeExportResponse encodes an ExportMetricsServiceResponse in the
@@ -168,4 +167,12 @@ func writeExportResponse(w http.ResponseWriter, isProto bool, resp *metricspb.Ex
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(body)
+}
+
+func exportMetricsResponse(rejected int) *metricspb.ExportMetricsServiceResponse {
+	resp := &metricspb.ExportMetricsServiceResponse{}
+	if rejected > 0 {
+		resp.PartialSuccess = &metricspb.ExportMetricsPartialSuccess{RejectedDataPoints: int64(rejected), ErrorMessage: "points rejected: unsupported metric, invalid histogram or series limit"}
+	}
+	return resp
 }

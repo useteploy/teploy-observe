@@ -87,10 +87,14 @@ func metricsQueryHandler(svc *metrics.Service) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		points, err := svc.Query(r.Context(), req.siteID, req.name, req.labels, req.fromMs, req.toMs, req.agg)
+		series, err := svc.QuerySeries(r.Context(), req.siteID, req.name, req.labels, req.fromMs, req.toMs, metrics.QueryOptions{Agg: req.agg, StepMs: req.stepMs})
 		if err != nil {
 			writeMetricsError(w, r, err, http.StatusBadRequest)
 			return
+		}
+		var points []metrics.Point
+		if len(series) > 0 {
+			points = series[0].Points
 		}
 		if points == nil {
 			points = []metrics.Point{}
@@ -151,14 +155,35 @@ func parseQueryRequest(r *http.Request) (*queryRequest, error) {
 	if siteID == "" || name == "" {
 		return nil, &httpErr{msg: `{"error":"site_id and name required"}`}
 	}
-	fromMs, _ := strconv.ParseInt(q.Get("from"), 10, 64)
-	toMs, _ := strconv.ParseInt(q.Get("to"), 10, 64)
-	now := time.Now().UTC().UnixMilli()
-	if toMs == 0 {
-		toMs = now
+	toMs := time.Now().UTC().UnixMilli()
+	parseBound := func(key string, fallback int64) (int64, error) {
+		values, present := q[key]
+		if !present {
+			return fallback, nil
+		}
+		if len(values) != 1 || values[0] == "" {
+			return 0, &httpErr{msg: "invalid metric time bound"}
+		}
+		n, err := strconv.ParseInt(values[0], 10, 64)
+		if err != nil {
+			return 0, &httpErr{msg: "invalid metric time bound"}
+		}
+		return n, nil
 	}
-	if fromMs == 0 {
-		fromMs = toMs - 60*60*1000 // default: last hour
+	toMs, err := parseBound("to", toMs)
+	if err != nil {
+		return nil, err
+	}
+	// Validate the endpoint before default subtraction to avoid wrapping.
+	if toMs < (-1<<63)/1_000_000 || toMs > (1<<63-1)/1_000_000 {
+		return nil, &httpErr{msg: "unrepresentable metric time bound"}
+	}
+	fromMs, err := parseBound("from", toMs-60*60*1000)
+	if err != nil {
+		return nil, err
+	}
+	if _, _, err := metrics.ValidateTimeBounds(fromMs, toMs); err != nil {
+		return nil, err
 	}
 	agg := q.Get("agg")
 	if agg == "" {

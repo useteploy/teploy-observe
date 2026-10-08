@@ -36,6 +36,7 @@ type ExportMetricsRequest struct {
 }
 
 type ResourceMetrics struct {
+	SchemaURL    string         `json:"schemaUrl"`
 	Resource     Resource       `json:"resource"`
 	ScopeMetrics []ScopeMetrics `json:"scopeMetrics"`
 }
@@ -45,25 +46,33 @@ type Resource struct {
 }
 
 type ScopeMetrics struct {
-	Scope   InstrumentationScope `json:"scope"`
-	Metrics []OTLPMetric         `json:"metrics"`
+	SchemaURL string               `json:"schemaUrl"`
+	Scope     InstrumentationScope `json:"scope"`
+	Metrics   []OTLPMetric         `json:"metrics"`
 }
 
 type InstrumentationScope struct {
-	Name    string `json:"name"`
-	Version string `json:"version"`
+	Attributes []KeyValue `json:"attributes"`
+	Name       string     `json:"name"`
+	Version    string     `json:"version"`
 }
 
 // OTLPMetric is a single metric of one of three kinds. Exactly one of
 // Gauge / Sum / Histogram is populated per OTLP spec. The unmarshaller
 // inspects the populated field to pick the kind.
 type OTLPMetric struct {
-	Name        string     `json:"name"`
-	Description string     `json:"description"`
-	Unit        string     `json:"unit"`
-	Gauge       *Gauge     `json:"gauge,omitempty"`
-	Sum         *Sum       `json:"sum,omitempty"`
-	Histogram   *Histogram `json:"histogram,omitempty"`
+	Name                 string             `json:"name"`
+	Description          string             `json:"description"`
+	Unit                 string             `json:"unit"`
+	Gauge                *Gauge             `json:"gauge,omitempty"`
+	Sum                  *Sum               `json:"sum,omitempty"`
+	Histogram            *Histogram         `json:"histogram,omitempty"`
+	Summary              *UnsupportedMetric `json:"summary,omitempty"`
+	ExponentialHistogram *UnsupportedMetric `json:"exponentialHistogram,omitempty"`
+}
+
+type UnsupportedMetric struct {
+	DataPoints []json.RawMessage `json:"dataPoints"`
 }
 
 type Gauge struct {
@@ -107,11 +116,21 @@ type KeyValue struct {
 	Value AnyValue `json:"value"`
 }
 
+type ArrayValue struct {
+	Values []AnyValue `json:"values"`
+}
+type KeyValueList struct {
+	Values []KeyValue `json:"values"`
+}
+
 type AnyValue struct {
-	StringValue string  `json:"stringValue,omitempty"`
-	IntValue    jsonInt `json:"intValue,omitempty"`
-	BoolValue   bool    `json:"boolValue,omitempty"`
-	DoubleValue float64 `json:"doubleValue,omitempty"`
+	ArrayValue  *ArrayValue   `json:"arrayValue,omitempty"`
+	KVListValue *KeyValueList `json:"kvlistValue,omitempty"`
+	BytesValue  string        `json:"bytesValue,omitempty"`
+	StringValue string        `json:"stringValue,omitempty"`
+	IntValue    jsonInt       `json:"intValue,omitempty"`
+	BoolValue   bool          `json:"boolValue,omitempty"`
+	DoubleValue float64       `json:"doubleValue,omitempty"`
 
 	// kind records which field the decoder saw set. The scalar fields cannot
 	// say that themselves (false, 0, 0.0 and "" are Go zero values), so
@@ -128,6 +147,9 @@ const (
 	kindInt
 	kindBool
 	kindDouble
+	kindArray
+	kindKVList
+	kindBytes
 )
 
 func stringAny(s string) AnyValue  { return AnyValue{StringValue: s, kind: kindString} }
@@ -138,15 +160,24 @@ func doubleAny(f float64) AnyValue { return AnyValue{DoubleValue: f, kind: kindD
 func (a *AnyValue) UnmarshalJSON(b []byte) error {
 	*a = AnyValue{}
 	var w struct {
-		StringValue *string  `json:"stringValue"`
-		IntValue    *jsonInt `json:"intValue"`
-		BoolValue   *bool    `json:"boolValue"`
-		DoubleValue *float64 `json:"doubleValue"`
+		ArrayValue  *ArrayValue   `json:"arrayValue"`
+		KVListValue *KeyValueList `json:"kvlistValue"`
+		BytesValue  *string       `json:"bytesValue"`
+		StringValue *string       `json:"stringValue"`
+		IntValue    *jsonInt      `json:"intValue"`
+		BoolValue   *bool         `json:"boolValue"`
+		DoubleValue *float64      `json:"doubleValue"`
 	}
 	if err := json.Unmarshal(b, &w); err != nil {
 		return err
 	}
 	switch {
+	case w.ArrayValue != nil:
+		a.ArrayValue, a.kind = w.ArrayValue, kindArray
+	case w.KVListValue != nil:
+		a.KVListValue, a.kind = w.KVListValue, kindKVList
+	case w.BytesValue != nil:
+		a.BytesValue, a.kind = *w.BytesValue, kindBytes
 	case w.StringValue != nil:
 		*a = stringAny(*w.StringValue)
 	case w.IntValue != nil:
@@ -176,6 +207,28 @@ func (a AnyValue) text() (string, bool) {
 		}
 	}
 	switch k {
+	case kindArray:
+		values := []any{}
+		if a.ArrayValue != nil {
+			for _, v := range a.ArrayValue.Values {
+				text, _ := v.text()
+				values = append(values, []any{v.kind, text})
+			}
+		}
+		raw, _ := json.Marshal(values)
+		return string(raw), true
+	case kindKVList:
+		values := map[string]any{}
+		if a.KVListValue != nil {
+			for _, kv := range a.KVListValue.Values {
+				text, _ := kv.Value.text()
+				values[kv.Key] = []any{kv.Value.kind, text}
+			}
+		}
+		raw, _ := json.Marshal(values)
+		return string(raw), true
+	case kindBytes:
+		return a.BytesValue, true
 	case kindString:
 		return a.StringValue, true
 	case kindInt:

@@ -46,7 +46,7 @@ func (d *ConsecutiveDB) Detect(spans []Span) []Issue {
 		if s.ParentSpanID == "" || !isDBSpan(s) {
 			continue
 		}
-		byParent[s.ParentSpanID] = append(byParent[s.ParentSpanID], s)
+		byParent[s.TraceID+"\x00"+s.ParentSpanID] = append(byParent[s.TraceID+"\x00"+s.ParentSpanID], s)
 	}
 
 	parents := make([]string, 0, len(byParent))
@@ -69,6 +69,15 @@ func (d *ConsecutiveDB) Detect(spans []Span) []Issue {
 
 		// Walk for the longest non-overlapping run.
 		var bestRun []Span
+		consider := func(candidate []Span) {
+			var duration int64
+			for _, s := range candidate {
+				duration += s.DurationMs
+			}
+			if len(candidate) >= minSpans && duration >= minTotal && len(candidate) > len(bestRun) {
+				bestRun = append([]Span(nil), candidate...)
+			}
+		}
 		run := []Span{siblings[0]}
 		for i := 1; i < len(siblings); i++ {
 			prev := run[len(run)-1]
@@ -76,15 +85,11 @@ func (d *ConsecutiveDB) Detect(spans []Span) []Issue {
 			if curr.StartMs >= prev.EndMs {
 				run = append(run, curr)
 			} else {
-				if len(run) > len(bestRun) {
-					bestRun = append(bestRun[:0:0], run...)
-				}
+				consider(run)
 				run = []Span{curr}
 			}
 		}
-		if len(run) > len(bestRun) {
-			bestRun = run
-		}
+		consider(run)
 		if len(bestRun) < minSpans {
 			continue
 		}
@@ -109,7 +114,7 @@ func (d *ConsecutiveDB) Detect(spans []Span) []Issue {
 			stmts = append(stmts, fingerprintSQL(dbStatement(s)))
 		}
 		joined := joinSlice(stmts, "|")
-		fp := hashFingerprint("consecutive_db", parentID, joined)
+		fp := hashFingerprint("consecutive_db", first.ParentSpanID, joined)
 		issues = append(issues, Issue{
 			TraceID:      first.TraceID,
 			DetectorName: "consecutive_db",

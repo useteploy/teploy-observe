@@ -12,10 +12,14 @@ package metrics
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
 
@@ -35,11 +39,13 @@ type Service struct {
 	// row budgets) for ListMetrics / QuerySeries. Distinct from guard
 	// above, which bounds INGEST cardinality. nil = default budgets, no
 	// concurrency bound.
-	qguard *guardmap.Guard
+	qguard    *guardmap.Guard
+	maxWindow time.Duration
 
 	// Read-query seams: nil in production (the engine is queried
 	// directly); tests inject row sets and blocking reads so the budget
 	// refusals are exercised without a store.
+	writePointRows  func(context.Context, string, []metricPointRow) (int, error)
 	queryPointRows  func(ctx context.Context, query string, args ...any) ([]pointRow, error)
 	queryMetricRows func(ctx context.Context, query string, args ...any) ([]metricRow, error)
 }
@@ -48,6 +54,10 @@ type Service struct {
 // disables concurrency admission; budgets are always in force.
 func (s *Service) WithQueryGuard(l *queryguard.Limiter, b queryguard.Budgets) *Service {
 	s.qguard = guardmap.NewGuard(l, b)
+	s.maxWindow = b.MaxWindow
+	if s.maxWindow <= 0 {
+		s.maxWindow = queryguard.DefaultBudgets().MaxWindow
+	}
 	return s
 }
 
@@ -79,8 +89,9 @@ func (s *Service) CardinalityStats() CardinalityStats {
 
 // IngestResponse is returned to the OTLP exporter.
 type IngestResponse struct {
-	OK     bool `json:"ok"`
-	Points int  `json:"points"`
+	OK       bool `json:"ok"`
+	Points   int  `json:"points"`
+	Rejected int  `json:"rejected"`
 }
 
 // metricPointRow is one metric_points row, built without touching the DB.
@@ -91,6 +102,7 @@ type IngestResponse struct {
 // this package.
 type metricPointRow struct {
 	name, kind, service    string
+	streamIdentity         string
 	attrsJSON              string
 	tsNs                   int64
 	value                  float64
@@ -124,8 +136,9 @@ func (s *Service) Ingest(ctx context.Context, siteID string, req ExportMetricsRe
 	if siteID == "" {
 		return IngestResponse{}, fmt.Errorf("metrics: site_id required")
 	}
-	sql := s.db.SQL()
-
+	if err := s.guard.checkBatch(requestPointCount(req)); err != nil {
+		return IngestResponse{}, err
+	}
 	var rows []metricPointRow
 	var dropped int
 	// guardedAttrs applies the cardinality guard to one data point's
@@ -135,16 +148,37 @@ func (s *Service) Ingest(ctx context.Context, siteID string, req ExportMetricsRe
 		return MarshalAttrs(s.guard.truncateAttrs(siteID, AttrsToMap(attrs)))
 	}
 	admit := func(r metricPointRow) bool {
-		return s.guard.admit(siteID, seriesKey(r.name, r.service, r.attrsJSON))
+		return s.guard.admit(siteID, seriesKey(r.name, r.service, r.streamIdentity))
 	}
 	for _, rm := range req.ResourceMetrics {
 		serviceName := ExtractServiceName(rm.Resource.Attributes)
 		for _, sm := range rm.ScopeMetrics {
 			for _, m := range sm.Metrics {
+				shapes := 0
+				if m.Gauge != nil {
+					shapes++
+				}
+				if m.Sum != nil {
+					shapes++
+				}
+				if m.Histogram != nil {
+					shapes++
+				}
+				if m.Summary != nil {
+					shapes++
+				}
+				if m.ExponentialHistogram != nil {
+					shapes++
+				}
+				if shapes != 1 {
+					dropped += metricPointCount(m)
+					continue
+				}
 				switch {
 				case m.Gauge != nil:
 					for _, dp := range m.Gauge.DataPoints {
 						r := numberRow(m.Name, "gauge", serviceName, dp, guardedAttrs(dp.Attributes), "false", "cumulative")
+						r.streamIdentity = metricStreamIdentity(rm, sm, m, dp.Attributes, r.kind, r.monotonic, r.temporality)
 						if admit(r) {
 							rows = append(rows, r)
 						} else {
@@ -159,6 +193,7 @@ func (s *Service) Ingest(ctx context.Context, siteID string, req ExportMetricsRe
 					temp := AggregationTemporality(m.Sum.AggregationTemporality)
 					for _, dp := range m.Sum.DataPoints {
 						r := numberRow(m.Name, "sum", serviceName, dp, guardedAttrs(dp.Attributes), monotonic, temp)
+						r.streamIdentity = metricStreamIdentity(rm, sm, m, dp.Attributes, r.kind, r.monotonic, r.temporality)
 						if admit(r) {
 							rows = append(rows, r)
 						} else {
@@ -168,13 +203,20 @@ func (s *Service) Ingest(ctx context.Context, siteID string, req ExportMetricsRe
 				case m.Histogram != nil:
 					temp := AggregationTemporality(m.Histogram.AggregationTemporality)
 					for _, dp := range m.Histogram.DataPoints {
+						if !validHistogramPoint(dp) {
+							dropped++
+							continue
+						}
 						r := histogramRow(m.Name, serviceName, dp, guardedAttrs(dp.Attributes), temp)
+						r.streamIdentity = metricStreamIdentity(rm, sm, m, dp.Attributes, r.kind, r.monotonic, r.temporality)
 						if admit(r) {
 							rows = append(rows, r)
 						} else {
 							dropped++
 						}
 					}
+				default:
+					dropped += metricPointCount(m)
 				}
 			}
 		}
@@ -183,7 +225,13 @@ func (s *Service) Ingest(ctx context.Context, siteID string, req ExportMetricsRe
 		return IngestResponse{}, err
 	}
 
-	count, err := insertMetricRows(ctx, sql, siteID, rows)
+	var count int
+	var err error
+	if s.writePointRows != nil {
+		count, err = s.writePointRows(ctx, siteID, rows)
+	} else if len(rows) > 0 {
+		count, err = insertMetricRows(ctx, s.db.SQL(), siteID, rows)
+	}
 	if err != nil {
 		return IngestResponse{}, fmt.Errorf("insert metric points: %w", err)
 	}
@@ -192,7 +240,7 @@ func (s *Service) Ingest(ctx context.Context, siteID string, req ExportMetricsRe
 			"site", siteID, "dropped", dropped, "limit", s.guard.limits.MaxSeriesPerSite)
 	}
 
-	return IngestResponse{OK: true, Points: count}, nil
+	return IngestResponse{OK: true, Points: count, Rejected: dropped}, nil
 }
 
 func numberRow(name, kind, service string, dp NumberDataPoint, attrsJSON, monotonic, temporality string) metricPointRow {
@@ -235,12 +283,12 @@ func floatParam(v float64) string {
 	return strconv.FormatFloat(v, 'g', 17, 64)
 }
 
-const metricPointCols = 11
+const metricPointCols = 12
 
 const metricPointColList = `site_id, tenant_id, metric_name, metric_kind, service_name,
-	attributes, ts_ns, value, histogram, is_monotonic, aggregation_temporality`
+	attributes, ts_ns, value, histogram, is_monotonic, aggregation_temporality, stream_identity`
 
-// buildMetricPlaceholders returns "($1,...,$11),($12,...,$22),..." for rows*metricPointCols placeholders.
+// buildMetricPlaceholders numbers rows*metricPointCols placeholders.
 func buildMetricPlaceholders(rows int) string {
 	var b strings.Builder
 	b.Grow(rows * metricPointCols * 5)
@@ -266,7 +314,7 @@ func buildMetricPlaceholders(rows int) string {
 func metricArgs(dst []any, siteID string, r *metricPointRow) []any {
 	return append(dst,
 		siteID, "default", r.name, r.kind, r.service,
-		r.attrsJSON, dbutil.IntParam(r.tsNs), floatParam(r.value), r.histogram, r.monotonic, r.temporality,
+		r.attrsJSON, dbutil.IntParam(r.tsNs), floatParam(r.value), r.histogram, r.monotonic, r.temporality, r.streamIdentity,
 	)
 }
 
@@ -298,4 +346,65 @@ func insertMetricRows(ctx context.Context, sql *nucleus.SQLModel, siteID string,
 		total = end
 	}
 	return total, nil
+}
+
+func metricPointCount(m OTLPMetric) int {
+	n := 0
+	if m.Gauge != nil {
+		n += len(m.Gauge.DataPoints)
+	}
+	if m.Sum != nil {
+		n += len(m.Sum.DataPoints)
+	}
+	if m.Histogram != nil {
+		n += len(m.Histogram.DataPoints)
+	}
+	if m.Summary != nil {
+		n += len(m.Summary.DataPoints)
+	}
+	if m.ExponentialHistogram != nil {
+		n += len(m.ExponentialHistogram.DataPoints)
+	}
+	return n
+}
+func requestPointCount(req ExportMetricsRequest) int {
+	n := 0
+	for _, r := range req.ResourceMetrics {
+		for _, s := range r.ScopeMetrics {
+			for _, m := range s.Metrics {
+				n += metricPointCount(m)
+			}
+		}
+	}
+	return n
+}
+
+// Hash the complete producer identity before display-label truncation. JSON
+// supplies unambiguous framing, so arbitrary attribute values cannot collide.
+func metricStreamIdentity(r ResourceMetrics, s ScopeMetrics, m OTLPMetric, attrs []KeyValue, kind, mono, temp string) string {
+	canonical := func(attrs []KeyValue) map[string]any {
+		out := map[string]any{}
+		for _, kv := range attrs {
+			if v, ok := kv.Value.text(); ok {
+				k := kv.Value.kind
+				if k == kindUnset {
+					switch {
+					case kv.Value.StringValue != "":
+						k = kindString
+					case kv.Value.IntValue != "":
+						k = kindInt
+					case kv.Value.BoolValue:
+						k = kindBool
+					default:
+						k = kindDouble
+					}
+				}
+				out[kv.Key] = []any{k, v}
+			}
+		}
+		return out
+	}
+	raw, _ := json.Marshal([]any{canonical(r.Resource.Attributes), r.SchemaURL, s.Scope.Name, s.Scope.Version, canonical(s.Scope.Attributes), s.SchemaURL, m.Name, m.Unit, kind, mono, temp, canonical(attrs)})
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }

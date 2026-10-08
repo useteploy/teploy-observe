@@ -18,14 +18,20 @@ var ErrInvalidOTLP = errors.New("invalid otlp payload")
 // It reuses decodeProtoMetrics and Service.Ingest, so the cardinality refusal
 // (*ErrTooManyPoints) is returned as-is for the caller to classify.
 func IngestOTLPProto(ctx context.Context, svc metricIngester, siteID string, req *metricspb.ExportMetricsServiceRequest) error {
+	_, err := IngestOTLPProtoResult(ctx, svc, siteID, req)
+	return err
+}
+
+// IngestOTLPProtoResult returns permanent point rejections for OTLP partial success.
+func IngestOTLPProtoResult(ctx context.Context, svc metricIngester, siteID string, req *metricspb.ExportMetricsServiceRequest) (int, error) {
 	body, err := proto.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidOTLP, err)
+		return 0, fmt.Errorf("%w: %v", ErrInvalidOTLP, err)
 	}
 	decoded, err := decodeProtoMetrics(body)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidOTLP, err)
+		return 0, fmt.Errorf("%w: %v", ErrInvalidOTLP, err)
 	}
-	_, err = svc.Ingest(ctx, siteID, decoded)
-	return err
+	result, err := svc.Ingest(ctx, siteID, decoded)
+	return result.Rejected, err
 }

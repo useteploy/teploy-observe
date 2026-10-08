@@ -17,7 +17,7 @@ package metrics
 //
 //   HISTOGRAM QUANTILES — the official cumulative-histogram convention:
 //   linear interpolation INSIDE the crossing bucket between its lower
-//   boundary (previous explicit bound, 0 for the first bucket) and its
+//   boundary (previous explicit bound for finite interior buckets) and its
 //   upper boundary (the explicit bound), fraction (rank - below) / count;
 //   a rank landing exactly on a cumulative boundary returns that boundary;
 //   the +Inf bucket saturates to the last explicit bound. Cumulative
@@ -296,8 +296,8 @@ func TestO07_RateD3_DeltaAcrossBuckets(t *testing.T) {
 // Delta observation, bounds [10,50,100], per-bucket counts [5,5,5,5]
 // (total 20). A quantile is an ESTIMATE interpolated from bucketed data.
 //
-//	p25 rank 5  -> exactly the cumulative boundary after bucket 0 -> 10
-//	p10 rank 2  -> bucket 0 interior, frac 2/5 from lower bound 0 -> 4
+//	p25 rank 5  -> first bucket upper bound 10, labeled as such
+//	p10 rank 2  -> unbounded first bucket: only upper bound 10 is identifiable
 //	p50 rank 10 -> exactly the boundary after bucket 1 -> 50
 //	p70 rank 14 -> bucket 1... cum after b0=5, after b1=10 <14, bucket 2
 //	              (bounds 50..100), frac (14-10)/5 = 0.8 -> 50+50*0.8 = 90
@@ -313,10 +313,17 @@ func TestO07_QuantileQ1_OfficialInterpolation(t *testing.T) {
 	for _, tc := range []struct {
 		q    float64
 		want float64
-	}{{0.50, 50}, {0.25, 10}, {0.10, 4}, {0.70, 90}, {0.95, 100}} {
+	}{{0.50, 50}, {0.25, 10}, {0.10, 10}, {0.70, 90}, {0.95, 100}} {
 		pts := quantileGroupReduce(splitSeries(rows), tc.q, 60_000)
+		method := "histogram-quantile/linear-interpolation+nonnegative-bounds"
+		if tc.q <= 0.25 {
+			method += "+underflow-upper-bound"
+		}
+		if tc.q > 0.75 {
+			method += "+overflow-lower-bound"
+		}
 		assertRefPoints(t, pts, []refPoint{
-			{0, tc.want, boolPtr(true), "histogram-quantile/linear-interpolation"},
+			{0, tc.want, boolPtr(true), method},
 		})
 	}
 }
@@ -331,7 +338,7 @@ func TestO07_QuantileQ2_DeltaObservationsSum(t *testing.T) {
 	}
 	pts := quantileGroupReduce(splitSeries(rows), 0.95, 60_000)
 	assertRefPoints(t, pts, []refPoint{
-		{0, 50, boolPtr(true), "histogram-quantile/linear-interpolation"},
+		{0, 50, boolPtr(true), "histogram-quantile/linear-interpolation+nonnegative-bounds+overflow-lower-bound"},
 	})
 }
 
@@ -345,8 +352,8 @@ func TestO07_QuantileQ2_DeltaObservationsSum(t *testing.T) {
 // answers p50 = 10+40*(6-3)/4 = 40 — wrong; the reference is 50.
 func TestO07_QuantileQ3_CumulativeDifferenced(t *testing.T) {
 	rows := []pointRow{
-		histRow(0, []jsonInt{"1", "1", "1"}, []float64{10, 50, 100}, "cumulative", ""),
-		histRow(30, []jsonInt{"2", "3", "4"}, []float64{10, 50, 100}, "cumulative", ""),
+		histRow(0, []jsonInt{"1", "1", "1", "0"}, []float64{10, 50, 100}, "cumulative", ""),
+		histRow(30, []jsonInt{"2", "3", "4", "0"}, []float64{10, 50, 100}, "cumulative", ""),
 	}
 	for _, tc := range []struct {
 		q    float64
@@ -354,7 +361,7 @@ func TestO07_QuantileQ3_CumulativeDifferenced(t *testing.T) {
 	}{{0.50, 50}, {0.95, 95}} {
 		pts := quantileGroupReduce(splitSeries(rows), tc.q, 60_000)
 		assertRefPoints(t, pts, []refPoint{
-			{0, tc.want, boolPtr(true), "histogram-quantile/linear-interpolation"},
+			{0, tc.want, boolPtr(true), "histogram-quantile/linear-interpolation+nonnegative-bounds"},
 		})
 	}
 }
@@ -365,12 +372,12 @@ func TestO07_QuantileQ3_CumulativeDifferenced(t *testing.T) {
 // 10 + 40*0.5 = 30. Labeled estimate with the reset assumption named.
 func TestO07_QuantileQ4_CumulativeResetEpoch(t *testing.T) {
 	rows := []pointRow{
-		histRow(0, []jsonInt{"5", "5", "5"}, []float64{10, 50, 100}, "cumulative", ""),
-		histRow(30, []jsonInt{"1", "1", "1"}, []float64{10, 50, 100}, "cumulative", ""),
+		histRow(0, []jsonInt{"5", "5", "5", "0"}, []float64{10, 50, 100}, "cumulative", ""),
+		histRow(30, []jsonInt{"1", "1", "1", "0"}, []float64{10, 50, 100}, "cumulative", ""),
 	}
 	pts := quantileGroupReduce(splitSeries(rows), 0.50, 60_000)
 	assertRefPoints(t, pts, []refPoint{
-		{0, 30, boolPtr(true), "histogram-quantile/linear-interpolation+reset-assumed"},
+		{0, 30, boolPtr(true), "histogram-quantile/linear-interpolation+nonnegative-bounds+reset-assumed"},
 	})
 }
 
@@ -385,14 +392,14 @@ func TestO07_QuantileQ5_PerSeriesThenMerge(t *testing.T) {
 	attrsA := MarshalAttrs(map[string]string{"a": "1"})
 	attrsB := MarshalAttrs(map[string]string{"b": "2"})
 	rows := []pointRow{
-		histRow(0, []jsonInt{"2", "2", "2"}, []float64{10, 50, 100}, "cumulative", attrsA),
-		histRow(30, []jsonInt{"3", "2", "2"}, []float64{10, 50, 100}, "cumulative", attrsA),
-		histRow(0, []jsonInt{"1", "1", "1"}, []float64{10, 50, 100}, "cumulative", attrsB),
-		histRow(30, []jsonInt{"1", "2", "1"}, []float64{10, 50, 100}, "cumulative", attrsB),
+		histRow(0, []jsonInt{"2", "2", "2", "0"}, []float64{10, 50, 100}, "cumulative", attrsA),
+		histRow(30, []jsonInt{"3", "2", "2", "0"}, []float64{10, 50, 100}, "cumulative", attrsA),
+		histRow(0, []jsonInt{"1", "1", "1", "0"}, []float64{10, 50, 100}, "cumulative", attrsB),
+		histRow(30, []jsonInt{"1", "2", "1", "0"}, []float64{10, 50, 100}, "cumulative", attrsB),
 	}
 	pts := quantileGroupReduce(splitSeries(rows), 0.50, 60_000)
 	assertRefPoints(t, pts, []refPoint{
-		{0, 10, boolPtr(true), "histogram-quantile/linear-interpolation"},
+		{0, 10, boolPtr(true), "histogram-quantile/linear-interpolation+nonnegative-bounds+underflow-upper-bound"},
 	})
 }
 
@@ -420,9 +427,9 @@ func TestO07_DispatchSurfacesReferenceValues(t *testing.T) {
 	})
 	hrows := []pointRow{histRow(10, []jsonInt{"5", "5", "5", "5"}, []float64{10, 50, 100}, "delta", "")}
 	assertRefPoints(t, aggregateSeries(hrows, AggP95, 60_000), []refPoint{
-		{0, 100, boolPtr(true), "histogram-quantile/linear-interpolation"},
+		{0, 100, boolPtr(true), "histogram-quantile/linear-interpolation+nonnegative-bounds+overflow-lower-bound"},
 	})
 	assertRefPoints(t, aggregateSeries(hrows, AggP50, 60_000), []refPoint{
-		{0, 50, boolPtr(true), "histogram-quantile/linear-interpolation"},
+		{0, 50, boolPtr(true), "histogram-quantile/linear-interpolation+nonnegative-bounds"},
 	})
 }

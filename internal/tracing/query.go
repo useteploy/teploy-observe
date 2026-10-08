@@ -33,14 +33,7 @@ type servicesEntry struct {
 type QueryService struct {
 	db *nucleus.Client
 
-	// Keyed by site AND window bounds. Keying on the window *length* alone was
-	// wrong: from/to are arbitrary caller-supplied timestamps, so a 24h
-	// historical range primed the entry the rolling 24h live view then read,
-	// and the Traces page served last January's rollup for a whole TTL. The
-	// bounds are snapped to a TTL-wide bucket before they enter the key, so the
-	// live view — whose bounds move every request — still shares a key with the
-	// requests around it. Entries the lookup would reject are swept on write,
-	// so the map stays bounded by the windows queried within one TTL.
+	// Exact predicate keys; TTL expiry plus a fixed entry ceiling bound storage.
 	servicesMu    sync.Mutex
 	servicesCache map[string]servicesEntry
 
@@ -65,17 +58,13 @@ func NewQueryService(db *nucleus.Client) *QueryService {
 	return &QueryService{db: db, servicesCache: map[string]servicesEntry{}}
 }
 
-// servicesKey identifies a rollup by site and window bounds, each bound
-// truncated to a TTL-wide bucket. Truncation is what keeps the cache useful:
-// exact bounds would mint a fresh key on every rolling-window request and never
-// hit. A bucket is the TTL wide and no wider, so the bounds a hit is served for
-// are off by at most the staleness the TTL already permits, and two genuinely
-// different windows can never land on the same key.
+// servicesKey preserves the exact SQL millisecond predicate, including fixed
+// windows within a TTL bucket. TTL controls freshness, never predicate identity.
 func servicesKey(siteID string, from, to time.Time) string {
-	return fmt.Sprintf("%s|%d|%d", siteID,
-		from.Truncate(servicesCacheTTL).UnixMilli(),
-		to.Truncate(servicesCacheTTL).UnixMilli())
+	return fmt.Sprintf("%d:%s|%d|%d", len(siteID), siteID, from.UnixMilli(), to.UnixMilli())
 }
+
+const maxServicesCacheEntries = 256
 
 // cachedServices returns a fresh-enough rollup for the same site and window,
 // if one was computed within the TTL.
@@ -96,6 +85,20 @@ func (q *QueryService) storeServices(key string, result []ServiceSummary) {
 		if time.Since(e.at) > servicesCacheTTL {
 			delete(q.servicesCache, k)
 		}
+	}
+	if q.servicesCache == nil {
+		q.servicesCache = make(map[string]servicesEntry)
+	}
+	if _, ok := q.servicesCache[key]; !ok && len(q.servicesCache) >= maxServicesCacheEntries {
+		oldest := ""
+		var at time.Time
+		for k, e := range q.servicesCache {
+			if oldest == "" || e.at.Before(at) || (e.at.Equal(at) && k < oldest) {
+				oldest = k
+				at = e.at
+			}
+		}
+		delete(q.servicesCache, oldest)
 	}
 	q.servicesCache[key] = servicesEntry{at: time.Now(), result: result}
 }

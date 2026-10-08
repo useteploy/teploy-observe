@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/neutron-build/neutron/go/neutron"
 )
 
 // FunnelStep defines one step in a funnel (event type or pathname match).
@@ -86,7 +87,6 @@ type funnelWalker struct {
 	steps      []FunnelStep
 	exclusions []FunnelStep
 	windowMs   int64
-	counts     []int
 	stepIdx    int
 	done       bool
 	e0ts       int64
@@ -97,7 +97,7 @@ func newFunnelWalker(steps []FunnelStep, windowMs int64, exclusions []FunnelStep
 		steps:      steps,
 		exclusions: exclusions,
 		windowMs:   windowMs,
-		counts:     make([]int, len(steps)),
+		done:       len(steps) == 0,
 	}
 }
 
@@ -110,7 +110,6 @@ func (w *funnelWalker) push(e funnelEvent) {
 	}
 	if w.stepIdx == 0 {
 		if matchesStep(e, w.steps[0]) {
-			w.counts[0]++
 			w.stepIdx = 1
 			w.e0ts = e.Timestamp
 			if len(w.steps) == 1 {
@@ -119,7 +118,7 @@ func (w *funnelWalker) push(e funnelEvent) {
 		}
 		return
 	}
-	if w.windowMs > 0 && e.Timestamp > w.e0ts+w.windowMs {
+	if w.windowMs > 0 && e.Timestamp >= w.e0ts && uint64(e.Timestamp)-uint64(w.e0ts) > uint64(w.windowMs) {
 		w.done = true // out of window; every later event is further out
 		return
 	}
@@ -128,7 +127,6 @@ func (w *funnelWalker) push(e funnelEvent) {
 		return
 	}
 	if matchesStep(e, w.steps[w.stepIdx]) {
-		w.counts[w.stepIdx]++
 		w.stepIdx++
 		if w.stepIdx >= len(w.steps) {
 			w.done = true
@@ -165,7 +163,11 @@ func walkFunnelEvents(events []funnelEvent, steps []FunnelStep, windowMs int64, 
 	for _, e := range events {
 		w.push(e)
 	}
-	return w.counts
+	counts := make([]int, len(steps))
+	for i := 0; i < w.stepIdx; i++ {
+		counts[i] = 1
+	}
+	return counts
 }
 
 // matchesAnyStep reports whether the event matches any exclusion step.
@@ -189,10 +191,16 @@ func (s *StatsService) Funnel(ctx context.Context, siteID string, from, to time.
 //
 // O12: the read is a budgeted stream (guard.go) in the walk's pinned
 // (timestamp, event_id) order — one funnelWalker per entity, O(entities)
-// memory — under the declared window clamp, row budget and time budget,
+// memory — under the declared window ceiling, row budget and time budget,
 // with per-site/global concurrency admission. It replaces the unbounded
 // whole-range SELECT the funnel used to run.
 func (s *StatsService) FunnelWithOptions(ctx context.Context, siteID string, from, to time.Time, steps []FunnelStep, opts FunnelOptions) ([]FunnelResult, error) {
+	if opts.ConversionWindowMs < 0 {
+		return nil, neutron.ErrBadRequest("conversion_window_ms must be nonnegative")
+	}
+	if len(steps) > 32 || len(opts.Exclusions) > 32 {
+		return nil, neutron.ErrBadRequest("at most 32 funnel steps and exclusions are supported")
+	}
 	if len(steps) == 0 {
 		return nil, nil
 	}
@@ -201,7 +209,9 @@ func (s *StatsService) FunnelWithOptions(ctx context.Context, siteID string, fro
 		return nil, err
 	}
 
-	from = s.clampWindow(from, to)
+	if err := s.validateWindow(from, to); err != nil {
+		return nil, err
+	}
 	qctx, finish, err := s.beginQuery(ctx, siteID)
 	if err != nil {
 		return nil, err
@@ -239,8 +249,11 @@ func (s *StatsService) FunnelWithOptions(ctx context.Context, siteID string, fro
 
 	counts := make([]int, len(steps))
 	for _, w := range walkers {
-		for i, c := range w.counts {
-			counts[i] += c
+		if err := qctx.Err(); err != nil {
+			return nil, err
+		}
+		for i := 0; i < w.stepIdx; i++ {
+			counts[i]++
 		}
 	}
 
@@ -293,6 +306,12 @@ func (s *StatsService) FunnelByBreakdown(ctx context.Context, siteID string, fro
 // value of its EARLIEST event in the pinned total order — the old code
 // kept whichever row an unordered scan happened to deliver first.
 func (s *StatsService) FunnelByBreakdownWithOptions(ctx context.Context, siteID string, from, to time.Time, steps []FunnelStep, breakdownBy string, minSize int, opts FunnelOptions) ([]FunnelBreakdownResult, error) {
+	if opts.ConversionWindowMs < 0 {
+		return nil, neutron.ErrBadRequest("conversion_window_ms must be nonnegative")
+	}
+	if len(steps) > 32 || len(opts.Exclusions) > 32 {
+		return nil, neutron.ErrBadRequest("at most 32 funnel steps and exclusions are supported")
+	}
 	if len(steps) == 0 {
 		return nil, nil
 	}
@@ -310,7 +329,9 @@ func (s *StatsService) FunnelByBreakdownWithOptions(ctx context.Context, siteID 
 		return nil, fmt.Errorf("unsupported breakdown: %s", breakdownBy)
 	}
 
-	from = s.clampWindow(from, to)
+	if err := s.validateWindow(from, to); err != nil {
+		return nil, err
+	}
 	qctx, finish, err := s.beginQuery(ctx, siteID)
 	if err != nil {
 		return nil, err
@@ -357,13 +378,16 @@ func (s *StatsService) FunnelByBreakdownWithOptions(ctx context.Context, siteID 
 	// Sum step counts per breakdown.
 	perBreakdown := make(map[string][]int) // breakdown -> stepCounts[]
 	for k, w := range grouped {
+		if err := qctx.Err(); err != nil {
+			return nil, err
+		}
 		counts, ok := perBreakdown[k.Breakdown]
 		if !ok {
 			counts = make([]int, len(steps))
 			perBreakdown[k.Breakdown] = counts
 		}
-		for i, c := range w.counts {
-			counts[i] += c
+		for i := 0; i < w.stepIdx; i++ {
+			counts[i]++
 		}
 	}
 
@@ -392,7 +416,10 @@ func (s *StatsService) FunnelByBreakdownWithOptions(ctx context.Context, siteID 
 		if len(out[j].Results) == 0 {
 			return true
 		}
-		return out[i].Results[0].Visitors > out[j].Results[0].Visitors
+		if out[i].Results[0].Visitors != out[j].Results[0].Visitors {
+			return out[i].Results[0].Visitors > out[j].Results[0].Visitors
+		}
+		return out[i].Breakdown < out[j].Breakdown
 	})
 	return out, nil
 }

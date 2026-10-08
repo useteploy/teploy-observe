@@ -2,7 +2,9 @@ package metrics
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -99,7 +101,7 @@ func (s *Service) ListMetrics(ctx context.Context, siteID string) ([]MetricInfo,
 	rows, err := s.fetchMetricRows(qctx,
 		`SELECT metric_name, metric_kind FROM metric_points WHERE site_id = $1
 		 GROUP BY metric_name, metric_kind
-		 LIMIT `+strconv.FormatInt(s.qguard.MaxRows()+1, 10),
+		 LIMIT `+strconv.FormatInt(metricRowLimit(s.qguard.MaxRows()), 10),
 		siteID,
 	)
 	if err != nil {
@@ -124,12 +126,15 @@ func (s *Service) ListMetrics(ctx context.Context, siteID string) ([]MetricInfo,
 
 // pointRow is the scan target for raw point pulls before aggregation.
 type pointRow struct {
-	TsNs        int64   `db:"ts_ns"`
-	Value       float64 `db:"value"`
-	Histogram   string  `db:"histogram"`
-	Kind        string  `db:"metric_kind"`
-	Attributes  string  `db:"attributes"`
-	Temporality string  `db:"aggregation_temporality"`
+	StreamIdentity string  `db:"stream_identity"`
+	ServiceName    string  `db:"service_name"`
+	Monotonic      string  `db:"is_monotonic"`
+	TsNs           int64   `db:"ts_ns"`
+	Value          float64 `db:"value"`
+	Histogram      string  `db:"histogram"`
+	Kind           string  `db:"metric_kind"`
+	Attributes     string  `db:"attributes"`
+	Temporality    string  `db:"aggregation_temporality"`
 }
 
 // Aggregation names the supported reducers for Query.
@@ -165,7 +170,7 @@ func IsValidAggregation(agg string) bool {
 // without touching every call site.
 type QueryOptions struct {
 	Agg     string
-	StepMs  int64    // bucket size in milliseconds; 0 falls back to default 60s
+	StepMs  int64    // bucket size in whole milliseconds; 0 falls back to default 60s
 	GroupBy []string // label keys to fan series out by; empty = single collapsed series
 }
 
@@ -193,7 +198,7 @@ func ParseStep(raw string) (int64, error) {
 	// Allow generic Go-style durations as a courtesy (e.g. "10m"). Cap at
 	// 1d to keep the bucket count finite for sane query windows.
 	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 || d > 24*time.Hour {
+	if err != nil || d < time.Millisecond || d%time.Millisecond != 0 || d > 24*time.Hour {
 		return 0, fmt.Errorf("metrics: unsupported step %q", raw)
 	}
 	return d.Milliseconds(), nil
@@ -251,12 +256,24 @@ func (s *Service) QuerySeries(ctx context.Context, siteID, name string, labels m
 		return nil, fmt.Errorf("metrics: unsupported aggregation %q", agg)
 	}
 	stepMs := opts.StepMs
-	if stepMs <= 0 {
+	if stepMs == 0 {
 		stepMs = 60_000
 	}
 
-	fromNs := fromMs * 1_000_000
-	toNs := toMs * 1_000_000
+	if stepMs < 1 || stepMs > 86_400_000 {
+		return nil, fmt.Errorf("metrics: step must be between 1ms and 1d")
+	}
+	fromNs, toNs, err := ValidateTimeBounds(fromMs, toMs)
+	if err != nil {
+		return nil, err
+	}
+	maxWindow := s.maxWindow
+	if maxWindow <= 0 {
+		maxWindow = 186 * 24 * time.Hour
+	}
+	if time.UnixMilli(toMs).Sub(time.UnixMilli(fromMs)) > maxWindow {
+		return nil, fmt.Errorf("metrics: window exceeds supported maximum %s", maxWindow)
+	}
 
 	// O12: concurrency slot + time budget, and a hard row cap. Every raw
 	// point in range is loaded into Go memory before aggregation, so the
@@ -273,14 +290,15 @@ func (s *Service) QuerySeries(ctx context.Context, siteID, name string, labels m
 	// `ts_ns >= literal` returns zero rows even when the row is in range.
 	// The tracing package solved this the same way for `start_time`.
 	rows, err := s.fetchPointRows(qctx,
-		`SELECT ts_ns, value, histogram, metric_kind, attributes,
+		`SELECT ts_ns, value, histogram, metric_kind, attributes, service_name, is_monotonic,
+		        COALESCE(stream_identity, '') AS stream_identity,
 		        COALESCE(aggregation_temporality, 'cumulative') AS aggregation_temporality
 		 FROM metric_points
 		 WHERE site_id = $1 AND metric_name = $2
 		   AND ts_ns >= $3
 		   AND ts_ns < $4
 		 ORDER BY ts_ns ASC
-		 LIMIT `+strconv.FormatInt(s.qguard.MaxRows()+1, 10),
+		 LIMIT `+strconv.FormatInt(metricRowLimit(s.qguard.MaxRows()), 10),
 		siteID, name,
 		dbutil.IntParam(fromNs),
 		dbutil.IntParam(toNs),
@@ -303,6 +321,12 @@ func (s *Service) QuerySeries(ctx context.Context, siteID, name string, labels m
 	keys := []string{}
 
 	for _, r := range rows {
+		if err := qctx.Err(); err != nil {
+			return nil, s.qguard.DeadlineError(ctx, err)
+		}
+		if (agg == "p50" || agg == "p95" || agg == "p99") && r.Kind == "histogram" && !validHistogramShape(UnmarshalHistogram(r.Histogram)) {
+			return nil, fmt.Errorf("metrics: histogram distribution unsupported or malformed")
+		}
 		havem := UnmarshalAttrs(r.Attributes)
 		if !MatchLabels(havem, labels) {
 			continue
@@ -320,8 +344,16 @@ func (s *Service) QuerySeries(ctx context.Context, siteID, name string, labels m
 	sort.Strings(keys)
 	out := make([]Series, 0, len(keys))
 	for _, k := range keys {
+		if err := qctx.Err(); err != nil {
+			return nil, s.qguard.DeadlineError(ctx, err)
+		}
 		acc := groups[k]
 		pts := aggregateSeries(acc.points, Aggregation(agg), stepMs)
+		for i := range pts {
+			if strings.Contains(pts[i].Method, "+mixed-bounds") {
+				return nil, fmt.Errorf("metrics: incompatible histogram bounds cannot produce a complete distribution")
+			}
+		}
 		out = append(out, Series{Labels: acc.labels, Points: pts})
 	}
 
@@ -330,6 +362,9 @@ func (s *Service) QuerySeries(ctx context.Context, siteID, name string, labels m
 	// of crashing on undefined.
 	if len(out) == 0 && len(opts.GroupBy) == 0 {
 		out = append(out, Series{Labels: map[string]string{}, Points: []Point{}})
+	}
+	if err := qctx.Err(); err != nil {
+		return nil, s.qguard.DeadlineError(ctx, err)
 	}
 	return out, nil
 }
@@ -343,19 +378,14 @@ func groupKey(have map[string]string, groupBy []string) (string, map[string]stri
 	}
 	keys := append([]string(nil), groupBy...)
 	sort.Strings(keys)
-	var b strings.Builder
 	out := make(map[string]string, len(keys))
-	for i, k := range keys {
-		if i > 0 {
-			b.WriteByte('\x1f') // unit-separator: never appears in label values
+	for _, k := range keys {
+		if v, ok := have[k]; ok {
+			out[k] = v
 		}
-		v := have[k]
-		out[k] = v
-		b.WriteString(k)
-		b.WriteByte('=')
-		b.WriteString(v)
 	}
-	return b.String(), out
+	raw, _ := json.Marshal(out)
+	return string(raw), out
 }
 
 // aggregateSeries runs the chosen reducer over one output group's rows.
@@ -398,7 +428,12 @@ func splitSeries(rows []pointRow) [][]pointRow {
 	keys := []string{}
 	for _, r := range rows {
 		m := UnmarshalAttrs(r.Attributes)
-		k, _ := groupKey(m, sortedLabelKeys(m))
+		k := r.StreamIdentity
+		if k == "" {
+			labels, _ := groupKey(m, sortedLabelKeys(m))
+			raw, _ := json.Marshal([]string{r.ServiceName, r.Kind, r.Monotonic, r.Temporality, labels})
+			k = string(raw)
+		}
 		if _, ok := groups[k]; !ok {
 			keys = append(keys, k)
 		}
@@ -628,7 +663,7 @@ func quantileGroupReduce(series [][]pointRow, q float64, stepMs int64) []Point {
 				prev, havePrev = h, true
 				continue
 			}
-			if !boundsEqual(prev.Bounds, h.Bounds) || histTotal(h) < histTotal(prev) {
+			if len(prev.Counts) != len(h.Counts) || !boundsEqual(prev.Bounds, h.Bounds) || histTotal(h) < histTotal(prev) {
 				// Reset (or exporter bounds change): new epoch — the last
 				// snapshot alone is the window.
 				contribute(key, h.Bounds, intsToFloats(h.Counts), true)
@@ -656,12 +691,27 @@ func quantileGroupReduce(series [][]pointRow, q float64, stepMs int64) []Point {
 		for _, c := range b.counts {
 			total += c
 		}
+		if total <= 0 {
+			continue
+		} // No observations cannot identify a quantile.
 		method := refMethodHistQuantile
 		if b.reset {
 			method = refMethodHistQuantileReset
 		}
 		if b.mixedBounds {
 			method += "+mixed-bounds"
+		}
+		finite := 0.0
+		for i, c := range b.counts {
+			if i < len(b.bounds) {
+				finite += c
+			}
+		}
+		if len(b.bounds) > 0 && len(b.counts) > 0 && total > 0 && q*total <= b.counts[0] {
+			method += "+underflow-upper-bound"
+		}
+		if q*total > finite {
+			method += "+overflow-lower-bound"
 		}
 		est := true
 		out = append(out, Point{
@@ -679,8 +729,8 @@ const (
 	refMethodRatePerSeries      = "rate/per-series"
 	refMethodRatePerSeriesReset = "rate/per-series+reset-assumed"
 	refMethodRateDelta          = "rate/delta-window-sum"
-	refMethodHistQuantile       = "histogram-quantile/linear-interpolation"
-	refMethodHistQuantileReset  = "histogram-quantile/linear-interpolation+reset-assumed"
+	refMethodHistQuantile       = "histogram-quantile/linear-interpolation+nonnegative-bounds"
+	refMethodHistQuantileReset  = "histogram-quantile/linear-interpolation+nonnegative-bounds+reset-assumed"
 )
 
 func boundsEqual(a, b []float64) bool {
@@ -787,11 +837,16 @@ func histogramQuantile(bounds []float64, counts []float64, total float64, q floa
 				upper = bounds[i]
 			} else {
 				// +Inf overflow — there's no upper bound, so the best
-				// estimate is the previous bound (saturate).
+				// identifiable result is a lower bound, labeled on the point.
 				if len(bounds) > 0 {
 					return bounds[len(bounds)-1]
 				}
 				return lower
+			}
+			if i == 0 {
+				// No minimum was persisted. The first bucket is (-Inf, upper],
+				// so only its upper bound is identifiable, not a zero-based estimate.
+				return upper
 			}
 			if c <= 0 {
 				return upper
@@ -860,4 +915,22 @@ func ParseLabelFilters(query map[string][]string) map[string]string {
 		out[strings.TrimPrefix(k, "label.")] = vs[0]
 	}
 	return out
+}
+
+// ValidateTimeBounds preserves explicit epoch zero and refuses lossy ms→ns
+// conversion before any query. Both HTTP and direct callers use this contract.
+func ValidateTimeBounds(fromMs, toMs int64) (int64, int64, error) {
+	const maxMs = int64((1<<63 - 1) / 1_000_000)
+	const minMs = int64((-1 << 63) / 1_000_000)
+	if fromMs < minMs || fromMs > maxMs || toMs < minMs || toMs > maxMs || fromMs >= toMs {
+		return 0, 0, fmt.Errorf("metrics: require representable nanosecond bounds with from < to")
+	}
+	return fromMs * 1_000_000, toMs * 1_000_000, nil
+}
+
+func metricRowLimit(max int64) int64 {
+	if max == math.MaxInt64 {
+		return max
+	}
+	return max + 1
 }

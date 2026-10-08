@@ -138,7 +138,7 @@ func computeFunnel(rows []funnelSpan, ops []string) FunnelResult {
 			}
 			// First op matches the first occurrence; subsequent ops must
 			// occur strictly after the previous matched op.
-			if stepIdx > 0 && s.ts < lastTs {
+			if stepIdx > 0 && s.ts <= lastTs {
 				continue
 			}
 			stepHits[stepIdx]++

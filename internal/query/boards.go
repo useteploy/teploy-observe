@@ -30,16 +30,17 @@ import (
 // is 0 when the site has no events in the window (renders as "—" client
 // side).
 type SiteRow struct {
-	SiteID         string  `json:"site_id"`
-	SiteName       string  `json:"site_name"`
-	Domain         string  `json:"domain"`
-	Pageviews      int64   `json:"pageviews"`
-	Visitors       int64   `json:"visitors"`
-	Sessions       int64   `json:"sessions"`
-	Errors         int64   `json:"errors"`
-	UptimePct      float64 `json:"uptime_pct"`
-	ReplayCount    int64   `json:"replay_count"`
-	LastActivityMs int64   `json:"last_activity_ms"`
+	SiteID          string  `json:"site_id"`
+	SiteName        string  `json:"site_name"`
+	Domain          string  `json:"domain"`
+	Pageviews       int64   `json:"pageviews"`
+	Visitors        int64   `json:"visitors"`
+	Sessions        int64   `json:"sessions"`
+	Errors          int64   `json:"errors"`
+	UptimeAvailable bool    `json:"uptime_available"`
+	UptimePct       float64 `json:"uptime_pct"`
+	ReplayCount     int64   `json:"replay_count"`
+	LastActivityMs  int64   `json:"last_activity_ms"`
 }
 
 // SiteMeta is the minimum site-identity tuple BoardService needs.
@@ -106,6 +107,7 @@ func (s *BoardService) BoardSummary(ctx context.Context, siteIDs []string, fromM
 	}
 
 	rows := make([]SiteRow, len(dedup))
+	errs := make([]error, len(dedup))
 	sem := make(chan struct{}, fanoutLimit)
 	var wg sync.WaitGroup
 
@@ -116,10 +118,15 @@ func (s *BoardService) BoardSummary(ctx context.Context, siteIDs []string, fromM
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			rows[i] = s.summarizeSite(ctx, id, fromMs, toMs)
+			rows[i], errs[i] = s.summarizeSiteChecked(ctx, id, fromMs, toMs)
 		}()
 	}
 	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// Stable order: sites with traffic first (by pageviews desc), then
 	// alphabetical. Keeps the grid usable on boards with mixed activity.
@@ -136,7 +143,7 @@ func (s *BoardService) BoardSummary(ctx context.Context, siteIDs []string, fromM
 // summarizeSite issues the per-site SELECTs. Each query failure is
 // swallowed so one bad site doesn't poison the whole board — the row
 // just comes back with zeroed counts for the failing column.
-func (s *BoardService) summarizeSite(ctx context.Context, siteID string, fromMs, toMs int64) SiteRow {
+func (s *BoardService) summarizeSiteChecked(ctx context.Context, siteID string, fromMs, toMs int64) (SiteRow, error) {
 	row := SiteRow{SiteID: siteID}
 	if s.lookup != nil {
 		if meta, ok := s.lookup(ctx, siteID); ok {
@@ -174,7 +181,9 @@ func (s *BoardService) summarizeSite(ctx context.Context, siteID string, fromMs,
 		   AND timestamp < $3
 		   AND event_type = 'pageview'`,
 		siteID, from, to,
-	); err == nil && len(r) > 0 {
+	); err != nil {
+		return SiteRow{}, fmt.Errorf("board site %s: %w", siteID, err)
+	} else if len(r) > 0 {
 		row.Pageviews = r[0].Pageviews
 		row.Visitors = r[0].Visitors
 		row.Sessions = r[0].Sessions
@@ -194,7 +203,9 @@ func (s *BoardService) summarizeSite(ctx context.Context, siteID string, fromMs,
 		   AND timestamp >= $2
 		   AND timestamp < $3`,
 		siteID, from, to,
-	); err == nil && len(r) > 0 {
+	); err != nil {
+		return SiteRow{}, fmt.Errorf("board site %s: %w", siteID, err)
+	} else if len(r) > 0 {
 		row.Errors = r[0].Errors
 	}
 
@@ -211,7 +222,9 @@ func (s *BoardService) summarizeSite(ctx context.Context, siteID string, fromMs,
 		   AND start_time >= $2
 		   AND start_time < $3`,
 		siteID, from, to,
-	); err == nil && len(r) > 0 {
+	); err != nil {
+		return SiteRow{}, fmt.Errorf("board site %s: %w", siteID, err)
+	} else if len(r) > 0 {
 		row.ReplayCount = r[0].ReplayCount
 	}
 
@@ -232,7 +245,10 @@ func (s *BoardService) summarizeSite(ctx context.Context, siteID string, fromMs,
 		   AND timestamp >= $2
 		   AND timestamp < $3`,
 		siteID, from, to,
-	); err == nil && len(r) > 0 && r[0].Total > 0 {
+	); err != nil {
+		return SiteRow{}, fmt.Errorf("board uptime %s: %w", siteID, err)
+	} else if len(r) > 0 && r[0].Total > 0 {
+		row.UptimeAvailable = true
 		row.UptimePct = float64(r[0].Up) * 100.0 / float64(r[0].Total)
 	}
 
@@ -251,12 +267,14 @@ func (s *BoardService) summarizeSite(ctx context.Context, siteID string, fromMs,
 			   AND start_time >= $2
 			   AND start_time < $3`,
 			siteID, from, to,
-		); err == nil && len(r) > 0 {
+		); err != nil {
+			return SiteRow{}, fmt.Errorf("board site %s: %w", siteID, err)
+		} else if len(r) > 0 {
 			row.LastActivityMs = r[0].LastTS
 		}
 	}
 
-	return row
+	return row, nil
 }
 
 // ---------------------------------------------------------------------------

@@ -6,23 +6,24 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
-// Engine runs every registered detector across a span batch and persists the
-// resulting issues into performance_issues (a replacing_mergetree keyed on
-// fingerprint, see migration 015). The replacing merge REPLACES rows — it does
-// not sum — so re-detection totals are accumulated explicitly on write via an
-// atomic KV counter; the newest row (highest last_seen) wins the merge and
-// carries the running count + earliest first_seen. See Persist.
+// Engine projects detections into versioned performance issue snapshots.
+// One process serializes read/update/write; event times remain min/max and
+// a separate monotonic persistence version selects the current snapshot.
 type Engine struct {
 	db        *nucleus.Client
 	logger    *slog.Logger
 	detectors []Detector
+	mu        sync.Mutex
 }
 
 // New returns an Engine wired with the default four-detector suite. Callers
@@ -76,103 +77,56 @@ func (e *Engine) Persist(ctx context.Context, siteID string, spans []Span) {
 // WriteIssues persists pre-computed findings into performance_issues and
 // returns the first failure so the outbox worker can retry the intent.
 //
-// Idempotency (O01 section 5.7): the KV count accumulation is NOT naturally
-// idempotent — a naive re-derive double-counts. When intentID is non-empty
-// (the outbox path), each (intent, fingerprint) contribution is bracketed by
-// a KV completion marker: a marker hit skips that fingerprint entirely, so a
-// re-delivered intent writes nothing the second time. Residual window,
-// documented: a crash between a fingerprint's insert and its marker-set can
-// double-count that one fingerprint's severity counter on the retry (the
-// marker order is write-then-mark so the failure mode over-counts a
-// diagnostic metric rather than silently losing a detection). An empty
-// intentID keeps the legacy accumulate-on-every-call semantics.
+// Contributions count individual detections, aggregated once per fingerprint
+// within each intent. Completion markers make healthy retries idempotent.
+// A crash after SQL commit but before marker commit can still overcount on
+// retry; the documented write-then-mark residual is retained.
 func (e *Engine) WriteIssues(ctx context.Context, intentID, siteID string, issues []Issue) error {
 	if len(issues) == 0 {
 		return nil
 	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	sql := e.db.SQL()
 	kv := e.db.KV()
-	var firstErr error
-	for _, iss := range issues {
+	for _, iss := range aggregateIssues(issues) {
+		doneKey := "outbox:perf:" + intentID + ":" + iss.Fingerprint
 		if intentID != "" {
-			doneKey := "outbox:perf:" + intentID + ":" + iss.Fingerprint
-			if b, err := kv.Get(ctx, doneKey); err == nil && b != nil && string(b) == "1" {
+			b, err := kv.Get(ctx, doneKey)
+			if err != nil {
+				return fmt.Errorf("perf marker read: %w", err)
+			}
+			if string(b) == "1" {
 				continue
 			}
 		}
-		// performance_issues is a replacing_mergetree keyed on
-		// (tenant_id, site_id, fingerprint) with version_column=last_seen, and
-		// Nucleus DOES apply replacing dedup on read — so every re-detection
-		// of a fingerprint collapses at read time to the single highest-
-		// last_seen row. Writing count=1 per detection therefore undercounts
-		// permanently (the surviving row always reads count=1) and pins
-		// first_seen to the LATEST detection instead of the earliest.
-		//
-		// Accumulate on write instead. The running count lives in an atomic KV
-		// counter (kv.Incr) so concurrent detector batches for the same
-		// fingerprint can't lose an increment — a plain SELECT-then-INSERT
-		// read-modify-write on the DB would race here. The new row's last_seen
-		// is the newest, so it wins the replacing merge carrying the
-		// accumulated count + earliest first_seen.
-		countKey := "perf:count:" + siteID + ":" + iss.Fingerprint
-		count, err := kv.Incr(ctx, countKey)
+		previous, err := nucleus.Query[issueSnapshot](ctx, sql,
+			`SELECT count, first_seen, last_seen, version, severity, trace_id, title, description FROM performance_issues WHERE site_id = $1 AND fingerprint = $2 ORDER BY version DESC LIMIT 1`, siteID, iss.Fingerprint)
 		if err != nil {
-			e.logger.Warn("perf_issue: count incr failed",
-				"detector", iss.DetectorName, "fingerprint", iss.Fingerprint, "err", err)
-			count = 1 // best-effort: still record the detection
+			return fmt.Errorf("perf snapshot read: %w", err)
 		}
-
-		// first_seen must be the MINIMUM observed time, not the first writer's:
-		// detection batches can arrive out of order. Read-modify-write min via
-		// KV. The count above is the number that must be exact (it drives
-		// severity/sorting), so it gets the atomic counter; a rare race here
-		// only mis-pins first_seen by the gap between two near-simultaneous
-		// first detections, which is immaterial for a "first seen" display.
-		firstSeen := iss.FirstSeen
-		firstKey := "perf:first:" + siteID + ":" + iss.Fingerprint
-		if b, err := kv.Get(ctx, firstKey); err == nil && b != nil {
-			if stored, perr := strconv.ParseInt(string(b), 10, 64); perr == nil && stored < firstSeen {
-				firstSeen = stored
-			}
+		if len(previous) > 0 && previous[0].LastSeen > iss.LastSeen {
+			iss.TraceID, iss.Title, iss.Description = previous[0].TraceID, previous[0].Title, previous[0].Description
 		}
-		if err := kv.Set(ctx, firstKey, []byte(strconv.FormatInt(firstSeen, 10))); err != nil {
-			e.logger.Warn("perf_issue: first_seen set failed",
-				"fingerprint", iss.Fingerprint, "err", err)
-		}
-
-		issueID := genID()
+		count, firstSeen, lastSeen, version, severity := nextSnapshot(iss, previous, time.Now().UnixNano())
 		_, err = sql.Exec(ctx,
 			`INSERT INTO performance_issues (
 				issue_id, tenant_id, site_id, trace_id,
 				detector_name, fingerprint, title, description,
-				severity, count, first_seen, last_seen
-			) VALUES ($1,'default',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-			issueID, siteID, iss.TraceID,
-			iss.DetectorName, iss.Fingerprint, iss.Title, iss.Description,
-			iss.Severity,
-			strconv.FormatInt(count, 10),
-			dbutil.IntParam(firstSeen),
-			dbutil.IntParam(iss.LastSeen),
-		)
+				severity, count, first_seen, last_seen, version
+			) VALUES ($1,'default',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+			genID(), siteID, iss.TraceID, iss.DetectorName, iss.Fingerprint, iss.Title, iss.Description,
+			severity, strconv.FormatInt(count, 10), dbutil.IntParam(firstSeen), dbutil.IntParam(lastSeen), dbutil.IntParam(version))
 		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			e.logger.Warn("perf_issue: insert failed",
-				"detector", iss.DetectorName, "fingerprint", iss.Fingerprint, "err", err)
-			continue
+			return fmt.Errorf("perf snapshot write: %w", err)
 		}
 		if intentID != "" {
-			// Mark only after the contribution landed (see the comment on
-			// WriteIssues for the ordering rationale).
-			doneKey := "outbox:perf:" + intentID + ":" + iss.Fingerprint
 			if err := kv.Set(ctx, doneKey, []byte("1")); err != nil {
-				e.logger.Warn("perf_issue: completion marker set failed",
-					"intent", intentID, "fingerprint", iss.Fingerprint, "err", err)
+				return fmt.Errorf("perf marker write: %w", err)
 			}
 		}
 	}
-	return firstErr
+	return nil
 }
 
 // genID is a small wrapper around crypto/rand for opaque issue IDs. Hex-
@@ -190,3 +144,85 @@ func genID() string {
 // Compile-time check that Engine satisfies the runtime "log on bad sql" path
 // without a Persist call (helps callers stub the engine in tests).
 var _ = fmt.Sprintf
+
+type issueSnapshot struct {
+	TraceID     string `db:"trace_id"`
+	Title       string `db:"title"`
+	Description string `db:"description"`
+	Count       int64  `db:"count"`
+	FirstSeen   int64  `db:"first_seen"`
+	LastSeen    int64  `db:"last_seen"`
+	Version     int64  `db:"version"`
+	Severity    string `db:"severity"`
+}
+
+func severityRank(s string) int {
+	switch s {
+	case "fatal":
+		return 3
+	case "error":
+		return 2
+	case "warning":
+		return 1
+	}
+	return 0
+}
+func aggregateIssues(issues []Issue) []Issue {
+	groups := map[string]Issue{}
+	for _, iss := range issues {
+		if iss.Occurrences <= 0 {
+			iss.Occurrences = 1
+		}
+		prev, ok := groups[iss.Fingerprint]
+		if !ok {
+			groups[iss.Fingerprint] = iss
+			continue
+		}
+		count := prev.Occurrences + iss.Occurrences
+		first, last := prev.FirstSeen, prev.LastSeen
+		if iss.FirstSeen < first {
+			first = iss.FirstSeen
+		}
+		if iss.LastSeen > last {
+			last = iss.LastSeen
+		}
+		sev := prev.Severity
+		if severityRank(iss.Severity) > severityRank(sev) {
+			sev = iss.Severity
+		}
+		if iss.LastSeen > prev.LastSeen || (iss.LastSeen == prev.LastSeen && iss.TraceID < prev.TraceID) {
+			prev = iss
+		}
+		prev.Occurrences, prev.FirstSeen, prev.LastSeen, prev.Severity = count, first, last, sev
+		groups[iss.Fingerprint] = prev
+	}
+	keys := make([]string, 0, len(groups))
+	for k := range groups {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]Issue, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, groups[k])
+	}
+	return out
+}
+func nextSnapshot(iss Issue, previous []issueSnapshot, now int64) (count, first, last, version int64, severity string) {
+	count, first, last, version, severity = iss.Occurrences, iss.FirstSeen, iss.LastSeen, now, iss.Severity
+	for _, p := range previous {
+		count += p.Count
+		if p.FirstSeen < first {
+			first = p.FirstSeen
+		}
+		if p.LastSeen > last {
+			last = p.LastSeen
+		}
+		if p.Version >= version {
+			version = p.Version + 1
+		}
+		if severityRank(p.Severity) > severityRank(severity) {
+			severity = p.Severity
+		}
+	}
+	return
+}

@@ -2,6 +2,7 @@ package detectors
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 
@@ -65,4 +66,59 @@ func TestPersistAccumulates(t *testing.T) {
 	if rows[0].FirstSeen != "3000" {
 		t.Fatalf("expected first_seen=3000 (earliest), got %s", rows[0].FirstSeen)
 	}
+}
+
+// OBS26-105/106: real persistence after every descending/equal timestamp and
+// healthy re-delivery of a multi-occurrence intent, plus concurrent arrivals.
+func TestOBS105106IntentAndLateSnapshots(t *testing.T) {
+	dsn := os.Getenv("OBSERVE_NUCLEUS_URL")
+	if dsn == "" {
+		t.Skip("no OBSERVE_NUCLEUS_URL")
+	}
+	ctx := context.Background()
+	db, err := nucleus.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	eng := New(db)
+	site, fp := "obs105-"+genID(), genID()
+	latest := Issue{Fingerprint: fp, TraceID: "new", DetectorName: "slow_db_query", FirstSeen: 5000, LastSeen: 5100, Severity: "warning"}
+	late := Issue{Fingerprint: fp, TraceID: "old", DetectorName: "slow_db_query", FirstSeen: 3000, LastSeen: 3100, Severity: "error"}
+	assert := func(count, first, last int64) {
+		t.Helper()
+		rows, err := nucleus.Query[issueSnapshot](ctx, db.SQL(), `SELECT count,first_seen,last_seen,version,severity FROM performance_issues WHERE site_id=$1 AND fingerprint=$2`, site, fp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || rows[0].Count != count || rows[0].FirstSeen != first || rows[0].LastSeen != last {
+			t.Fatalf("current snapshot missing: %+v", rows)
+		}
+	}
+	if err := eng.WriteIssues(ctx, "intent-new-"+site, site, []Issue{latest}); err != nil {
+		t.Fatal(err)
+	}
+	assert(1, 5000, 5100)
+	if err := eng.WriteIssues(ctx, "intent-late-"+site, site, []Issue{late}); err != nil {
+		t.Fatal(err)
+	}
+	assert(2, 3000, 5100)
+	if err := eng.WriteIssues(ctx, "intent-batch-"+site, site, []Issue{late, latest}); err != nil {
+		t.Fatal(err)
+	}
+	assert(4, 3000, 5100)
+	if err := eng.WriteIssues(ctx, "intent-batch-"+site, site, []Issue{latest, late}); err != nil {
+		t.Fatal(err)
+	}
+	assert(4, 3000, 5100)
+	errs := make(chan error, 4)
+	for i := 0; i < 4; i++ {
+		go func(i int) { errs <- eng.WriteIssues(ctx, fmt.Sprintf("intent-%d-%s", i, site), site, []Issue{late}) }(i)
+	}
+	for i := 0; i < 4; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	assert(8, 3000, 5100)
 }

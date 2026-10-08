@@ -26,6 +26,7 @@ type StatsService struct {
 	// retention decides which table can answer a unique count for a given
 	// range, and whether it covers all of it. See coverage.go.
 	retention RetentionWindows
+	clock     func() time.Time
 	// earliest memoises the per-site earliest-data instant the coverage note
 	// is decided against, so the dashboard's load-time call is not a scan.
 	earliest earliestCache
@@ -33,8 +34,12 @@ type StatsService struct {
 	// concurrency limiter (nil = concurrency admission disabled, e.g. in
 	// tests); budgets are always in force on the heavy read paths. See
 	// guard.go.
-	guard   *queryguard.Limiter
-	budgets queryguard.Budgets
+	guard              *queryguard.Limiter
+	budgets            queryguard.Budgets
+	goalCountRead      func(context.Context, string, ...any) ([]goalCountResult, error)
+	goalListRead       func(context.Context, string) ([]Goal, error)
+	propertyKeyRead    func(context.Context, string, ...any) ([]propertyKeyEvent, error)
+	postReadCheckpoint func(string)
 }
 
 func NewStatsService(db *nucleus.Client) *StatsService {
@@ -175,42 +180,54 @@ type TimeSeriesPoint struct {
 func (s *StatsService) PageviewTimeSeries(ctx context.Context, siteID string, from, to time.Time, interval string, filters *FilterBuilder) ([]TimeSeriesPoint, error) {
 	fromMs := from.UnixMilli()
 	toMs := to.UnixMilli()
-	table := tableForFilters(from, to, filters)
+	table := s.tableForFilters(from, to, filters)
 	ts := tsColumn(table)
 	fSQL, _ := filterSQL(filters)
 	allParams := baseParams(siteID, fromMs, toMs, filters)
 
+	bucketMs := int64(3600000) // default: hour
+	switch interval {
+	case "day":
+		bucketMs = 86400000
+	case "week":
+		bucketMs = 604800000
+	case "month":
+		bucketMs = 86400000 * 30
+	}
+	if table == "stats_daily" && bucketMs < 86400000 {
+		return nil, fmt.Errorf("hour interval is unavailable for daily retained data")
+	}
+	eventPredicate := " AND event_type = 'pageview'"
+	if filters != nil {
+		for _, e := range filters.entries {
+			if e.column == "event_type" {
+				eventPredicate = ""
+			}
+		}
+	}
 	var q string
 	if table == "events" {
-		bucketMs := int64(3600000) // default: hour
-		switch interval {
-		case "day":
-			bucketMs = 86400000
-		case "week":
-			bucketMs = 604800000
-		case "month":
-			bucketMs = 86400000 * 30
-		}
 		q = fmt.Sprintf(`SELECT (CAST(timestamp AS BIGINT) / %d) * %d AS bucket,
 		        COUNT(*) AS pageviews,
 		        COUNT(DISTINCT session_id) AS visitors
 		 FROM events
 		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-		   AND event_type = 'pageview'%s
+		   %s%s
 		 GROUP BY (CAST(timestamp AS BIGINT) / %d) * %d
-		 ORDER BY (CAST(timestamp AS BIGINT) / %d) * %d`, bucketMs, bucketMs, fSQL, bucketMs, bucketMs, bucketMs, bucketMs)
+		 ORDER BY bucket`, bucketMs, bucketMs, eventPredicate, fSQL, bucketMs, bucketMs)
 	} else {
 		// pageviews are additive across rollup rows, so they come from the
 		// rollup — collapsed to the latest version per bucket key first.
 		// visitors are not additive (see uniqueVisitors) and are filled in
 		// from raw events below.
-		where := fmt.Sprintf(`site_id = $1 AND %s >= $2 AND %s < $3 AND event_type = 'pageview'%s`, ts, ts, fSQL)
+		where := fmt.Sprintf(`site_id = $1 AND %s >= $2 AND %s < $3 %s%s`, ts, ts, eventPredicate, fSQL)
+		bucketExpr := fmt.Sprintf("(CAST(%s AS BIGINT) / %d) * %d", ts, bucketMs, bucketMs)
 		q = fmt.Sprintf(`SELECT %s AS bucket,
 		        SUM(pageviews) AS pageviews,
 		        0 AS visitors
 		 FROM %s AS r
 		 GROUP BY %s
-		 ORDER BY %s`, ts, LatestRows(table, []string{"pageviews"}, where), ts, ts)
+		 ORDER BY %s`, bucketExpr, LatestRows(table, []string{"pageviews"}, where), bucketExpr, "bucket")
 	}
 
 	rows, err := nucleus.Query[TimeSeriesPoint](ctx, s.db.SQL(), q, allParams...)
@@ -219,10 +236,6 @@ func (s *StatsService) PageviewTimeSeries(ctx context.Context, siteID string, fr
 	}
 
 	if table != "events" {
-		bucketMs := int64(3600000)
-		if table == "stats_daily" {
-			bucketMs = 86400000
-		}
 		visitors, err := s.uniqueVisitorsByBucket(ctx, siteID, fromMs, toMs, bucketMs, filters,
 			s.sourceFor(from, filters))
 		if err != nil {
@@ -277,13 +290,21 @@ func (s *StatsService) uniqueVisitorsByBucket(ctx context.Context, siteID string
 			bucketMs, bucketMs)
 	} else {
 		fSQL, _ := filterSQL(filters)
+		eventPredicate := " AND event_type = 'pageview'"
+		if filters != nil {
+			for _, e := range filters.entries {
+				if e.column == "event_type" {
+					eventPredicate = ""
+				}
+			}
+		}
 		params = baseParams(siteID, fromMs, toMs, filters)
 		q = fmt.Sprintf(`SELECT (CAST(timestamp AS BIGINT) / %d) * %d AS bucket,
 		        COUNT(DISTINCT session_id) AS visitors
 		 FROM events
 		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-		   AND event_type = 'pageview'%s
-		 GROUP BY (CAST(timestamp AS BIGINT) / %d) * %d`, bucketMs, bucketMs, fSQL, bucketMs, bucketMs)
+		   %s%s
+		 GROUP BY (CAST(timestamp AS BIGINT) / %d) * %d`, bucketMs, bucketMs, eventPredicate, fSQL, bucketMs, bucketMs)
 	}
 
 	type bucketRow struct {
@@ -328,9 +349,11 @@ func (s *StatsService) uniqueVisitorsByPathname(ctx context.Context, siteID stri
 
 // TopPage represents a page with its view count.
 type TopPage struct {
-	Pathname  string `json:"pathname" db:"pathname"`
-	Pageviews int64  `json:"pageviews" db:"pageviews"`
-	Visitors  int64  `json:"visitors" db:"visitors"`
+	VisitorsExact bool   `json:"visitors_exact"`
+	VisitorsNote  string `json:"visitors_note,omitempty"`
+	Pathname      string `json:"pathname" db:"pathname"`
+	Pageviews     int64  `json:"pageviews" db:"pageviews"`
+	Visitors      int64  `json:"visitors" db:"visitors"`
 }
 
 func (s *StatsService) TopPages(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]TopPage, error) {
@@ -339,7 +362,7 @@ func (s *StatsService) TopPages(ctx context.Context, siteID string, from, to tim
 	if limit <= 0 {
 		limit = 10
 	}
-	table := tableForFilters(from, to, filters)
+	table := s.tableForFilters(from, to, filters)
 	ts := tsColumn(table)
 	fSQL, _ := filterSQL(filters)
 	allParams := baseParams(siteID, fromMs, toMs, filters)
@@ -378,6 +401,13 @@ func (s *StatsService) TopPages(ctx context.Context, siteID string, from, to tim
 		}
 		for i := range rows {
 			rows[i].Visitors = visitors[rows[i].Pathname]
+		}
+	}
+	rawCut, bounded := cutoff(s.retention.RawDays, s.now())
+	for i := range rows {
+		rows[i].VisitorsExact = !bounded || !from.Before(rawCut)
+		if !rows[i].VisitorsExact {
+			rows[i].VisitorsNote = "Per-page visitors cover retained raw events only; historical page membership is unavailable."
 		}
 	}
 	return rows, nil
@@ -536,6 +566,15 @@ func rankChannels(counts map[string]int64, limit int) []ChannelStat {
 }
 
 func (s *StatsService) TopChannels(ctx context.Context, siteID string, from, to time.Time, limit int, filters *FilterBuilder) ([]ChannelStat, error) {
+	if err := s.validateWindow(from, to); err != nil {
+		return nil, err
+	}
+	qctx, finish, err := s.beginQuery(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+
 	fromMs := from.UnixMilli()
 	toMs := to.UnixMilli()
 	var q string
@@ -565,16 +604,26 @@ func (s *StatsService) TopChannels(ctx context.Context, siteID string, from, to 
 			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3%s`, fSQL)
 	}
 
-	rows, err := nucleus.Query[channelRow](ctx, s.db.SQL(), q, allParams...)
+	rows, err := boundedRangeQuery[channelRow](qctx, s, q, allParams...)
 	if err != nil {
 		return nil, fmt.Errorf("channels: %w", err)
 	}
 
 	// Classify each session and aggregate
 	counts := make(map[string]int64)
+	seen := make(map[string]map[string]bool)
 	for _, r := range rows {
+		if err := qctx.Err(); err != nil {
+			return nil, err
+		}
 		ch := ClassifyChannel(r.Referrer, r.UTMSource, r.UTMMedium)
-		counts[ch]++
+		if seen[ch] == nil {
+			seen[ch] = map[string]bool{}
+		}
+		if !seen[ch][r.SessionID] {
+			counts[ch]++
+			seen[ch][r.SessionID] = true
+		}
 	}
 
 	return rankChannels(counts, limit), nil
@@ -605,7 +654,7 @@ type sessionStats struct {
 func (s *StatsService) Overview(ctx context.Context, siteID string, from, to time.Time, filters *FilterBuilder) (OverviewStats, error) {
 	fromMs := from.UnixMilli()
 	toMs := to.UnixMilli()
-	table := tableForFilters(from, to, filters)
+	table := s.tableForFilters(from, to, filters)
 	ts := tsColumn(table)
 	fSQL, _ := filterSQL(filters)
 	allParams := baseParams(siteID, fromMs, toMs, filters)
@@ -683,9 +732,7 @@ func (s *StatsService) Overview(ctx context.Context, siteID string, from, to tim
 	// event_type), so apply only the compatible filters — otherwise a cohort or
 	// pathname filter referenced a missing column and the query errored, which
 	// was then silently swallowed and bounce/duration showed as 0.
-	sessFilters := filters.Subset(sessionsFilterColumns)
-	sessSQL, _ := filterSQL(sessFilters)
-	sessParams := baseParams(siteID, fromMs, toMs, sessFilters)
+	sessSQL, sessParams := sessionEventFilter(siteID, fromMs, toMs, filters)
 	sessQ := fmt.Sprintf(`SELECT
 		        SUM(CASE WHEN is_bounce = 'true' THEN 1 ELSE 0 END) AS bounces,
 		        COUNT(*) AS total_sessions,
@@ -698,7 +745,7 @@ func (s *StatsService) Overview(ctx context.Context, siteID string, from, to tim
 	if err != nil {
 		// Non-fatal, but log it rather than silently returning zero bounce/duration.
 		slog.Warn("overview: sessions sub-query failed", "site", siteID, "err", err)
-		return result, nil
+		return OverviewStats{}, fmt.Errorf("overview sessions: %w", err)
 	}
 	if len(sessRows) > 0 && sessRows[0].TotalSessions > 0 {
 		result.BounceRate = float64(sessRows[0].Bounces) / float64(sessRows[0].TotalSessions) * 100
@@ -726,7 +773,10 @@ func (s *StatsService) OverviewWithComparison(ctx context.Context, siteID string
 		prevTo = from
 	}
 
-	previous, _ := s.Overview(ctx, siteID, prevFrom, prevTo, filters)
+	previous, err := s.Overview(ctx, siteID, prevFrom, prevTo, filters)
+	if err != nil {
+		return OverviewWithCompare{}, err
+	}
 	return OverviewWithCompare{
 		Current:  current,
 		Previous: &previous,
@@ -822,8 +872,7 @@ func (s *StatsService) TopEntryPages(ctx context.Context, siteID string, from, t
 	if limit <= 0 {
 		limit = 10
 	}
-	fSQL, _ := filterSQL(filters)
-	allParams := baseParams(siteID, fromMs, toMs, filters)
+	fSQL, allParams := sessionEventFilter(siteID, fromMs, toMs, filters)
 
 	q := fmt.Sprintf(`SELECT entry_url AS pathname,
 	        COUNT(*) AS visitors
@@ -852,8 +901,7 @@ func (s *StatsService) TopExitPages(ctx context.Context, siteID string, from, to
 	if limit <= 0 {
 		limit = 10
 	}
-	fSQL, _ := filterSQL(filters)
-	allParams := baseParams(siteID, fromMs, toMs, filters)
+	fSQL, allParams := sessionEventFilter(siteID, fromMs, toMs, filters)
 
 	q := fmt.Sprintf(`SELECT exit_url AS pathname,
 	        COUNT(*) AS visitors
@@ -914,6 +962,20 @@ type PropertyStat struct {
 // EventProperties returns property key→value breakdowns for a specific event type.
 // Aggregated in Go because Nucleus doesn't support jsonb_each or similar.
 func (s *StatsService) EventProperties(ctx context.Context, siteID string, from, to time.Time, eventType string, limit int) ([]PropertyStat, error) {
+	if err := s.validateWindow(from, to); err != nil {
+		return nil, err
+	}
+	qctx, finish, err := s.beginQuery(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	ctx = qctx
+	capRows := int64(5000)
+	if scanLimit(s.budgets.MaxScanRows) < capRows {
+		capRows = scanLimit(s.budgets.MaxScanRows)
+	}
+
 	fromMs := from.UnixMilli()
 	toMs := to.UnixMilli()
 	if limit <= 0 {
@@ -928,23 +990,29 @@ func (s *StatsService) EventProperties(ctx context.Context, siteID string, from,
 		// ORDER BY timestamp DESC makes the 5000-row cap deterministic (the most
 		// recent events) rather than an arbitrary slice, so breakdowns are stable
 		// across calls.
-		`SELECT COALESCE(properties, '') AS properties, session_id
+		`SELECT event_id, timestamp, COALESCE(properties, '') AS properties, session_id
 		 FROM events
 		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
 		   AND event_type = $4 AND properties != ''
-		 ORDER BY timestamp DESC
-		 LIMIT 5000`,
+		 ORDER BY timestamp DESC, event_id ASC
+		 LIMIT `+itoa(capRows),
 		siteID, fromMs, toMs, eventType,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("event properties: %w", err)
 	}
 
+	if err := s.accountScan(ctx, int64(len(rows))); err != nil {
+		return nil, err
+	}
 	type key struct{ k, v string }
 	counts := make(map[key]int64)
 	visitors := make(map[key]map[string]bool)
 
 	for _, r := range rows {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if r.Properties == "" || r.Properties == "{}" {
 			continue
 		}
@@ -952,7 +1020,13 @@ func (s *StatsService) EventProperties(ctx context.Context, siteID string, from,
 		if err := json.Unmarshal([]byte(r.Properties), &props); err != nil {
 			continue
 		}
+		if len(props) > 50 {
+			return nil, fmt.Errorf("event properties exceed supported per-event work bound")
+		}
 		for k, v := range props {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			vStr := fmt.Sprintf("%v", v)
 			kv := key{k, vStr}
 			counts[kv]++
@@ -965,18 +1039,30 @@ func (s *StatsService) EventProperties(ctx context.Context, siteID string, from,
 
 	result := make([]PropertyStat, 0, len(counts))
 	for kv, c := range counts {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		result = append(result, PropertyStat{
 			Key: kv.k, Value: kv.v, Count: c, Visitors: int64(len(visitors[kv])),
 		})
 	}
 
-	// Sort by count desc, truncate
-	for i := 0; i < len(result); i++ {
-		for j := i + 1; j < len(result); j++ {
-			if result[j].Count > result[i].Count {
-				result[i], result[j] = result[j], result[i]
-			}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := sortWithContext(ctx, result, func(a, b PropertyStat) bool {
+		if a.Count != b.Count {
+			return a.Count > b.Count
 		}
+		if a.Key != b.Key {
+			return a.Key < b.Key
+		}
+		return a.Value < b.Value
+	}); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if len(result) > limit {
 		result = result[:limit]
@@ -1018,7 +1104,7 @@ func (s *StatsService) Sessions(ctx context.Context, siteID string, from, to tim
 	        entry_url, exit_url,
 	        browser, os, country, device, is_bounce
 	 FROM %s AS s
-	 ORDER BY first_ts DESC
+	 ORDER BY first_ts DESC, session_id ASC
 	 LIMIT %d`, LatestRows("sessions",
 		[]string{"first_ts", "last_ts", "pageviews", "entry_url", "exit_url",
 			"browser", "os", "country", "device", "is_bounce"},
@@ -1045,11 +1131,16 @@ type SessionEvent struct {
 }
 
 func (s *StatsService) SessionDetail(ctx context.Context, sessionID, siteID string) ([]SessionEvent, error) {
-	rows, err := nucleus.Query[SessionEvent](ctx, s.db.SQL(),
+	qctx, finish, err := s.beginQuery(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	rows, err := boundedRangeQuery[SessionEvent](qctx, s,
 		`SELECT event_id, event_type, url, pathname, title, timestamp
 		 FROM events
 		 WHERE session_id = $1 AND site_id = $2
-		 ORDER BY timestamp ASC`,
+		 ORDER BY timestamp ASC, event_id ASC`,
 		sessionID, siteID,
 	)
 	if err != nil {
@@ -1072,45 +1163,34 @@ type PropertyKeyStat struct {
 }
 
 func (s *StatsService) EventPropertyKeys(ctx context.Context, siteID, eventName string, from, to time.Time) ([]PropertyKeyStat, error) {
+	qctx, finish, err := s.beginQuery(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	if err := s.validateWindow(from, to); err != nil {
+		return nil, err
+	}
 	fromMs := from.UnixMilli()
 	toMs := to.UnixMilli()
 
-	type eventRow struct {
-		Properties string `db:"properties"`
+	q := `SELECT properties FROM events
+ WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+ AND event_type = $4 AND properties IS NOT NULL`
+	var rows []propertyKeyEvent
+	if s.propertyKeyRead != nil {
+		rows, err = s.propertyKeyRead(qctx, q, siteID, fromMs, toMs, eventName)
+		if err == nil {
+			err = s.accountScan(qctx, int64(len(rows)))
+		}
+	} else {
+		rows, err = boundedRangeQuery[propertyKeyEvent](qctx, s, q, siteID, fromMs, toMs, eventName)
 	}
-
-	rows, err := nucleus.Query[eventRow](ctx, s.db.SQL(),
-		`SELECT properties FROM events
-		 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-		   AND event_type = $4 AND properties IS NOT NULL`,
-		siteID, fromMs, toMs, eventName,
-	)
 	if err != nil {
 		return nil, fmt.Errorf("event property keys: %w", err)
 	}
 
-	keyCounts := make(map[string]int64)
-	for _, r := range rows {
-		if r.Properties == "" {
-			continue
-		}
-		var props map[string]any
-		if err := json.Unmarshal([]byte(r.Properties), &props); err != nil {
-			continue
-		}
-		for k := range props {
-			keyCounts[k]++
-		}
-	}
-
-	result := make([]PropertyKeyStat, 0, len(keyCounts))
-	for k, c := range keyCounts {
-		result = append(result, PropertyKeyStat{Key: k, Count: c})
-	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Count > result[j].Count
-	})
-	return result, nil
+	return s.computePropertyKeys(qctx, rows)
 }
 
 // PropertyValueStat represents a property value with its occurrence count.
@@ -1145,4 +1225,29 @@ func (s *StatsService) EventPropertyValues(ctx context.Context, siteID, eventNam
 		return nil, fmt.Errorf("event property values: %w", err)
 	}
 	return rows, nil
+}
+
+func (s *StatsService) tableForFilters(from, to time.Time, filters *FilterBuilder) string {
+	table := tableForFilters(from, to, filters)
+	rawCut, bounded := cutoff(s.retention.RawDays, s.now())
+	if bounded && from.Before(rawCut) && !filters.ReferencesColumnsOutside(rollupColumns["stats_daily"]) {
+		return "stats_daily"
+	}
+	return table
+}
+
+// sessionEventFilter preserves event-only filters by selecting matching session identities.
+func sessionEventFilter(siteID string, fromMs, toMs int64, filters *FilterBuilder) (string, []any) {
+	if filters.ReferencesColumnsOutside(sessionsFilterColumns) {
+		return " AND session_id IN (SELECT session_id FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3" + filters.SQL() + ")", baseParams(siteID, fromMs, toMs, filters)
+	}
+	f := filters.Subset(sessionsFilterColumns)
+	return f.SQL(), baseParams(siteID, fromMs, toMs, f)
+}
+
+func (s *StatsService) now() time.Time {
+	if s.clock != nil {
+		return s.clock().UTC()
+	}
+	return time.Now().UTC()
 }

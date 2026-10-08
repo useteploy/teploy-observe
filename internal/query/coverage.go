@@ -199,7 +199,7 @@ func (s *StatsService) forcedRaw(from time.Time, now time.Time, filters *FilterB
 // has. Only the honesty of the answer — Exact / Note — depends on that, and
 // that lives in UniqueCoverageFor.
 func (s *StatsService) sourceFor(from time.Time, filters *FilterBuilder) UniqueSource {
-	now := time.Now().UTC()
+	now := s.now()
 	if s.forcedRaw(from, now, filters) {
 		return SourceEvents
 	}
@@ -216,7 +216,7 @@ func (s *StatsService) sourceFor(from time.Time, filters *FilterBuilder) UniqueS
 // have pruned something, the site's earliest data decides whether it actually
 // did — and that lookup is cached per site (see earliestData).
 func (s *StatsService) UniqueCoverageFor(ctx context.Context, siteID string, from, to time.Time, filters *FilterBuilder) UniqueCoverage {
-	now := time.Now().UTC()
+	now := s.now()
 	forced := s.forcedRaw(from, now, filters)
 	if _, _, _, bounded := s.retention.bound(from, now, forced); !bounded {
 		return s.retention.coverage(from, now, forced, time.Time{})

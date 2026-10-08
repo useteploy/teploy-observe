@@ -8,7 +8,8 @@ package cohorts
 // (tenant, site, cohort, entity) and versioned. Add writes removed=0 rows,
 // remove writes removed=1 tombstones at a higher version; reads collapse to
 // the highest version per entity in Go (finding #10) over a row-bounded
-// SELECT. Versions are taken from max(now, cohort.updated_at+1) and the
+// SELECT. Versions exceed the durable membership highwater (including tombstones),
+// the stored summary and the current clock; the
 // cohort row is rewritten at the same value, so each mutation batch is
 // strictly newer than the last one on that cohort.
 //
@@ -180,6 +181,9 @@ type memberRow struct {
 
 // insertMembers writes rows in chunked multi-row INSERTs at one version.
 func (s *Service) insertMembers(ctx context.Context, siteID, cohortID string, rows []memberRow, version int64) error {
+	if s.memberWrite != nil {
+		return s.memberWrite(ctx, siteID, cohortID, rows, version)
+	}
 	for start := 0; start < len(rows); start += staticInsertChunk {
 		end := start + staticInsertChunk
 		if end > len(rows) {
@@ -237,9 +241,17 @@ func collapseMembers(rows []memberRecord) map[string]int64 {
 }
 
 func (s *Service) readStatic(ctx context.Context, siteID, cohortID string) (map[string]int64, error) {
-	rows, err := nucleus.Query[memberRecord](ctx, s.db.SQL(), staticMembersSQL(), siteID, cohortID)
+	ctx, finish, err := s.beginRead(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	rows, err := s.fetchMemberRows(ctx, siteID, cohortID)
 	if err != nil {
 		return nil, fmt.Errorf("read cohort_members: %w", err)
+	}
+	if err := s.accountRows(ctx, len(rows)); err != nil {
+		return nil, err
 	}
 	if len(rows) > maxStaticRows {
 		return nil, fmt.Errorf("%w: static cohort has more than %d stored rows", ErrTooLarge, maxStaticRows)
@@ -285,6 +297,9 @@ const staticRule = `{"op":"static"}`
 
 // putCohortRow inserts a new version of a cohorts row.
 func (s *Service) putCohortRow(ctx context.Context, c Cohort) error {
+	if s.summaryWrite != nil {
+		return s.summaryWrite(ctx, c)
+	}
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO cohorts (cohort_id, tenant_id, site_id, name, description, rule, member_count, created_at, updated_at)
 		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8)`,
@@ -351,6 +366,8 @@ func (s *Service) getStatic(ctx context.Context, siteID, cohortID string) (*Coho
 // AddMembers adds ids to a static cohort and returns the updated cohort and
 // how many were new. The resulting list may not exceed MaxStaticMembers.
 func (s *Service) AddMembers(ctx context.Context, siteID, cohortID string, ids []string) (*Cohort, int, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	c, err := s.getStatic(ctx, siteID, cohortID)
 	if err != nil {
 		return nil, 0, err
@@ -363,9 +380,9 @@ func (s *Service) AddMembers(ctx context.Context, siteID, cohortID string, ids [
 	if err != nil {
 		return nil, 0, err
 	}
-	version := time.Now().UTC().UnixMilli()
-	if version <= c.UpdatedAt {
-		version = c.UpdatedAt + 1
+	version, err := s.nextMemberVersion(ctx, siteID, cohortID, c.UpdatedAt, s.memberNow())
+	if err != nil {
+		return nil, 0, err
 	}
 	var fresh []memberRow
 	for _, e := range norm {
@@ -377,6 +394,13 @@ func (s *Service) AddMembers(ctx context.Context, siteID, cohortID string, ids [
 		return nil, 0, fmt.Errorf("%w: cohort would hold %d members, limit %d", ErrTooManyIDs, len(live)+len(fresh), MaxStaticMembers)
 	}
 	if len(fresh) == 0 {
+		if c.MemberCount != int64(len(live)) {
+			c.MemberCount = int64(len(live))
+			c.UpdatedAt = version
+			if err := s.putCohortRow(ctx, *c); err != nil {
+				return nil, 0, err
+			}
+		}
 		return c, 0, nil
 	}
 	if err := s.insertMembers(ctx, siteID, cohortID, fresh, version); err != nil {
@@ -394,6 +418,8 @@ func (s *Service) AddMembers(ctx context.Context, siteID, cohortID string, ids [
 // RemoveMembers removes ids from a static cohort (tombstone rows at a newer
 // version) and returns the updated cohort and how many were removed.
 func (s *Service) RemoveMembers(ctx context.Context, siteID, cohortID string, ids []string) (*Cohort, int, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	c, err := s.getStatic(ctx, siteID, cohortID)
 	if err != nil {
 		return nil, 0, err
@@ -406,9 +432,9 @@ func (s *Service) RemoveMembers(ctx context.Context, siteID, cohortID string, id
 	if err != nil {
 		return nil, 0, err
 	}
-	version := time.Now().UTC().UnixMilli()
-	if version <= c.UpdatedAt {
-		version = c.UpdatedAt + 1
+	version, err := s.nextMemberVersion(ctx, siteID, cohortID, c.UpdatedAt, s.memberNow())
+	if err != nil {
+		return nil, 0, err
 	}
 	var gone []memberRow
 	for _, e := range norm {
@@ -417,6 +443,13 @@ func (s *Service) RemoveMembers(ctx context.Context, siteID, cohortID string, id
 		}
 	}
 	if len(gone) == 0 {
+		if c.MemberCount != int64(len(live)) {
+			c.MemberCount = int64(len(live))
+			c.UpdatedAt = version
+			if err := s.putCohortRow(ctx, *c); err != nil {
+				return nil, 0, err
+			}
+		}
 		return c, 0, nil
 	}
 	if err := s.insertMembers(ctx, siteID, cohortID, gone, version); err != nil {
@@ -429,4 +462,61 @@ func (s *Service) RemoveMembers(ctx context.Context, siteID, cohortID string, id
 		return nil, 0, err
 	}
 	return &next, len(gone), nil
+}
+
+func (s *Service) staticMembersSQL() string {
+	limit := int64(maxStaticRows)
+	if s.budgets.MaxScanRows > 0 && s.budgets.MaxScanRows < limit {
+		limit = s.budgets.MaxScanRows
+	}
+	return `SELECT entity_id, added_at, removed, version FROM cohort_members WHERE site_id=$1 AND cohort_id=$2 LIMIT ` + strconv.FormatInt(limit+1, 10)
+}
+
+// Read the durable high-water including tombstones. Summary failure and process
+// restart cannot cause a subsequent opposite edit to reuse a member version.
+func (s *Service) nextMemberVersion(ctx context.Context, siteID, cohortID string, summary, now int64) (int64, error) {
+	ctx, finish, err := s.beginRead(ctx, siteID)
+	if err != nil {
+		return 0, err
+	}
+	defer finish()
+	rows, err := s.fetchMemberRows(ctx, siteID, cohortID)
+	if err != nil {
+		return 0, fmt.Errorf("member version high-water: %w", err)
+	}
+	if err := s.accountRows(ctx, len(rows)); err != nil {
+		return 0, err
+	}
+	if len(rows) > maxStaticRows {
+		return 0, ErrTooLarge
+	}
+	high := summary
+	for _, r := range rows {
+		if r.Version > high {
+			high = r.Version
+		}
+	}
+	return memberVersionAbove(high, now)
+}
+func memberVersionAbove(high, now int64) (int64, error) {
+	if high == 1<<63-1 {
+		return 0, fmt.Errorf("member version exhausted")
+	}
+	if now <= high {
+		now = high + 1
+	}
+	return now, nil
+}
+
+func (s *Service) fetchMemberRows(ctx context.Context, siteID, cohortID string) ([]memberRecord, error) {
+	if s.memberRead != nil {
+		return s.memberRead(ctx, siteID, cohortID)
+	}
+	return nucleus.Query[memberRecord](ctx, s.db.SQL(), s.staticMembersSQL(), siteID, cohortID)
+}
+func (s *Service) memberNow() int64 {
+	if s.clock != nil {
+		return s.clock()
+	}
+	return time.Now().UTC().UnixMilli()
 }

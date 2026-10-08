@@ -6,8 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-
-	"github.com/neutron-build/neutron/go/nucleus"
+	"github.com/neutron-build/neutron/go/neutron"
 )
 
 // RetentionCohort represents one row of the retention grid. Entity and
@@ -99,7 +98,7 @@ func (s *StatsService) Retention(ctx context.Context, siteID string, from, to ti
 //     has fully elapsed by `to`; incomplete columns (including the
 //     current one) are excluded from Periods and counted in
 //     IncompletePeriods.
-//   - Bounds: the window is clamped to 186 days and the grid to 12
+//   - Bounds: the windows above the configured budget are refused and the grid to 12
 //     columns (pre-O04 behavior, unchanged).
 func (s *StatsService) RetentionWithOptions(ctx context.Context, siteID string, from, to time.Time, periodDays int, opts RetentionOptions) ([]RetentionCohort, error) {
 	entity := opts.Entity
@@ -107,18 +106,23 @@ func (s *StatsService) RetentionWithOptions(ctx context.Context, siteID string, 
 		return nil, err
 	}
 
-	if periodDays <= 0 {
+	if periodDays < 0 || periodDays > 186 {
+		return nil, neutron.ErrBadRequest("period_days must be between 0 and 186")
+	}
+	if periodDays == 0 {
 		periodDays = 1
 		if to.Sub(from) > 30*24*time.Hour {
 			periodDays = 7
 		}
 	}
 
-	// Clamp the window so a single request can't trigger an unbounded events
+	// Refuse excessive windows so a single request cannot trigger an unbounded events
 	// scan / map build. The declared MaxWindow budget (default 186 days,
-	// matching this pinned clamp) governs; the grid stays capped at 12
+	// matching the historical 186-day ceiling) governs; the grid stays capped at 12
 	// columns (pre-O04 behavior, unchanged).
-	from = s.clampWindow(from, to)
+	if err := s.validateWindow(from, to); err != nil {
+		return nil, err
+	}
 
 	qctx, finish, err := s.beginQuery(ctx, siteID)
 	if err != nil {
@@ -146,9 +150,9 @@ func (s *StatsService) RetentionWithOptions(ctx context.Context, siteID string, 
 
 	// Default cohort entry for visitor-estimate: the sessions rollup's
 	// first_ts. Superseded by CohortEvent below when that is set.
-	usingSessionsCohorts := entity == "" && opts.CohortEvent == ""
+	usingSessionsCohorts := (entity == "" || entity == "visitor-estimate") && opts.CohortEvent == ""
 	if usingSessionsCohorts {
-		rows, err := nucleus.Query[sessionFirstLast](qctx, s.db.SQL(),
+		rows, err := boundedRangeQuery[sessionFirstLast](qctx, s,
 			`SELECT session_id, first_ts
 		 FROM `+LatestRows("sessions", []string{"first_ts"},
 				`site_id = $1 AND first_ts >= $2 AND first_ts < $3`)+` AS s`,
@@ -158,6 +162,9 @@ func (s *StatsService) RetentionWithOptions(ctx context.Context, siteID string, 
 			return nil, fmt.Errorf("retention query sessions: %w", err)
 		}
 		for _, r := range rows {
+			if err := qctx.Err(); err != nil {
+				return nil, err
+			}
 			getEntity(r.SessionID).firstTS = r.FirstTS
 		}
 	}
@@ -203,6 +210,9 @@ func (s *StatsService) RetentionWithOptions(ctx context.Context, siteID string, 
 	// fired, or — impossible in practice — a sessions row without events)
 	// are not cohort members.
 	for id, e := range entities {
+		if err := qctx.Err(); err != nil {
+			return nil, err
+		}
 		// With a cohort filter, an entity pre-seeded from the sessions
 		// rollup that never produced a member event is not a member.
 		if e.firstTS < 0 || (members != nil && !e.inCohort) {
@@ -210,7 +220,11 @@ func (s *StatsService) RetentionWithOptions(ctx context.Context, siteID string, 
 		}
 	}
 
-	return buildRetentionCohorts(entities, from, to, periodMs, entity), nil
+	result := buildRetentionCohorts(entities, from, to, periodMs, entity)
+	if err := qctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // buildRetentionCohorts is the deterministic grid math (storage-free;
@@ -220,6 +234,9 @@ func (s *StatsService) RetentionWithOptions(ctx context.Context, siteID string, 
 // of the cohort active in each complete bucket; incomplete grid columns
 // are excluded and counted.
 func buildRetentionCohorts(entities map[string]*retentionEntity, from, to time.Time, periodMs int64, entity string) []RetentionCohort {
+	if periodMs <= 0 {
+		return nil
+	}
 	cohortMap := make(map[int64][]*retentionEntity)
 	for _, e := range entities {
 		bucket := (e.firstTS / periodMs) * periodMs

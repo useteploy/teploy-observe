@@ -72,26 +72,30 @@ func TestServicesCache_SiteScoped(t *testing.T) {
 	}
 }
 
-// TestServicesCache_RollingWindowStillHits is the other half of the fix: the
-// dashboard's bounds move on every request, so if the key were the raw bounds
-// the cache would never hit and the expensive RED scan would run every time.
-// Requests inside the same TTL bucket must share an entry.
-func TestServicesCache_RollingWindowStillHits(t *testing.T) {
+// Moving bounds change the predicate and must miss even within one TTL bucket.
+func TestServicesCache_ExactWindow(t *testing.T) {
 	q := newCacheOnlyQueryService()
-
-	// Two rolling-24h requests a second apart, placed mid-bucket so they fall
-	// on the same side of a truncation boundary — the common case for the live
-	// view, where the alternative is a guaranteed miss on every request.
-	to1 := time.Now().UTC().Truncate(servicesCacheTTL).Add(2 * time.Second)
-	to2 := to1.Add(time.Second)
-
-	q.storeServices(servicesKey("site1", to1.Add(-24*time.Hour), to1), summary("live"))
-	got, ok := q.cachedServices(servicesKey("site1", to2.Add(-24*time.Hour), to2))
-	if !ok {
-		t.Fatal("second rolling request missed; the cache is now useless for the live view")
+	from := time.Unix(100, 0)
+	for _, reverse := range []bool{false, true} {
+		a, b := from, from.Add(time.Second)
+		if reverse {
+			a, b = b, a
+		}
+		q.storeServices(servicesKey("site1", a, a.Add(time.Second)), summary("one"))
+		if _, ok := q.cachedServices(servicesKey("site1", b, b.Add(time.Second))); ok {
+			t.Fatal("distinct predicate shared cache entry")
+		}
+		q.servicesCache = map[string]servicesEntry{}
 	}
-	if got[0].ServiceName != "live" {
-		t.Fatalf("got %q, want \"live\"", got[0].ServiceName)
+}
+func TestServicesCache_Cardinality(t *testing.T) {
+	q := newCacheOnlyQueryService()
+	from := time.Now()
+	for i := 0; i < maxServicesCacheEntries+10; i++ {
+		q.storeServices(servicesKey("site1", from.Add(time.Duration(i)*time.Millisecond), from.Add(time.Hour)), summary("one"))
+	}
+	if len(q.servicesCache) > maxServicesCacheEntries {
+		t.Fatal("cache exceeded entry ceiling")
 	}
 }
 

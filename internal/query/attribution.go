@@ -23,12 +23,11 @@ package query
 import (
 	"context"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
 
-	"github.com/useteploy/teploy-observe/internal/dbutil"
+	"github.com/useteploy/teploy-observe/internal/queryguard"
 )
 
 // Attribution model identifiers accepted by the API.
@@ -56,13 +55,15 @@ type AttributionRow struct {
 // own *nucleus.Client handle so callers don't have to thread the DB
 // through every signature.
 type AttributionService struct {
-	db *nucleus.Client
+	db         *nucleus.Client
+	stats      *StatsService
+	readEvents func(context.Context, string, ...any) ([]attributionEvent, error)
 }
 
 // NewAttributionService constructs an AttributionService bound to the
 // given DB client.
 func NewAttributionService(db *nucleus.Client) *AttributionService {
-	return &AttributionService{db: db}
+	return &AttributionService{db: db, stats: NewStatsService(db)}
 }
 
 // IsValidModel returns true if the given identifier is one of the
@@ -82,6 +83,7 @@ type attributionEvent struct {
 	SessionID string `db:"session_id"`
 	UTMSource string `db:"utm_source"`
 	Timestamp int64  `db:"timestamp"`
+	EventID   string `db:"event_id"`
 }
 
 // AttributionByModel computes per-source attribution credit for the
@@ -95,27 +97,45 @@ func (s *AttributionService) AttributionByModel(ctx context.Context, siteID, mod
 		return nil, fmt.Errorf("attribution: invalid model %q", model)
 	}
 
-	from := dbutil.IntParam(fromMs)
-	to := dbutil.IntParam(toMs)
+	qctx, finish, err := s.stats.beginQuery(ctx, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	if err := s.stats.validateWindow(time.UnixMilli(fromMs), time.UnixMilli(toMs)); err != nil {
+		return nil, err
+	}
+	from := fromMs
+	to := toMs
 
 	// Pull the minimal projection. Ordered for deterministic walks.
 	// Per dogfood finding #24 we scan natively (no CAST(... AS TEXT))
 	// and per finding #6 the BIGINT bound is wrapped with CAST so the
 	// SimpleProtocol-stringified parameter is compared as a number.
-	rows, err := nucleus.Query[attributionEvent](ctx, s.db.SQL(),
-		`SELECT session_id, COALESCE(utm_source, '') AS utm_source, timestamp
-		   FROM events
-		  WHERE site_id = $1
-		    AND timestamp >= $2
-		    AND timestamp < $3
-		  ORDER BY session_id, timestamp ASC`,
-		siteID, from, to,
-	)
+	q := `SELECT event_id, session_id, COALESCE(utm_source, '') AS utm_source, timestamp
+ FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
+ ORDER BY session_id ASC, timestamp ASC, event_id ASC`
+	var rows []attributionEvent
+	if s.readEvents != nil {
+		rows, err = s.readEvents(qctx, q, siteID, from, to)
+		if err == nil {
+			err = s.stats.accountScan(qctx, int64(len(rows)))
+		}
+	} else {
+		rows, err = boundedRangeQuery[attributionEvent](qctx, s.stats, q, siteID, from, to)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("attribution query: %w", err)
 	}
 
-	return ComputeAttribution(rows, model), nil
+	result, err := computeAttribution(qctx, rows, model, s.stats.checkPostRead)
+	if err != nil {
+		return nil, err
+	}
+	if err := qctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // ComputeAttribution is the pure (no-DB) attribution kernel. It accepts
@@ -124,65 +144,116 @@ func (s *AttributionService) AttributionByModel(ctx context.Context, siteID, mod
 //
 // Exposed so unit tests can exercise the math without spinning up a DB.
 func ComputeAttribution(events []attributionEvent, model string) []AttributionRow {
-	if len(events) == 0 {
-		return []AttributionRow{}
-	}
+	result, _ := computeAttribution(context.Background(), events, model, nil)
+	return result
+}
 
-	// Bucket by session and sort each bucket by timestamp. We sort here
-	// (rather than relying on the SQL ORDER BY) so unit tests can pass
-	// arbitrary input ordering.
+// Production and the pure oracle share the same stable, cancellable kernel.
+// Each map/slice has at most the admitted event cardinality; work is O(n log n).
+func computeAttribution(ctx context.Context, events []attributionEvent, model string, checkpoint func(context.Context, string) error) ([]AttributionRow, error) {
+	check := func(phase string) error {
+		if checkpoint != nil {
+			return checkpoint(ctx, phase)
+		}
+		return ctx.Err()
+	}
 	sessions := make(map[string][]attributionEvent)
 	for _, e := range events {
+		if err := check("attribution-copy"); err != nil {
+			return nil, err
+		}
 		sessions[e.SessionID] = append(sessions[e.SessionID], e)
 	}
-	for sid := range sessions {
-		bucket := sessions[sid]
-		sort.SliceStable(bucket, func(i, j int) bool {
-			return bucket[i].Timestamp < bucket[j].Timestamp
-		})
-		sessions[sid] = bucket
+	// Session order also pins floating-point accumulation independently of map iteration.
+	ids := make([]string, 0, len(sessions))
+	for id := range sessions {
+		if err := check("attribution-sessions"); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
 	}
-
+	if err := sortWithContext(ctx, ids, func(a, b string) bool { return a < b }); err != nil {
+		return nil, err
+	}
 	totals := make(map[string]float64)
-	conversions := make(map[string]float64)
-	totalSessions := 0
-
-	for _, evts := range sessions {
-		totalSessions++
-		credits := creditsForSession(evts, model)
-		for src, weight := range credits {
-			totals[src] += weight
-			// v1: every session is a conversion. Future: gate on a
-			// ConversionRule (e.g. "fired event_type=signup").
-			conversions[src] += weight
+	for _, id := range ids {
+		bucket := sessions[id]
+		if err := check("attribution-sort"); err != nil {
+			return nil, err
 		}
-	}
-
-	out := make([]AttributionRow, 0, len(totals))
-	for src, sess := range totals {
-		conv := conversions[src]
-		pct := 0.0
-		if sess > 0 {
-			pct = conv / sess * 100
-		}
-		out = append(out, AttributionRow{
-			Source:        src,
-			Sessions:      sess,
-			Conversions:   conv,
-			ConversionPct: pct,
+		var canceled error
+		err := sortWithContext(ctx, bucket, func(a, b attributionEvent) bool {
+			if canceled == nil {
+				canceled = check("attribution-sort-compare")
+			}
+			if a.Timestamp != b.Timestamp {
+				return a.Timestamp < b.Timestamp
+			}
+			return a.EventID < b.EventID
 		})
-	}
-
-	// Sort by sessions desc for stable presentation; tie-break by
-	// source name so test output is deterministic.
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Sessions != out[j].Sessions {
-			return out[i].Sessions > out[j].Sessions
+		if err != nil {
+			return nil, err
 		}
-		return out[i].Source < out[j].Source
+		if canceled != nil {
+			return nil, canceled
+		}
+		uniq := make(map[string]struct{})
+		first, last := "", ""
+		for _, e := range bucket {
+			if err := check("attribution-credit"); err != nil {
+				return nil, err
+			}
+			if e.UTMSource == "" {
+				continue
+			}
+			if first == "" {
+				first = e.UTMSource
+			}
+			last = e.UTMSource
+			uniq[e.UTMSource] = struct{}{}
+		}
+		if first == "" {
+			totals[directBucket]++
+			continue
+		}
+		switch model {
+		case AttributionFirstTouch:
+			totals[first]++
+		case AttributionLastTouch:
+			totals[last]++
+		case AttributionLinear:
+			for src := range uniq {
+				if err := check("attribution-accumulate"); err != nil {
+					return nil, err
+				}
+				totals[src] += 1 / float64(len(uniq))
+			}
+		}
+	}
+	out := make([]AttributionRow, 0, len(totals))
+	for src, n := range totals {
+		if err := check("attribution-output"); err != nil {
+			return nil, err
+		}
+		out = append(out, AttributionRow{Source: src, Sessions: n, Conversions: n, ConversionPct: 100})
+	}
+	var canceled error
+	err := sortWithContext(ctx, out, func(a, b AttributionRow) bool {
+		if canceled == nil {
+			canceled = check("attribution-final-sort")
+		}
+		if a.Sessions != b.Sessions {
+			return a.Sessions > b.Sessions
+		}
+		return a.Source < b.Source
 	})
-
-	return out
+	if err != nil {
+		return nil, err
+	}
+	if canceled != nil {
+		return nil, canceled
+	}
+	return out, check("attribution-complete")
 }
 
 // creditsForSession returns map[source] = credit for one session under
@@ -238,4 +309,9 @@ func TimeRangeMs(from, to time.Time) (int64, int64) {
 		to = time.Now().UTC()
 	}
 	return from.UnixMilli(), to.UnixMilli()
+}
+
+func (s *AttributionService) WithQueryGuard(l *queryguard.Limiter, b queryguard.Budgets) *AttributionService {
+	s.stats.WithQueryGuard(l, b)
+	return s
 }

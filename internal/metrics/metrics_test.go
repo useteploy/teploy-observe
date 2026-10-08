@@ -300,13 +300,9 @@ func TestHistogramQuantile_Edges(t *testing.T) {
 	if got := histogramQuantile([]float64{10, 50}, []float64{0, 0, 5}, 5, 0.99); math.Abs(got-50) > 1e-9 {
 		t.Errorf("overflow saturate = %v, want 50", got)
 	}
-	// q clamp.
-	if got := histogramQuantile([]float64{10}, []float64{1, 0}, 1, -1); got != 0 {
-		// target=0; first bucket: cum=0, c=1, next=1 ≥ 0 → frac=0 → returns lower (0).
-		// We assert q is clamped, not the exact value.
-		if math.Abs(got) > 1e-9 {
-			t.Errorf("q<0 should clamp to 0; got %v", got)
-		}
+	// q clamps to zero; the first bucket still has only an upper bound.
+	if got := histogramQuantile([]float64{10}, []float64{1, 0}, 1, -1); got != 10 {
+		t.Errorf("q<0 first-tail upper bound = %v, want 10", got)
 	}
 }
 

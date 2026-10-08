@@ -3,12 +3,15 @@ package query
 import (
 	"context"
 	"errors"
+	"github.com/neutron-build/neutron/go/neutron"
+	"math"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/neutron-build/neutron/go/nucleus"
 
+	"github.com/useteploy/teploy-observe/internal/cohorts"
 	"github.com/useteploy/teploy-observe/internal/queryguard"
 )
 
@@ -52,23 +55,12 @@ func (s *StatsService) beginQuery(ctx context.Context, siteID string) (context.C
 		}
 		release = rel
 	}
-	qctx, cancel := context.WithTimeout(ctx, s.budgets.Timeout)
+	ctx = context.WithValue(ctx, scanWorkKey{}, &scanWork{})
+	qctx, cancel := context.WithTimeout(cohorts.WithAdmission(ctx), s.budgets.Timeout)
 	return qctx, func() {
 		cancel()
 		release()
 	}, nil
-}
-
-// clampWindow applies the declared MaxWindow budget to the requested
-// range, mirroring RetentionWithOptions's pinned 186-day clamp: `from` is
-// pulled forward, `to` stays. Funnel reads previously had NO range clamp
-// at all — the budget makes the clamp declared and env-tunable for every
-// heavy path.
-func (s *StatsService) clampWindow(from, to time.Time) time.Time {
-	if max := s.budgets.MaxWindow; max > 0 && to.Sub(from) > max {
-		return to.Add(-max)
-	}
-	return from
 }
 
 // scanDeadlineError classifies a scan failure: a deadline hit on the
@@ -112,13 +104,11 @@ func (s *StatsService) streamEvents(ctx context.Context, siteID string, fromMs, 
 	}
 	defer rows.Close()
 
-	scanned := int64(0)
 	for rows.Next() {
-		scanned++
-		if s.budgets.MaxScanRows > 0 && scanned > s.budgets.MaxScanRows {
+		if err := s.accountScan(ctx, 1); err != nil {
 			// Return before visiting: the refusal replaces the result,
 			// never truncates it into a misleading partial answer.
-			return queryguard.RowBudgetRefusal(s.guard, s.budgets.MaxScanRows)
+			return err
 		}
 		if err := visit(rows); err != nil {
 			return err
@@ -162,13 +152,13 @@ func scanFunnelEventWithBreakdown(row pgx.Row) (struct {
 // no-total-order caveat does not apply to a bound we only ever refuse
 // past).
 func boundedRangeQuery[T any](ctx context.Context, s *StatsService, query string, args ...any) ([]T, error) {
-	bounded := query + " LIMIT " + itoa(s.budgets.MaxScanRows+1)
+	bounded := query + " LIMIT " + itoa(scanLimit(s.budgets.MaxScanRows))
 	rows, err := nucleus.Query[T](ctx, s.db.SQL(), bounded, args...)
 	if err != nil {
 		return nil, s.scanDeadlineError(ctx, err)
 	}
-	if int64(len(rows)) > s.budgets.MaxScanRows {
-		return nil, queryguard.RowBudgetRefusal(s.guard, s.budgets.MaxScanRows)
+	if err := s.accountScan(ctx, int64(len(rows))); err != nil {
+		return nil, err
 	}
 	return rows, nil
 }
@@ -193,4 +183,97 @@ func itoa(n int64) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+// A single admitted operation shares its materialized/streamed row allowance
+// across all reads (notably retention sessions plus raw activity).
+type scanWorkKey struct{}
+type scanWork struct{ rows int64 }
+
+func scanLimit(max int64) int64 {
+	if max == math.MaxInt64 {
+		return max
+	}
+	return max + 1
+}
+func (s *StatsService) accountScan(ctx context.Context, n int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	w, _ := ctx.Value(scanWorkKey{}).(*scanWork)
+	used := int64(0)
+	if w != nil {
+		used = w.rows
+	}
+	if n > s.budgets.MaxScanRows-used {
+		return queryguard.RowBudgetRefusal(s.guard, s.budgets.MaxScanRows)
+	}
+	if w != nil {
+		w.rows += n
+	}
+	return nil
+}
+func (s *StatsService) validateWindow(from, to time.Time) error {
+	if !from.Before(to) {
+		return neutron.ErrBadRequest("query requires from < to")
+	}
+	if to.Sub(from) > s.budgets.MaxWindow {
+		return neutron.ErrBadRequest("query window exceeds supported maximum")
+	}
+	return nil
+}
+
+// Stable bottom-up merge sorting with cooperative cancellation in the work
+// loop; checks around an uncancellable standard sort alone are insufficient.
+func sortWithContext[T any](ctx context.Context, values []T, less func(T, T) bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	n := len(values)
+	if n < 2 {
+		return nil
+	}
+	scratch := make([]T, n)
+	for width := 1; width < n; {
+		for start := 0; start < n; start += 2 * width {
+			mid := start + width
+			if mid > n {
+				mid = n
+			}
+			end := start + 2*width
+			if end > n {
+				end = n
+			}
+			i, j := start, mid
+			for k := start; k < end; k++ {
+				if k%64 == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
+				if i < mid && (j >= end || !less(values[j], values[i])) {
+					scratch[k] = values[i]
+					i++
+				} else {
+					scratch[k] = values[j]
+					j++
+				}
+			}
+		}
+		for start := 0; start < n; start += 64 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			end := start + 64
+			if end > n {
+				end = n
+			}
+			copy(values[start:end], scratch[start:end])
+		}
+		if width > n/2 {
+			break
+		}
+		width *= 2
+	}
+	return ctx.Err()
 }

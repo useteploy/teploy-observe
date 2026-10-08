@@ -283,8 +283,25 @@ const numericLiteral = `^-?[0-9]+(\.[0-9]+)?$`
 
 // GoalConversions computes conversion counts, and the money those conversions
 // were worth, for every goal in a time range.
-func (s *StatsService) GoalConversions(ctx context.Context, siteID string, from, to time.Time) ([]GoalConversion, error) {
-	goals, err := s.ListGoals(ctx, siteID)
+func (s *StatsService) GoalConversions(ctx context.Context, siteID string, from, to time.Time, cohortIDs ...string) ([]GoalConversion, error) {
+	var filters *FilterBuilder
+	if len(cohortIDs) > 0 && cohortIDs[0] != "" {
+		ids, err := s.resolveCohortAdmitted(ctx, siteID, cohortIDs[0])
+		if err != nil {
+			return nil, err
+		}
+		filters = NewFilterBuilder(4)
+		filters.AddIn("distinct_id", ids)
+	}
+	fSQL, _ := filterSQL(filters)
+
+	var goals []Goal
+	var err error
+	if s.goalListRead != nil {
+		goals, err = s.goalListRead(ctx, siteID)
+	} else {
+		goals, err = s.ListGoals(ctx, siteID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -296,19 +313,24 @@ func (s *StatsService) GoalConversions(ctx context.Context, siteID string, from,
 	toMs := to.UnixMilli()
 
 	// Get total visitors for the period
-	type countRow struct {
-		Count string `db:"count"`
-	}
-	totalRows, err := nucleus.Query[countRow](ctx, s.db.SQL(),
-		`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count
-		 FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
-		siteID, fromMs, toMs,
+	totalRows, err := s.readGoalCounts(ctx,
+		`SELECT COUNT(DISTINCT session_id) AS count
+		 FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`+fSQL,
+		baseParams(siteID, fromMs, toMs, filters)...,
 	)
-	totalVisitors := int64(0)
-	if err == nil && len(totalRows) > 0 {
-		totalVisitors, _ = strconv.ParseInt(totalRows[0].Count, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("goal total visitors: %w", err)
+	}
+	totalVisitors, err := strictGoalCount(totalRows, "count")
+	if err != nil {
+		return nil, fmt.Errorf("goal total visitors: %w", err)
 	}
 
+	var conversionFilters *FilterBuilder
+	if filters != nil {
+		conversionFilters = &FilterBuilder{startIdx: 5, entries: filters.entries}
+	}
+	conversionSQL, _ := filterSQL(conversionFilters)
 	var results []GoalConversion
 	for _, g := range goals {
 		match, ok := goalMatchSQL(g.GoalType)
@@ -319,21 +341,23 @@ func (s *StatsService) GoalConversions(ctx context.Context, siteID string, from,
 		// Both counts in one pass: distinct sessions is the conversion count
 		// the dashboard has always shown, and the raw event count is what the
 		// money corresponds to.
-		type conversionRow struct {
-			Sessions string `db:"sessions"`
-			Events   string `db:"events"`
-		}
-		rows, err := nucleus.Query[conversionRow](ctx, s.db.SQL(),
-			`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS sessions,
-			        CAST(COUNT(*) AS TEXT) AS events
+		rows, err := s.readGoalCounts(ctx,
+			`SELECT COUNT(DISTINCT session_id) AS sessions,
+			        COUNT(*) AS events
 			 FROM events
-			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3 AND `+match,
-			siteID, fromMs, toMs, g.GoalValue,
+			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3 AND `+match+conversionSQL,
+			append([]any{siteID, fromMs, toMs, g.GoalValue}, conversionFilters.Params()...)...,
 		)
-		var conversions, events int64
-		if err == nil && len(rows) > 0 {
-			conversions, _ = strconv.ParseInt(rows[0].Sessions, 10, 64)
-			events, _ = strconv.ParseInt(rows[0].Events, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("goal conversions: %w", err)
+		}
+		conversions, err := strictGoalCount(rows, "sessions")
+		if err != nil {
+			return nil, fmt.Errorf("goal %s conversion sessions: %w", g.GoalID, err)
+		}
+		events, err := strictGoalCount(rows, "events")
+		if err != nil {
+			return nil, fmt.Errorf("goal %s conversion events: %w", g.GoalID, err)
 		}
 
 		rate := 0.0
@@ -341,7 +365,7 @@ func (s *StatsService) GoalConversions(ctx context.Context, siteID string, from,
 			rate = float64(conversions) / float64(totalVisitors) * 100
 		}
 
-		total, err := s.goalValueMinor(ctx, siteID, g, match, fromMs, toMs, events)
+		total, err := s.goalValueMinor(ctx, siteID, g, match, fromMs, toMs, events, conversionFilters)
 		if err != nil {
 			return nil, err
 		}
@@ -382,12 +406,12 @@ func goalMatchSQL(goalType string) (string, bool) {
 // SUM over DOUBLE PRECISION, rounded at the end — drifts by a cent or two per
 // few thousand rows, and a revenue figure that disagrees with Stripe by two
 // cents is a support ticket that costs more than this comment.
-func (s *StatsService) goalValueMinor(ctx context.Context, siteID string, g Goal, match string, fromMs, toMs, events int64) (int64, error) {
+func (s *StatsService) goalValueMinor(ctx context.Context, siteID string, g Goal, match string, fromMs, toMs, events int64, active ...*FilterBuilder) (int64, error) {
 	if !g.HasValue() {
 		return 0, nil
 	}
 	if g.ValueSource == ValueSourceFixed {
-		return g.ValueMinor * events, nil
+		return checkedGoalTotal(g.ValueMinor, events)
 	}
 
 	// ValidateGoalValue has already proved ValueProperty is [A-Za-z0-9_]+.
@@ -409,7 +433,12 @@ func (s *StatsService) goalValueMinor(ctx context.Context, siteID string, g Goal
 		   AND properties ->> '%s' ~ '%s'`,
 		prop, scale, match, prop, numericLiteral,
 	)
-	rows, err := nucleus.Query[sumRow](ctx, s.db.SQL(), q, siteID, fromMs, toMs, g.GoalValue)
+	var filters *FilterBuilder
+	if len(active) > 0 {
+		filters = active[0]
+	}
+	fSQL, _ := filterSQL(filters)
+	rows, err := nucleus.Query[sumRow](ctx, s.db.SQL(), q+fSQL, append([]any{siteID, fromMs, toMs, g.GoalValue}, filters.Params()...)...)
 	if err != nil {
 		return 0, fmt.Errorf("goal value: %w", err)
 	}
@@ -434,4 +463,13 @@ func generateQueryID() string {
 // cryptoRandRead wraps crypto/rand.Read
 var cryptoRandRead = func(b []byte) (int, error) {
 	return randRead(b)
+}
+
+// Fixed revenue supports nonnegative int64 minor units for both unit and total.
+// Overflow is unavailable, never a wrapped monetary measurement.
+func checkedGoalTotal(unit, count int64) (int64, error) {
+	if unit < 0 || count < 0 || (unit > 0 && count > (1<<63-1)/unit) {
+		return 0, fmt.Errorf("goal revenue exceeds supported nonnegative int64 minor-unit domain")
+	}
+	return unit * count, nil
 }

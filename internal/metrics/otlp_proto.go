@@ -1,7 +1,8 @@
 package metrics
 
 import (
-	"encoding/hex"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 
 	"google.golang.org/protobuf/proto"
@@ -18,6 +19,9 @@ import (
 // so ingest, validation and storage remain single-sourced.
 
 func decodeProtoMetrics(body []byte) (ExportMetricsRequest, error) {
+	if err := ValidateProtoWire(body); err != nil {
+		return ExportMetricsRequest{}, err
+	}
 	var pb metricspb.ExportMetricsServiceRequest
 	if err := proto.Unmarshal(body, &pb); err != nil {
 		return ExportMetricsRequest{}, fmt.Errorf("invalid protobuf: %w", err)
@@ -26,14 +30,17 @@ func decodeProtoMetrics(body []byte) (ExportMetricsRequest, error) {
 	out := ExportMetricsRequest{ResourceMetrics: make([]ResourceMetrics, 0, len(pb.GetResourceMetrics()))}
 	for _, rm := range pb.GetResourceMetrics() {
 		res := ResourceMetrics{
+			SchemaURL:    rm.GetSchemaUrl(),
 			Resource:     Resource{Attributes: protoAttrs(rm.GetResource().GetAttributes())},
 			ScopeMetrics: make([]ScopeMetrics, 0, len(rm.GetScopeMetrics())),
 		}
 		for _, sm := range rm.GetScopeMetrics() {
 			scope := ScopeMetrics{
+				SchemaURL: sm.GetSchemaUrl(),
 				Scope: InstrumentationScope{
-					Name:    sm.GetScope().GetName(),
-					Version: sm.GetScope().GetVersion(),
+					Name:       sm.GetScope().GetName(),
+					Attributes: protoAttrs(sm.GetScope().GetAttributes()),
+					Version:    sm.GetScope().GetVersion(),
 				},
 				Metrics: make([]OTLPMetric, 0, len(sm.GetMetrics())),
 			}
@@ -61,6 +68,10 @@ func protoMetric(m *otlpmetrics.Metric) OTLPMetric {
 			AggregationTemporality: int(d.Sum.GetAggregationTemporality()),
 			IsMonotonic:            d.Sum.GetIsMonotonic(),
 		}
+	case *otlpmetrics.Metric_Summary:
+		out.Summary = &UnsupportedMetric{DataPoints: make([]json.RawMessage, len(d.Summary.GetDataPoints()))}
+	case *otlpmetrics.Metric_ExponentialHistogram:
+		out.ExponentialHistogram = &UnsupportedMetric{DataPoints: make([]json.RawMessage, len(d.ExponentialHistogram.GetDataPoints()))}
 	case *otlpmetrics.Metric_Histogram:
 		out.Histogram = &Histogram{
 			DataPoints:             protoHistogramPoints(d.Histogram.GetDataPoints()),
@@ -128,7 +139,15 @@ func protoAnyValue(v *commonpb.AnyValue) AnyValue {
 	case *commonpb.AnyValue_DoubleValue:
 		return doubleAny(val.DoubleValue)
 	case *commonpb.AnyValue_BytesValue:
-		return stringAny(hex.EncodeToString(val.BytesValue))
+		return AnyValue{BytesValue: base64.StdEncoding.EncodeToString(val.BytesValue), kind: kindBytes}
+	case *commonpb.AnyValue_ArrayValue:
+		a := &ArrayValue{}
+		for _, v := range val.ArrayValue.GetValues() {
+			a.Values = append(a.Values, protoAnyValue(v))
+		}
+		return AnyValue{ArrayValue: a, kind: kindArray}
+	case *commonpb.AnyValue_KvlistValue:
+		return AnyValue{KVListValue: &KeyValueList{Values: protoAttrs(val.KvlistValue.GetValues())}, kind: kindKVList}
 	case nil:
 		return AnyValue{}
 	default:

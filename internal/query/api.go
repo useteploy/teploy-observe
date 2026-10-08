@@ -20,6 +20,9 @@ type StatsInput struct {
 	Limit       int    `query:"limit"`
 	Interval    string `query:"interval"`
 	Compare     string `query:"compare"`
+	EventType   string `query:"event_type"`
+	Channel     string `query:"channel"`
+	Screen      string `query:"screen"`
 	Pathname    string `query:"pathname"`
 	Referrer    string `query:"referrer"`
 	Browser     string `query:"browser"`
@@ -53,6 +56,8 @@ func (i StatsInput) TimeRange() (time.Time, time.Time) {
 // Parameter numbering starts at $4 since $1=site_id, $2=from, $3=to.
 func (i StatsInput) Filters() *FilterBuilder {
 	fb := NewFilterBuilder(4)
+	fb.Add("event_type", i.EventType)
+	fb.Add("CAST(screen_width AS TEXT) || 'x' || CAST(screen_height AS TEXT)", i.Screen)
 	fb.Add("pathname", i.Pathname)
 	fb.Add("referrer", i.Referrer)
 	fb.Add("browser", i.Browser)
@@ -83,6 +88,17 @@ func (i StatsInput) Filters() *FilterBuilder {
 // the status mapping.
 func (i StatsInput) resolveFilters(ctx context.Context, svc *StatsService) (*FilterBuilder, error) {
 	fb := i.Filters()
+	if i.Channel != "" {
+		if svc == nil {
+			return nil, neutron.ErrBadRequest("channel filtering requires stats service")
+		}
+		from, to := i.TimeRange()
+		ids, err := svc.channelEventIDs(ctx, i.SiteID, i.Channel, from, to)
+		if err != nil {
+			return nil, err
+		}
+		fb.AddIn("event_id", ids)
+	}
 	if i.CohortID == "" || svc == nil {
 		return fb, nil
 	}
@@ -233,14 +249,16 @@ type FunnelInput struct {
 
 // FunnelBreakdownInput augments FunnelInput with a breakdown dimension.
 type FunnelBreakdownInput struct {
-	SiteID      string       `json:"site_id"`
-	From        string       `json:"from"`
-	To          string       `json:"to"`
-	Steps       []FunnelStep `json:"steps"`
-	BreakdownBy string       `json:"breakdown_by"`
-	MinSize     int          `json:"min_size"`
-	Entity      string       `json:"entity"`
-	CohortID    string       `json:"cohort_id"`
+	ConversionWindowMs int64        `json:"conversion_window_ms"`
+	Exclusions         []FunnelStep `json:"exclusions"`
+	SiteID             string       `json:"site_id"`
+	From               string       `json:"from"`
+	To                 string       `json:"to"`
+	Steps              []FunnelStep `json:"steps"`
+	BreakdownBy        string       `json:"breakdown_by"`
+	MinSize            int          `json:"min_size"`
+	Entity             string       `json:"entity"`
+	CohortID           string       `json:"cohort_id"`
 }
 
 func (i FunnelBreakdownInput) TimeRange() (time.Time, time.Time) {
@@ -603,13 +621,21 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 		if target == "" {
 			target = "signup"
 		}
-		return svc.CorrelationAnalysis(ctx, input.SiteID, target, from, to)
+		filters, err := input.resolveFilters(ctx, svc)
+		if err != nil {
+			return nil, err
+		}
+		return svc.CorrelationAnalysis(ctx, input.SiteID, target, from, to, filters)
 	}, neutron.WithTags("stats"))
 
 	// User journeys
 	neutron.Get(api, "/journeys", func(ctx context.Context, input StatsInput) (*JourneyResult, error) {
 		from, to := input.TimeRange()
-		return svc.Journeys(ctx, input.SiteID, from, to, input.Limit)
+		filters, err := input.resolveFilters(ctx, svc)
+		if err != nil {
+			return nil, err
+		}
+		return svc.Journeys(ctx, input.SiteID, from, to, input.Limit, filters)
 	}, neutron.WithTags("stats"))
 
 	// Funnel analysis
@@ -631,8 +657,10 @@ func RegisterRoutes(r *neutron.Router, svc *StatsService, mw ...neutron.Middlewa
 			min = 5
 		}
 		return svc.FunnelByBreakdownWithOptions(ctx, input.SiteID, from, to, input.Steps, input.BreakdownBy, min, FunnelOptions{
-			Entity:   input.Entity,
-			CohortID: input.CohortID,
+			Entity:             input.Entity,
+			CohortID:           input.CohortID,
+			ConversionWindowMs: input.ConversionWindowMs,
+			Exclusions:         input.Exclusions,
 		})
 	}, neutron.WithTags("stats"))
 

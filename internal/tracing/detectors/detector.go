@@ -39,6 +39,8 @@ type Span struct {
 // Issue is one detector finding. The engine groups issues across batches by
 // fingerprint into a single performance_issues row.
 type Issue struct {
+	// Occurrences is the contribution count after per-intent aggregation (zero means one).
+	Occurrences  int64
 	TraceID      string
 	DetectorName string
 	Fingerprint  string

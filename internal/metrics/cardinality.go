@@ -205,6 +205,10 @@ func (g *seriesGuard) truncateAttrs(site string, m map[string]string) map[string
 			attrsHit = true
 			continue
 		}
+		if len(k) > g.limits.MaxAttrValueBytes {
+			attrsHit = true
+			continue
+		}
 		v := m[k]
 		if len(v) > g.limits.MaxAttrValueBytes {
 			v = truncateUTF8(v, g.limits.MaxAttrValueBytes)
@@ -224,8 +228,8 @@ func (g *seriesGuard) truncateAttrs(site string, m map[string]string) map[string
 }
 
 func anyOverLong(m map[string]string, limit int) bool {
-	for _, v := range m {
-		if len(v) > limit {
+	for k, v := range m {
+		if len(k) > limit || len(v) > limit {
 			return true
 		}
 	}
