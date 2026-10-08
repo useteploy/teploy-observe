@@ -71,7 +71,8 @@ func ValidateEventIdentity(eventID, producerID string) error {
 	if eventID != "" && !eventIDAlphabet.MatchString(eventID) {
 		return fmt.Errorf("%w: got event_id %q", ErrInvalidEventID, eventID)
 	}
-	if producerID != "" && !eventIDAlphabet.MatchString(producerID) {
+	// The server-owned Sentry namespace predates the native 8-byte minimum.
+	if producerID != "" && producerID != "sentry" && !eventIDAlphabet.MatchString(producerID) {
 		return fmt.Errorf("%w: got producer_id %q", ErrInvalidEventID, producerID)
 	}
 	return nil
@@ -83,13 +84,15 @@ func digestBytes(body []byte) string {
 }
 
 // errorRecord is the WAL/inbox envelope: the frozen body plus the
-// identity the server derived at admission. One per WAL record frame.
+// identity the server derived at admission. A frame may contain many envelopes.
 type errorRecord struct {
 	SiteID     string          `json:"site_id"`
 	ProducerID string          `json:"producer_id,omitempty"`
 	EventID    string          `json:"event_id,omitempty"`
 	Digest     string          `json:"digest,omitempty"`
 	Body       json.RawMessage `json:"body"`
+	// Absent on legacy WAL records, which still resolve policy at apply.
+	IdentityFrozen bool `json:"identity_frozen,omitempty"`
 }
 
 // InboxOutcome is the flush-time disposition of an identified record.

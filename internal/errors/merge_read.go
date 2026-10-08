@@ -2,6 +2,7 @@ package errors
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -10,15 +11,6 @@ import (
 )
 
 // Read-side helpers for merge/assignment (see merge.go).
-
-const maxScopeIDs = 50
-
-func capIDs(ids []string) []string {
-	if len(ids) > maxScopeIDs-1 {
-		ids = ids[:maxScopeIDs-1]
-	}
-	return ids
-}
 
 // issueIDClause renders `issue_id IN ($n, ...)` for ids (an empty list
 // matches nothing), with parameters numbered from start.
@@ -58,16 +50,27 @@ func (s *IssueService) siteAssignments(ctx context.Context, siteID string) map[s
 // regression reopen) and, when the target was resolved, sends the
 // regression notification for the target. The hidden source is never
 // bumped or notified. Returns the target id.
-func (s *IssueService) attributeMerged(ctx context.Context, siteID, target, release string, ts int64) string {
+func (s *IssueService) attributeMerged(ctx context.Context, siteID, target, release string, ts int64) (string, error) {
 	lc := s.lifecycle()
 	t, err := lc.issueByID(ctx, siteID, target)
+	if err != nil {
+		return "", fmt.Errorf("merged issue lookup: %w", err)
+	}
+	if t == nil {
+		return "", ErrIssueNotFound
+	}
 	count := s.mergedCount(ctx, lc, siteID, target) + 1
-	_ = lc.bump(ctx, target, siteID, ts, count)
+	if err := lc.bump(ctx, target, siteID, ts, count); err != nil {
+		s.counts.mu.Lock()
+		delete(s.counts.m, siteID+"\x00"+target)
+		s.counts.mu.Unlock()
+		return "", fmt.Errorf("bump merged issue: %w", err)
+	}
 	if err == nil && t != nil && t.Status == "resolved" {
 		s.notify(ctx, IssueEvent{Kind: IssueEventRegression, SiteID: siteID, IssueID: target,
 			Title: t.Title, Culprit: t.Culprit, Level: t.Level, Release: release, EventCount: count})
 	}
-	return target
+	return target, nil
 }
 
 const (
@@ -78,6 +81,7 @@ const (
 type scopeCountEntry struct {
 	n       int64
 	fetched time.Time
+	scope   [32]byte
 }
 
 // scopeCountCache bounds the COUNT(*) over error_events that attributing an
@@ -93,31 +97,33 @@ type scopeCountCache struct {
 func (s *IssueService) mergedCount(ctx context.Context, lc lifecycleStore, siteID, target string) int64 {
 	c := &s.counts
 	key := siteID + "\x00" + target
+	scope := s.issueScope(ctx, siteID, target)
+	scopeKey := sha256.Sum256([]byte(strings.Join(scope, "\x00")))
 	now := time.Now
 	c.mu.Lock()
 	if c.now != nil {
 		now = c.now
 	}
-	if e, ok := c.m[key]; ok && now().Sub(e.fetched) < scopeCountTTL {
+	if e, ok := c.m[key]; ok && now().Sub(e.fetched) < scopeCountTTL && e.scope == scopeKey {
 		e.n++
 		c.m[key] = e
 		c.mu.Unlock()
 		return e.n - 1
 	}
 	c.mu.Unlock()
-	n := lc.scopeCount(ctx, siteID, s.issueScope(ctx, siteID, target))
+	n := lc.scopeCount(ctx, siteID, scope)
 	c.mu.Lock()
 	if c.m == nil || len(c.m) >= scopeCountMaxItems {
 		c.m = map[string]scopeCountEntry{}
 	}
 	// n counts events stored so far; the caller adds the current one.
-	c.m[key] = scopeCountEntry{n: n + 1, fetched: now()}
+	c.m[key] = scopeCountEntry{n: n + 1, fetched: now(), scope: scopeKey}
 	c.mu.Unlock()
 	return n
 }
 
-// issueScope is [issue, merged sources...] (capped), the id set whose
+// issueScope is [issue, merged sources...] (complete), the id set whose
 // events count towards the issue.
 func (s *IssueService) issueScope(ctx context.Context, siteID, issueID string) []string {
-	return append([]string{issueID}, capIDs(sourcesOf(s.siteMerges(ctx, siteID), issueID))...)
+	return append([]string{issueID}, sourcesOf(s.siteMerges(ctx, siteID), issueID)...)
 }

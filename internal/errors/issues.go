@@ -285,10 +285,12 @@ func (s *IssueService) ResolveIssue(ctx context.Context, siteID, groupHash, titl
 	// 1. Check KV cache
 	if ci, ok := lc.cacheGet(ctx, siteID, groupHash); ok {
 		if target := s.ResolveMerged(ctx, siteID, ci.IssueID); target != ci.IssueID {
-			return s.attributeMerged(ctx, siteID, target, release, ts), nil
+			return s.attributeMerged(ctx, siteID, target, release, ts)
 		}
 		newCount := ci.EventCount + 1
-		_ = lc.bump(ctx, ci.IssueID, siteID, ts, newCount)
+		if err := lc.bump(ctx, ci.IssueID, siteID, ts, newCount); err != nil {
+			return "", fmt.Errorf("bump issue: %w", err)
+		}
 		ci.EventCount = newCount
 		if ci.Resolved {
 			// bumpIssue reopened it (resolved -> open).
@@ -305,16 +307,22 @@ func (s *IssueService) ResolveIssue(ctx context.Context, siteID, groupHash, titl
 	if err == nil && existing != nil {
 		if target := s.ResolveMerged(ctx, siteID, existing.IssueID); target != existing.IssueID {
 			lc.cacheSet(ctx, siteID, groupHash, cachedIssue{IssueID: existing.IssueID, EventCount: existing.EventCount})
-			return s.attributeMerged(ctx, siteID, target, release, ts), nil
+			return s.attributeMerged(ctx, siteID, target, release, ts)
 		}
 		newCount := existing.EventCount + 1
-		_ = lc.bump(ctx, existing.IssueID, siteID, ts, newCount)
+		if err := lc.bump(ctx, existing.IssueID, siteID, ts, newCount); err != nil {
+			return "", fmt.Errorf("bump issue: %w", err)
+		}
 		lc.cacheSet(ctx, siteID, groupHash, cachedIssue{IssueID: existing.IssueID, EventCount: newCount})
 		if existing.Status == "resolved" {
 			s.notify(ctx, IssueEvent{Kind: IssueEventRegression, SiteID: siteID, IssueID: existing.IssueID,
 				Title: existing.Title, Culprit: existing.Culprit, Level: existing.Level, Release: release, EventCount: newCount})
 		}
 		return existing.IssueID, nil
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("find issue: %w", err)
 	}
 
 	// 3. New issue: create.
@@ -492,7 +500,7 @@ func (s *IssueService) ListIssues(ctx context.Context, siteID, status string, li
 			continue
 		}
 		issue := issues[i].toIssue(now)
-		sources := capIDs(sourcesOf(merges, issue.IssueID))
+		sources := sourcesOf(merges, issue.IssueID)
 		ids := append([]string{issue.IssueID}, sources...)
 		issue.MergedSources = sources
 		if a, ok := assigns[issue.IssueID]; ok {

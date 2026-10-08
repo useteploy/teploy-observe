@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,6 +50,7 @@ type ErrorBuffer struct {
 	flushSize     int
 	flushInterval time.Duration
 	handler       *ErrorHandler
+	apply         func(context.Context, bufferedError) bool
 	logger        *slog.Logger
 	stopCh        chan struct{}
 	// wake coalesces size-triggered flush wakeups: capacity one, so any
@@ -71,8 +70,10 @@ type ErrorBuffer struct {
 	adm *admissionCache
 	// quarantineDir hosts the poison spool when a queue is attached.
 	quarantineDir string
+	quarantineMu  sync.Mutex
 	// scrub redacts secrets/PII before the record is frozen (scrub.go).
-	scrub *Scrubber
+	scrub        *Scrubber
+	quarantineIO *quarantineIO
 	// O01 §5.10 counters (atomics — the admission path must not take a
 	// second lock for accounting).
 	accepted          atomic.Int64
@@ -98,8 +99,9 @@ type bufferedError struct {
 	Digest     string
 	// Offset is the WAL position after this record's frame (0 without a
 	// queue). The flush checkpoint target: advancing past it is only
-	// correct once the record reaches a FINAL disposition.
-	Offset int64
+	// correct once EVERY remaining member of the frame is FINAL.
+	Offset         int64
+	IdentityFrozen bool
 }
 
 // DefaultErrorBufferBytes is the retained-memory budget for queued plus
@@ -107,11 +109,14 @@ type bufferedError struct {
 const DefaultErrorBufferBytes = 64 << 20
 
 // maxErrorRecordBytes caps one serialized error record at admission. Larger
-// inputs are rejected (429) rather than buffered.
+// inputs are permanently rejected rather than buffered.
 const maxErrorRecordBytes = 256 << 10
 
 // ErrErrorBufferFull is the capacity-class admission refusal (429).
 var ErrErrorBufferFull = errors.New("error buffer full or closed")
+
+// ErrErrorRecordTooLarge is permanent; capacity recovery cannot admit it.
+var ErrErrorRecordTooLarge = errors.New("error record exceeds 256 KiB")
 
 // admissionCacheTTL/capacity mirror the events BatchDeduper constants: the
 // cache is the fast path only; the durable arbiter is the error_inbox
@@ -195,7 +200,8 @@ func (b *ErrorBuffer) WorkerErr() error {
 // replays the previous process's uncheckpointed records WRITE-THROUGH, the
 // errors twin of the events Buffer.AttachQueue discipline (TO-014):
 // pending frames are applied through ApplyInbox in bounded chunks before
-// the queue is installed, so replay memory is one frame and a corrupt
+// the queue is installed, with failed pending records bounded by admission
+// memory and count budgets. A corrupt
 // frame fails the attach with nothing partially staged. Records whose
 // apply fails during replay (storage still down at boot) are re-enqueued
 // as PENDING — their frames stay uncheckpointed, so a later crash
@@ -206,6 +212,8 @@ func (b *ErrorBuffer) AttachQueue(q *ingest.DiskQueue) error {
 		b.mu.Unlock()
 		return fmt.Errorf("errors WAL already attached")
 	}
+	availableBytes, availableSize := b.maxBytes-b.usedBytes, b.maxSize-len(b.events)
+	b.quarantineDir = q.Dir() // poison diversion must be durable during startup replay
 	b.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -217,41 +225,48 @@ func (b *ErrorBuffer) AttachQueue(q *ingest.DiskQueue) error {
 	target := int64(-1)
 	gapOpen := false
 	err := q.StreamRecordFrames(func(recs []json.RawMessage, endOffset int64) error {
+		frameFinal := true
 		for _, raw := range recs {
 			var rec errorRecord
 			if uerr := json.Unmarshal(raw, &rec); uerr != nil || len(rec.Body) == 0 || rec.SiteID == "" {
 				// Frame decodes, envelope does not: poison by inspection —
 				// quarantine and keep replaying.
-				b.quarantineRaw(raw, fmt.Errorf("replay: undecodable error envelope: %v", uerr))
-				if !gapOpen {
-					target = endOffset
+				if err := b.quarantineRaw(raw, fmt.Errorf("replay: undecodable error envelope: %v", uerr)); err != nil {
+					return fmt.Errorf("errors WAL poison quarantine failed: %w", err)
 				}
+				b.quarantined.Add(1)
 				recovered++
 				continue
 			}
 			ev := bufferedError{
-				Body:       rec.Body,
-				Site:       rec.SiteID,
-				Cost:       int64(len(rec.Body) + len(rec.SiteID) + 128),
-				ProducerID: rec.ProducerID,
-				EventID:    rec.EventID,
-				Digest:     rec.Digest,
-				Offset:     endOffset,
+				Body:           rec.Body,
+				Site:           rec.SiteID,
+				Cost:           int64(len(rec.Body) + len(rec.SiteID) + 128),
+				ProducerID:     rec.ProducerID,
+				EventID:        rec.EventID,
+				Digest:         rec.Digest,
+				Offset:         endOffset,
+				IdentityFrozen: rec.IdentityFrozen,
 			}
 			if b.applyOne(ctx, ev) {
 				// Final disposition (applied/deduped/conflict/quarantined).
-				if !gapOpen {
-					target = endOffset
-				}
 				recovered++
 			} else {
 				// Storage unavailable at boot: PENDING, checkpoint stops
 				// here, the record keeps its WAL frame.
-				gapOpen = true
+				frameFinal = false
 				failed++
+				if pendingCost+ev.Cost > availableBytes || len(pending) >= availableSize {
+					return fmt.Errorf("errors WAL pending replay exceeds memory budget; restore storage and retry startup")
+				}
 				pending = append(pending, ev)
 				pendingCost += ev.Cost
 			}
+		}
+		if !frameFinal {
+			gapOpen = true
+		} else if !gapOpen {
+			target = endOffset
 		}
 		return nil
 	})
@@ -267,9 +282,10 @@ func (b *ErrorBuffer) AttachQueue(q *ingest.DiskQueue) error {
 		b.mu.Unlock()
 		return fmt.Errorf("errors WAL already attached")
 	}
-	b.events = append(pending, b.events...)
-	b.usedBytes += pendingCost
-	b.quarantineDir = q.Dir()
+	if b.usedBytes+pendingCost > b.maxBytes || len(b.events)+len(pending) > b.maxSize {
+		b.mu.Unlock()
+		return fmt.Errorf("errors WAL pending replay exceeds available admission budget")
+	}
 	// Everything final is durable in the database; advance the checkpoint
 	// past it so it never replays again. A gap leaves the tail alone.
 	if target >= 0 {
@@ -278,6 +294,8 @@ func (b *ErrorBuffer) AttachQueue(q *ingest.DiskQueue) error {
 			return fmt.Errorf("errors WAL recovery checkpoint failed (final records are committed and will replay-dedupe after a restart): %w", cerr)
 		}
 	}
+	b.events = append(pending, b.events...)
+	b.usedBytes += pendingCost
 	b.lastOff = q.Offset()
 	b.queue = q
 	b.mu.Unlock()
@@ -327,6 +345,19 @@ func (b *ErrorBuffer) Stop() {
 // it will flush or replay, and the inbox dedupe absorbs the producer's
 // retry — at-least-once, never a lossy 200.
 func (b *ErrorBuffer) Push(siteID string, input ErrorInput) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return b.PushContext(ctx, siteID, input)
+}
+
+// PushContext freezes the site-policy identity before any durable admission.
+// The legacy Push entry point uses a bounded context for non-HTTP producers.
+func (b *ErrorBuffer) PushContext(ctx context.Context, siteID string, input ErrorInput) error {
+	// Never trust an internal marker supplied by a caller.
+	input.identityFrozen = false
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	input.SiteID = siteID
 	if err := ValidateEventIdentity(input.EventID, input.ProducerID); err != nil {
 		return err
@@ -336,12 +367,35 @@ func (b *ErrorBuffer) Push(siteID string, input ErrorInput) error {
 	if input.ClientTimestamp != 0 && input.ClientTimestamp > time.Now().UnixMilli()+24*60*60*1000 {
 		return fmt.Errorf("%w: timestamp is too far in the future", ErrBadTimestamp)
 	}
+	// Digest the scrubbed producer content before policy transformation, so
+	// an identical retry remains a duplicate across a policy/salt change.
+	// Only the digest and the policy-frozen body enter memory/WAL.
 	input = b.prepareRecord(input)
-	raw, err := json.Marshal(input)
-	if err != nil || len(raw) > maxErrorRecordBytes {
-		return ErrErrorBufferFull
+	producerBody, err := json.Marshal(input)
+	if err != nil {
+		return fmt.Errorf("serialize error record: %w", err)
 	}
-	digest := digestBytes(raw)
+	digest := digestBytes(producerBody)
+	if b.handler != nil {
+		id, err := b.handler.resolveDistinctID(ctx, input)
+		if err != nil {
+			return err
+		}
+		input.DistinctID = id
+	} else if input.DistinctID != "" {
+		return fmt.Errorf("error identity policy unavailable")
+	}
+	input.identityFrozen = true
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(input)
+	if err != nil {
+		return fmt.Errorf("serialize error record: %w", err)
+	}
+	if len(raw) > maxErrorRecordBytes {
+		return ErrErrorRecordTooLarge
+	}
 	if input.EventID != "" {
 		duplicate, conflict := b.adm.lookup(siteID, input.ProducerID, input.EventID, digest)
 		if duplicate {
@@ -357,13 +411,17 @@ func (b *ErrorBuffer) Push(siteID string, input ErrorInput) error {
 	// Payload + site key + envelope allowance.
 	cost := int64(len(raw) + len(siteID) + 128)
 
-	rec := errorRecord{SiteID: siteID, ProducerID: input.ProducerID, EventID: input.EventID, Digest: digest, Body: raw}
+	rec := errorRecord{SiteID: siteID, ProducerID: input.ProducerID, EventID: input.EventID, Digest: digest, Body: raw, IdentityFrozen: true}
 	frame, err := json.Marshal(rec)
 	if err != nil {
 		return ErrErrorBufferFull
 	}
 
 	b.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		b.mu.Unlock()
+		return err
+	}
 	if b.closing || len(b.events) >= b.maxSize || cost > b.maxBytes-b.usedBytes {
 		b.mu.Unlock()
 		return ErrErrorBufferFull
@@ -383,7 +441,7 @@ func (b *ErrorBuffer) Push(siteID string, input ErrorInput) error {
 		}
 	}
 	b.events = append(b.events, bufferedError{Body: raw, Site: siteID, Cost: cost,
-		ProducerID: input.ProducerID, EventID: input.EventID, Digest: digest, Offset: off})
+		ProducerID: input.ProducerID, EventID: input.EventID, Digest: digest, Offset: off, IdentityFrozen: true})
 	b.usedBytes += cost
 	full := len(b.events) >= b.flushSize
 	b.mu.Unlock()
@@ -448,13 +506,16 @@ func (b *ErrorBuffer) release(ev bufferedError) {
 // (applied / deduped / conflict / quarantined — the checkpoint may advance
 // past it), false when PENDING (transient failure; requeue, never drop).
 func (b *ErrorBuffer) applyOne(ctx context.Context, ev bufferedError) bool {
+	if b.apply != nil {
+		return b.apply(ctx, ev)
+	}
 	var input ErrorInput
 	if err := json.Unmarshal(ev.Body, &input); err != nil {
 		// A record that no longer decodes cannot ever succeed: quarantine
 		// (counted, spooled) and let the stream continue — O01 §5.4/§5.9.
-		b.quarantine(ev, fmt.Errorf("record undecodable after admission: %w", err))
-		return true
+		return b.quarantine(ev, fmt.Errorf("record undecodable after admission: %w", err))
 	}
+	input.identityFrozen = ev.IdentityFrozen
 	actx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	outcome, _, err := b.handler.ApplyInbox(actx, input, ev.ProducerID, ev.EventID, ev.Digest)
@@ -505,18 +566,29 @@ func (b *ErrorBuffer) Flush() {
 	target := int64(-1)
 	gapOpen := false
 	final := 0
-	for _, ev := range batch {
-		if b.applyOne(ctx, ev) {
-			final++
-			b.release(ev)
-			if !gapOpen {
-				// The checkpoint may cover this record's frame.
-				target = ev.Offset
-			}
-			continue
+	for i := 0; i < len(batch); {
+		// Replayed frames can contain multiple records. Keep their remaining
+		// members together, and advance only after the whole group is final.
+		end := i + 1
+		for end < len(batch) && batch[end].Offset == batch[i].Offset {
+			end++
 		}
-		gapOpen = true
-		pending = append(pending, ev)
+		frameFinal := true
+		for _, ev := range batch[i:end] {
+			if b.applyOne(ctx, ev) {
+				final++
+				b.release(ev)
+			} else {
+				frameFinal = false
+				pending = append(pending, ev)
+			}
+		}
+		if !frameFinal {
+			gapOpen = true
+		} else if !gapOpen {
+			target = batch[i].Offset
+		}
+		i = end
 	}
 
 	b.mu.Lock()
@@ -547,38 +619,14 @@ func (b *ErrorBuffer) Flush() {
 // inspection — undecodable after admission) to the bounded spool beside
 // the WAL and counts it. Quarantine is visible through counters, never a
 // silent 200-as-applied (ADR §5.9).
-func (b *ErrorBuffer) quarantine(ev bufferedError, reason error) {
+func (b *ErrorBuffer) quarantine(ev bufferedError, reason error) bool {
+	if err := b.quarantineRaw(ev.Body, reason); err != nil {
+		b.logger.Error("errors: quarantine failed; record remains PENDING", "err", err)
+		return false
+	}
 	b.quarantined.Add(1)
 	b.logger.Error("errors: record quarantined (permanently unapplicable)", "site", ev.Site, "event_id", ev.EventID, "err", reason)
-	b.quarantineRaw(ev.Body, reason)
-}
-
-func (b *ErrorBuffer) quarantineRaw(body []byte, reason error) {
-	dir := b.quarantineDir
-	if dir == "" {
-		return
-	}
-	entry := struct {
-		TS     string `json:"ts"`
-		Reason string `json:"reason"`
-		Record []byte `json:"record"`
-	}{TS: time.Now().UTC().Format(time.RFC3339), Reason: reason.Error(), Record: body}
-	line, err := json.Marshal(entry)
-	if err != nil {
-		return
-	}
-	path := filepath.Join(dir, "quarantine.log")
-	if info, err := os.Stat(path); err == nil && info.Size()+int64(len(line))+1 > maxQuarantineBytes {
-		b.logger.Error("errors: quarantine spool full — record counted but not spooled", "path", path)
-		return
-	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
-	if err != nil {
-		b.logger.Error("errors: quarantine spool write failed", "err", err)
-		return
-	}
-	defer f.Close()
-	_, _ = f.Write(append(line, '\n'))
+	return true
 }
 
 // ErrorBufferStats is the errors counter block at /healthz (O01 §5.10 —

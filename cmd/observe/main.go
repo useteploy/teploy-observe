@@ -31,6 +31,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/cohorts"
 	"github.com/useteploy/teploy-observe/internal/config"
 	"github.com/useteploy/teploy-observe/internal/dashboards"
+	"github.com/useteploy/teploy-observe/internal/dbutil"
 	"github.com/useteploy/teploy-observe/internal/dogfood"
 	obserrors "github.com/useteploy/teploy-observe/internal/errors"
 	"github.com/useteploy/teploy-observe/internal/experiments"
@@ -139,7 +140,7 @@ func main() {
 	maxRetries := 15
 	for i := 0; i < maxRetries; i++ {
 		var err error
-		db, err = nucleus.Connect(ctx, cfg.NucleusURL)
+		db, err = dbutil.Connect(ctx, cfg.NucleusURL)
 		if err == nil {
 			break
 		}
@@ -226,7 +227,7 @@ func main() {
 	issueSvc := obserrors.NewIssueService(db)
 	searchSvc := obserrors.NewSearchService(db)
 	errorHandler := obserrors.NewErrorHandler(db, issueSvc, searchSvc, srcmapSvc).
-		WithPrivacy(siteSvc.PrivacyConfig, cfg.SessionSalt)
+		WithPrivacyChecked(siteSvc.PrivacyConfigChecked, cfg.SessionSalt)
 
 	// Seed demo data only when explicitly opted in (or in demo mode). Default is
 	// OFF so a fresh production install never injects fabricated logs/errors/
@@ -420,7 +421,8 @@ func main() {
 	// 023) and exposes MembersForFilter to the stats service so any
 	// analytics chart can opt in to a cohort filter via ?cohort_id=X.
 	personsSvc := persons.NewService(db)
-	cohortsSvc := cohorts.NewService(db)
+	buf.SetErasureLookup(personsSvc.IsErased)
+	cohortsSvc := cohorts.NewService(db).WithQueryGuard(queryLimiter, queryBudgets)
 	statsSvc.WithCohortResolver(cohortsSvc.MembersForFilter)
 
 	// Platform services
@@ -431,9 +433,7 @@ func main() {
 	// recorder appends 'notified'/'suppressed' events as deliveries land.
 	incidentSvc := incidents.NewService(db)
 	maintenanceSvc := platform.NewMaintenanceService(db, logger)
-	notifier := platform.NewNotifier(db, logger, maintenanceSvc, func(ctx context.Context, incidentID, kind, actor, detail string) error {
-		return incidentSvc.RecordEvent(ctx, incidentID, kind, actor, detail)
-	})
+	notifier := platform.NewNotifier(db, logger, maintenanceSvc, incidentSvc.RecordEventTx)
 	alertSvc := platform.NewAlertService(db, logger, webhookSvc, incidentSvc, notifier)
 
 	// Feature expansion services
@@ -454,7 +454,7 @@ func main() {
 	ssoSvc := sso.NewSSOService(db)
 	flagSvc := flags.NewFlagService(db)
 	flagSvc.WithEvalDedup(flags.LoadEvalDedupFromEnv(os.Getenv))
-	experimentSvc := experiments.NewExperimentService(db).WithPrivacy(siteSvc.PrivacyConfig, cfg.SessionSalt)
+	experimentSvc := experiments.NewExperimentService(db).WithPrivacyChecked(siteSvc.PrivacyConfigChecked, cfg.SessionSalt)
 	surveySvc := surveys.NewSurveyService(db, cfg.SessionSalt, siteSvc)
 	logSvc := logs.NewLogService(db)
 	logSvc.SetPipelines(pipelineSvc)
@@ -469,7 +469,7 @@ func main() {
 	dashSvc := dashboards.NewDashboardService(db).WithMetrics(metricsSvc)
 	replaySvc := replays.NewReplayService(db).
 		WithLogger(logger).
-		WithPrivacy(siteSvc.PrivacyConfig, cfg.SessionSalt).
+		WithPrivacyChecked(siteSvc.PrivacyConfigChecked, cfg.SessionSalt).
 		WithQueryGuard(queryLimiter, queryBudgets)
 	heatmapsSvc := heatmaps.NewService(db)
 	aiSvc := aiquery.NewService(db, logger)
@@ -532,46 +532,12 @@ func main() {
 		})
 	})
 
-	// A cron check-in resolves any open missed-cron incident for that
-	// monitor - and (O10 tail) notifies through the durable outbox when it
-	// actually closed something, so a recovered cron reaches the same
-	// channels its missing did.
-	// notifyCronIncident enqueues one durable notification intent per
-	// severity-matched webhook (cron severity is warning) - the same
-	// outbox, delivery contract and dead-letter posture as alerts.
-	notifyCronIncident := func(ctx context.Context, kind string, cron platform.CronMonitorRef, incidentID string, graceSecs int) {
-		hooks, err := webhookSvc.List(ctx, cron.SiteID)
-		if err != nil {
-			logger.Warn("cron notification: webhook listing failed", "cron", cron.CronID, "err", err)
-			return
-		}
-		payload := platform.BuildCronPayload(kind, cron, incidentID, graceSecs, time.Now())
-		for _, hook := range hooks {
-			if !platform.MatchesSeverity(hook.Severities, "warning") {
-				continue
-			}
-			if _, err := notifier.Enqueue(ctx, platform.NotificationIntent{
-				Kind: kind, RuleID: "cron:" + cron.CronID, IncidentID: incidentID,
-				SiteID: cron.SiteID, WebhookID: hook.WebhookID,
-				TargetType: hook.WebhookType, TargetURL: hook.URL, Secret: hook.Secret,
-				Payload: payload,
-			}); err != nil {
-				logger.Warn("cron notification enqueue failed", "cron", cron.CronID, "err", err)
-			}
-		}
-	}
+	// Incident state and all notification obligations commit together.
 	cronSvc.OnCheckin = func(ctx context.Context, c monitoring.CronMonitor) {
-		closed, err := incidentSvc.CloseByRule(ctx, "cron:"+c.CronID)
+		_, err := alertSvc.RecoverCron(ctx, platform.CronMonitorRef{CronID: c.CronID, SiteID: c.SiteID, Name: c.Name, Slug: c.Slug}, c.GracePeriod)
 		if err != nil {
-			logger.Warn("cron incident auto-resolve failed", "cron", c.CronID, "err", err)
-			return
+			logger.Warn("cron recovery failed", "cron", c.CronID, "err", err)
 		}
-		if closed == 0 {
-			return
-		}
-		notifyCronIncident(ctx, platform.NotifyCronRecovered, platform.CronMonitorRef{
-			CronID: c.CronID, SiteID: c.SiteID, Name: c.Name, Slug: c.Slug,
-		}, "", 0)
 	}
 
 	// W2.B: cross-site board summary. SiteLookup adapts the SiteService
@@ -646,7 +612,7 @@ func main() {
 	app = neutron.New(
 		neutron.WithLogger(logger),
 		neutron.WithMiddleware(self.RecoverMiddleware, self.TraceMiddleware),
-		neutron.WithLifecycle(db.LifecycleHook()),
+		neutron.WithLifecycle(observeLifecycleHook(db.LifecycleHook())),
 		neutron.WithLifecycle(neutron.LifecycleHook{
 			Name: "ingest-buffer",
 			OnStart: func(ctx context.Context) error {
@@ -662,7 +628,8 @@ func main() {
 		// error buffer's final flush (which can raise new-issue and
 		// regression events) runs before the dispatcher shuts down.
 		neutron.WithLifecycle(neutron.LifecycleHook{
-			Name: "issue-notifications",
+			Name:    "issue-notifications",
+			OnStart: func(context.Context) error { return nil },
 			OnStop: func(ctx context.Context) error {
 				return shutdownIssueNotifications(issueNotifier)
 			},
@@ -681,7 +648,8 @@ func main() {
 		// R22 (round 4): webhook delivery drains on shutdown instead of
 		// dying with the process mid-alert.
 		neutron.WithLifecycle(neutron.LifecycleHook{
-			Name: "webhook-delivery",
+			Name:    "webhook-delivery",
+			OnStart: func(context.Context) error { return nil },
 			OnStop: func(ctx context.Context) error {
 				webhookSvc.Shutdown()
 				return nil
@@ -708,17 +676,7 @@ func main() {
 		// process's committed-but-undelivered notifications (receivers
 		// dedupe on the stable X-Observe-Delivery id), Stop waits for the
 		// in-flight delivery.
-		neutron.WithLifecycle(neutron.LifecycleHook{
-			Name: "notification-outbox",
-			OnStart: func(ctx context.Context) error {
-				notifier.Start()
-				return nil
-			},
-			OnStop: func(ctx context.Context) error {
-				notifier.Stop()
-				return nil
-			},
-		}),
+		neutron.WithLifecycle(notifier.LifecycleHook()),
 		neutron.WithLifecycle(neutron.LifecycleHook{
 			Name: "scheduler",
 			OnStart: func(ctx context.Context) error {
@@ -757,35 +715,11 @@ func main() {
 						return err
 					}
 					for _, c := range missed {
-						// EnsureOpen, never Create: this reuses the monitor's
-						// already-open incident and, critically, refuses to
-						// declare anything when the lookup itself fails. The
-						// old `if active, _ := ActiveByRule(...)` read a failed
-						// query as "nothing open" and opened another incident
-						// every tick.
-						inc, created, err := incidentSvc.EnsureOpen(ctx, incidents.CreateInput{
-							SiteID:      c.SiteID,
-							Title:       fmt.Sprintf("Cron missed: %s", c.Name),
-							Description: fmt.Sprintf("cron %q (slug %q) has not checked in within its %ds grace period", c.Name, c.Slug, c.GracePeriod),
-							Severity:    "warning",
-							Source:      incidents.SourceCron,
-							RuleID:      "cron:" + c.CronID,
-						}, "cron")
-						if err != nil {
-							logger.Warn("cron incident auto-create failed", "cron", c.CronID, "err", err)
-							continue
-						}
-						// O10 tail: the missed-cron notification rides the
-						// DURABLE outbox (it was EnsureOpen-only - the
-						// incident existed, nothing was delivered). Gated on
-						// created so a still-missing cron does not re-notify
-						// every tick; the check-in hook sends the recovery.
-						if created {
-							notifyCronIncident(ctx, platform.NotifyCronMissed, platform.CronMonitorRef{
-								CronID: c.CronID, SiteID: c.SiteID, Name: c.Name, Slug: c.Slug,
-							}, inc.IncidentID, c.GracePeriod)
+						if _, _, err := alertSvc.EnsureCronMissed(ctx, platform.CronMonitorRef{CronID: c.CronID, SiteID: c.SiteID, Name: c.Name, Slug: c.Slug}, c.GracePeriod); err != nil {
+							return err
 						}
 					}
+
 					return nil
 				})
 				bgWorkers.Run("scheduled-export", 10*time.Second, time.Minute, func(ctx context.Context) error {
@@ -848,6 +782,7 @@ func main() {
 		// below once its dependencies exist. See otlpgrpc_wiring.go.
 		neutron.WithLifecycle(otlpGRPCHook(logger)),
 		neutron.WithMiddleware(ingest.RequestInfoMiddleware(ingest.ParseTrustedProxies(cfg.TrustedProxies))),
+		neutron.WithMiddleware(queryRefusalMetadata),
 		neutron.WithMiddleware(securityHeadersMiddleware(strings.HasPrefix(cfg.PublicURL, "https://"))),
 		neutron.WithMiddleware(config.DemoModeMiddleware(cfg.DemoMode)),
 		// Record every admin mutation to the audit trail (comprehensive
@@ -873,7 +808,7 @@ func main() {
 	// --- Auth API (public) ---
 	// IP-keyed rate limit on login throttles password brute-force (10/min/IP).
 	loginLimiter := ingest.NewRateLimiter(10, time.Minute, 10)
-	loginGroup := r.Group("/api/v1", ipRateLimitMW(loginLimiter))
+	loginGroup := r.Group("/api/v1", ipRateLimitMW(loginLimiter), loginBodyMiddleware)
 	neutron.Post(loginGroup, "/auth/login", loginHandler(authSvc, auditSvc),
 		neutron.WithTags("auth"),
 		neutron.WithSummary("Login and receive JWT token"),
@@ -920,11 +855,12 @@ func main() {
 	// high-water refusal, WAL latch) — the OTLP handlers' convention.
 	apiKeyMW := auth.APIKeyAuthMiddleware(authSvc)
 	registerSentryRoutes(r, authSvc, errorBuf, rateLimiter, logger)
-	ingestGroup := r.Group("/api/v1", ingestCORS, apiKeyMW, rateLimiter.Middleware, neutron.BodyLimit(2<<20), ingest.RetryAfterOnUnavailable(5*time.Second))
+	ingestGroup := r.Group("/api/v1", ingestCORS, apiKeyMW, rateLimiter.Middleware, boundedRequestBody(2<<20), ingest.RetryAfterOnUnavailable(5*time.Second))
 	neutron.Post(ingestGroup, "/events", ingest.Handler(buf, cfg.SessionSalt, siteSvc),
 		neutron.WithTags("ingest"),
 		neutron.WithSummary("Ingest analytics event"),
 	)
+	neutron.Post(ingestGroup, "/events/import", ingest.HistoricalHandler(buf, cfg.SessionSalt, siteSvc), neutron.WithTags("events"), neutron.WithSummary("Import authenticated historical events"))
 	neutron.Post(ingestGroup, "/events/batch", ingest.BatchHandler(buf, cfg.SessionSalt, siteSvc, eventBatchDeduper),
 		neutron.WithTags("ingest"),
 		neutron.WithSummary("Ingest batch of analytics events"),
@@ -1324,7 +1260,7 @@ func main() {
 	// standard OTLP exporters require the exact /v1/<signal> path — and so
 	// previously inherited none of the group's middleware.
 	otlpChain := func(h http.Handler) http.Handler {
-		return apiKeyMW(rateLimiter.Middleware(neutron.BodyLimit(otlpMaxBodyBytes)(h)))
+		return apiKeyMW(rateLimiter.Middleware(boundedRequestBody(otlpMaxBodyBytes)(h)))
 	}
 	otlpHandler := tracing.NewOTLPHandler(traceIngest)
 	r.Handle("POST /v1/traces", otlpChain(otlpHandler))
@@ -1374,7 +1310,7 @@ func main() {
 	// has a more general path") and panics at startup. GET is registered so the
 	// handler can answer 405 rather than letting the SPA serve HTML to an MCP
 	// client that guessed the verb.
-	r.Handle("POST /api/mcp", mcpHandler)
+	r.Handle("POST /api/mcp", boundedRequestBody(64<<10)(mcpHandler))
 	r.Handle("GET /api/mcp", mcpHandler)
 	// Minting and revoking a credential is admin work (RBAC contract rule 1).
 	// These live under /api/v1 so the audit middleware records the mutations.
@@ -1660,6 +1596,7 @@ func main() {
 	r.HandleFunc("GET /l/{slug}", linkSvc.ClickHandler())
 	// Tracking pixel (no auth)
 	r.HandleFunc("GET /t/pixel.gif", linkSvc.PixelHandler())
+	r.HandleFunc("GET /t/{slug}/pixel.gif", linkSvc.PixelHandler())
 
 	// Tracker scripts (served as static JS)
 	r.HandleFunc("GET /t/observe.js", serveTracker)
@@ -1685,46 +1622,11 @@ func main() {
 			writeJSONError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
+		failures := readinessFailures(walDegraded, errorWalDegraded, buf.WorkerErr(), errorBuf.WorkerErr(), queueError(eventsQ), queueError(errorsQ), errorBuf.Stats().FlushFailing)
+		degraded := len(failures) != 0
 		durability := "wal"
-		degraded := false
-		if walDegraded {
-			durability = "memory-only"
-		} else if buf.WorkerErr() != nil {
-			// AUD-016 (round 2): a dead flush worker leaves a process that
-			// acknowledges nothing and flushes nothing — report it.
-			durability = "flush-worker-failed"
-			degraded = true
-		} else if errorBuf.WorkerErr() != nil {
-			// R15 (round 4): same contract for the error pipeline — a dead
-			// error worker still acking admissions is a failed readiness,
-			// not a healthy process.
-			durability = "error-worker-failed"
-			degraded = true
-		} else if eventsQ != nil && eventsQ.LastError() != nil {
-			// Audit F14: a WAL failure after healthy startup (disk full,
-			// I/O error) latches in the queue; ingestion is refused while
-			// the durability contract is broken, and health must show it
-			// instead of reporting "wal" on a queue that stopped writing.
-			durability = "wal-degraded"
-			degraded = true
-		} else if errorWalDegraded {
-			// O01 slice 2: the errors path's own WAL never attached — error
-			// acks are memory-only, which the durability label must not
-			// paper over.
-			durability = "errors-memory-only"
-			degraded = true
-		} else if errorsQ != nil && errorsQ.LastError() != nil {
-			// O01 slice 2: F14 latch on the errors queue — error admission
-			// is refused while the queue cannot back an ack.
-			durability = "error-wal-degraded"
-			degraded = true
-		} else if errorBuf.Stats().FlushFailing {
-			// O01 §5.4: records are PENDING, not dropped, but the pipeline
-			// cannot drain — a sustained apply failure is a degraded state,
-			// not a healthy one (it will turn into 429s as the budget
-			// fills).
-			durability = "error-flush-failing"
-			degraded = true
+		if degraded {
+			durability = strings.Join(failures, ",")
 		}
 		// R15 (round 4): readiness tells the truth — a degraded durability
 		// state is a 503 so HTTP-status-based supervisors, deployment gates
@@ -1827,7 +1729,7 @@ func main() {
 	// --- Attribution API ---
 	// Routes live in attribution_handlers.go (W2.C). Single-line wiring keeps
 	// the merge surface minimal against W2.A (funnels) and W2.B (boards).
-	RegisterAttributionRoutes(r.Group("", jwtMW), query.NewAttributionService(db))
+	RegisterAttributionRoutes(r.Group("", jwtMW), query.NewAttributionService(db).WithQueryGuard(queryLimiter, queryBudgets))
 
 	// --- Trace funnels API ---
 	// Routes live in funnel_handlers.go (W2.A). Same single-line wiring
@@ -1882,6 +1784,9 @@ func main() {
 		w.Write(indexHTML)
 	})
 
+	r.HandleFunc("GET /openapi.json", func(w http.ResponseWriter, req *http.Request) {
+		neutron.JSON(w, http.StatusOK, observeOpenAPI(app.OpenAPI()))
+	})
 	if os.Getenv("OBSERVE_LOG_ROUTES") == "1" {
 		r.PrintRoutes()
 	}
@@ -1968,7 +1873,7 @@ Example upgrade:
 
 func connectForCLI(cfg config.Config, logger *slog.Logger) *nucleus.Client {
 	ctx := context.Background()
-	db, err := nucleus.Connect(ctx, cfg.NucleusURL)
+	db, err := dbutil.Connect(ctx, cfg.NucleusURL)
 	if err != nil {
 		logger.Error("failed to connect to nucleus", "err", err)
 		os.Exit(1)
@@ -2867,7 +2772,11 @@ func errorIngestHandler(buf *obserrors.ErrorBuffer) neutron.HandlerFunc[obserror
 		// events; a duplicate retry acks {ok, deduped}; a conflicting
 		// event_id reuse is 409. The 409 and the deduped flag are new wire
 		// shapes only identity-carrying SDKs can produce.
-		if err := buf.Push(siteID, input); err != nil {
+		if err := buf.PushContext(ctx, siteID, input); err != nil {
+			var appErr *neutron.AppError
+			if errors.As(err, &appErr) {
+				return obserrors.ErrorResponse{}, appErr
+			}
 			switch {
 			case errors.Is(err, obserrors.ErrAdmittedDuplicate):
 				return obserrors.ErrorResponse{OK: true, Deduped: true}, nil
@@ -2877,6 +2786,8 @@ func errorIngestHandler(buf *obserrors.ErrorBuffer) neutron.HandlerFunc[obserror
 				return obserrors.ErrorResponse{}, neutron.ErrBadRequest(err.Error())
 			case errors.Is(err, obserrors.ErrBadTimestamp):
 				return obserrors.ErrorResponse{}, neutron.ErrBadRequest(err.Error())
+			case errors.Is(err, obserrors.ErrErrorRecordTooLarge):
+				return obserrors.ErrorResponse{}, &neutron.AppError{Status: http.StatusRequestEntityTooLarge, Title: "Payload Too Large", Detail: "error record exceeds admission budget"}
 			case errors.Is(err, obserrors.ErrErrorBufferFull):
 				return obserrors.ErrorResponse{}, neutron.ErrRateLimited("error buffer full")
 			default:
@@ -3156,6 +3067,9 @@ type infraHistoryInput struct {
 
 func infraHistoryHandler(svc *infra.InfraService) neutron.HandlerFunc[infraHistoryInput, []infra.HostMetric] {
 	return func(ctx context.Context, input infraHistoryInput) ([]infra.HostMetric, error) {
+		if input.SiteID == "" {
+			return nil, neutron.ErrBadRequest("site_id required")
+		}
 		from, to, err := parseTimeRange(input.From, input.To)
 		if err != nil {
 			return nil, neutron.ErrBadRequest(err.Error())
@@ -3259,7 +3173,14 @@ type addMemberInput struct {
 
 func addGroupMemberHandler(svc *groups.GroupService) neutron.HandlerFunc[addMemberInput, neutron.Empty] {
 	return func(ctx context.Context, input addMemberInput) (neutron.Empty, error) {
-		return neutron.Empty{}, svc.AddMember(ctx, input.SiteID, input.GroupID, input.SessionID, input.UserID)
+		err := svc.AddMember(ctx, input.SiteID, input.GroupID, input.SessionID, input.UserID)
+		if errors.Is(err, groups.ErrInvalidMember) {
+			return neutron.Empty{}, neutron.ErrBadRequest(err.Error())
+		}
+		if errors.Is(err, groups.ErrGroupNotFound) {
+			return neutron.Empty{}, neutron.ErrNotFound(err.Error())
+		}
+		return neutron.Empty{}, err
 	}
 }
 
@@ -3612,15 +3533,7 @@ func aiConfigPutHandler(svc *aiquery.Service) http.HandlerFunc {
 	}
 }
 
-// R40 (round 4): per-user rate limit and process-wide concurrency gate for
-// AI query generation — the route is authenticated-JWT reachable and each
-// call costs real provider money; the upstream 30s timeout bounds one call,
-// not aggregate concurrency or spend.
-var (
-	aiQueryLimiter = ingest.NewRateLimiter(10, time.Minute, 10)
-	aiQuerySlots   = make(chan struct{}, 4)
-)
-
+// AI generation admission is shared with MCP inside aiquery.Service.
 func aiQueryHandler(svc *aiquery.Service, card *aiquery.SchemaCard, llmSvc *llm.LLMService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// R40: bounded body — a question is text, not a document.
@@ -3643,17 +3556,8 @@ func aiQueryHandler(svc *aiquery.Service, card *aiquery.SchemaCard, llmSvc *llm.
 		if claims, cerr := neutronauth.ClaimsFromContext(r.Context()); cerr == nil {
 			sub, _ = claims["sub"].(string)
 		}
-		if sub == "" || !aiQueryLimiter.Allow("ai", sub) {
-			w.Header().Set("Retry-After", "10")
-			writeJSONError(w, http.StatusTooManyRequests, "AI query rate limit exceeded")
-			return
-		}
-		select {
-		case aiQuerySlots <- struct{}{}:
-			defer func() { <-aiQuerySlots }()
-		default:
-			w.Header().Set("Retry-After", "5")
-			writeJSONError(w, http.StatusTooManyRequests, "AI query capacity is busy")
+		if sub == "" {
+			writeJSONError(w, http.StatusUnauthorized, "authenticated principal required")
 			return
 		}
 		siteID := input.SiteID
@@ -3666,7 +3570,7 @@ func aiQueryHandler(svc *aiquery.Service, card *aiquery.SchemaCard, llmSvc *llm.
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		result, err := svc.Generate(ctx, input.Question, schema)
+		result, err := svc.Generate(aiquery.WithPrincipal(ctx, "user:"+sub), input.Question, schema)
 		// Dogfood: record the AI call in llm_traces whether success or error.
 		go func(ok bool, errMsg string) {
 			bg, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -3689,6 +3593,23 @@ func aiQueryHandler(svc *aiquery.Service, card *aiquery.SchemaCard, llmSvc *llm.
 				Completion:       result.SQL,
 			})
 		}(err == nil, errStr(err))
+		if errors.Is(err, aiquery.ErrQuestion) {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, aiquery.ErrPrincipal) {
+			writeJSONError(w, http.StatusUnauthorized, err.Error())
+			return
+		}
+		if errors.Is(err, aiquery.ErrRateLimit) || errors.Is(err, aiquery.ErrCapacity) {
+			retry := "10"
+			if errors.Is(err, aiquery.ErrCapacity) {
+				retry = "5"
+			}
+			w.Header().Set("Retry-After", retry)
+			writeJSONError(w, http.StatusTooManyRequests, err.Error())
+			return
+		}
 		if err != nil {
 			writeJSONError(w, http.StatusBadGateway, err.Error())
 			return
@@ -3752,7 +3673,7 @@ type createFlagInput struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	FlagType    string `json:"flag_type"`
-	RolloutPct  int    `json:"rollout_pct"`
+	RolloutPct  *int   `json:"rollout_pct"`
 	Variants    string `json:"variants"`
 	Targeting   string `json:"targeting"`
 }
@@ -3762,7 +3683,11 @@ func createFlagHandler(svc *flags.FlagService) neutron.HandlerFunc[createFlagInp
 		if input.SiteID == "" || input.FlagKey == "" {
 			return flags.FeatureFlag{}, neutron.ErrBadRequest("site_id and flag_key required")
 		}
-		f, err := svc.Create(ctx, input.SiteID, input.FlagKey, input.Name, input.Description, input.FlagType, input.Variants, input.Targeting, input.RolloutPct)
+		rollout := 100
+		if input.RolloutPct != nil {
+			rollout = *input.RolloutPct
+		}
+		f, err := svc.Create(ctx, input.SiteID, input.FlagKey, input.Name, input.Description, input.FlagType, input.Variants, input.Targeting, rollout)
 		if err != nil {
 			// O08: a ruleset the write boundary rejected is a 400 naming
 			// the error, not a 500 — and never a silent store.
@@ -3883,6 +3808,9 @@ func createExperimentHandler(svc *experiments.ExperimentService) neutron.Handler
 	return func(ctx context.Context, input createExperimentInput) (experiments.Experiment, error) {
 		if input.SiteID == "" || input.FlagKey == "" {
 			return experiments.Experiment{}, neutron.ErrBadRequest("site_id and flag_key required")
+		}
+		if err := experiments.ValidateExperimentDefinition(input.Variants, input.MinSample); err != nil {
+			return experiments.Experiment{}, neutron.ErrBadRequest(err.Error())
 		}
 		e, err := svc.Create(ctx, input.SiteID, input.Name, input.FlagKey, input.GoalMetric, input.GoalValue, input.Variants, input.MinSample)
 		if err != nil {
@@ -4081,6 +4009,11 @@ func surveyExposeHandler(svc *surveys.SurveyService) http.HandlerFunc {
 		if err := dec.Decode(&input); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]string{"error": "invalid request body"})
+			return
+		}
+		var extra json.RawMessage
+		if err := dec.Decode(&extra); err != io.EOF {
+			writeJSONError(w, http.StatusBadRequest, "request body must contain exactly one JSON value")
 			return
 		}
 		if input.SurveyID == "" || input.SiteID == "" {
@@ -4776,9 +4709,10 @@ func logStreamHandler(svc *logs.LogService, authSvc *auth.AuthService) http.Hand
 // --- Goal handlers ---
 
 type listGoalsInput struct {
-	SiteID string `query:"site_id"`
-	From   string `query:"from"`
-	To     string `query:"to"`
+	CohortID string `query:"cohort_id"`
+	SiteID   string `query:"site_id"`
+	From     string `query:"from"`
+	To       string `query:"to"`
 }
 
 func listGoalsHandler(svc *query.StatsService) neutron.HandlerFunc[listGoalsInput, []query.GoalConversion] {
@@ -4787,7 +4721,7 @@ func listGoalsHandler(svc *query.StatsService) neutron.HandlerFunc[listGoalsInpu
 		if err != nil {
 			return nil, neutron.ErrBadRequest(err.Error())
 		}
-		return emptyOnNil(svc.GoalConversions(ctx, input.SiteID, from, to))
+		return emptyOnNil(svc.GoalConversions(ctx, input.SiteID, from, to, input.CohortID))
 	}
 }
 
@@ -5260,6 +5194,12 @@ type executePanelInput struct {
 
 func executePanelHandler(svc *dashboards.DashboardService) neutron.HandlerFunc[executePanelInput, any] {
 	return func(ctx context.Context, input executePanelInput) (any, error) {
+		if input.SiteID == "" {
+			return nil, neutron.ErrBadRequest("site_id required")
+		}
+		if _, _, err := dashboards.PanelTimeRange(input.From, input.To); err != nil {
+			return nil, neutron.ErrBadRequest(err.Error())
+		}
 		panels, err := svc.ListPanels(ctx, input.DashboardID)
 		if err != nil {
 			return nil, err
@@ -5472,9 +5412,9 @@ func srcmapUploadHandler(svc *sourcemaps.SourceMapService) http.HandlerFunc {
 		// Audit F22: bound the WHOLE multipart body and parse it explicitly
 		// BEFORE any FormValue/FormFile call. FormValue triggers parsing of
 		// the entire request (spooling oversized parts to disk) first, so
-		// the old per-file 10 MiB check only ran after the damage. 12 MiB
-		// covers the 10 MiB file cap plus bounded metadata overhead.
-		const maxSourcemap = 10 * 1024 * 1024 // 10MB per file
+		// the old per-file check only ran after the damage. The body cap
+		// covers the 8 MiB file cap plus bounded metadata overhead.
+		const maxSourcemap = 8 * 1024 * 1024 // Same accepted budget as resolver
 		const maxMultipart = 12 * 1024 * 1024
 		r.Body = http.MaxBytesReader(w, r.Body, maxMultipart)
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
@@ -5516,10 +5456,14 @@ func srcmapUploadHandler(svc *sourcemaps.SourceMapService) http.HandlerFunc {
 			return
 		}
 		if len(data) > maxSourcemap {
-			http.Error(w, "sourcemap exceeds 10MB limit", http.StatusRequestEntityTooLarge)
+			http.Error(w, "sourcemap exceeds 8MiB limit", http.StatusRequestEntityTooLarge)
 			return
 		}
 
+		if _, err := sourcemaps.ParseSourceMap(data); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid source map: "+err.Error())
+			return
+		}
 		if err := svc.Upload(r.Context(), siteID, release, filename, data); err != nil {
 			// Retention used to run only after a *successful* upload, which
 			// made the failure mode self-sustaining: if the store is what
@@ -5663,6 +5607,9 @@ func listAlertRulesHandler(svc *platform.AlertService) neutron.HandlerFunc[listA
 }
 
 type createAlertRuleInput struct {
+	MinSamples    int     `json:"min_samples"`
+	Severity      string  `json:"severity"`
+	CheckInterval int     `json:"check_interval"`
 	SiteID        string  `json:"site_id"`
 	Name          string  `json:"name"`
 	Metric        string  `json:"metric"`
@@ -5691,7 +5638,14 @@ func createAlertRuleHandler(svc *platform.AlertService) neutron.HandlerFunc[crea
 				return platform.AlertRule{}, neutron.ErrBadRequest("unsupported operator: " + input.Operator)
 			}
 		}
+		if input.MinSamples < 0 || input.CheckInterval < 0 {
+			return platform.AlertRule{}, neutron.ErrBadRequest("min_samples and check_interval must be nonnegative")
+		}
+		if input.Severity != "" && input.Severity != "info" && input.Severity != "warning" && input.Severity != "critical" {
+			return platform.AlertRule{}, neutron.ErrBadRequest("unsupported severity")
+		}
 		rule := platform.AlertRule{
+			MinSamples: input.MinSamples, Severity: input.Severity, CheckInterval: input.CheckInterval,
 			SiteID: input.SiteID, Name: input.Name, Metric: input.Metric,
 			Operator:      input.Operator,
 			Threshold:     input.Threshold,

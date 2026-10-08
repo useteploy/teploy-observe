@@ -108,8 +108,9 @@ func (s *ReleaseHealthService) Health(ctx context.Context, siteID string, fromMs
 			argMax(first_ts, version) AS first_ts,
 			argMax(last_ts, version) AS last_ts
 		       FROM sessions
-		       WHERE site_id = $1 AND first_ts >= $2 AND first_ts < $3
+		       WHERE site_id = $1
 		       GROUP BY tenant_id, site_id, session_id) s
+		 WHERE first_ts >= $2 AND first_ts < $3
 		 GROUP BY release_tag`,
 		siteID, strconv.FormatInt(fromMs, 10), strconv.FormatInt(toMs, 10),
 	)
@@ -125,16 +126,22 @@ func (s *ReleaseHealthService) Health(ctx context.Context, siteID string, fromMs
 		CrashedSessions int64  `db:"crashed_sessions"`
 	}
 	errRows, err := nucleus.Query[errRow](ctx, s.db.SQL(),
-		`SELECT release_tag,
+		`SELECT s.release_tag AS release_tag,
 			COUNT(*) AS errors,
-			COUNT(DISTINCT session_id) AS crashed_sessions
-		 FROM error_events
-		 WHERE site_id = $1
-		   AND timestamp >= $2
-		   AND timestamp < $3
-		   AND level IN ('error', 'fatal')
-		   AND session_id != ''
-		 GROUP BY release_tag`,
+			COUNT(DISTINCT e.session_id) AS crashed_sessions
+		 FROM error_events e
+		 JOIN (SELECT tenant_id, site_id, session_id,
+			argMax(release_tag, version) AS release_tag,
+			argMax(first_ts, version) AS first_ts
+		       FROM sessions WHERE site_id = $1
+		       GROUP BY tenant_id, site_id, session_id) s
+		 ON e.site_id = s.site_id AND e.tenant_id = s.tenant_id AND e.session_id = s.session_id
+		 WHERE e.site_id = $1
+		   AND s.first_ts >= $2 AND s.first_ts < $3
+		   AND e.timestamp >= $2 AND e.timestamp < $3
+		   AND e.level IN ('error', 'fatal')
+		   AND e.session_id != ''
+		 GROUP BY s.release_tag`,
 		siteID, strconv.FormatInt(fromMs, 10), strconv.FormatInt(toMs, 10),
 	)
 	if err != nil {
@@ -215,11 +222,11 @@ func (s *ReleaseHealthService) Sparkline(ctx context.Context, siteID, releaseTag
 		`SELECT (CAST(first_ts AS BIGINT) / 86400000) * 86400000 AS bucket,
 			COUNT(*) AS sessions
 		 FROM (SELECT tenant_id, site_id, session_id,
-			argMax(first_ts, version) AS first_ts
-		       FROM sessions
-		       WHERE site_id = $1 AND release_tag = $2
-			 AND first_ts >= $3 AND first_ts < $4
+			argMax(first_ts, version) AS first_ts,
+			argMax(release_tag, version) AS release_tag
+		       FROM sessions WHERE site_id = $1
 		       GROUP BY tenant_id, site_id, session_id) s
+		 WHERE release_tag = $2 AND first_ts >= $3 AND first_ts < $4
 		 GROUP BY (CAST(first_ts AS BIGINT) / 86400000) * 86400000`,
 		siteID, releaseTag, fromMs, toMs,
 	)
@@ -232,16 +239,20 @@ func (s *ReleaseHealthService) Sparkline(ctx context.Context, siteID, releaseTag
 		CrashedSessions int64 `db:"crashed_sessions"`
 	}
 	errRows, err := nucleus.Query[errRow](ctx, s.db.SQL(),
-		`SELECT (CAST(timestamp AS BIGINT) / 86400000) * 86400000 AS bucket,
-			COUNT(DISTINCT session_id) AS crashed_sessions
-		 FROM error_events
-		 WHERE site_id = $1
-		   AND release_tag = $2
-		   AND level IN ('error', 'fatal')
-		   AND session_id != ''
-		   AND timestamp >= $3
-		   AND timestamp < $4
-		 GROUP BY (CAST(timestamp AS BIGINT) / 86400000) * 86400000`,
+		`SELECT (CAST(s.first_ts AS BIGINT) / 86400000) * 86400000 AS bucket,
+			COUNT(DISTINCT e.session_id) AS crashed_sessions
+		 FROM error_events e
+		 JOIN (SELECT tenant_id, site_id, session_id,
+			argMax(first_ts, version) AS first_ts,
+			argMax(release_tag, version) AS release_tag
+		       FROM sessions WHERE site_id = $1
+		       GROUP BY tenant_id, site_id, session_id) s
+		 ON e.site_id = s.site_id AND e.tenant_id = s.tenant_id AND e.session_id = s.session_id
+		 WHERE e.site_id = $1 AND s.release_tag = $2
+		   AND s.first_ts >= $3 AND s.first_ts < $4
+		   AND e.level IN ('error', 'fatal') AND e.session_id != ''
+		   AND e.timestamp >= $3 AND e.timestamp < $4
+		 GROUP BY (CAST(s.first_ts AS BIGINT) / 86400000) * 86400000`,
 		siteID, releaseTag, fromMs, toMs,
 	)
 	if err != nil {

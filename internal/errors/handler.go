@@ -9,8 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/neutron-build/neutron/go/neutron"
 	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/identity"
@@ -24,14 +27,16 @@ type ErrorInput struct {
 	SessionID string `json:"session_id"`
 	ReplayID  string `json:"replay_id"`
 	// DistinctID, when present, is the user identifier from identify().
-	// The server hashes it with the site's session_salt before storage.
+	// The buffer freezes it under the admitting site policy before WAL/storage.
 	DistinctID string `json:"distinct_id,omitempty"`
-	ErrorType  string `json:"error_type"`
-	ErrorValue string `json:"error_value"`
-	Mechanism  string `json:"mechanism"`
-	Handled    bool   `json:"handled"`
-	Level      string `json:"level"`
-	ReleaseTag string `json:"release"`
+	// Only the server-owned WAL envelope can restore this marker.
+	identityFrozen bool
+	ErrorType      string `json:"error_type"`
+	ErrorValue     string `json:"error_value"`
+	Mechanism      string `json:"mechanism"`
+	Handled        bool   `json:"handled"`
+	Level          string `json:"level"`
+	ReleaseTag     string `json:"release"`
 	// ReleaseTagAlt accepts the alternate `release_tag` wire field some SDKs
 	// send, so the release isn't silently dropped on a key-name mismatch.
 	// Reconciled into ReleaseTag in the handler.
@@ -122,11 +127,12 @@ type Service struct {
 	issueSvc  *IssueService
 	searchSvc *SearchService
 	srcmapSvc *sourcemaps.SourceMapService
-	// privacy is optional. If nil, distinct_id is stored as-is. cmd/observe
-	// wires this from sites.SiteService.PrivacyConfig at boot.
-	privacy PrivacyLookup
-	// fallbackSalt is the global session salt used when a per-site lookup
-	// returns ok=false. Empty means "do not hash" — leave distinct_id raw.
+	// Production wires the checked site policy. Identified input without
+	// an available salt or explicit raw opt-in is refused.
+	privacy        PrivacyLookup
+	privacyChecked func(context.Context, string) (string, bool, bool, error)
+	// fallbackSalt supports legacy nonchecked callers only. The checked
+	// production policy never falls back on absence/error.
 	fallbackSalt string
 	// spike is the per-site/per-issue rate guard (spike.go); nil = off.
 	spike *SpikeLimiter
@@ -138,6 +144,42 @@ func (s *Service) WithPrivacy(lookup PrivacyLookup, fallbackSalt string) *Servic
 	s.privacy = lookup
 	s.fallbackSalt = fallbackSalt
 	return s
+}
+
+// WithPrivacyChecked fails closed when identity policy is unavailable.
+func (s *Service) WithPrivacyChecked(lookup func(context.Context, string) (string, bool, bool, error), fallbackSalt string) *Service {
+	s.privacyChecked = lookup
+	s.fallbackSalt = fallbackSalt
+	return s
+}
+
+func (s *Service) resolveDistinctID(ctx context.Context, input ErrorInput) (string, error) {
+	if len(input.DistinctID) > 256 || !utf8.ValidString(input.DistinctID) || strings.ContainsRune(input.DistinctID, 0) {
+		return "", neutron.ErrBadRequest("invalid distinct_id")
+	}
+	if input.identityFrozen {
+		return input.DistinctID, nil
+	}
+	if input.DistinctID == "" {
+		return "", nil
+	}
+	salt, rawOptIn := s.fallbackSalt, false
+	if s.privacyChecked != nil {
+		ps, raw, found, err := s.privacyChecked(ctx, input.SiteID)
+		if err != nil || !found {
+			return "", &neutron.AppError{Status: 503, Title: "Service Unavailable", Detail: "error identity policy unavailable"}
+		}
+		salt, rawOptIn = ps, raw
+	} else if s.privacy != nil {
+		if ps, raw, found := s.privacy(ctx, input.SiteID); found {
+			salt, rawOptIn = ps, raw
+		}
+	}
+	if salt == "" && !rawOptIn {
+		slog.Warn("errors: refusing identity admission — no salt available and site has not opted into raw storage", "site", input.SiteID)
+		return "", &neutron.AppError{Status: 503, Title: "Service Unavailable", Detail: "error identity policy unavailable"}
+	}
+	return identity.MaybeHashDistinctID(input.DistinctID, salt, rawOptIn), nil
 }
 
 // ErrorHandler is the legacy alias retained for callers that still reference
@@ -193,6 +235,10 @@ func (s *Service) ingestEvent(ctx context.Context, input ErrorInput) (issueID st
 // resolution still writes through the pool handle beside the caller's
 // transaction; see ApplyInbox for why that exposure self-heals.
 func (s *Service) insertErrorEvent(ctx context.Context, sqlc *nucleus.SQLModel, input ErrorInput) (errorID, issueID string, err error) {
+	distinctID, err := s.resolveDistinctID(ctx, input)
+	if err != nil {
+		return "", "", err
+	}
 	now := time.Now().UTC()
 	// Event time: the producer's own when captured (bounded — anything
 	// past a day of future skew is clock garbage, refused rather than
@@ -277,31 +323,6 @@ func (s *Service) insertErrorEvent(ctx context.Context, sqlc *nucleus.SQLModel, 
 	handled := "true"
 	if !input.Handled {
 		handled = "false"
-	}
-
-	// Resolve distinct_id: hash with the per-site salt if a privacy
-	// lookup is wired and the site is known; otherwise fall back to the
-	// global salt. With no salt anywhere the identifier is DROPPED, not
-	// stored raw (audit F21): a missing privacy dependency must never turn
-	// into consent for raw storage. main.go always seeds a random fallback
-	// salt, so this is defense in depth for other wiring paths — same rule
-	// internal/replays already enforces.
-	distinctID := ""
-	if input.DistinctID != "" {
-		salt := s.fallbackSalt
-		rawOptIn := false
-		if s.privacy != nil {
-			if siteSalt, raw, ok := s.privacy(ctx, input.SiteID); ok {
-				salt = siteSalt
-				rawOptIn = raw
-			}
-		}
-		if salt == "" && !rawOptIn {
-			slog.Warn("errors: dropping distinct_id — no salt available and site has not opted into raw storage",
-				"site", input.SiteID)
-		} else {
-			distinctID = identity.MaybeHashDistinctID(input.DistinctID, salt, rawOptIn)
-		}
 	}
 
 	// Insert error event

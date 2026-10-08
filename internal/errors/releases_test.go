@@ -184,3 +184,58 @@ func randomID() string {
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
+
+// OBS26-86: numerator and denominator share the latest session-start cohort.
+func TestOBS86ReleaseCohortCrossesWindowAndMidnight(t *testing.T) {
+	db, err := nucleus.Connect(context.Background(), nucleustest.DSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	site := "obs86-" + uniqueToken()
+	now := time.Now().UTC()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	from := today.AddDate(0, 0, -2).UnixMilli()
+	to := today.AddDate(0, 0, 1).UnixMilli()
+	session := func(id, release string, ts, version int64) {
+		t.Helper()
+		_, err := db.SQL().Exec(ctx, `INSERT INTO sessions (tenant_id,site_id,session_id,first_ts,last_ts,release_tag,version) VALUES ('default',$1,$2,$3,$3,$4,$5)`, site, id, strconv.FormatInt(ts, 10), release, strconv.FormatInt(version, 10))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	event := func(id, release string, ts int64) {
+		t.Helper()
+		_, err := db.SQL().Exec(ctx, `INSERT INTO error_events (error_id,tenant_id,site_id,session_id,issue_id,group_hash,timestamp,error_type,error_value,level,release_tag) VALUES ($1,'default',$2,$3,'issue','hash',$4,'Test','boom','error',$5)`, randomID(), site, id, strconv.FormatInt(ts, 10), release)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	session("outside", "release", from-1, 1)
+	event("outside", "release", from+1)
+	session("healthy", "release", from+1000, 1)
+	midnight := today.AddDate(0, 0, -1).UnixMilli()
+	session("cross-midnight", "release", midnight-1000, 1)
+	event("cross-midnight", "release", midnight+1000)
+	session("changed", "old", from+2000, 1)
+	session("changed", "release", from+2000, 2)
+	event("changed", "old", from+3000)
+	event("absent", "release", from+4000)
+	svc := NewReleaseHealthService(db)
+	stats, err := svc.Health(ctx, site, from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats) != 1 || stats[0].ReleaseTag != "release" || stats[0].Sessions != 3 || stats[0].CrashedSessions != 2 {
+		t.Fatalf("mismatched cohort: %+v", stats)
+	}
+	points, err := svc.Sparkline(ctx, site, "release", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 3 || points[0].Sessions != 3 || points[0].CrashedSessions != 2 || points[1].CrashedSessions != 0 {
+		t.Fatalf("crash attributed to error day instead of session cohort day: %+v", points)
+	}
+}

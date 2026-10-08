@@ -288,8 +288,11 @@ func (s *Scrubber) scrubStringIn(v string, st *scrubState) string {
 // to the pattern rules. Depth and node budgets bound the work.
 func (s *Scrubber) scrubJSONString(v string, st *scrubState) string {
 	t := strings.TrimSpace(v)
-	if len(t) < 2 || (t[0] != '{' && t[0] != '[') || st.jd >= scrubMaxJSONDepth || st.nodes > scrubMaxNodes {
+	if len(t) < 2 || (t[0] != '{' && t[0] != '[') {
 		return v
+	}
+	if st.jd >= scrubMaxJSONDepth || st.nodes > scrubMaxNodes {
+		return Filtered
 	}
 	dec := json.NewDecoder(strings.NewReader(t))
 	dec.UseNumber()

@@ -25,22 +25,24 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
 
 const (
-	maxMergeDepth      = 5
-	maxMergesPerSite   = 10000
-	maxAssigneeLen     = 128
-	mergeCacheTTL      = 15 * time.Second
-	mergeCacheMaxSites = 1024
+	maxMergeDepth         = 5
+	maxAssignmentsPerSite = 10000
+	maxAssigneeLen        = 128
+	mergeCacheTTL         = 15 * time.Second
+	mergeCacheMaxSites    = 1024
 )
 
 var (
@@ -79,10 +81,11 @@ type mergeCacheEntry struct {
 // mergeState is the IssueService's merge cache (single-process posture:
 // in-process invalidation on write, TTL for anything else).
 type mergeState struct {
-	store mergeStore
-	mu    sync.Mutex
-	cache map[string]mergeCacheEntry
-	now   func() time.Time
+	store    mergeStore
+	mu       sync.Mutex
+	cache    map[string]mergeCacheEntry
+	revision uint64
+	now      func() time.Time
 	// writeLocks serialise merge/unmerge validate-then-write per site
 	// (striped by site hash): two concurrent merges (A->B, B->A) each pass
 	// cycle validation against the pre-write state and would otherwise both
@@ -105,6 +108,7 @@ func newMergeState(store mergeStore) *mergeState {
 func (m *mergeState) invalidate(siteID string) {
 	m.mu.Lock()
 	delete(m.cache, siteID)
+	m.revision++
 	m.mu.Unlock()
 }
 
@@ -117,6 +121,7 @@ func (m *mergeState) siteMerges(ctx context.Context, siteID string) map[string]s
 		m.mu.Unlock()
 		return e.merges
 	}
+	revision, fetched := m.revision, m.now()
 	m.mu.Unlock()
 	merges, err := m.store.activeMerges(ctx, siteID)
 	if err != nil {
@@ -127,7 +132,9 @@ func (m *mergeState) siteMerges(ctx context.Context, siteID string) map[string]s
 	if len(m.cache) >= mergeCacheMaxSites {
 		m.cache = map[string]mergeCacheEntry{}
 	}
-	m.cache[siteID] = mergeCacheEntry{merges: merges, fetched: m.now()}
+	if m.revision == revision {
+		m.cache[siteID] = mergeCacheEntry{merges: merges, fetched: fetched}
+	}
 	m.mu.Unlock()
 	return merges
 }
@@ -163,6 +170,7 @@ func sourcesOf(merges map[string]string, target string) []string {
 			out = append(out, src)
 		}
 	}
+	sort.Strings(out)
 	return out
 }
 
@@ -312,25 +320,42 @@ func (s sqlMergeStore) issueExists(ctx context.Context, siteID, issueID string) 
 }
 
 func (s sqlMergeStore) activeMerges(ctx context.Context, siteID string) (map[string]string, error) {
-	type row struct {
-		Source string `db:"source_issue_id"`
-		Target string `db:"target_issue_id"`
-	}
-	rows, err := nucleus.Query[row](ctx, s.db.SQL(),
-		`SELECT source_issue_id, target_issue_id FROM (
+	// One statement/row stream includes all accepted mappings, including legacy
+	// sites over 10,000. No pagination snapshot or arbitrary row cap is needed.
+	rows, err := s.db.Pool().Query(ctx,
+		`SELECT tenant_id, source_issue_id, target_issue_id FROM (
 			SELECT tenant_id, site_id, source_issue_id,
 			       argMax(target_issue_id, version) AS target_issue_id,
 			       argMax(active, version) AS active
 			FROM issue_merges WHERE site_id = $1
 			GROUP BY tenant_id, site_id, source_issue_id) AS m
 		 WHERE active = 'true'
-		 LIMIT `+fmt.Sprint(maxMergesPerSite), siteID)
+		 ORDER BY tenant_id ASC, source_issue_id ASC`, pgx.QueryExecModeSimpleProtocol, siteID)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]string, len(rows))
-	for _, r := range rows {
-		out[r.Source] = r.Target
+	return readMergeMappings(rows)
+}
+
+// A failed scan/stream never publishes a partially populated cache entry.
+func readMergeMappings(rows pgx.Rows) (map[string]string, error) {
+	defer rows.Close()
+	out := make(map[string]string)
+	tenants := make(map[string]string)
+	for rows.Next() {
+		var tenant, source, target string
+		if err := rows.Scan(&tenant, &source, &target); err != nil {
+			return nil, err
+		}
+		// The application addresses issues by (site, issue). Refuse ambiguous
+		// legacy tenant collisions instead of choosing a map overwrite winner.
+		if prior, ok := tenants[source]; ok && prior != tenant {
+			return nil, fmt.Errorf("merge source has ambiguous tenant identity")
+		}
+		tenants[source], out[source] = tenant, target
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -378,7 +403,7 @@ func (s sqlMergeStore) assignments(ctx context.Context, siteID string) (map[stri
 			FROM issue_assignments WHERE site_id = $1
 			GROUP BY tenant_id, site_id, issue_id) AS a
 		 WHERE assignee <> ''
-		 LIMIT `+fmt.Sprint(maxMergesPerSite), siteID)
+		 LIMIT `+fmt.Sprint(maxAssignmentsPerSite), siteID)
 	if err != nil {
 		return nil, err
 	}

@@ -39,6 +39,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/neutron-build/neutron/go/neutron"
 	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
@@ -67,9 +68,9 @@ const (
 	notifyMaxLastErrorChars  = 1024
 )
 
-// IncidentRecorder appends an incident timeline event. Wired from main to
-// incidents.Service.RecordEvent; nil disables timeline recording.
-type IncidentRecorder func(ctx context.Context, incidentID, kind, actor, detail string) error
+// IncidentRecorder appends a timeline event through the disposition transaction.
+// Wired to incidents.Service.RecordEventTx; nil disables timeline recording.
+type IncidentRecorder func(ctx context.Context, sql *nucleus.SQLModel, eventID, incidentID string, at int64, kind, actor, detail string) error
 
 // Notifier owns the notification_outbox table: enqueue happens inside the
 // engine's transactions (enqueueTx); the drain, dispositions and healthz
@@ -94,7 +95,7 @@ type Notifier struct {
 	started     bool
 	stopCtx     context.Context
 	stopCancel  context.CancelFunc
-	wg          sync.WaitGroup
+	workerDone  chan struct{}
 
 	failedMu       sync.Mutex
 	failedAttempts map[string]*atomic.Int64
@@ -105,6 +106,8 @@ type Notifier struct {
 	// process kill opens between a successful send and its durable mark.
 	now      func() time.Time
 	skipMark bool
+	// enqueueHook injects admission failures before selected target writes in tests.
+	enqueueHook func(NotificationIntent) error
 }
 
 func NewNotifier(db *nucleus.Client, logger *slog.Logger, maintenance *MaintenanceService, recorder IncidentRecorder) *Notifier {
@@ -206,6 +209,7 @@ func notifyCollapseSelect(where string) string {
 // per (notification, webhook target). Everything the POST needs is frozen
 // here so a retry reproduces the identical request.
 type NotificationIntent struct {
+	ID         string // optional stable logical identity (transaction callers only)
 	Kind       string
 	RuleID     string
 	IncidentID string
@@ -222,7 +226,15 @@ type NotificationIntent struct {
 // intent commits or rolls back with the state it describes. The minted id
 // is the delivery id (X-Observe-Delivery).
 func (n *Notifier) enqueueTx(ctx context.Context, sql *nucleus.SQLModel, in NotificationIntent) (string, error) {
-	id := genNotificationID()
+	if n.enqueueHook != nil {
+		if err := n.enqueueHook(in); err != nil {
+			return "", err
+		}
+	}
+	id := in.ID
+	if id == "" {
+		id = genNotificationID()
+	}
 	now := n.now().UTC().UnixMilli()
 	if _, err := sql.Exec(ctx,
 		`INSERT INTO notification_outbox (
@@ -238,12 +250,8 @@ func (n *Notifier) enqueueTx(ctx context.Context, sql *nucleus.SQLModel, in Noti
 	return id, nil
 }
 
-// Enqueue writes one intent outside an originating transaction - for
-// origins that own no transaction of their own (the cron missed/recovered
-// paths: the incident service commits the incident, then this runs). The
-// atomicity gap is bounded and self-healing: a committed cron incident
-// whose intents failed re-enqueues on the next missed-check tick, and the
-// created-gate suppresses duplicates.
+// Enqueue admits an independent intent. Incident transitions must use the
+// originating transaction (EnsureCronMissed/RecoverCron or the alert engine).
 func (n *Notifier) Enqueue(ctx context.Context, in NotificationIntent) (string, error) {
 	return n.enqueueTx(ctx, n.db.SQL(), in)
 }
@@ -306,7 +314,9 @@ func (n *Notifier) LastIntentAt(ctx context.Context, ruleID string) (int64, erro
 // stops yielding. Maintenance windows are resolved once per pass. Per-row
 // failures are recorded on their rows; only a scan failure returns an error.
 func (n *Notifier) DrainDue(ctx context.Context) (int, error) {
-	n.processMu.Lock()
+	if err := lockNotify(ctx, &n.processMu); err != nil {
+		return 0, err
+	}
 	defer n.processMu.Unlock()
 
 	now := n.now().UTC()
@@ -329,12 +339,20 @@ func (n *Notifier) DrainDue(ctx context.Context) (int, error) {
 			return total, nil
 		}
 		for i := range rows {
+			if err := ctx.Err(); err != nil {
+				return total, err
+			}
 			if maintenanceMatch(windows, rows[i].SiteID) {
-				n.markSuppressed(ctx, &rows[i], now)
+				if err := n.markSuppressed(ctx, &rows[i], now); err != nil {
+					return total, err
+				}
+				total++
 				continue
 			}
-			n.processOne(ctx, &rows[i])
 			total++
+			if err := n.processOne(ctx, &rows[i]); err != nil {
+				return total, err
+			}
 		}
 		if len(rows) < n.batchSize {
 			return total, nil
@@ -372,22 +390,26 @@ func (n *Notifier) due(ctx context.Context) ([]notifyRow, error) {
 
 // processOne delivers one intent and records the disposition as a new row
 // version (strictly-monotonic stamp, the version-tie convention).
-func (n *Notifier) processOne(ctx context.Context, row *notifyRow) {
-	err := n.deliver(row)
+func (n *Notifier) processOne(ctx context.Context, row *notifyRow) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	err := n.deliver(ctx, row)
 	if err == nil {
 		if n.skipMark {
 			// TEST-ONLY crash simulation: the POST left, the disposition
 			// mark did not. The row stays pending; the next drain re-POSTs
 			// under the SAME delivery id.
-			return
+			return nil
 		}
-		if derr := n.markDelivered(ctx, row); derr != nil {
-			n.logger.Error("notification: mark delivered failed", "delivery_id", row.ID, "err", derr)
-		} else {
-			n.recordEvent(ctx, row.IncidentID, incidents.EventNotified, "notifier",
-				fmt.Sprintf("%s delivered (%s)", row.Kind, row.ID))
-		}
-		return
+		// A completed POST gets a bounded accounting context even if shutdown
+		// canceled admission while the response arrived. Unsent rows stay pending.
+		markCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		return n.markDelivered(markCtx, row)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	attempts := row.Attempts + 1
@@ -403,25 +425,27 @@ func (n *Notifier) processOne(ctx context.Context, row *notifyRow) {
 	}
 	if derr := n.markAttempt(ctx, row, attempts, next, err); derr != nil {
 		n.logger.Error("notification: record failure failed", "delivery_id", row.ID, "err", derr)
+		return derr
 	}
 	if dead {
 		n.logger.Error("notification: dead-lettered - delivery keeps failing",
 			"delivery_id", row.ID, "kind", row.Kind, "site", row.SiteID,
 			"attempts", attempts, "err", err)
 	}
+	return nil
 }
 
 // deliver performs the POST. The delivery id header is the dedupe marker;
 // signed targets carry the same HMAC scheme as the in-memory webhook path
 // (R22), so receivers verify both identically.
-func (n *Notifier) deliver(row *notifyRow) error {
+func (n *Notifier) deliver(ctx context.Context, row *notifyRow) error {
 	if row.TargetType == "slack" {
-		return n.postSlack(row)
+		return n.postSlack(ctx, row)
 	}
-	return postSignedJSON(n.client, row.ID, row.TargetURL, row.Secret, []byte(row.Payload))
+	return postSignedJSON(ctx, n.client, row.ID, row.TargetURL, row.Secret, []byte(row.Payload))
 }
 
-func (n *Notifier) postSlack(row *notifyRow) error {
+func (n *Notifier) postSlack(ctx context.Context, row *notifyRow) error {
 	var p NotificationPayload
 	if err := json.Unmarshal([]byte(row.Payload), &p); err != nil {
 		return fmt.Errorf("slack notification: decode payload: %w", err)
@@ -429,24 +453,35 @@ func (n *Notifier) postSlack(row *notifyRow) error {
 	text := fmt.Sprintf("*[%s] %s*\n%s\nSite: %s (incident %s)",
 		p.Severity, p.RuleName, p.Message, p.SiteID, p.IncidentID)
 	body, _ := json.Marshal(map[string]string{"text": text})
-	return postSignedJSON(n.client, row.ID, row.TargetURL, "", body)
+	return postSignedJSON(ctx, n.client, row.ID, row.TargetURL, "", body)
 }
 
-// recordEvent is a nil-safe timeline append; a timeline write failure is
-// logged, never a delivery failure.
-func (n *Notifier) recordEvent(ctx context.Context, incidentID, kind, actor, detail string) {
-	if n.recorder == nil || incidentID == "" {
-		return
+// recordDispositionTx persists the timeline through the same SQL transaction as
+// its disposition. Failure rolls back the mark, making timeline repair retryable.
+func (n *Notifier) recordDispositionTx(ctx context.Context, sql *nucleus.SQLModel, row *notifyRow, at int64, kind, detail string) error {
+	if n.recorder == nil || row.IncidentID == "" {
+		return nil
 	}
-	if err := n.recorder(ctx, incidentID, kind, actor, detail); err != nil {
-		n.logger.Warn("notification: incident timeline write failed", "incident", incidentID, "kind", kind, "err", err)
+	svc := incidents.NewService(n.db)
+	known, err := svc.Get(ctx, row.IncidentID)
+	if err != nil {
+		return err
 	}
+	if known == nil {
+		return fmt.Errorf("incident %s not found", row.IncidentID)
+	}
+	return n.recorder(ctx, sql, kind+"-"+row.ID, row.IncidentID, at, kind, "notifier", detail)
 }
 
 // markDelivered writes the delivered disposition.
 func (n *Notifier) markDelivered(ctx context.Context, row *notifyRow) error {
+	tx, err := n.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
 	now := n.now().UTC().UnixMilli()
-	_, err := n.db.SQL().Exec(ctx,
+	_, err = tx.SQL().Exec(ctx,
 		`INSERT INTO notification_outbox (
 			tenant_id, id, kind, rule_id, incident_id, site_id, webhook_id,
 			target_type, target_url, secret, payload, created_at,
@@ -457,15 +492,26 @@ func (n *Notifier) markDelivered(ctx context.Context, row *notifyRow) error {
 		dbutil.IntParam(row.Attempts), dbutil.IntParam(row.NextAttemptAt),
 		dbutil.IntParam(now), dbutil.IntParam(notifyNextVersion(row.Version, now)),
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if err := n.recordDispositionTx(ctx, tx.SQL(), row, now, incidents.EventNotified, fmt.Sprintf("%s delivered (%s)", row.Kind, row.ID)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // markSuppressed records a maintenance-window suppression: no POST happened,
 // no attempt was consumed, and the suppression stays inspectable.
-func (n *Notifier) markSuppressed(ctx context.Context, row *notifyRow, at time.Time) {
+func (n *Notifier) markSuppressed(ctx context.Context, row *notifyRow, at time.Time) error {
+	tx, err := n.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
 	ms := at.UTC().UnixMilli()
 	reason := "maintenance window active"
-	_, err := n.db.SQL().Exec(ctx,
+	_, err = tx.SQL().Exec(ctx,
 		`INSERT INTO notification_outbox (
 			tenant_id, id, kind, rule_id, incident_id, site_id, webhook_id,
 			target_type, target_url, secret, payload, created_at,
@@ -479,10 +525,12 @@ func (n *Notifier) markSuppressed(ctx context.Context, row *notifyRow, at time.T
 	)
 	if err != nil {
 		n.logger.Error("notification: mark suppressed failed", "delivery_id", row.ID, "err", err)
-		return
+		return err
 	}
-	n.recordEvent(ctx, row.IncidentID, incidents.EventSuppressed, "notifier",
-		fmt.Sprintf("%s suppressed: %s (%s)", row.Kind, reason, row.ID))
+	if err := n.recordDispositionTx(ctx, tx.SQL(), row, ms, incidents.EventSuppressed, fmt.Sprintf("%s suppressed: %s (%s)", row.Kind, reason, row.ID)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // markAttempt writes the failure disposition (attempts bumped, backoff
@@ -528,9 +576,10 @@ func (n *Notifier) Start() {
 	}
 	n.started = true
 	n.stopCtx, n.stopCancel = context.WithCancel(context.Background())
-	n.wg.Add(1)
+	n.workerDone = make(chan struct{})
+	done := n.workerDone
 	go func() {
-		defer n.wg.Done()
+		defer close(done)
 		n.run(n.stopCtx)
 	}()
 }
@@ -552,15 +601,48 @@ func (n *Notifier) run(ctx context.Context) {
 
 // Stop cancels the worker and waits for the in-flight delivery. Pending
 // intents survive the stop and resume on the next Start.
-func (n *Notifier) Stop() {
-	n.lifecycleMu.Lock()
+func (n *Notifier) Stop() { _ = n.StopContext(context.Background()) }
+
+// StopContext cancels admission and in-flight HTTP requests, and bounds waiting
+// by the caller's deadline. A timed-out stop remains canceled/started until a
+// later StopContext joins it, preventing an overlapping restart.
+func (n *Notifier) StopContext(ctx context.Context) error {
+	if err := lockNotify(ctx, &n.lifecycleMu); err != nil {
+		return err
+	}
 	defer n.lifecycleMu.Unlock()
 	if !n.started {
-		return
+		return nil
 	}
-	n.started = false
 	n.stopCancel()
-	n.wg.Wait()
+	done := n.workerDone
+	select {
+	case <-done:
+		n.started = false
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func lockNotify(ctx context.Context, mu *sync.Mutex) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for !mu.TryLock() {
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 // NotificationKindStats is the per-kind healthz block.
@@ -683,8 +765,8 @@ func BuildNotificationPayload(kind string, rule AlertRule, value float64, sample
 //	X-Observe-Delivery:  the logical delivery id (dedupe marker)
 //	X-Observe-Timestamp: unix seconds
 //	X-Observe-Signature: sha256=hex(HMAC-SHA256(secret, timestamp + "." + body))
-func postSignedJSON(client *http.Client, deliveryID, url, secret string, body []byte) error {
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+func postSignedJSON(ctx context.Context, client *http.Client, deliveryID, url, secret string, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -714,4 +796,13 @@ func postSignedJSON(client *http.Client, deliveryID, url, secret string, body []
 // notification id is recognizable in logs and dead letters.
 func genNotificationID() string {
 	return "nfy-" + genID()
+}
+
+// LifecycleHook is the application hook, including incomplete join errors.
+func (n *Notifier) LifecycleHook() neutron.LifecycleHook {
+	return neutron.LifecycleHook{
+		Name:    "notification-outbox",
+		OnStart: func(context.Context) error { n.Start(); return nil },
+		OnStop:  n.StopContext,
+	}
 }
