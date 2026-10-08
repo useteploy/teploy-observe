@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from "preact/hooks";
+import { useRequestGuard } from "../hooks/useRequestGuard.js";
 import { personsApi } from "../api/persons.js";
 import type { Person, PersonDetail } from "../api/persons.js";
 import EmptyState from "../components/shared/EmptyState.js";
@@ -49,11 +50,13 @@ function PersonDetailPanel({ distinctID, siteID, onBack }:
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    setLoading(true);
+    let active = true;
+    setData(null); setLoading(true);
     personsApi.detail(distinctID, siteID)
-      .then(d => setData(d))
-      .catch(() => setData(null))
-      .finally(() => setLoading(false));
+      .then(d => { if (active) setData(d); })
+      .catch(() => { if (active) setData(null); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
   }, [distinctID, siteID]);
 
   return (
@@ -155,8 +158,11 @@ export default function PersonsPage() {
     return [f.toISOString(), now.toISOString()];
   }, []);
 
+  const request = useRequestGuard(JSON.stringify([siteId, from, to, page, includeAnonymous]));
+  useEffect(() => { setPage(1); setSelected(null); }, [siteId]);
   const fetchPersons = useCallback(async () => {
-    setLoading(true);
+    const current = request();
+    setPersons([]); setTotal(0); setLoading(true);
     try {
       const r = await personsApi.list(siteId, {
         from, to,
@@ -164,13 +170,15 @@ export default function PersonsPage() {
         offset: (page - 1) * PAGE_SIZE,
         includeAnonymous,
       });
+      if (!current()) return;
       setPersons(r.persons || []);
       setTotal(r.total || 0);
     } catch {
+      if (!current()) return;
       setPersons([]);
       setTotal(0);
     } finally {
-      setLoading(false);
+      if (current()) setLoading(false);
     }
   }, [siteId, from, to, page, includeAnonymous]);
 

@@ -55,7 +55,8 @@ nucleus:
   externalUrl: ""
   image:
     repository: ghcr.io/neutron-build/nucleus
-    # Pinned. Do not use :latest. Supported release: v1.1.1.
+    # Historical default. Availability and compatibility with the Observe
+    # appVersion must pass the release pair gate; no tested-pair claim is implied.
     tag: v1.1.1
     pullPolicy: IfNotPresent
   port: 5432

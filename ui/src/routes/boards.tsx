@@ -1,3 +1,4 @@
+import { useRequestGuard } from "../hooks/useRequestGuard.js";
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { get, post, del } from "../api/helpers.js";
 import Modal from "../components/shared/Modal.js";
@@ -16,6 +17,7 @@ interface SiteRow {
   sessions: number;
   errors: number;
   uptime_pct: number;
+  uptime_available?: boolean;
   replay_count: number;
   last_activity_ms: number;
 }
@@ -51,8 +53,8 @@ function rangeFor(windowKey: string): { from: string; to: string; key: string } 
   return { from: from.toISOString(), to: to.toISOString(), key: w.key };
 }
 
-function formatPct(v: number): string {
-  if (v <= 0) return "—";
+function formatPct(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) return "—";
   if (v >= 99.95) return "100%";
   return v.toFixed(1) + "%";
 }
@@ -256,7 +258,7 @@ function BoardGrid({
             <td class="boards-num">{formatNum(r.pageviews)}</td>
             <td class="boards-num">{formatNum(r.visitors)}</td>
             <td class={"boards-num" + (r.errors > 0 ? " boards-warn" : "")}>{formatNum(r.errors)}</td>
-            <td class="boards-num">{formatPct(r.uptime_pct)}</td>
+            <td class="boards-num">{formatPct(r.uptime_available === false ? null : r.uptime_pct)}</td>
             <td class="boards-num">{formatNum(r.replay_count)}</td>
             <td class="boards-num">{formatRelative(r.last_activity_ms)}</td>
           </tr>
@@ -278,6 +280,7 @@ export default function BoardsPage() {
   const [openIDs, setOpenIDs] = useState<string[]>([]);
   const [windowKey, setWindowKey] = useState<string>("24h");
   const [rows, setRows] = useState<SiteRow[]>([]);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
   const [loadingRows, setLoadingRows] = useState(false);
   const [showBuilder, setShowBuilder] = useState(false);
 
@@ -297,7 +300,10 @@ export default function BoardsPage() {
     })();
   }, []);
 
+  const requestloadSummary = useRequestGuard("board-summary");
   const loadSummary = useCallback(async (ids: string[], wKey: string) => {
+    const current = requestloadSummary();
+    setSummaryError(null); setRows([]);
     if (ids.length === 0) {
       setRows([]);
       return;
@@ -310,11 +316,14 @@ export default function BoardsPage() {
         "&from=" + encodeURIComponent(from) +
         "&to=" + encodeURIComponent(to),
       );
+      if (!current()) return;
       setRows(r || []);
-    } catch {
+    } catch (e) {
+      if (!current()) return;
+      setSummaryError(e instanceof Error ? e.message : "Unable to load board summary");
       setRows([]);
     } finally {
-      setLoadingRows(false);
+      if (current()) setLoadingRows(false);
     }
   }, []);
 
@@ -331,6 +340,7 @@ export default function BoardsPage() {
   };
 
   const closeBoard = () => {
+    requestloadSummary();
     setOpenID("");
     setOpenName("");
     setOpenIDs([]);
@@ -408,6 +418,7 @@ export default function BoardsPage() {
 
       {openID && (
         <div class="boards-open">
+          {summaryError && <div role="alert">Unable to load board summary: {summaryError} <button class="obs-btn obs-btn--sm" onClick={() => loadSummary(openIDs, windowKey)}>Retry</button></div>}
           <div class="boards-open-header">
             <button class="obs-btn obs-btn--sm" type="button" onClick={closeBoard}>← Back</button>
             <h2>{openName}</h2>

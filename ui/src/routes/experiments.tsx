@@ -1,3 +1,4 @@
+import { useRequestGuard } from "../hooks/useRequestGuard.js";
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { experimentsApi } from "../api/flags.js";
 import type { Experiment, ExperimentResults } from "../api/flags.js";
@@ -36,19 +37,23 @@ function ExperimentsSkeleton() {
   );
 }
 
-function ResultsPanel({ experimentId }: { experimentId: string }) {
+function ResultsPanel({ experimentId, siteId }: { experimentId: string; siteId: string }) {
   const [results, setResults] = useState<ExperimentResults | null>(null);
   const [loading, setLoading] = useState(true);
 
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
-    setLoading(true);
-    experimentsApi.results(experimentId)
-      .then(r => setResults(r))
-      .catch(() => setResults(null))
-      .finally(() => setLoading(false));
-  }, [experimentId]);
+    let active = true;
+    setLoading(true); setResults(null); setError(null);
+    experimentsApi.results(experimentId, siteId)
+      .then(r => { if (active) setResults(r); })
+      .catch(e => { if (active) setError(e instanceof Error ? e.message : "Unable to load results"); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [experimentId, siteId]);
 
   if (loading) return <div class="obs-empty-state">Loading results...</div>;
+  if (error) return <div class="obs-empty-state" role="alert">Unable to load results: {error}</div>;
   if (!results || !results.variants?.length) return <div class="obs-empty-state">No results yet</div>;
 
   const maxRate = Math.max(...results.variants.map(v => v.conversion_rate), 0.001);
@@ -221,6 +226,7 @@ export default function ExperimentsPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   // Create form
+  const [createError, setCreateError] = useState<string | null>(null);
   const [formName, setFormName] = useState("");
   const [formFlagKey, setFormFlagKey] = useState("");
   const [formVariants, setFormVariants] = useState("control,treatment");
@@ -228,13 +234,16 @@ export default function ExperimentsPage() {
   const [formGoalValue, setFormGoalValue] = useState("");
   const [formMinSample, setFormMinSample] = useState("100");
 
+  const requestfetchExperiments = useRequestGuard(JSON.stringify([siteId]));
   const fetchExperiments = useCallback(async () => {
+    const current = requestfetchExperiments();
     setLoading(true);
     try {
       const data = await experimentsApi.list(siteId);
+      if (!current()) return;
       setExperiments(data || []);
-    } catch { setExperiments([]); }
-    finally { setLoading(false); }
+    } catch { if (!current()) return; setExperiments([]); }
+    finally { if (current()) setLoading(false); }
   }, [siteId]);
 
   useEffect(() => { fetchExperiments(); }, [fetchExperiments]);
@@ -259,20 +268,27 @@ export default function ExperimentsPage() {
 
   const handleCreate = async () => {
     if (!formName.trim() || !formFlagKey.trim() || !formGoal.trim()) return;
-    setCreating(true);
+    if (creating) return;
+    setCreating(true); setCreateError(null);
     try {
+      const keys = formVariants.split(",").map(k => k.trim());
+      const minimum = Number(formMinSample);
+      if (keys.length < 2 || keys.some(k => !k) || new Set(keys).size !== keys.length) throw new Error("Enter at least two distinct variant keys");
+      if (!Number.isSafeInteger(minimum) || minimum < 1) throw new Error("Minimum sample must be a positive integer");
       await experimentsApi.create({
         site_id: siteId,
         name: formName.trim(),
         flag_key: formFlagKey.trim(),
-        variants: formVariants.trim(),
+        variants: JSON.stringify(keys.map(key => ({ key, weight: 1 }))),
+        min_sample: minimum,
+        goal_value: formGoalValue.trim(),
         goal_metric: formGoal.trim(),
       });
       setShowCreate(false);
       setFormName(""); setFormFlagKey(""); setFormVariants("control,treatment");
       setFormGoal(""); setFormGoalValue(""); setFormMinSample("100");
       fetchExperiments();
-    } catch (err) { console.error("Failed to create experiment:", err); }
+    } catch (err) { setCreateError(err instanceof Error ? err.message : "Unable to create experiment"); }
     finally { setCreating(false); }
   };
 
@@ -329,7 +345,7 @@ export default function ExperimentsPage() {
                     <span>Created: {formatDate(exp.created_at)}</span>
                     <span>Variants: {exp.variants}</span>
                   </div>
-                  <ResultsPanel experimentId={exp.experiment_id} />
+                  <ResultsPanel experimentId={exp.experiment_id} siteId={exp.site_id} />
                 </div>
               )}
             </div>
@@ -338,6 +354,7 @@ export default function ExperimentsPage() {
       )}
 
       <Modal open={showCreate} onClose={() => setShowCreate(false)} title="Create Experiment">
+        {createError && <div role="alert">{createError}</div>}
         <div class="obs-form-group">
           <label class="obs-label">Name</label>
           <input class="obs-input" placeholder="Checkout Flow Test" value={formName}
@@ -349,7 +366,7 @@ export default function ExperimentsPage() {
             onInput={(e) => setFormFlagKey((e.target as HTMLInputElement).value)} />
         </div>
         <div class="obs-form-group">
-          <label class="obs-label">Variants (comma-separated)</label>
+          <label class="obs-label">Variants (comma-separated, equal allocation; control key or first key is control)</label>
           <input class="obs-input" placeholder="control,treatment" value={formVariants}
             onInput={(e) => setFormVariants((e.target as HTMLInputElement).value)} />
         </div>

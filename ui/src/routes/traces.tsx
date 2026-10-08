@@ -1,3 +1,4 @@
+import { useRequestGuard } from "../hooks/useRequestGuard.js";
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { tracesApi } from "../api/traces.js";
 import type { Service, Operation, Span, TraceSummary, TraceError, ServiceDependency, PerformanceIssue, FunnelStep, FunnelResult, SavedFunnel } from "../api/traces.js";
@@ -210,9 +211,12 @@ function TraceWaterfall({ spans, traceId, siteId }: { spans: Span[]; traceId: st
   const [traceErrors, setTraceErrors] = useState<TraceError[]>([]);
 
   useEffect(() => {
+    let active = true;
+    setTraceErrors([]);
     tracesApi.traceErrors(traceId, siteId)
-      .then(e => setTraceErrors(e || []))
-      .catch(() => setTraceErrors([]));
+      .then(e => { if (active) setTraceErrors(e || []); })
+      .catch(() => { if (active) setTraceErrors([]); });
+    return () => { active = false; };
   }, [traceId, siteId]);
 
   if (!spans.length) return <div class="obs-empty-state">No spans found</div>;
@@ -365,21 +369,27 @@ function OperationsTable({ siteId, service, from, to, onSelectTrace }: {
   const [sortKey, setSortKey] = useState<"p95_ms" | "avg_duration_ms" | "request_count" | "error_count" | "operation_name">("p95_ms");
 
   useEffect(() => {
+    let active = true;
+    setOperations([]);
     setLoading(true);
     tracesApi.operations(siteId, service, from, to)
-      .then(d => setOperations(d || []))
-      .catch(() => setOperations([]))
-      .finally(() => setLoading(false));
+      .then(d => { if (active) setOperations(d || []); })
+      .catch(() => { if (active) setOperations([]); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
   }, [siteId, service, from, to]);
 
+  const operationRequest = useRequestGuard(JSON.stringify([siteId, service, from, to]));
   const handleOpClick = async (opName: string) => {
+    const current = operationRequest();
+    setTraceList([]);
     setSelectedOp(opName);
     setLoadingTraces(true);
     try {
       const traces = await tracesApi.search(siteId, from, to, { service, operation: opName });
-      setTraceList(traces || []);
-    } catch { setTraceList([]); }
-    finally { setLoadingTraces(false); }
+      if (current()) setTraceList(traces || []);
+    } catch { if (current()) setTraceList([]); }
+    finally { if (current()) setLoadingTraces(false); }
   };
 
   if (loading) return <ListSkeleton />;
@@ -520,7 +530,9 @@ function SearchFilters({ siteId, from, to, services, onSelectTrace }: {
     setChipKey(""); setChipValue(""); setChipError("");
   };
 
+  const searchRequest = useRequestGuard(JSON.stringify([siteId, from, to, filterService, filterOperation, filterStatus, filterMinDuration, filterMaxDuration, chips, includeOrphans]));
   const handleSearch = async () => {
+    const current = searchRequest();
     setLoading(true);
     setSearched(true);
     setTruncatedNote("");
@@ -535,12 +547,13 @@ function SearchFilters({ siteId, from, to, services, onSelectTrace }: {
         attrs: chips,
         includeOrphans,
       });
+      if (!current()) return;
       setResults(data?.traces || []);
       if (data?.truncated) {
         setTruncatedNote(data.truncated_reason || "Results were cut by a search bound and may be incomplete");
       }
-    } catch { setResults([]); }
-    finally { setLoading(false); }
+    } catch { if (current()) setResults([]); }
+    finally { if (current()) setLoading(false); }
   };
 
   return (
@@ -908,11 +921,14 @@ function PerformanceIssuesTable({ siteId, from, to, onSelectTrace }: {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    let active = true;
+    setIssues([]);
     setLoading(true);
     tracesApi.performanceIssues(siteId, from, to)
-      .then(d => setIssues(d || []))
-      .catch(() => setIssues([]))
-      .finally(() => setLoading(false));
+      .then(d => { if (active) setIssues(d || []); })
+      .catch(() => { if (active) setIssues([]); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
   }, [siteId, from, to]);
 
   if (loading) return <ListSkeleton />;
@@ -972,6 +988,11 @@ function PerformanceIssuesTable({ siteId, from, to, onSelectTrace }: {
 
 export default function TracesPage() {
   const { state: { siteId } } = useFilters();
+  return <SiteTracesPage key={siteId} />;
+}
+
+function SiteTracesPage() {
+  const { state: { siteId } } = useFilters();
 
   const [services, setServices] = useState<Service[]>([]);
   const [loading, setLoading] = useState(true);
@@ -986,17 +1007,22 @@ export default function TracesPage() {
   const [depsLoading, setDepsLoading] = useState(false);
   const [depsLoaded, setDepsLoaded] = useState(false);
 
-  const now = new Date();
-  const from = new Date(now.getTime() - 86400000).toISOString();
-  const to = now.toISOString();
+  const [windowRange] = useState(() => {
+    const now = new Date();
+    return { from: new Date(now.getTime() - 86400000).toISOString(), to: now.toISOString() };
+  });
+  const { from, to } = windowRange;
+  const serviceRequest = useRequestGuard(siteId);
+  const traceRequest = useRequestGuard(siteId);
 
   const fetchServices = useCallback(async () => {
-    setLoading(true);
+    const current = serviceRequest();
+    setServices([]); setLoading(true);
     try {
       const data = await tracesApi.services(siteId, from, to);
-      setServices(data || []);
-    } catch { setServices([]); }
-    finally { setLoading(false); }
+      if (current()) setServices(data || []);
+    } catch { if (current()) setServices([]); }
+    finally { if (current()) setLoading(false); }
   }, [siteId]);
 
   useEffect(() => {
@@ -1012,28 +1038,32 @@ export default function TracesPage() {
   // Lazy-load dependencies the first time the user opens deps or map.
   useEffect(() => {
     if ((view !== "deps" && view !== "map") || depsLoaded) return;
+    let active = true;
     setDepsLoading(true);
     tracesApi.dependencies(siteId, from, to)
-      .then(d => setDeps(d || []))
-      .catch(() => setDeps([]))
+      .then(d => { if (active) setDeps(d || []); })
+      .catch(() => { if (active) setDeps([]); })
       .finally(() => {
-        setDepsLoading(false);
-        setDepsLoaded(true);
+        if (active) { setDepsLoading(false); setDepsLoaded(true); }
       });
+    return () => { active = false; };
   }, [view, depsLoaded, siteId]);
 
   const loadTrace = async (id: string) => {
-    setLoadingTrace(true);
+    const current = traceRequest();
+    setTraceSpans([]); setLoadingTrace(true);
     setTraceId(id);
     setView("trace");
     try {
       const spans = await tracesApi.trace(id, siteId);
-      setTraceSpans(spans || []);
-    } catch { setTraceSpans([]); }
-    finally { setLoadingTrace(false); }
+      if (current()) setTraceSpans(spans || []);
+    } catch { if (current()) setTraceSpans([]); }
+    finally { if (current()) setLoadingTrace(false); }
   };
 
   const goBack = () => {
+    traceRequest();
+    setTraceSpans([]); setLoadingTrace(false);
     if (view === "trace" && selectedService) {
       setView("operations");
       setTraceId(null);

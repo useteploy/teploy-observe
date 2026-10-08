@@ -4,18 +4,19 @@
 
 {{- define "observe.fullname" -}}
 {{- if .Values.fullnameOverride -}}
-{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- .Values.fullnameOverride | trunc 55 | trimSuffix "-" -}}
 {{- else -}}
 {{- $name := default .Chart.Name .Values.nameOverride -}}
 {{- if contains $name .Release.Name -}}
-{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- .Release.Name | trunc 55 | trimSuffix "-" -}}
 {{- else -}}
-{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 55 | trimSuffix "-" -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
 
 {{- define "observe.nucleusName" -}}
+{{/* Reserve eight characters in fullname for component suffixes. */}}
 {{- printf "%s-nucleus" (include "observe.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 

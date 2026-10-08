@@ -1,7 +1,8 @@
 name: Perf Budget
 
-# Roadmap T041: 10k events/sec sustained on 1vCPU/2GB over 10 minutes with
-# <50ms p95 ingest latency. Runs weekly so a regression shows up before the
+# Weekly runner regression budget: 10k events/sec over 10 minutes with
+# <50ms p95 ingest latency. These ubuntu-latest processes are unconstrained;
+# this does not establish the separate 1vCPU/2GB deployment target. Runs weekly so a regression shows up before the
 # next release tag, and on-demand via workflow_dispatch when investigating
 # a suspected slowdown.
 #
@@ -85,14 +86,22 @@ jobs:
         working-directory: bench
         run: go build -o observe-bench .
 
+      - name: Generate disposable bootstrap credentials
+        run: |
+          password=$(openssl rand -hex 24)
+          echo "::add-mask::$password"
+          echo "OBSERVE_ADMIN_PASSWORD=$password" >> "$GITHUB_ENV"
+          echo "OBSERVE_ADMIN_USER=admin" >> "$GITHUB_ENV"
+          echo "Runner envelope: $(nproc) CPUs, $(free -m | awk '/Mem:/ {print $2}') MiB RAM; services are not cgroup constrained" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Boot Nucleus + Observe
         run: |
-          set -eu
+          set -euo pipefail
           mkdir -p /tmp/perfbudget/data
           NUCLEUS_BIN="$PWD/Neutron/nucleus/target/release/nucleus"
           OBSERVE_BIN="$PWD/observe"
 
-          "$NUCLEUS_BIN" start --port 5432 --data /tmp/perfbudget/data/nucleus \
+          NUCLEUS_ALLOW_NO_AUTH=1 "$NUCLEUS_BIN" start --no-tls --port 5432 --data /tmp/perfbudget/data/nucleus \
             >/tmp/perfbudget/nucleus.log 2>&1 &
           echo $! > /tmp/perfbudget/nucleus.pid
 
@@ -109,7 +118,7 @@ jobs:
           }
 
           OBSERVE_NUCLEUS_URL="postgres://postgres@localhost:5432/postgres?sslmode=disable" \
-          OBSERVE_PORT=3000 \
+          OBSERVE_ADDR=127.0.0.1:3000 \
           OBSERVE_DATA_DIR=/tmp/perfbudget/data \
           OBSERVE_JWT_SECRET="perfbudget-ci-secret-not-for-prod" \
           "$OBSERVE_BIN" >/tmp/perfbudget/observe.log 2>&1 &
@@ -130,27 +139,28 @@ jobs:
       - name: Provision API key + raise rate limit
         id: provision
         run: |
-          set -eu
-          TOKEN=$(curl -fs -X POST http://localhost:3000/api/v1/auth/login \
-            -H 'Content-Type: application/json' \
-            -d '{"username":"admin","password":"observe"}' | \
-            python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+          set -euo pipefail
+          login_body=$(python3 -c 'import json,os; print(json.dumps({"username":os.environ["OBSERVE_ADMIN_USER"],"password":os.environ["OBSERVE_ADMIN_PASSWORD"]}))')
+          curl --fail-with-body -sS --max-time 30 -X POST http://localhost:3000/api/v1/auth/login \
+            -H 'Content-Type: application/json' -d "$login_body" -o /tmp/perfbudget/login.json
+          TOKEN=$(python3 -c 'import json; r=json.load(open("/tmp/perfbudget/login.json")); t=r["token"]; assert isinstance(t,str) and t; print(t)')
+          echo "::add-mask::$TOKEN"
 
           # Raise per-site cap above the bench target so the rate limiter
           # doesn't become the bottleneck under measurement.
           CAP=$(( BUDGET_MIN_RPS * 5 ))
-          curl -fs -X PUT \
+          curl --fail-with-body -sS --max-time 30 -X PUT \
             -H "Authorization: Bearer $TOKEN" \
             -H 'Content-Type: application/json' \
             -d "{\"rate_per_second\":$CAP}" \
             http://localhost:3000/api/v1/sites/default/ratelimit >/dev/null
 
-          KEY=$(curl -fs -X POST \
+          KEY=$(curl --fail-with-body -sS --max-time 30 -X POST \
             -H "Authorization: Bearer $TOKEN" \
             -H 'Content-Type: application/json' \
             -d '{"name":"perfbudget-ci"}' \
             http://localhost:3000/api/v1/sites/default/keys | \
-            python3 -c 'import json,sys; print(json.load(sys.stdin)["key"])')
+            python3 -c 'import json,sys; k=json.load(sys.stdin)["key"]; assert isinstance(k,str) and k; print(k)')
 
           echo "::add-mask::$KEY"
           echo "api_key=$KEY" >> "$GITHUB_OUTPUT"
@@ -167,6 +177,7 @@ jobs:
         run: |
           [ -f /tmp/perfbudget/observe.pid ] && kill -TERM "$(cat /tmp/perfbudget/observe.pid)" 2>/dev/null || true
           [ -f /tmp/perfbudget/nucleus.pid ] && kill -TERM "$(cat /tmp/perfbudget/nucleus.pid)" 2>/dev/null || true
+          rm -f /tmp/perfbudget/login.json
 
       - name: Summarize results
         if: always()

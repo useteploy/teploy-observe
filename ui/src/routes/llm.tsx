@@ -1,3 +1,7 @@
+import QueryFailure from "../components/shared/QueryFailure.js";
+import type { ProvenanceTotals } from "../lib/llmProvenance.js";
+import { provenance, costSplit, tokenSplit, requirePartition, partitionColumns } from "../lib/llmProvenance.js";
+import { useRequestGuard } from "../hooks/useRequestGuard.js";
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { get } from "../api/helpers.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
@@ -9,20 +13,22 @@ export const config = { mode: "app" };
 
 const BASE = "/api/v1/llm";
 
-interface LLMStats {
+interface LLMStats extends ProvenanceTotals {
   total_calls: string;
   total_tokens: string;
   total_cost_usd: string;
+  estimated_cost_usd: string;
   avg_latency_ms: string;
   error_count: string;
 }
 
-interface ModelStats {
+interface ModelStats extends ProvenanceTotals {
   model: string;
   provider: string;
   call_count: string;
   total_tokens: string;
   total_cost_usd: string;
+  estimated_cost_usd: string;
   avg_latency_ms: string;
 }
 
@@ -39,6 +45,8 @@ interface LLMTrace {
   completion_tokens: string;
   total_tokens: string;
   cost_usd: string;
+  cost_source: string;
+  token_source: string;
   latency_ms: string;
   status: string;
   error_message: string;
@@ -74,25 +82,37 @@ export default function LLMPage() {
   const [models, setModels] = useState<ModelStats[]>([]);
   const [traces, setTraces] = useState<LLMTrace[]>([]);
   const [loading, setLoading] = useState(true);
+  const [errors, setErrors] = useState<Record<string, string>>({});
   const [selected, setSelected] = useState<LLMTrace | null>(null);
 
+  const requestfetch = useRequestGuard(JSON.stringify([siteId]));
+  useEffect(() => { setSelected(null); }, [siteId]);
   const fetch = useCallback(async () => {
-    setLoading(true);
+    const current = requestfetch();
+    setLoading(true); setErrors({}); setStats(null); setModels([]); setTraces([]);
     // Compute the window inside the callback so the ref stays stable across
     // renders — otherwise from/to change every render and we infinite-loop.
     const now = new Date();
     const from = new Date(now.getTime() - 7 * 86400000).toISOString();
     const to = now.toISOString();
     try {
-      const [s, m, t] = await Promise.all([
-        get<LLMStats>(`${BASE}/stats?site_id=${siteId}&from=${from}&to=${to}`).catch(() => null),
-        get<ModelStats[]>(`${BASE}/models?site_id=${siteId}&from=${from}&to=${to}`).catch(() => []),
-        get<LLMTrace[]>(`${BASE}/traces?site_id=${siteId}&from=${from}&to=${to}&limit=50`).catch(() => []),
+      const results = await Promise.allSettled([
+        get<LLMStats>(`${BASE}/stats?site_id=${siteId}&from=${from}&to=${to}`).then(requirePartition),
+        get<ModelStats[]>(`${BASE}/models?site_id=${siteId}&from=${from}&to=${to}`).then(rows => {
+          if (!Array.isArray(rows)) throw new Error("Invalid model breakdown");
+          return rows.map(requirePartition);
+        }),
+        get<LLMTrace[]>(`${BASE}/traces?site_id=${siteId}&from=${from}&to=${to}&limit=50`),
       ]);
-      setStats(s);
-      setModels(m || []);
-      setTraces(t || []);
-    } finally { setLoading(false); }
+      if (!current()) return;
+      const [s, m, t] = results;
+      const failures: Record<string, string> = {};
+      results.forEach((r, i) => { if (r.status === "rejected") failures[["stats", "models", "traces"][i]] = r.reason instanceof Error ? r.reason.message : "Unable to load LLM data"; });
+      setErrors(failures);
+      setStats(s.status === "fulfilled" ? s.value : null);
+      setModels(m.status === "fulfilled" ? m.value : []);
+      setTraces(t.status === "fulfilled" ? t.value || [] : []);
+    } finally { if (current()) setLoading(false); }
   }, [siteId]);
 
   useEffect(() => { fetch(); }, [fetch]);
@@ -119,10 +139,10 @@ export default function LLMPage() {
             { label: "Provider", value: selected.provider || "unknown" },
             { label: "Operation", value: selected.operation },
             { label: "Latency", value: `${selected.latency_ms}ms` },
-            { label: "Cost", value: formatCost(selected.cost_usd) },
-            { label: "Prompt Tokens", value: formatNumber(selected.prompt_tokens) },
-            { label: "Completion Tokens", value: formatNumber(selected.completion_tokens) },
-            { label: "Total Tokens", value: formatNumber(selected.total_tokens) },
+            { label: "Cost", value: `${formatCost(selected.cost_usd)} (${provenance(selected.cost_source)})` },
+            { label: "Prompt Tokens", value: `${formatNumber(selected.prompt_tokens)} (${provenance(selected.token_source)})` },
+            { label: "Completion Tokens", value: `${formatNumber(selected.completion_tokens)} (${provenance(selected.token_source)})` },
+            { label: "Total Tokens", value: `${formatNumber(selected.total_tokens)} (${provenance(selected.token_source)})` },
             { label: "Timestamp", value: formatTime(selected.timestamp) },
           ].map((c, i) => (
             <div key={i} style={{ background: "var(--obs-surface)", padding: "12px", borderRadius: "var(--obs-radius-md)" }}>
@@ -168,20 +188,21 @@ export default function LLMPage() {
         <h1 class="obs-page-title">LLM Observability</h1>
       </div>
 
+      {Object.entries(errors).map(([surface, message]) => <QueryFailure key={surface} message={`${surface}: ${message}`} retry={fetch} />)}
       {loading ? (
         <div class="obs-empty-state">Loading...</div>
-      ) : !stats || parseInt(stats.total_calls || "0") === 0 ? (
-        <div class="obs-empty-state">
-          No LLM calls recorded. POST to /api/v1/llm/ingest to start tracking.
-        </div>
       ) : (
         <>
+          {stats && parseInt(stats.total_calls) === 0 && <div class="obs-empty-state">No LLM calls recorded. POST to /api/v1/llm/ingest to start tracking.</div>}
+          <p>Cost and token provenance are classified independently. Legacy totals retain historical stored values and can differ from input plus output tokens.</p>
+          {stats && (<>
+          <ExportButton filename={`llm-costs-${siteId}.csv`} rows={[stats]} columns={[{ key: "total_calls", label: "total_calls" }, ...partitionColumns]} />
           {/* Summary cards */}
           <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: "12px", marginBottom: "20px" }}>
             {[
               { label: "Total Calls", value: formatNumber(stats.total_calls), color: "var(--obs-accent)" },
-              { label: "Total Tokens", value: formatNumber(stats.total_tokens), color: "var(--obs-text)" },
-              { label: "Total Cost", value: formatCost(stats.total_cost_usd), color: "var(--obs-success)" },
+              { label: "Total Tokens", value: tokenSplit(stats), color: "var(--obs-text)" },
+              { label: "Total Cost", value: costSplit(stats), color: "var(--obs-success)" },
               { label: "Avg Latency", value: `${Math.round(parseFloat(stats.avg_latency_ms || "0"))}ms`, color: "var(--obs-text)" },
               { label: "Errors", value: formatNumber(stats.error_count), color: parseInt(stats.error_count || "0") > 0 ? "var(--obs-danger)" : "var(--obs-text-muted)" },
             ].map((c, i) => (
@@ -192,10 +213,13 @@ export default function LLMPage() {
             ))}
           </div>
 
+          </>)}
+
           {/* Models breakdown */}
           {models.length > 0 && (
             <div style={{ marginBottom: "20px" }}>
               <h2 style={{ fontSize: "14px", fontWeight: 600, color: "var(--obs-text)", marginBottom: "8px" }}>Models</h2>
+              <ExportButton filename={`llm-models-${siteId}.csv`} rows={models} columns={[{ key: "model", label: "model" }, { key: "provider", label: "provider" }, { key: "call_count", label: "call_count" }, ...partitionColumns]} />
               <div style={{ background: "var(--obs-surface)", borderRadius: "var(--obs-radius-md)", overflow: "hidden" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
                   <thead>
@@ -214,8 +238,8 @@ export default function LLMPage() {
                         <td style={{ padding: "10px 16px", fontWeight: 500, color: "var(--obs-text)" }}>{m.model}</td>
                         <td style={{ padding: "10px 16px", color: "var(--obs-text-secondary)" }}>{m.provider}</td>
                         <td style={{ padding: "10px 16px", textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--obs-text-secondary)" }}>{formatNumber(m.call_count)}</td>
-                        <td style={{ padding: "10px 16px", textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--obs-text-secondary)" }}>{formatNumber(m.total_tokens)}</td>
-                        <td style={{ padding: "10px 16px", textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--obs-success)" }}>{formatCost(m.total_cost_usd)}</td>
+                        <td style={{ padding: "10px 16px", textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--obs-text-secondary)" }}>{tokenSplit(m)}</td>
+                        <td style={{ padding: "10px 16px", textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--obs-success)" }}>{costSplit(m)}</td>
                         <td style={{ padding: "10px 16px", textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--obs-text-secondary)" }}>{Math.round(parseFloat(m.avg_latency_ms || "0"))}ms</td>
                       </tr>
                     ))}
@@ -232,13 +256,17 @@ export default function LLMPage() {
                 <h2 style={{ fontSize: "14px", fontWeight: 600, color: "var(--obs-text)", margin: 0 }}>Recent Calls</h2>
                 <ExportButton
                   filename={`llm-traces-${siteId}-${Date.now()}.csv`}
-                  rows={traces}
+                  rows={traces.map(t => ({ ...t, cost_provenance: provenance(t.cost_source), token_provenance: provenance(t.token_source) }))}
                   columns={[
                     { key: "model", label: "model" },
                     { key: "provider", label: "provider" },
                     { key: "operation", label: "operation" },
                     { key: "total_tokens", label: "tokens" },
                     { key: "cost_usd", label: "cost_usd" },
+                    { key: "cost_source", label: "cost_source" },
+                    { key: "token_source", label: "token_source" },
+                    { key: "cost_provenance", label: "cost_provenance" },
+                    { key: "token_provenance", label: "token_provenance" },
                     { key: "latency_ms", label: "latency_ms" },
                     { key: "status", label: "status" },
                     { key: "timestamp", label: "timestamp_ms" },
@@ -252,8 +280,8 @@ export default function LLMPage() {
                     <StatusBadge status={t.status === "ok" ? "ok" : "error"} size="sm" />
                     <span style={{ flex: 1, fontWeight: 500, color: "var(--obs-text)" }}>{t.model}</span>
                     <span style={{ color: "var(--obs-text-muted)", fontSize: "11px", textTransform: "uppercase" }}>{t.operation}</span>
-                    <span style={{ color: "var(--obs-text-secondary)", fontVariantNumeric: "tabular-nums", minWidth: "70px", textAlign: "right" }}>{formatNumber(t.total_tokens)} tok</span>
-                    <span style={{ color: "var(--obs-success)", fontVariantNumeric: "tabular-nums", minWidth: "60px", textAlign: "right" }}>{formatCost(t.cost_usd)}</span>
+                    <span style={{ color: "var(--obs-text-secondary)", fontVariantNumeric: "tabular-nums", minWidth: "70px", textAlign: "right" }}>{formatNumber(t.total_tokens)} tok ({provenance(t.token_source)})</span>
+                    <span style={{ color: "var(--obs-success)", fontVariantNumeric: "tabular-nums", minWidth: "60px", textAlign: "right" }}>{formatCost(t.cost_usd)} ({provenance(t.cost_source)})</span>
                     <span style={{ color: "var(--obs-text-secondary)", fontVariantNumeric: "tabular-nums", minWidth: "60px", textAlign: "right" }}>{t.latency_ms}ms</span>
                     <span style={{ color: "var(--obs-text-muted)", fontSize: "11px", minWidth: "130px", textAlign: "right" }}>{formatTime(t.timestamp)}</span>
                   </div>

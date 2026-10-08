@@ -45,7 +45,11 @@ function DatePicker() {
 
   function openCustom() {
     setCustomFrom(toDateInput(state.from));
-    setCustomTo(toDateInput(state.to));
+    const end = new Date(state.to);
+    if (end.getHours() === 0 && end.getMinutes() === 0 && end.getSeconds() === 0 && end.getMilliseconds() === 0) {
+      end.setDate(end.getDate() - 1);
+    }
+    setCustomTo(toDateInput(end.toISOString()));
     setCustomOpen(true);
   }
 

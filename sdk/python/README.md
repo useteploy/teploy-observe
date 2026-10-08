@@ -44,7 +44,7 @@ observe.close()
 | `log(level, msg, **fields)` | Emit a log. |
 | `debug / info / warn / error / fatal` | Level helpers. |
 | `flush(timeout=None)` | Drain buffered logs synchronously under an optional whole-drain deadline. |
-| `close(timeout=None)` | Stop the flush thread and drain; leftovers at the deadline are counted as `shutdown_unflushed` losses. |
+| `close(timeout=None)` | Stop the flush thread and drain; incomplete close raises and leaves records queued for a later close. |
 | `stats()` | O11 diagnostics: delivered / retries / dropped-by-reason counters + live queue depth. |
 
 ## Guarantees
@@ -68,8 +68,9 @@ observe.close()
 - **Partial errors**: the batch ack's per-entry `rejected` count becomes a
   `server_rejected` loss; the accepted neighbors are never resent.
 - **Shutdown**: `close(timeout=...)` bounds worker join and drain;
-  leftovers are counted as `shutdown_unflushed` and reported via
-  `on_error`. Signal recipe:
+  one deadline covers ownership waits, worker join, and drain. An incomplete
+  close raises `TimeoutError`; retained records stay in `stats()["queued"]`
+  and a later close can deliver them. Signal recipe:
 
 ```python
 import signal, observe_sdk

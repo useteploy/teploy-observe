@@ -3,8 +3,8 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "nameOverride": {"type": "string"},
-    "fullnameOverride": {"type": "string"},
+    "nameOverride": {"type": "string", "maxLength": 63, "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"},
+    "fullnameOverride": {"type": "string", "maxLength": 63, "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"},
     "image": {
       "type": "object",
       "additionalProperties": false,

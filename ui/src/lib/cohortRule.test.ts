@@ -81,3 +81,28 @@ test("parseIdList enforces caps", () => {
   const big = Array.from({ length: MAX_STATIC_IDS + 1 }, (_, i) => "u" + i).join("\n");
   assert.ok(parseIdList(big).error);
 });
+
+
+test("OBS26-71 valid JSON wrong runtime types return errors without throwing", () => {
+  for (const value of [null, 1, true, [], "x", { rules: {} }, { children: "bad" }, { op: 42 },
+    { leaf: { type: "event", name: 42 } }, { leaf: { type: "event", name: "x", window: 7 } },
+    { leaf: { type: "event", name: "x", min_count: "2" } }, { leaf: { type: "property", key: "country", value: [] } },
+    { leaf: [] }, { leaf: null }, { children: [null] },
+    { leaf: { type: { toString: null } } }, { leaf: { type: "event", name: "x", window: { toString: null } } },
+    { leaf: { type: "property", key: "country", operator: { toString: null } } }]) {
+    const result = validateRuleJson(JSON.stringify(value));
+    assert.equal(result.ok, false, JSON.stringify(value));
+    if (!result.ok) assert.ok(result.error.length);
+  }
+});
+
+test("OBS26-66 quoted comma and escaped quote IDs match server fixture", () => {
+  assert.deepEqual(parseIdList('id,name\r\nu1,A\r\n"u,2",B\r\n"u""3",C\r\n').ids, ["u1", "u,2", 'u"3']);
+  assert.deepEqual(parseIdList('\uFEFFid\n\n"u,2"\n"u,2"\n').ids, ["u,2"]);
+  assert.equal(parseIdList("é".repeat(128)).error, undefined);
+  assert.ok(parseIdList("é".repeat(129)).error);
+  assert.ok(parseIdList('"unfinished').error);
+  assert.ok(parseIdList('"u"trailing').error);
+  assert.ok(parseIdList('"u\n2"').error);
+  assert.ok(parseIdList("u\u0000").error);
+});

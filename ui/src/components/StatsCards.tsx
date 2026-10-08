@@ -19,16 +19,22 @@ function StatsCards() {
   const { siteId, from, to, compare, filters } = state;
 
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [realtime, setRealtime] = useState<RealtimeResult | null>(null);
 
   useEffect(() => {
-    api.overview(siteId, from, to, compare, filters).then(setOverview).catch(() => {});
-    api.realtime(siteId).then(setRealtime).catch(() => {});
-
-    const interval = setInterval(() => {
-      api.realtime(siteId).then(setRealtime).catch(() => {});
-    }, 15000);
-    return () => clearInterval(interval);
+    let active = true, realtimeGeneration = 0;
+    setOverview(null); setRealtime(null); setError(null);
+    api.overview(siteId, from, to, compare, filters)
+      .then(d => { if (active) setOverview(d); })
+      .catch(e => { if (active) setError(e instanceof Error ? e.message : "Unable to load overview"); });
+    const refresh = () => {
+      const generation = ++realtimeGeneration;
+      api.realtime(siteId).then(d => { if (active && generation === realtimeGeneration) setRealtime(d); }).catch(() => {});
+    };
+    refresh();
+    const interval = setInterval(refresh, 15000);
+    return () => { active = false; clearInterval(interval); };
   }, [siteId, from, to, compare, JSON.stringify(filters)]);
 
   const cur = overview?.current;
@@ -81,6 +87,7 @@ function StatsCards() {
 
   return (
     <div class="obs-grid-stats">
+      {error && <div role="alert">Unable to load overview: {error}</div>}
       {cards.map((c, i) => (
         <div key={c.label} class="obs-card" style={{ animationDelay: `${i * 40}ms` }}>
           {c.target !== null ? (

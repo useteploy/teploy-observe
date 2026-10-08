@@ -25,6 +25,7 @@ from .breadcrumbs import (
     BreadcrumbHandler,
 )
 from . import flags as _flags
+from .transport import Operation, DeliveryDeadline
 
 # Wire protocol version this SDK speaks (F12/F19 idempotent delivery).
 PROTOCOL_VERSION = 2
@@ -108,6 +109,8 @@ def _validate_options(opts: "Options") -> None:
     """AUD-037 (round 2): reject configuration that would spin the worker
     (zero/negative interval), hang requests (non-finite timeout), or break
     batching — BEFORE the thread starts, not at first failure."""
+    if not isinstance(opts.endpoint, str) or not opts.endpoint.strip():
+        raise ValueError("observe_sdk: endpoint is required")
     if type(opts.log_batch_size) is not int or not 1 <= opts.log_batch_size <= _MAX_LOG_BATCH:
         raise ValueError(f"log_batch_size must be an integer in [1, {_MAX_LOG_BATCH}]")
     for name, value, lower, upper in (
@@ -169,7 +172,7 @@ class Client:
         # O11: visible loss/delivery counters, surfaced via stats().
         # dropped maps reason -> count: entry_invalid, entry_oversize,
         # queue_full, retry_exhausted, non_retryable, server_rejected,
-        # shutdown_unflushed. delivered + sum(dropped) + len(queue)
+        # Retained shutdown work remains queued. delivered + sum(dropped) + len(queue)
         # accounts for every admitted record.
         self._stats_dropped: Dict[str, int] = {}
         self._stats_delivered = 0
@@ -199,6 +202,8 @@ class Client:
         # TO-037: the opener refuses redirects; a 3xx surfaces as an error
         # (strict 2xx below) instead of silently forwarding the API key.
         self._opener = urlrequest.build_opener(_NoTelemetryRedirect)
+        self._default_opener = self._opener
+        self._batch_operation: Optional[Operation] = None
         self._thread.start()
 
     # ── public API ────────────────────────────────────────────────────────
@@ -498,11 +503,17 @@ class Client:
         ``stats()["queued"]``.
         """
         deadline = time.monotonic() + timeout if timeout is not None else None
-        with self._flush_lock:
+        wait = max(0.0, deadline - time.monotonic()) if deadline is not None else None
+        acquired = self._flush_lock.acquire(timeout=wait) if wait is not None else self._flush_lock.acquire()
+        if not acquired:
+            raise TimeoutError("observe_sdk: flush ownership deadline reached")
+        try:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("observe_sdk: flush deadline reached")
             with self._lock:
                 remaining = len(self._buffer)  # fixed watermark, not a live drain
             while remaining:
-                if self._send_attempts >= 2 and time.monotonic() < self._retry_not_before:
+                if self._state == "open" and self._send_attempts >= 2 and time.monotonic() < self._retry_not_before:
                     return  # mid-backoff; the worker or a later flush retries
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError(
@@ -531,10 +542,17 @@ class Client:
                 body = b'{"logs":[' + b",".join(chosen) + b']}'
                 per_request = self.opts.timeout
                 if deadline is not None:
-                    per_request = min(per_request, max(deadline - time.monotonic(), 0.05))
+                    per_request = min(per_request, max(deadline - time.monotonic(), 0.001))
                 try:
                     accepted, rejected = self._post_batch(body, timeout=per_request)
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise DeliveryDeadline("observe_sdk: acknowledgement exceeded flush deadline")
+                    if accepted is not None and (accepted < 0 or rejected is None or rejected < 0 or accepted + rejected != len(chosen)):
+                        raise RuntimeError("observe_sdk: ambiguous batch acknowledgement")
                 except Exception as exc:  # noqa: BLE001 - classified below
+                    if isinstance(exc, DeliveryDeadline):
+                        self._last_error = exc
+                        raise
                     if not _retryable(exc):
                         with self._lock:
                             del self._buffer[: len(chosen)]
@@ -580,6 +598,8 @@ class Client:
                     self._buffer_bytes -= sum(len(c) for c in chosen)
                 remaining -= len(chosen)
             self._last_error = None
+        finally:
+            self._flush_lock.release()
 
     def close(self, timeout: Optional[float] = None) -> None:
         """Stop the background flusher and drain pending logs.
@@ -592,46 +612,43 @@ class Client:
 
         O11: ``timeout`` bounds BOTH the worker join and the final drain
         (default: the configured flush interval + request timeout + 1 s).
-        Entries still queued when close gives up are counted as
-        ``shutdown_unflushed`` losses and reported through ``on_error`` —
-        never swallowed.
+        Entries still queued when close gives up remain recoverable in
+        ``stats()["queued"]``; incomplete close raises instead of counting
+        those records as lost.
         """
-        with self._close_lock:
+        budget = timeout if timeout is not None else self.opts.log_flush_interval + self.opts.timeout + 1.0
+        deadline = time.monotonic() + budget
+        if not self._close_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            raise TimeoutError("observe_sdk: close ownership deadline reached")
+        try:
             with self._lock:
                 if self._state == "closed":
                     return
                 self._state = "closing"
             self.remove_logging_breadcrumbs()
             self._stop.set()
-            join_timeout = (
-                timeout if timeout is not None
-                else self.opts.log_flush_interval + self.opts.timeout + 1.0
-            )
-            self._thread.join(timeout=join_timeout)
+            operation = self._batch_operation
+            if operation is not None and not operation.done.is_set():
+                operation.cancel()
+            self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
             if self._thread.is_alive():
-                raise TimeoutError(
-                    "observe_sdk: flush worker has not stopped; close is incomplete"
-                )
-            drain_timeout = timeout if timeout is not None else self.opts.timeout
+                raise TimeoutError("observe_sdk: flush worker has not stopped; close is incomplete")
             drain_error: Optional[BaseException] = None
             try:
-                self.flush(timeout=drain_timeout)
-            except Exception as exc:  # noqa: BLE001 - surfaced via the raise below
+                self.flush(timeout=max(0.0, deadline - time.monotonic()))
+            except Exception as exc:
                 drain_error = exc
             with self._lock:
                 leftover = len(self._buffer)
-            if leftover:
-                self._count_loss(
-                    "shutdown_unflushed", leftover,
-                    "close deadline reached with entries queued",
-                )
+            # Retained records are queued, not lost: retries may still deliver them.
             if drain_error is not None or leftover:
                 raise TimeoutError(
-                    f"observe_sdk: close incomplete ({leftover} entries queued"
-                    f"{f'; last error: {drain_error}' if drain_error else ''})"
+                    f"observe_sdk: close incomplete ({leftover} entries queued; last error: {drain_error})"
                 )
             with self._lock:
                 self._state = "closed"
+        finally:
+            self._close_lock.release()
 
     # ── internal ──────────────────────────────────────────────────────────
 
@@ -666,23 +683,49 @@ class Client:
         if self.opts.api_key:
             headers["X-API-Key"] = self.opts.api_key
         req = urlrequest.Request(url, data=body, headers=headers, method="POST")
-        try:
-            with self._opener.open(req, timeout=timeout or self.opts.timeout) as resp:
-                raw = resp.read(64 * 1024)
-        except urlrequest.HTTPError as exc:
-            raise ObserveHTTPError("/api/v1/logs/batch", exc.code) from exc
-        except (URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError(f"observe: post /api/v1/logs/batch failed: {exc}") from exc
-        if not 200 <= resp.status < 300:
-            raise ObserveHTTPError("/api/v1/logs/batch", resp.status)
-        try:
-            ack = json.loads(raw.decode("utf-8")) if raw else {}
-        except ValueError:
-            return None, None
-        return (
-            ack.get("accepted") if isinstance(ack.get("accepted"), int) else None,
-            ack.get("rejected") if isinstance(ack.get("rejected"), int) else None,
-        )
+        previous = self._batch_operation
+        if previous is not None and not previous.done.is_set():
+            raise DeliveryDeadline("observe_sdk: cancelled transport is still stopping")
+        operation = Operation(time.monotonic() + (timeout if timeout is not None else self.opts.timeout))
+        self._batch_operation = operation
+        opener = operation.opener(_NoTelemetryRedirect) if self._opener is self._default_opener else self._opener
+
+        def send():
+            try:
+                operation.remaining()
+                with opener.open(req, timeout=operation.remaining()) as resp:
+                    operation.own_response(resp)
+                    raw = resp.read(64 * 1024 + 1)
+                    operation.remaining()
+                    if len(raw) > 64 * 1024:
+                        raise RuntimeError("observe_sdk: acknowledgement exceeds 64 KiB")
+                    if not 200 <= resp.status < 300:
+                        raise ObserveHTTPError("/api/v1/logs/batch", resp.status)
+                if not raw:
+                    operation.result = (None, None)  # legacy bodyless 2xx
+                else:
+                    ack = json.loads(raw.decode("utf-8"))
+                    if not isinstance(ack, dict) or type(ack.get("accepted")) is not int or type(ack.get("rejected")) is not int:
+                        raise RuntimeError("observe_sdk: ambiguous batch acknowledgement")
+                    operation.result = (ack["accepted"], ack["rejected"])
+            except urlrequest.HTTPError as exc:
+                exc.close()
+                operation.error = ObserveHTTPError("/api/v1/logs/batch", exc.code)
+            except Exception as exc:
+                operation.error = exc
+            finally:
+                operation.cancel(interrupt=False)
+                operation.done.set()
+
+        threading.Thread(target=send, name="observe-batch-transport", daemon=True).start()
+        if not operation.done.wait(max(0.0, operation.deadline - time.monotonic())):
+            operation.cancel()
+            raise DeliveryDeadline("observe_sdk: batch transport deadline reached")
+        if operation.cancelled.is_set() or time.monotonic() >= operation.deadline:
+            raise DeliveryDeadline("observe_sdk: transport cancelled or deadline reached")
+        if operation.error is not None:
+            raise operation.error
+        return operation.result
 
     def _post_bytes(self, path: str, data: bytes, *, url: Optional[str] = None, silent: bool = False) -> None:
         if url is None:
@@ -773,13 +816,13 @@ def _require() -> Client:
     return _default
 
 
-def close() -> None:
+def close(timeout: Optional[float] = None) -> None:
     if _default is not None:
-        _default.close()
+        _default.close(timeout=timeout)
 
 
-def flush() -> None:
-    _require().flush()
+def flush(timeout: Optional[float] = None) -> None:
+    _require().flush(timeout=timeout)
 
 
 def stats() -> Dict[str, Any]:

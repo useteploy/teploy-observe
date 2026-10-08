@@ -28,7 +28,7 @@ function withShare(path: string): string {
 // query auto-includes the active cohort filter without each call site
 // having to plumb it. C2 (Wave 4): the chip on /insights writes the
 // param; the panels read here. Returns "" when not set.
-function activeCohortID(): string {
+export function activeCohortID(): string {
   if (typeof window === "undefined") return "";
   return new URLSearchParams(window.location.search).get("cohort_id") || "";
 }

@@ -151,8 +151,8 @@ def test_close_deadline_counts_unflushed_as_losses(fault):
         client.close(timeout=0.3)
 
     stats = client.stats()
-    assert stats["dropped"].get("shutdown_unflushed") == 2, stats
-    assert any("shutdown_unflushed" in e for e in errors)
+    assert stats["queued"] == 2, stats
+    assert stats["dropped"].get("shutdown_unflushed", 0) == 0, stats
 
 
 def test_flush_deadline_leaves_queue_visible(fault):

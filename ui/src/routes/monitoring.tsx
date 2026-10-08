@@ -1,3 +1,4 @@
+import { useRequestGuard } from "../hooks/useRequestGuard.js";
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { monitoringApi } from "../api/monitoring.js";
 import type { UptimeMonitor, UptimeResult, CronMonitor, InfraHost, InfraMetric } from "../api/monitoring.js";
@@ -12,7 +13,9 @@ export const config = { mode: "app" };
 function formatDate(iso: string | number): string {
   if (!iso) return "--";
   try {
-    return new Date(iso).toLocaleString("en-US", {
+    const date = new Date(typeof iso === "string" && /^\d+$/.test(iso) ? Number(iso) : iso);
+    if (Number.isNaN(date.getTime())) return "--";
+    return date.toLocaleString("en-US", {
       month: "short", day: "numeric",
       hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
     });
@@ -409,25 +412,31 @@ function InfraTab() {
   const [history, setHistory] = useState<InfraMetric[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
 
+  const historyRequest = useRequestGuard(siteId);
   useEffect(() => {
+    let active = true;
+    setSelectedHost(null); setHistory([]); setHosts([]);
     setLoading(true);
     monitoringApi.infraHosts(siteId)
-      .then(d => setHosts(d || []))
-      .catch(() => setHosts([]))
-      .finally(() => setLoading(false));
+      .then(d => { if (active) setHosts(d || []); })
+      .catch(() => { if (active) setHosts([]); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
   }, [siteId]);
 
   const handleHostClick = async (hostname: string) => {
+    const current = historyRequest();
+    setHistory([]);
     if (selectedHost === hostname) { setSelectedHost(null); return; }
     setSelectedHost(hostname);
     setLoadingHistory(true);
     const now = new Date();
     const from = new Date(now.getTime() - 86400000).toISOString();
     try {
-      const data = await monitoringApi.infraHistory(hostname, from, now.toISOString());
-      setHistory(data || []);
-    } catch { setHistory([]); }
-    finally { setLoadingHistory(false); }
+      const data = await monitoringApi.infraHistory(hostname, siteId, from, now.toISOString());
+      if (current()) setHistory(data || []);
+    } catch { if (current()) setHistory([]); }
+    finally { if (current()) setLoadingHistory(false); }
   };
 
   if (loading) return <MonitoringSkeleton />;

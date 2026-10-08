@@ -1,3 +1,5 @@
+import QueryFailure from "../components/shared/QueryFailure.js";
+import { useRequestGuard } from "../hooks/useRequestGuard.js";
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { analyticsApi } from "../api/analytics.js";
 import type { UTMStat, AttributionRow, AttributionModel } from "../api/analytics.js";
@@ -21,9 +23,12 @@ interface CampaignGroupProps {
   data: UTMStat[];
   total: number;
   color: string;
+  error?: string;
+  retry?: () => void;
 }
 
-function CampaignGroup({ title, data, total, color }: CampaignGroupProps) {
+function CampaignGroup({ title, data, total, color, error, retry }: CampaignGroupProps) {
+  if (error) return <div class="obs-card-static"><h3>{title}</h3><QueryFailure message={error} retry={retry!} /></div>;
   if (!data.length) {
     return (
       <div class="obs-card-static">
@@ -128,17 +133,21 @@ function AttributionTab({ siteId, from, to }: AttributionTabProps) {
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
 
+  const requestload = useRequestGuard(JSON.stringify([siteId, from, to, model]));
   const load = useCallback(async () => {
+    const current = requestload();
     setLoading(true);
     setErr(null);
     try {
       const r = await analyticsApi.attribution(siteId, from, to, model);
+      if (!current()) return;
       setRows(r || []);
     } catch (e) {
+      if (!current()) return;
       setErr((e as Error).message);
       setRows([]);
     } finally {
-      setLoading(false);
+      if (current()) setLoading(false);
     }
   }, [siteId, from, to, model]);
 
@@ -230,27 +239,33 @@ export default function CampaignsPage() {
   const [terms, setTerms] = useState<UTMStat[]>([]);
   const [contents, setContents] = useState<UTMStat[]>([]);
   const [loading, setLoading] = useState(true);
+  const [utmErrors, setUtmErrors] = useState<Record<string, string>>({});
 
-  const now = new Date();
-  const from = new Date(now.getTime() - 30 * 86400000).toISOString();
-  const to = now.toISOString();
+  const [range] = useState(() => {
+    const now = new Date();
+    return { from: new Date(now.getTime() - 30 * 86400000).toISOString(), to: now.toISOString() };
+  });
+  const { from, to } = range;
 
+  const requestfetch = useRequestGuard(JSON.stringify([siteId]));
   const fetch = useCallback(async () => {
-    setLoading(true);
+    const current = requestfetch();
+    setLoading(true); setUtmErrors({});
+    setSources([]); setMediums([]); setCampaigns([]); setTerms([]); setContents([]);
     try {
-      const [src, med, cam, ter, con] = await Promise.all([
-        analyticsApi.utm(siteId, from, to, "source", 20).catch(() => []),
-        analyticsApi.utm(siteId, from, to, "medium", 20).catch(() => []),
-        analyticsApi.utm(siteId, from, to, "campaign", 20).catch(() => []),
-        analyticsApi.utm(siteId, from, to, "term", 20).catch(() => []),
-        analyticsApi.utm(siteId, from, to, "content", 20).catch(() => []),
-      ]);
-      setSources(src || []);
-      setMediums(med || []);
-      setCampaigns(cam || []);
-      setTerms(ter || []);
-      setContents(con || []);
-    } finally { setLoading(false); }
+      const dimensions = ["source", "medium", "campaign", "term", "content"] as const;
+      const results = await Promise.allSettled(dimensions.map(d => analyticsApi.utm(siteId, from, to, d, 20)));
+      if (!current()) return;
+      const errors: Record<string, string> = {};
+      const values = results.map((r, i) => {
+        if (r.status === "fulfilled") return r.value || [];
+        errors[dimensions[i]] = `Unable to load UTM ${dimensions[i]}.`;
+        return [];
+      });
+      setUtmErrors(errors);
+      setSources(values[0]); setMediums(values[1]); setCampaigns(values[2]);
+      setTerms(values[3]); setContents(values[4]);
+    } finally { if (current()) setLoading(false); }
   }, [siteId]);
 
   useEffect(() => { fetch(); }, [fetch]);
@@ -277,7 +292,7 @@ export default function CampaignsPage() {
       {tab === "overview" ? (
         loading ? (
           <div class="obs-empty-state">Loading...</div>
-        ) : !hasData ? (
+        ) : !hasData && Object.keys(utmErrors).length === 0 ? (
           <div class="obs-empty-state">
             No UTM-tagged traffic in the last 30 days. Add utm_source, utm_medium, utm_campaign
             query parameters to your links to track campaigns.
@@ -287,9 +302,9 @@ export default function CampaignsPage() {
             {/* Summary */}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "12px", marginBottom: "20px" }}>
               {[
-                { label: "Unique Sources", value: sources.length, color: "var(--obs-accent)" },
-                { label: "Unique Mediums", value: mediums.length, color: "#22c55e" },
-                { label: "Unique Campaigns", value: campaigns.length, color: "#f59e0b" },
+                { label: "Unique Sources", value: utmErrors.source ? "Unavailable" : sources.length, color: "var(--obs-accent)" },
+                { label: "Unique Mediums", value: utmErrors.medium ? "Unavailable" : mediums.length, color: "#22c55e" },
+                { label: "Unique Campaigns", value: utmErrors.campaign ? "Unavailable" : campaigns.length, color: "#f59e0b" },
               ].map((c, i) => (
                 <div key={i} style={{ background: "var(--obs-surface)", padding: "16px", borderRadius: "var(--obs-radius-md)", borderLeft: `3px solid ${c.color}` }}>
                   <div style={{ fontSize: "11px", color: "var(--obs-text-muted)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: "4px" }}>{c.label}</div>
@@ -299,18 +314,18 @@ export default function CampaignsPage() {
             </div>
 
             <div class="obs-grid-2">
-              <CampaignGroup title="UTM Source" data={sources} total={totalSources} color="var(--obs-accent)" />
-              <CampaignGroup title="UTM Medium" data={mediums} total={totalMediums} color="#22c55e" />
+              <CampaignGroup error={utmErrors.source} retry={fetch} title="UTM Source" data={sources} total={totalSources} color="var(--obs-accent)" />
+              <CampaignGroup error={utmErrors.medium} retry={fetch} title="UTM Medium" data={mediums} total={totalMediums} color="#22c55e" />
             </div>
 
             <div style={{ marginTop: "12px" }}>
-              <CampaignGroup title="UTM Campaign" data={campaigns} total={totalCampaigns} color="#f59e0b" />
+              <CampaignGroup error={utmErrors.campaign} retry={fetch} title="UTM Campaign" data={campaigns} total={totalCampaigns} color="#f59e0b" />
             </div>
 
-            {(terms.length > 0 || contents.length > 0) && (
+            {(terms.length > 0 || contents.length > 0 || utmErrors.term || utmErrors.content) && (
               <div class="obs-grid-2" style={{ marginTop: "12px" }}>
-                <CampaignGroup title="UTM Term" data={terms} total={totalTerms} color="#a78bfa" />
-                <CampaignGroup title="UTM Content" data={contents} total={totalContents} color="#ec4899" />
+                <CampaignGroup error={utmErrors.term} retry={fetch} title="UTM Term" data={terms} total={totalTerms} color="#a78bfa" />
+                <CampaignGroup error={utmErrors.content} retry={fetch} title="UTM Content" data={contents} total={totalContents} color="#ec4899" />
               </div>
             )}
           </>

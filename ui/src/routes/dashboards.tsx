@@ -1,3 +1,5 @@
+import QueryFailure from "../components/shared/QueryFailure.js";
+import { useRequestGuard } from "../hooks/useRequestGuard.js";
 import { useState, useEffect, useCallback, useRef } from "preact/hooks";
 import { get, post, del } from "../api/helpers.js";
 import { analyticsApi } from "../api/analytics.js";
@@ -296,6 +298,8 @@ function MetricSeriesChart({ series }: { series: MetricSeries[] }) {
 
 function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; siteId: string; onBack: () => void }) {
   const [detail, setDetail] = useState<DashboardDetail | null>(null);
+  const [detailError, setDetailError] = useState("");
+  const [trendError, setTrendError] = useState("");
   const [loading, setLoading] = useState(true);
   const [showAddPanel, setShowAddPanel] = useState(false);
   const [adding, setAdding] = useState(false);
@@ -305,9 +309,13 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
   const [panelValues, setPanelValues] = useState<Record<string, string>>({});
   const [panelSparklines, setPanelSparklines] = useState<Record<string, number[]>>({});
   const [chartLabels, setChartLabels] = useState<string[]>([]);
+  const [errorSeriesByPanel, setErrorSeriesByPanel] = useState<Record<string, { bucket: number; errors: number }[]>>({});
+  const [panelErrors, setPanelErrors] = useState<Record<string, string>>({});
   const [metricSeriesByPanel, setMetricSeriesByPanel] = useState<Record<string, MetricSeries[]>>({});
   // Add Panel modal — metric_series specific state
   const [availableMetrics, setAvailableMetrics] = useState<MetricInfo[]>([]);
+  const [catalogueError, setCatalogueError] = useState("");
+  const [catalogueRetry, setCatalogueRetry] = useState(0);
   const [metricName, setMetricName] = useState("");
   const [metricAgg, setMetricAgg] = useState<Aggregation>("last");
   const [metricStep, setMetricStep] = useState<StepDuration>("60s");
@@ -318,11 +326,15 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
   const [resize, setResize] = useState<{ panelId: string; startX: number; startWidth: number; previewWidth: number } | null>(null);
   const gridRef = useRef<HTMLDivElement>(null);
 
+  const requestfetchDetail = useRequestGuard(JSON.stringify([dashboardId, siteId]));
   const fetchDetail = useCallback(async () => {
-    setLoading(true);
+    const current = requestfetchDetail();
+    setLoading(true); setDetailError(""); setTrendError("");
     try {
       const data = await get<DashboardDetail>(`${BASE}/${dashboardId}?site_id=${siteId}`);
+      if (!current()) return;
       setDetail(data);
+      setPanelValues({}); setPanelSparklines({}); setMetricSeriesByPanel({}); setErrorSeriesByPanel({}); setPanelErrors({});
       if (data?.panels?.length) {
         const now = new Date();
         const from = new Date(now.getTime() - 7 * 86400000).toISOString();
@@ -339,8 +351,9 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
           .map(async (p) => {
             try {
               const s = await post<MetricSeries[]>(`${BASE}/${dashboardId}/panels/${p.panel_id}/execute`, { site_id: siteId, from: fromMs, to: toMs });
-              return { id: p.panel_id, series: Array.isArray(s) ? s : [] };
-            } catch { return { id: p.panel_id, series: [] as MetricSeries[] }; }
+              if (!Array.isArray(s)) throw new Error("Invalid metric series response");
+              return { id: p.panel_id, series: s };
+            } catch { return { id: p.panel_id, series: [] as MetricSeries[], error: "Unable to load metric series" }; }
           });
 
         // Fetch panel values + sparkline data in parallel
@@ -348,16 +361,21 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
           .filter(p => p.title && p.panel_type !== "metric_series" && p.query_type !== "metric_series")
           .map(async (p) => {
             try {
-              const r = await post<{ value: string }>(`${BASE}/${dashboardId}/panels/${p.panel_id}/execute`, { site_id: siteId, from, to });
-              return { id: p.panel_id, value: r?.value || "0" };
-            } catch { return { id: p.panel_id, value: "--" }; }
+              const r = await post<{ value: string } | { bucket: number; errors: number }[]>(`${BASE}/${dashboardId}/panels/${p.panel_id}/execute`, { site_id: siteId, from: fromMs, to: toMs });
+              if (p.panel_type === "timeseries" && p.query_type === "errors") {
+                if (!Array.isArray(r) || r.some(point => !Number.isFinite(point.bucket) || !Number.isFinite(point.errors))) throw new Error("Invalid error series response");
+                return { id: p.panel_id, value: "", errorSeries: r };
+              }
+              if (Array.isArray(r) || typeof r?.value !== "string") throw new Error("Invalid panel value response");
+              return { id: p.panel_id, value: r.value };
+            } catch (e) { return { id: p.panel_id, value: "--", error: e instanceof Error ? e.message : "Unable to load panel" }; }
           });
 
         // Fetch timeseries for sparklines
         let tsData: TimeSeriesPoint[] = [];
         try {
           tsData = await analyticsApi.timeseries(siteId, from, to, "day") || [];
-        } catch {}
+        } catch { if (current()) setTrendError("Dashboard trends are unavailable; accepted panel values remain available."); }
 
         const [results, metricResults] = await Promise.all([
           Promise.all(valPromises),
@@ -366,8 +384,14 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
         const vals: Record<string, string> = {};
         const sparks: Record<string, number[]> = {};
         const metricMap: Record<string, MetricSeries[]> = {};
-        for (const r of results) { vals[r.id] = r.value; }
-        for (const m of metricResults) { metricMap[m.id] = m.series; }
+        const errorSeries: Record<string, { bucket: number; errors: number }[]> = {};
+        const errors: Record<string, string> = {};
+        for (const r of results) {
+          vals[r.id] = r.value;
+          if (r.errorSeries) errorSeries[r.id] = r.errorSeries;
+          if (r.error) errors[r.id] = r.error;
+        }
+        for (const m of metricResults) { metricMap[m.id] = m.series; if (m.error) errors[m.id] = m.error; }
 
         // Map sparkline data to each panel based on query type
         for (const p of data.panels) {
@@ -383,20 +407,28 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
           new Date(d.bucket).toLocaleDateString("en-US", { month: "short", day: "numeric" })
         );
 
+        if (!current()) return;
+        setErrorSeriesByPanel(errorSeries); setPanelErrors(errors);
         setPanelValues(vals);
         setPanelSparklines(sparks);
         setChartLabels(labels);
         setMetricSeriesByPanel(metricMap);
       }
-    } catch { setDetail(null); }
-    finally { setLoading(false); }
+    } catch { if (current()) { setDetail(null); setDetailError("Unable to load dashboard."); } }
+    finally { if (current()) setLoading(false); }
   }, [dashboardId, siteId]);
 
   // Lazy-load the metric autocomplete list when the modal opens.
   useEffect(() => {
-    if (!showAddPanel || availableMetrics.length > 0) return;
-    metricsApi.list(siteId).then((m) => setAvailableMetrics(m || [])).catch(() => {});
-  }, [showAddPanel, siteId]);
+    let active = true;
+    setAvailableMetrics([]); setCatalogueError("");
+    setMetricName(""); setMetricLabelRows([]); setMetricGroupBy("");
+    if (!showAddPanel) return;
+    metricsApi.list(siteId)
+      .then(m => { if (active) setAvailableMetrics(m || []); })
+      .catch(() => { if (active) setCatalogueError("Unable to load this site’s metric catalogue."); });
+    return () => { active = false; };
+  }, [showAddPanel, siteId, catalogueRetry]);
 
   useEffect(() => { fetchDetail(); }, [fetchDetail]);
 
@@ -488,6 +520,7 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
   };
 
   if (loading) return <div class="obs-empty-state">Loading dashboard...</div>;
+  if (detailError) return <QueryFailure message={detailError} retry={fetchDetail} />;
   if (!detail) return <div class="obs-empty-state">Dashboard not found</div>;
 
   return (
@@ -515,6 +548,7 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
         </button>
       </div>
 
+      {trendError && <QueryFailure message={trendError} retry={fetchDetail} />}
       {!detail.panels?.length ? (
         <EmptyState
           title="No panels yet"
@@ -597,7 +631,13 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
                     setResize({ panelId: panel.panel_id, startX: e.clientX, startWidth: savedW, previewWidth: savedW });
                   }}
                 />
-                {isMetricSeries ? (
+                {panelErrors[panel.panel_id] ? (
+                  <QueryFailure message={panelErrors[panel.panel_id]} retry={fetchDetail} />
+                ) : isTimeSeries && panel.query_type === "errors" ? (
+                  errorSeriesByPanel[panel.panel_id]?.length
+                    ? <PanelTimeSeries data={errorSeriesByPanel[panel.panel_id].map(p => p.errors)} labels={errorSeriesByPanel[panel.panel_id].map(p => new Date(p.bucket).toLocaleString())} label="errors" />
+                    : <div class="dashboard-panel-empty">No errors in this period.</div>
+                ) : isMetricSeries ? (
                   metricSeries && metricSeries.length > 0
                     ? <MetricSeriesChart series={metricSeries} />
                     : <div class="dashboard-panel-empty">No metric data yet.</div>
@@ -623,6 +663,7 @@ function DashboardView({ dashboardId, siteId, onBack }: { dashboardId: string; s
       )}
 
       <Modal open={showAddPanel} onClose={() => setShowAddPanel(false)} title="Add Panel">
+        {catalogueError && <QueryFailure message={catalogueError} retry={() => setCatalogueRetry(n => n + 1)} />}
         <div class="add-panel-form">
           <div class="obs-form-group">
             <label class="obs-label">Title</label>
@@ -734,13 +775,17 @@ export default function DashboardsPage() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
 
+  const [listError, setListError] = useState("");
+  const requestList = useRequestGuard(siteId);
+  useEffect(() => { setSelectedId(null); setShowCreate(false); setDeletingId(null); }, [siteId]);
   const fetchDashboards = useCallback(async () => {
-    setLoading(true);
+    const current = requestList();
+    setLoading(true); setListError(""); setDashboards([]);
     try {
       const data = await get<Dashboard[]>(`${BASE}?site_id=${siteId}`);
-      setDashboards((data || []).filter(d => d.name));
-    } catch { setDashboards([]); }
-    finally { setLoading(false); }
+      if (current()) setDashboards((data || []).filter(d => d.name));
+    } catch { if (current()) setListError("Unable to load dashboards."); }
+    finally { if (current()) setLoading(false); }
   }, [siteId]);
 
   useEffect(() => { fetchDashboards(); }, [fetchDashboards]);
@@ -769,7 +814,7 @@ export default function DashboardsPage() {
   };
 
   if (selectedId) {
-    return <DashboardView dashboardId={selectedId} siteId={siteId} onBack={() => { setSelectedId(null); fetchDashboards(); }} />;
+    return <DashboardView key={`${siteId}:${selectedId}`} dashboardId={selectedId} siteId={siteId} onBack={() => { setSelectedId(null); fetchDashboards(); }} />;
   }
 
   return (
@@ -781,9 +826,10 @@ export default function DashboardsPage() {
         </div>
       </div>
 
+      {listError && <QueryFailure message={listError} retry={fetchDashboards} />}
       {loading ? (
         <div class="obs-empty-state">Loading...</div>
-      ) : dashboards.length === 0 ? (
+      ) : listError ? null : dashboards.length === 0 ? (
         <div class="obs-empty-state">No custom dashboards. Create one to build your own views.</div>
       ) : (
         <div class="dashboards-grid">

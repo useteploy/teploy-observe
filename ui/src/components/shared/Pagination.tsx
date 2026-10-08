@@ -2,11 +2,12 @@ interface Props {
   page: number;
   pageSize: number;
   resultCount: number;
+  hasMore?: boolean;
   onPageChange: (page: number) => void;
 }
 
-export default function Pagination({ page, pageSize, resultCount, onPageChange }: Props) {
-  const hasMore = resultCount === pageSize;
+export default function Pagination({ page, pageSize, resultCount, hasMore: continuation, onPageChange }: Props) {
+  const hasMore = continuation ?? (resultCount === pageSize);
   if (page === 1 && !hasMore) return null;
 
   return (

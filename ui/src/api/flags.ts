@@ -144,6 +144,6 @@ export const experimentsApi = {
     post<{ ok: boolean }>(`${BASE}/experiments/${experimentId}/start`, {}),
   stop: (experimentId: string) =>
     post<{ ok: boolean }>(`${BASE}/experiments/${experimentId}/stop`, {}),
-  results: (experimentId: string) =>
-    get<ExperimentResults>(`${BASE}/experiments/${experimentId}/results`),
+  results: (experimentId: string, siteId: string) =>
+    get<ExperimentResults>(`${BASE}/experiments/${encodeURIComponent(experimentId)}/results?site_id=${encodeURIComponent(siteId)}`),
 };

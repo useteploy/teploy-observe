@@ -1,3 +1,4 @@
+import { useRequestGuard } from "../hooks/useRequestGuard.js";
 import { useState, useEffect, useCallback, useMemo } from "preact/hooks";
 import { cohortsApi, parseRule, isFlatAnd } from "../api/persons.js";
 import type { Cohort, CohortDefinition, CohortRule } from "../api/persons.js";
@@ -568,15 +569,20 @@ export default function CohortsPage() {
   const [creatingStatic, setCreatingStatic] = useState(false);
   const [selectedID, setSelectedID] = useState<string | null>(null);
 
+  const requestfetchCohorts = useRequestGuard(JSON.stringify([siteId]));
+  useEffect(() => { setSelectedID(null); }, [siteId]);
   const fetchCohorts = useCallback(async () => {
+    const current = requestfetchCohorts();
     setLoading(true);
     try {
       const data = await cohortsApi.list(siteId);
+      if (!current()) return;
       setCohorts(data || []);
     } catch {
+      if (!current()) return;
       setCohorts([]);
     } finally {
-      setLoading(false);
+      if (current()) setLoading(false);
     }
   }, [siteId]);
 

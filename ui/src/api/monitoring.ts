@@ -79,6 +79,6 @@ export const monitoringApi = {
     post<CronMonitor>(`${BASE}/crons`, data),
   infraHosts: (siteId: string) =>
     get<InfraHost[]>(`${BASE}/infra/hosts?site_id=${siteId}`),
-  infraHistory: (hostname: string, from: string, to: string) =>
-    get<InfraMetric[]>(`${BASE}/infra/hosts/${encodeURIComponent(hostname)}/history?from=${from}&to=${to}`),
+  infraHistory: (hostname: string, siteId: string, from: string, to: string) =>
+    get<InfraMetric[]>(`${BASE}/infra/hosts/${encodeURIComponent(hostname)}/history?site_id=${encodeURIComponent(siteId)}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
 };

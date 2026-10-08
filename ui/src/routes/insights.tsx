@@ -1,3 +1,4 @@
+import { activeCohortID } from "../api/helpers.js";
 import type { ComponentChildren } from "preact";
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { analyticsApi } from "../api/analytics.js";
@@ -9,6 +10,8 @@ import Tabs from "../components/shared/Tabs.js";
 import EmptyState from "../components/shared/EmptyState.js";
 import { formatMinor, toMinorUnits, fromMinorUnits } from "../utils/money.js";
 import "../styles/insights.css";
+import QueryFailure from "../components/shared/QueryFailure.js";
+import { useRequestGuard } from "../hooks/useRequestGuard.js";
 import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
@@ -54,8 +57,14 @@ function FunnelsPanel({ siteId, from, to }: { siteId: string; from: string; to: 
   const [results, setResults] = useState<FunnelResult[]>([]);
   const [loading, setLoading] = useState(false);
   const [analyzed, setAnalyzed] = useState(false);
+  const [error, setError] = useState("");
   const [breakdownBy, setBreakdownBy] = useState<string>("");
   const [breakdownResults, setBreakdownResults] = useState<Array<{ breakdown: string; results: FunnelResult[] }>>([]);
+
+  const requestAnalyze = useRequestGuard(JSON.stringify([siteId, from, to, steps, breakdownBy]));
+  useEffect(() => {
+    setAnalyzed(false); setError(""); setLoading(false); setResults([]); setBreakdownResults([]);
+  }, [siteId, from, to, steps, breakdownBy]);
 
   const updateStep = (idx: number, field: "type" | "value", val: string) => {
     setSteps(prev => prev.map((s, i) => i === idx ? { ...s, [field]: val } : s));
@@ -66,23 +75,27 @@ function FunnelsPanel({ siteId, from, to }: { siteId: string; from: string; to: 
   const analyze = async () => {
     const validSteps = steps.filter(s => s.value.trim());
     if (validSteps.length < 2) return;
-    setLoading(true);
+    const current = requestAnalyze();
+    setLoading(true); setError("");
     setAnalyzed(true);
     try {
       if (breakdownBy) {
         const bd = await analyticsApi.funnelBreakdown(siteId, from, to, validSteps, breakdownBy);
+        if (!current()) return;
         setBreakdownResults(bd || []);
         setResults([]);
       } else {
         const data = await analyticsApi.funnel(siteId, from, to, validSteps);
+        if (!current()) return;
         setResults(data || []);
         setBreakdownResults([]);
       }
     } catch {
-      setResults([]);
-      setBreakdownResults([]);
+      if (!current()) return;
+      setError("Unable to analyze funnel. Your steps are preserved.");
+      setResults([]); setBreakdownResults([]);
     }
-    finally { setLoading(false); }
+    finally { if (current()) setLoading(false); }
   };
 
   const maxVisitors = results.length > 0 ? results[0].visitors : 1;
@@ -129,7 +142,7 @@ function FunnelsPanel({ siteId, from, to }: { siteId: string; from: string; to: 
         </div>
       </div>
 
-      {loading ? <InsightsSkeleton /> : analyzed && breakdownResults.length > 0 ? (
+      {loading ? <InsightsSkeleton /> : error ? <QueryFailure message={error} retry={analyze} /> : analyzed && breakdownResults.length > 0 ? (
         <div class="funnel-breakdown-grid">
           {breakdownResults.map((bd) => {
             const firstN = bd.results[0]?.visitors || 0;
@@ -218,15 +231,22 @@ function RetentionPanel({ siteId, from, to }: { siteId: string; from: string; to
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState<"heatmap" | "overlay">("heatmap");
 
+  const [error, setError] = useState("");
+  const [retry, setRetry] = useState(0);
   useEffect(() => {
+    let active = true;
+    setError("");
+    setCohorts([]);
     setLoading(true);
     analyticsApi.retention(siteId, from, to)
-      .then(d => setCohorts(d || []))
-      .catch(() => setCohorts([]))
-      .finally(() => setLoading(false));
-  }, [siteId, from, to]);
+      .then(d => { if (active) setCohorts(d || []); })
+      .catch(() => { if (active) setError("Unable to load retention analysis."); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [siteId, from, to, retry]);
 
   if (loading) return <InsightsSkeleton />;
+  if (error) return <QueryFailure message={error} retry={() => setRetry(n => n + 1)} />;
   if (!cohorts.length) {
     return (
       <div>
@@ -361,13 +381,19 @@ function JourneysPanel({ siteId, from, to }: { siteId: string; from: string; to:
   const [data, setData] = useState<JourneyResult | null>(null);
   const [loading, setLoading] = useState(true);
 
+  const [error, setError] = useState("");
+  const [retry, setRetry] = useState(0);
   useEffect(() => {
+    let active = true;
+    setError("");
+    setData(null);
     setLoading(true);
     analyticsApi.journeys(siteId, from, to)
-      .then(d => setData(d || null))
-      .catch(() => setData(null))
-      .finally(() => setLoading(false));
-  }, [siteId, from, to]);
+      .then(d => { if (active) setData(d || null); })
+      .catch(() => { if (active) setError("Unable to load journeys analysis."); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [siteId, from, to, retry]);
 
   const heading = (
     <PanelHeading title="User journeys">
@@ -377,6 +403,7 @@ function JourneysPanel({ siteId, from, to }: { siteId: string; from: string; to:
   );
 
   if (loading) return <InsightsSkeleton />;
+  if (error) return <QueryFailure message={error} retry={() => setRetry(n => n + 1)} />;
   if (!data || (!data.transitions?.length && !data.top_paths?.length)) {
     return (
       <div>
@@ -469,13 +496,17 @@ function GoalsPanel({ siteId, from, to }: { siteId: string; from: string; to: st
   const [formSource, setFormSource] = useState("fixed");
   const [formProperty, setFormProperty] = useState("revenue");
 
+  const requestGoals = useRequestGuard(JSON.stringify([siteId, from, to]));
+  const requestAction = useRequestGuard(siteId);
+  const [loadError, setLoadError] = useState("");
   const load = useCallback(async () => {
-    setLoading(true);
+    const current = requestGoals();
+    setLoading(true); setLoadError(""); setGoals([]);
     try {
       const data = await analyticsApi.goals(siteId, from, to);
-      setGoals(data || []);
-    } catch { setGoals([]); }
-    finally { setLoading(false); }
+      if (current()) setGoals(data || []);
+    } catch { if (current()) setLoadError("Unable to load goal conversions."); }
+    finally { if (current()) setLoading(false); }
   }, [siteId, from, to]);
 
   useEffect(() => { load(); }, [load]);
@@ -526,6 +557,7 @@ function GoalsPanel({ siteId, from, to }: { siteId: string; from: string; to: st
       value_source: formCurrency ? formSource : "fixed",
       value_property: formSource === "event" ? formProperty.trim() : "",
     };
+    const current = requestAction();
     setSaving(true);
     setError("");
     try {
@@ -534,20 +566,20 @@ function GoalsPanel({ siteId, from, to }: { siteId: string; from: string; to: st
       } else {
         await analyticsApi.createGoal(payload);
       }
-      setShowForm(false);
-      load();
+      if (current()) { setShowForm(false); load(); }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not save the goal.");
-    } finally { setSaving(false); }
+      if (current()) setError(err instanceof Error ? err.message : "Could not save the goal.");
+    } finally { if (current()) setSaving(false); }
   };
 
   const handleDelete = async (g: Goal) => {
     if (!confirm(`Delete goal "${g.name}"? Conversions are computed from events, so nothing else is lost.`)) return;
+    const current = requestAction();
     try {
       await analyticsApi.deleteGoal(g.goal_id, siteId);
-      load();
+      if (current()) load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not delete the goal.");
+      if (current()) setError(err instanceof Error ? err.message : "Could not delete the goal.");
     }
   };
 
@@ -586,7 +618,7 @@ function GoalsPanel({ siteId, from, to }: { siteId: string; from: string; to: st
         <div class="obs-form-error" role="alert" style={{ marginBottom: "12px" }}>{error}</div>
       )}
 
-      {loading ? <InsightsSkeleton /> : goals.length === 0 ? (
+      {loading ? <InsightsSkeleton /> : loadError ? <QueryFailure message={loadError} retry={load} /> : goals.length === 0 ? (
         <EmptyState
           icon="package"
           title="No goals yet"
@@ -716,13 +748,19 @@ function CorrelationsPanel({ siteId, from, to }: { siteId: string; from: string;
   const [data, setData] = useState<Correlation[]>([]);
   const [loading, setLoading] = useState(true);
 
+  const [error, setError] = useState("");
+  const [retry, setRetry] = useState(0);
   useEffect(() => {
+    let active = true;
+    setError("");
+    setData([]);
     setLoading(true);
     analyticsApi.correlations(siteId, from, to)
-      .then(d => setData(d || []))
-      .catch(() => setData([]))
-      .finally(() => setLoading(false));
-  }, [siteId, from, to]);
+      .then(d => { if (active) setData(d || []); })
+      .catch(() => { if (active) setError("Unable to load correlations analysis."); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [siteId, from, to, retry]);
 
   const heading = (
     <PanelHeading title="Conversion correlations">
@@ -732,6 +770,7 @@ function CorrelationsPanel({ siteId, from, to }: { siteId: string; from: string;
   );
 
   if (loading) return <InsightsSkeleton />;
+  if (error) return <QueryFailure message={error} retry={() => setRetry(n => n + 1)} />;
   if (!data.length) {
     return (
       <div>
@@ -798,20 +837,20 @@ function CorrelationsPanel({ siteId, from, to }: { siteId: string; from: string;
 // which cohort is active and switch / clear without leaving the page.
 // The chip writes to URL state so deep links round-trip.
 
-function CohortFilterChip({ siteId }: { siteId: string }) {
+function CohortFilterChip({ siteId, active }: { siteId: string; active: string }) {
   const [cohorts, setCohorts] = useState<Cohort[]>([]);
-  const [active, setActive] = useState<string>(() => {
-    if (typeof window === "undefined") return "";
-    return new URLSearchParams(window.location.search).get("cohort_id") || "";
-  });
   const [open, setOpen] = useState(false);
 
+  const [error, setError] = useState("");
+  const [retry, setRetry] = useState(0);
   useEffect(() => {
-    cohortsApi.list(siteId).then(d => setCohorts(d || [])).catch(() => setCohorts([]));
-  }, [siteId]);
+    let current = true;
+    setCohorts([]); setError("");
+    cohortsApi.list(siteId).then(d => { if (current) setCohorts(d || []); }).catch(() => { if (current) setError("Unable to load cohort filters."); });
+    return () => { current = false; };
+  }, [siteId, retry]);
 
   const apply = (id: string) => {
-    setActive(id);
     setOpen(false);
     const url = new URL(window.location.href);
     if (id) {
@@ -835,7 +874,7 @@ function CohortFilterChip({ siteId }: { siteId: string }) {
         <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
           <path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5z" />
         </svg>
-        {activeCohort ? activeCohort.name : "Filter by cohort"}
+        {activeCohort ? activeCohort.name : active ? "Cohort filter active" : "Filter by cohort"}
         {active && (
           <span onClick={(e) => { e.stopPropagation(); apply(""); }}
             style={{ marginLeft: "4px", color: "var(--obs-text-muted)", cursor: "pointer" }}
@@ -849,7 +888,7 @@ function CohortFilterChip({ siteId }: { siteId: string }) {
           border: "1px solid var(--obs-border)", borderRadius: "var(--obs-radius-md)",
           boxShadow: "var(--obs-shadow-md, 0 4px 12px rgba(0,0,0,.15))",
           zIndex: 100, maxHeight: "320px", overflow: "auto" }}>
-          {cohorts.length === 0 ? (
+          {error ? <QueryFailure message={error} retry={() => setRetry(n => n + 1)} /> : cohorts.length === 0 ? (
             <div style={{ padding: "12px", fontSize: "12px", color: "var(--obs-text-muted)" }}>
               No cohorts yet — <a href="/cohorts" style={{ color: "var(--obs-accent)" }}>create one</a>.
             </div>
@@ -885,9 +924,17 @@ function CohortFilterChip({ siteId }: { siteId: string }) {
 export default function InsightsPage() {
   const { state: { siteId } } = useFilters();
 
-  const now = new Date();
-  const from = new Date(now.getTime() - 30 * 86400000).toISOString();
-  const to = now.toISOString();
+  const [cohortId, setCohortId] = useState(activeCohortID);
+  useEffect(() => {
+    const sync = () => setCohortId(activeCohortID());
+    window.addEventListener("popstate", sync);
+    return () => window.removeEventListener("popstate", sync);
+  }, []);
+  const [range] = useState(() => {
+    const now = new Date();
+    return { from: new Date(now.getTime() - 30 * 86400000).toISOString(), to: now.toISOString() };
+  });
+  const { from, to } = range;
 
   return (
     <div>
@@ -904,7 +951,7 @@ export default function InsightsPage() {
           </p>
         </div>
         <div style={{ marginLeft: "auto" }}>
-          <CohortFilterChip siteId={siteId} />
+          <CohortFilterChip siteId={siteId} active={cohortId} />
         </div>
       </div>
 
@@ -912,27 +959,27 @@ export default function InsightsPage() {
         {
           key: "funnels",
           label: "Funnels",
-          content: <FunnelsPanel siteId={siteId} from={from} to={to} />,
+          content: <FunnelsPanel key={`${siteId}:${cohortId}`} siteId={siteId} from={from} to={to} />,
         },
         {
           key: "goals",
           label: "Goal conversions",
-          content: <GoalsPanel siteId={siteId} from={from} to={to} />,
+          content: <GoalsPanel key={`${siteId}:${cohortId}`} siteId={siteId} from={from} to={to} />,
         },
         {
           key: "retention",
           label: "Retention",
-          content: <RetentionPanel siteId={siteId} from={from} to={to} />,
+          content: <RetentionPanel key={`${siteId}:${cohortId}`} siteId={siteId} from={from} to={to} />,
         },
         {
           key: "journeys",
           label: "Journeys",
-          content: <JourneysPanel siteId={siteId} from={from} to={to} />,
+          content: <JourneysPanel key={`${siteId}:${cohortId}`} siteId={siteId} from={from} to={to} />,
         },
         {
           key: "correlations",
           label: "Correlations",
-          content: <CorrelationsPanel siteId={siteId} from={from} to={to} />,
+          content: <CorrelationsPanel key={`${siteId}:${cohortId}`} siteId={siteId} from={from} to={to} />,
         },
       ]} />
     </div>

@@ -247,6 +247,7 @@ export default function LogsPage() {
   // live by site only); disable it rather than implying a filtered tail.
   useEffect(() => { if (query.trim()) setLive(false); }, [query]);
 
+  const incomingCursor = page > 1 ? cursors[page - 2] : undefined;
   const fetchLogs = useCallback(async () => {
     const generation = ++requestGeneration.current;
     setLoading(true);
@@ -268,7 +269,7 @@ export default function LogsPage() {
       };
       if (query.trim()) {
         opts.query = query.trim();
-        if (page > 1) opts.cursor = cursors[page - 2];
+        if (page > 1) opts.cursor = incomingCursor;
       } else {
         opts.offset = (page - 1) * PAGE_SIZE;
       }
@@ -284,9 +285,11 @@ export default function LogsPage() {
 
       setLogs(logData.logs);
       setTruncated(logData.truncated);
-      if (logData.nextCursor) {
-        setCursors((prev) => { const n = prev.slice(0, page - 1); n[page - 1] = logData.nextCursor; return n; });
-      }
+      setCursors((prev) => {
+        const next = prev.slice(0, page - 1);
+        if (logData.nextCursor) next[page - 1] = logData.nextCursor;
+        return next.length === prev.length && next.every((v, i) => v === prev[i]) ? prev : next;
+      });
       setStats(statData || []);
       setHistogram(histData || []);
     } catch (err) {
@@ -297,6 +300,7 @@ export default function LogsPage() {
       const syn = err instanceof Error ? parseQuerySyntaxError(err.message) : null;
       if (syn) {
         setSyntaxError(syn);
+        setTruncated(false); setCursors(prev => prev.slice(0, page - 1));
         setLogs([]);
         return;
       }
@@ -306,7 +310,7 @@ export default function LogsPage() {
     } finally {
       if (generation === requestGeneration.current) setLoading(false);
     }
-  }, [siteId, query, activeLevel, service, page, cursors]);
+  }, [siteId, query, activeLevel, service, page, incomingCursor]);
 
   useEffect(() => {
     fetchLogs();
@@ -487,8 +491,8 @@ export default function LogsPage() {
       ) : logs.length === 0 ? (
         query || activeLevel !== "ALL" || service ? (
           <EmptyState
-            title="No logs match the current filters"
-            description="Adjust the filters or clear the search to see more results."
+            title={cursors[page - 1] ? "No matches in this scan window" : "No logs match the current filters"}
+            description={cursors[page - 1] ? "Continue to scan older candidates with Next." : "Adjust the filters or clear the search to see more results."}
             icon="zap"
             actions={[
               { label: "Clear filters", onClick: () => { setQuery(""); setActiveLevel("ALL"); setService(""); } },
@@ -517,8 +521,16 @@ export default function LogsPage() {
               />
             ))}
           </div>
-          {/* R38: pagination describes the historical query only. */}
-          <Pagination page={page} pageSize={PAGE_SIZE} resultCount={logs.length} onPageChange={(p) => { setPage(p); window.scrollTo(0, 0); }} />
+
+        </>
+      )}
+      {!live && !loading && !error && (
+        <>
+          {syntaxError && <div role="alert">Query error at {syntaxError.position}: {syntaxError.message}</div>}
+          {truncated && <div role="status">This scan is incomplete. {cursors[page - 1] ? "Use Next to scan older candidates." : "Narrow the query to inspect more matches."}</div>}
+          {!syntaxError && <Pagination page={page} pageSize={PAGE_SIZE} resultCount={logs.length}
+            hasMore={query.trim() ? !!cursors[page - 1] : undefined}
+            onPageChange={(p) => { setPage(p); window.scrollTo(0, 0); }} />}
         </>
       )}
     </div>

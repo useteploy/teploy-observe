@@ -1,6 +1,6 @@
 // Analytics stats API — pageviews, visitors, breakdowns, etc.
 
-import { get, post, put, del, qs } from "./helpers.js";
+import { get, post, put, del, qs, activeCohortID } from "./helpers.js";
 
 const BASE = "/api/v1/stats";
 
@@ -10,7 +10,7 @@ export interface OverviewStats {
 }
 export interface OverviewResponse { current: OverviewStats; previous?: OverviewStats; }
 export interface TimeSeriesPoint { bucket: number; pageviews: number; visitors: number; }
-export interface TopPage { pathname: string; pageviews: number; visitors: number; }
+export interface TopPage { pathname: string; pageviews: number; visitors: number; visitors_exact?: boolean; visitors_note?: string; }
 export interface TopReferrer { referrer: string; visitors: number; }
 export interface BrowserStat { browser: string; visitors: number; }
 export interface CountryStat { country: string; visitors: number; }
@@ -152,11 +152,11 @@ export const analyticsApi = {
   eventProperties: (siteId: string, from: string, to: string, eventType: string) =>
     get<PropertyStat[]>(`${BASE}/event-properties?${qs(siteId, from, to)}&event_type=${encodeURIComponent(eventType)}`),
   funnel: (siteId: string, from: string, to: string, steps: FunnelStep[]) =>
-    post<FunnelResult[]>(`${BASE}/funnel`, { site_id: siteId, from, to, steps }),
+    post<FunnelResult[]>(`${BASE}/funnel`, { site_id: siteId, from, to, steps, cohort_id: activeCohortID() }),
   funnelBreakdown: (siteId: string, from: string, to: string, steps: FunnelStep[], breakdownBy: string, minSize = 5) =>
     post<Array<{ breakdown: string; results: FunnelResult[] }>>(
       `${BASE}/funnel/breakdown`,
-      { site_id: siteId, from, to, steps, breakdown_by: breakdownBy, min_size: minSize },
+      { site_id: siteId, from, to, steps, breakdown_by: breakdownBy, min_size: minSize, cohort_id: activeCohortID() },
     ),
   retention: (siteId: string, from: string, to: string, periodDays?: number) =>
     get<RetentionCohort[]>(`${BASE}/retention?${qs(siteId, from, to)}${periodDays ? `&period_days=${periodDays}` : ""}`),
@@ -169,7 +169,8 @@ export const analyticsApi = {
     get<GoalConversion[]>(
       `/api/v1/goals?site_id=${encodeURIComponent(siteId)}` +
       (from ? `&from=${encodeURIComponent(from)}` : "") +
-      (to ? `&to=${encodeURIComponent(to)}` : ""),
+      (to ? `&to=${encodeURIComponent(to)}` : "") +
+      (activeCohortID() ? `&cohort_id=${encodeURIComponent(activeCohortID())}` : ""),
     ),
   createGoal: (data: GoalInput) =>
     post<Goal>(`/api/v1/goals`, data),

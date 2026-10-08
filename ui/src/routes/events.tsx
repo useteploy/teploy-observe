@@ -1,8 +1,10 @@
-import { useState, useEffect, useCallback } from "preact/hooks";
+import QueryFailure from "../components/shared/QueryFailure.js";
+import { useState, useEffect, useCallback, useMemo } from "preact/hooks";
 import { analyticsApi } from "../api/analytics.js";
 import type { CustomEventStat, PropertyStat, TimeSeriesPoint } from "../api/analytics.js";
 import SearchInput from "../components/shared/SearchInput.js";
 import ExportButton from "../components/shared/ExportButton.js";
+import { useRequestGuard } from "../hooks/useRequestGuard.js";
 import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
@@ -19,20 +21,24 @@ export default function EventsPage() {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
 
-  const now = new Date();
-  const from = new Date(now.getTime() - 7 * 86400000).toISOString();
-  const to = now.toISOString();
-
-  const fetch = useCallback(async () => {
-    setLoading(true);
-    try {
-      const data = await analyticsApi.customEvents(siteId, from, to, 50);
-      setEvents(data || []);
-    } catch { setEvents([]); }
-    finally { setLoading(false); }
+  const requestList = useRequestGuard(siteId);
+  const [error, setError] = useState("");
+  const { from, to } = useMemo(() => {
+    const now = new Date();
+    return { from: new Date(now.getTime() - 7 * 86400000).toISOString(), to: now.toISOString() };
   }, [siteId]);
 
-  useEffect(() => { fetch(); }, [fetch]);
+  const fetch = useCallback(async () => {
+    const current = requestList();
+    setLoading(true); setEvents([]); setError("");
+    try {
+      const data = await analyticsApi.customEvents(siteId, from, to, 50);
+      if (current()) setEvents(data || []);
+    } catch { if (current()) setError("Unable to load events."); }
+    finally { if (current()) setLoading(false); }
+  }, [siteId, from, to, requestList]);
+
+  useEffect(() => { setSelected(null); setQuery(""); fetch(); }, [fetch]);
 
   const filtered = query.trim()
     ? events.filter(e => e.event_type.toLowerCase().includes(query.toLowerCase()))
@@ -41,7 +47,7 @@ export default function EventsPage() {
   const maxCount = Math.max(...events.map(e => e.count), 1);
 
   if (selected) {
-    return <EventDetailView eventType={selected} siteId={siteId} from={from} to={to} onBack={() => setSelected(null)} />;
+    return <EventDetailView key={`${siteId}:${selected}`} eventType={selected} siteId={siteId} from={from} to={to} onBack={() => setSelected(null)} />;
   }
 
   return (
@@ -67,7 +73,7 @@ export default function EventsPage() {
 
       {loading ? (
         <div class="obs-empty-state">Loading...</div>
-      ) : filtered.length === 0 ? (
+      ) : error ? <QueryFailure message={error} retry={fetch} /> : filtered.length === 0 ? (
         <div class="obs-empty-state">
           {query ? "No events match" : "No custom events tracked. Use window.observe('event_name', { ...props }) to track events."}
         </div>
@@ -104,16 +110,23 @@ function EventDetailView({ eventType, siteId, from, to, onBack }: {
   const [timeseries, setTimeseries] = useState<TimeSeriesPoint[]>([]);
   const [loading, setLoading] = useState(true);
 
+  const [propsError, setPropsError] = useState("");
+  const [trendError, setTrendError] = useState("");
+  const [retry, setRetry] = useState(0);
   useEffect(() => {
-    setLoading(true);
+    let active = true;
+    setProps([]); setTimeseries([]); setLoading(true);
+    setPropsError(""); setTrendError("");
     Promise.all([
-      analyticsApi.eventProperties(siteId, from, to, eventType).catch(() => []),
-      analyticsApi.timeseries(siteId, from, to, "day", { event_type: eventType }).catch(() => []),
-    ]).then(([p, ts]) => {
-      setProps(p || []);
-      setTimeseries(ts || []);
-    }).finally(() => setLoading(false));
-  }, [eventType, siteId, from, to]);
+      analyticsApi.eventProperties(siteId, from, to, eventType)
+        .then(p => { if (active) setProps(p || []); })
+        .catch(() => { if (active) setPropsError("Unable to load event properties."); }),
+      analyticsApi.timeseries(siteId, from, to, "day", { event_type: eventType })
+        .then(ts => { if (active) setTimeseries(ts || []); })
+        .catch(() => { if (active) setTrendError("Unable to load event trend."); }),
+    ]).finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [eventType, siteId, from, to, retry]);
 
   const grouped = new Map<string, PropertyStat[]>();
   for (const p of props) {
@@ -136,11 +149,12 @@ function EventDetailView({ eventType, siteId, from, to, onBack }: {
         <h1 class="obs-page-title">{eventType}</h1>
       </div>
 
+      {trendError && <QueryFailure message={trendError} retry={() => setRetry(n => n + 1)} />}
       {/* Timeline sparkline */}
       {timeseries.length > 0 && (
         <div class="obs-card-static" style={{ marginBottom: "16px" }}>
           <div style={{ fontSize: "12px", color: "var(--obs-text-muted)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: "8px" }}>
-            7-Day Trend
+            Trend for selected range
           </div>
           <MiniChart data={timeseries.map(t => t.pageviews)} />
         </div>
@@ -148,7 +162,7 @@ function EventDetailView({ eventType, siteId, from, to, onBack }: {
 
       {loading ? (
         <div class="obs-empty-state">Loading properties...</div>
-      ) : props.length === 0 ? (
+      ) : propsError ? <QueryFailure message={propsError} retry={() => setRetry(n => n + 1)} /> : props.length === 0 ? (
         <div class="obs-empty-state">No properties recorded for this event</div>
       ) : (
         <div>

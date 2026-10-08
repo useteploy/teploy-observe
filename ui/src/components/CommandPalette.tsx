@@ -84,7 +84,7 @@ export default function CommandPalette() {
   }, [items, query]);
 
   const runSelected = () => {
-    const item = filtered[sel];
+    const item = displayed[sel];
     if (item) {
       item.action();
       setOpen(false);
@@ -114,7 +114,7 @@ export default function CommandPalette() {
     groups[i.group].push(i);
   }
 
-  let idx = -1;
+  const displayed = groupOrder.flatMap(group => groups[group]);
   return (
     <div class="cmdk-overlay" onClick={() => setOpen(false)}>
       <div class="cmdk-modal" onClick={(e) => e.stopPropagation()}>
@@ -142,14 +142,14 @@ export default function CommandPalette() {
               <div key={g} class="cmdk-group">
                 <div class="cmdk-group-label">{g}</div>
                 {groups[g].map((item) => {
-                  idx++;
-                  const active = idx === sel;
+                  const itemIndex = displayed.indexOf(item);
+                  const active = itemIndex === sel;
                   return (
                     <div
                       key={item.label}
                       class={`cmdk-item ${active ? "cmdk-item--active" : ""}`}
-                      onMouseEnter={() => setSel(idx)}
-                      onClick={runSelected}
+                      onMouseEnter={() => setSel(itemIndex)}
+                      onClick={() => { item.action(); setOpen(false); }}
                     >
                       <div class="cmdk-item-label">{item.label}</div>
                       {item.description && <div class="cmdk-item-desc">{item.description}</div>}

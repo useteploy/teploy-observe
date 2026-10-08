@@ -1,3 +1,4 @@
+import { useRequestGuard } from "../hooks/useRequestGuard.js";
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { flagsApi } from "../api/flags.js";
 import type { FeatureFlag, FlagHistoryEntry } from "../api/flags.js";
@@ -34,8 +35,9 @@ interface TargetingRule {
 
 interface Variant {
   key: string;
-  value: string;
-  weight: number;
+  name: string;
+  payload: string;
+  rollout_pct: number;
 }
 
 // Targeting is either a legacy rule array or {"groups":[{conditions:[...]}]}
@@ -127,7 +129,7 @@ function TargetingRuleBuilder({ rules, onChange }: { rules: TargetingRule[]; onC
 // ─── Variant Editor ───
 
 function VariantEditor({ variants, onChange }: { variants: Variant[]; onChange: (v: Variant[]) => void }) {
-  const addVariant = () => onChange([...variants, { key: "", value: "", weight: 50 }]);
+  const addVariant = () => onChange([...variants, { key: "", name: "", payload: "", rollout_pct: 50 }]);
   const removeVariant = (i: number) => onChange(variants.filter((_, idx) => idx !== i));
   const updateVariant = (i: number, field: keyof Variant, val: string | number) => {
     const updated = [...variants];
@@ -151,11 +153,11 @@ function VariantEditor({ variants, onChange }: { variants: Variant[]; onChange: 
           <input class="obs-input" placeholder="key" value={v.key}
             onInput={(e) => updateVariant(i, "key", (e.target as HTMLInputElement).value)}
             style={{ flex: 1 }} />
-          <input class="obs-input" placeholder="value" value={v.value}
-            onInput={(e) => updateVariant(i, "value", (e.target as HTMLInputElement).value)}
+          <input class="obs-input" placeholder="JSON payload (e.g. &quot;blue&quot;)" value={v.payload}
+            onInput={(e) => updateVariant(i, "payload", (e.target as HTMLInputElement).value)}
             style={{ flex: 1 }} />
-          <input class="obs-input" type="number" placeholder="weight" value={v.weight}
-            onInput={(e) => updateVariant(i, "weight", parseInt((e.target as HTMLInputElement).value) || 0)}
+          <input class="obs-input" type="number" placeholder="allocation %" min="0" max="100" value={v.rollout_pct}
+            onInput={(e) => updateVariant(i, "rollout_pct", Number((e.target as HTMLInputElement).value))}
             style={{ width: "70px" }} />
           <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => removeVariant(i)} type="button"
             style={{ padding: "4px 8px" }}>
@@ -298,6 +300,7 @@ export default function FlagsPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   // Create form state
+  const [createError, setCreateError] = useState<string | null>(null);
   const [formKey, setFormKey] = useState("");
   const [formName, setFormName] = useState("");
   const [formDesc, setFormDesc] = useState("");
@@ -306,13 +309,16 @@ export default function FlagsPage() {
   const [formTargeting, setFormTargeting] = useState<TargetingRule[]>([]);
   const [formVariants, setFormVariants] = useState<Variant[]>([]);
 
+  const requestfetchFlags = useRequestGuard(JSON.stringify([siteId]));
   const fetchFlags = useCallback(async () => {
+    const current = requestfetchFlags();
     setLoading(true);
     try {
       const data = await flagsApi.list(siteId);
+      if (!current()) return;
       setFlags(data || []);
-    } catch { setFlags([]); }
-    finally { setLoading(false); }
+    } catch { if (!current()) return; setFlags([]); }
+    finally { if (current()) setLoading(false); }
   }, [siteId]);
 
   useEffect(() => { fetchFlags(); }, [fetchFlags]);
@@ -329,22 +335,30 @@ export default function FlagsPage() {
 
   const handleCreate = async () => {
     if (!formKey.trim() || !formName.trim()) return;
-    setCreating(true);
+    if (creating) return;
+    setCreating(true); setCreateError(null);
     try {
+      const rollout = Number(formRollout);
+      if (!formRollout.trim() || !Number.isInteger(rollout) || rollout < 0 || rollout > 100) throw new Error("Rollout must be an integer from 0 to 100");
+      const variants = formType === "multivariate" ? formVariants.map(v => ({
+        key: v.key.trim(), name: v.name.trim() || v.key.trim(), rollout_pct: v.rollout_pct,
+        ...(v.payload.trim() ? { payload: JSON.parse(v.payload) } : {}),
+      })) : [];
+      if (formType === "multivariate" && (!variants.length || variants.some(v => !v.key || !Number.isInteger(v.rollout_pct) || v.rollout_pct < 0 || v.rollout_pct > 100) || new Set(variants.map(v => v.key)).size !== variants.length || variants.reduce((n, v) => n + v.rollout_pct, 0) !== 100)) throw new Error("Variants need distinct keys and integer allocations totaling 100%");
       await flagsApi.create({
         site_id: siteId,
         flag_key: formKey.trim(),
         name: formName.trim(),
         description: formDesc.trim() || undefined,
         flag_type: formType,
-        rollout_pct: parseInt(formRollout) || 100,
+        rollout_pct: rollout,
         targeting: formTargeting.length > 0 ? JSON.stringify(formTargeting) : undefined,
-        variants: formVariants.length > 0 ? JSON.stringify(formVariants) : undefined,
+        variants: variants.length > 0 ? JSON.stringify(variants) : undefined,
       });
       setShowCreate(false);
       resetForm();
       fetchFlags();
-    } catch (err) { console.error("Failed to create flag:", err); }
+    } catch (err) { setCreateError(err instanceof Error ? err.message : "Unable to create flag"); }
     finally { setCreating(false); }
   };
 
@@ -447,9 +461,7 @@ export default function FlagsPage() {
             <select class="obs-select" value={formType}
               onChange={(e) => setFormType((e.target as HTMLSelectElement).value)}>
               <option value="boolean">Boolean</option>
-              <option value="string">String</option>
-              <option value="number">Number</option>
-              <option value="json">JSON</option>
+              <option value="multivariate">Multivariate (JSON payload)</option>
             </select>
           </div>
           <div class="obs-form-group">

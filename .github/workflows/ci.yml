@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -22,9 +23,8 @@ concurrency:
   cancel-in-progress: true
 
 # This repo embeds the built UI at cmd/observe/ui/dist/ as part of the
-# repo (single-binary story). CI only needs to build + test the Go code
-# — no pnpm, no Rust toolchain, no Nucleus build. Local devs run
-# scripts/ui-sync.sh after editing UI sources.
+# repo (single-binary story). Reusable release assurance below requires
+# freshness, locked replay regeneration, SDKs, race, browser and live engines.
 
 jobs:
   go:
@@ -178,9 +178,8 @@ jobs:
       - name: Test
         working-directory: sdk/python
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install pytest
-          python -m pip install -e .
+          python -m pip install --no-deps -r requirements-ci.lock
+          python -m pip install --no-deps --no-build-isolation -e .
           python -m pytest tests -q
 
   # F49: embedded-UI freshness gate. The UI is embedded into the Go binary
@@ -232,7 +231,9 @@ jobs:
           OBSERVE_BIN: /tmp/observe-ui-sync
           NEUTRON_ROOT: ${{ github.workspace }}/../Neutron
       - name: Embedded dist must be fresh
-        run: git diff --exit-code -- cmd/observe/ui/dist
+        run: |
+          git diff --exit-code -- cmd/observe/ui/dist
+          test -z "$(git status --porcelain --untracked-files=all -- cmd/observe/ui/dist)"
 
   # AUD-056 remainder: the DB-backed suites ran only when a developer had a
   # local Nucleus. This job runs them against a pinned published Nucleus
@@ -529,3 +530,115 @@ jobs:
           OBSERVE_REQUIRE_NUCLEUS: "1"
           OBSERVE_REQUIRE_SNAPSHOT_LEASE: "1"
         run: go test -p 1 -count=1 ./internal/backup/... ./internal/audit/... ./internal/replays/...
+
+  sdk-sentry-shim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - working-directory: sdk/sentry-shim
+        run: npm ci && npm test && npm run build
+
+  replay-freshness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: bash scripts/regenerate-replay.sh --check
+
+  helm-pair-availability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+      - name: Render defaults and resolve the actual published pair
+        run: |
+          set -euo pipefail
+          helm template release packaging/helm/observe -f packaging/helm/observe/ci/values-ci.yaml > /tmp/pair.yaml
+          python3 - <<'PYPAIR'
+          import re
+          from pathlib import Path
+          images = re.findall(r'^\s+image: ["\']?([^"\'\s]+)', Path('/tmp/pair.yaml').read_text(), re.M)
+          if len(images) != 2 or any('latest' in image or ':' not in image for image in images):
+              raise SystemExit('expected two explicit default image versions')
+          Path('/tmp/pair-images').write_text('\n'.join(images) + '\n')
+          PYPAIR
+          while IFS= read -r image; do
+            docker buildx imagetools inspect "$image" > /tmp/manifest.txt
+            grep -q linux/amd64 /tmp/manifest.txt
+            grep -q linux/arm64 /tmp/manifest.txt
+            docker pull "$image"
+            docker image inspect "$image" --format '{{json .RepoDigests}}' >> /tmp/pair-digests.jsonl
+          done < /tmp/pair-images
+      - name: Default pair real migrations, health and seeded browser acceptance
+        run: |
+          set -euo pipefail
+          observe_image=$(sed -n '1p' /tmp/pair-images)
+          nucleus_image=$(sed -n '2p' /tmp/pair-images)
+          # Identify by repository, independent of template document order.
+          if [[ "$observe_image" == *neutron-build/nucleus* ]]; then
+            pair_swap=$observe_image; observe_image=$nucleus_image; nucleus_image=$pair_swap
+          fi
+          docker network create observe-helm-pair
+          docker run -d --name pair-nucleus --network observe-helm-pair \
+            -e NUCLEUS_ALLOW_NO_AUTH=1 -e NUCLEUS_ALLOW_INSECURE_CLUSTER=1 -e NUCLEUS_ALLOW_INSECURE_REPLICATION=1 \
+            "$nucleus_image" start --host 0.0.0.0 --port 5432 --cluster-port 5433 --data /data --max-memory 512
+          docker run -d --name pair-observe --network observe-helm-pair -p 127.0.0.1:3000:3000 \
+            -e 'OBSERVE_NUCLEUS_URL=postgres://nucleus@pair-nucleus:5432/observe?sslmode=disable' \
+            -e OBSERVE_ADMIN_PASSWORD=observe-e2e-pass -e OBSERVE_SEED_DEMO=true \
+            -e OBSERVE_JWT_SECRET=ci-pair-secret-at-least-32-characters \
+            -e OBSERVE_SESSION_SALT=ci-pair-disposable-salt "$observe_image"
+          ready=false
+          for i in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:3000/healthz >/dev/null; then ready=true; break; fi
+            sleep 1
+          done
+          "$ready"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - working-directory: e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npx playwright test tests/smoke.spec.ts tests/core.spec.ts tests/dashboard-replay-journey.spec.ts
+        env:
+          OBSERVE_URL: http://127.0.0.1:3000
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: helm-pair-${{ github.sha }}
+          path: /tmp/pair-digests.jsonl
+          if-no-files-found: error
+      - name: Pair logs and cleanup
+        if: always()
+        run: |
+          docker logs pair-observe || true
+          docker logs pair-nucleus || true
+          docker rm -f pair-observe pair-nucleus || true
+          docker network rm observe-helm-pair || true
+
+  assurance:
+    if: always()
+    needs: [go, go-race, govulncheck, staticcheck, tracker-contracts, ui-unit, sdk-go, sdk-browser, sdk-python, sdk-sentry-shim, ui-freshness, vendor-pin-parity, replay-freshness, nucleus-integration, nucleus-integration-arm64, nucleus-lease, e2e-smoke, helm-pair-availability]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require every gate on this exact SHA
+        run: python3 scripts/verify-release-assurance.py --record assurance.json
+        env:
+          GATE_RESULTS: ${{ toJSON(needs) }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assurance-${{ github.sha }}
+          path: assurance.json
+          if-no-files-found: error

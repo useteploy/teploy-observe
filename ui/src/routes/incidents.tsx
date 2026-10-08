@@ -1,4 +1,6 @@
-import { useState, useEffect } from "preact/hooks";
+import QueryFailure from "../components/shared/QueryFailure.js";
+import { useRequestGuard } from "../hooks/useRequestGuard.js";
+import { useState, useEffect, useCallback } from "preact/hooks";
 import ExportButton from "../components/shared/ExportButton.js";
 import { useFilters } from "../hooks/useFilters.js";
 
@@ -52,8 +54,13 @@ export default function IncidentsPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [form, setForm] = useState({ title: "", description: "", severity: "warning" });
 
-  const load = async () => {
-    setLoading(true);
+  const requestList = useRequestGuard(siteId);
+  const requestAction = useRequestGuard(siteId);
+  const [error, setError] = useState("");
+  const [actionError, setActionError] = useState("");
+  const load = useCallback(async () => {
+    const current = requestList();
+    setLoading(true); setError(""); setActive([]); setRecent([]);
     try {
       const now = Date.now();
       const from = now - 7 * 24 * 3600 * 1000;
@@ -62,16 +69,19 @@ export default function IncidentsPage() {
         api<Incident[]>(`/api/v1/incidents?site_id=${enc}`),
         api<Incident[]>(`/api/v1/incidents?site_id=${enc}&from=${from}&to=${now}`),
       ]);
-      setActive(activeList || []);
-      setRecent((rangeList || []).filter(i => i.ended_at !== 0));
-    } finally {
-      setLoading(false);
-    }
-  };
+      if (current()) {
+        setActive(activeList || []);
+        setRecent((rangeList || []).filter(i => i.ended_at !== 0));
+      }
+    } catch { if (current()) setError("Unable to load incidents."); }
+    finally { if (current()) setLoading(false); }
+  }, [siteId, requestList]);
 
-  useEffect(() => { load(); }, [siteId]);
+  useEffect(() => { setShowCreate(false); setActionError(""); setForm({ title: "", description: "", severity: "warning" }); load(); }, [load]);
 
   const create = async () => {
+    const current = requestAction();
+    setActionError("");
     try {
       await api("/api/v1/incidents", {
         method: "POST",
@@ -82,17 +92,22 @@ export default function IncidentsPage() {
           severity: form.severity,
         }),
       });
+      if (!current()) return;
       setShowCreate(false);
       setForm({ title: "", description: "", severity: "warning" });
       load();
     } catch (e: any) {
-      alert("Create failed: " + e.message);
+      if (current()) setActionError("Create failed: " + e.message);
     }
   };
 
   const close = async (id: string) => {
-    await api(`/api/v1/incidents/${id}/close`, { method: "POST" });
-    load();
+    const current = requestAction();
+    setActionError("");
+    try {
+      await api(`/api/v1/incidents/${id}/close`, { method: "POST" });
+      if (current()) load();
+    } catch { if (current()) setActionError("Unable to close incident. Retry Close on the incident."); }
   };
 
   return (
@@ -118,9 +133,10 @@ export default function IncidentsPage() {
         </div>
       </div>
 
+      {actionError && <div role="alert">{actionError}</div>}
       {loading ? (
         <div class="obs-empty-state">Loading...</div>
-      ) : (
+      ) : error ? <QueryFailure message={error} retry={load} /> : (
         <>
           <section style={{ marginBottom: "24px" }}>
             <h2 style={{ fontSize: "14px", marginBottom: "8px" }}>Active</h2>

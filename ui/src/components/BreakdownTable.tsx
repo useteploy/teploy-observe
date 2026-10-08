@@ -39,15 +39,20 @@ function BreakdownTable({ fetchFn, labelKey, valueKey, filterKey, limit: initial
   const [sortAsc, setSortAsc] = useState(false);
 
   useEffect(() => {
+    let active = true;
+    setData([]);
     setLoading(true);
     setError(null);
     fetchFn(siteId, from, to, limit, filters).then((d) => {
+      if (!active) return;
       setData(d || []);
       setLoading(false);
     }).catch((err) => {
+      if (!active) return;
       setError(err instanceof Error ? err.message : String(err));
       setLoading(false);
     });
+    return () => { active = false; };
   }, [siteId, from, to, limit, JSON.stringify(filters), reloadKey]);
 
   const sorted = sortRows(data, valueKey, labelKey, sortAsc);
@@ -115,8 +120,9 @@ function BreakdownTable({ fetchFn, labelKey, valueKey, filterKey, limit: initial
               <div style="flex:1;min-width:0;">
                 <div style="display:flex;justify-content:space-between;align-items:baseline;">
                   <span class="obs-table-row-label">{label}</span>
-                  <span class="obs-table-row-value">{formatNumber(value)}</span>
+                  <span class="obs-table-row-value">{formatNumber(value)}{valueKey === "visitors" && row.visitors_exact === false ? " (partial)" : ""}</span>
                 </div>
+                {row.visitors_exact === false && <div role="note" style={{ fontSize: "11px", color: "var(--obs-text-muted)" }}>{row.visitors_note || "Visitor coverage is incomplete for the selected period."}</div>}
                 <div class="obs-bar">
                   <div class="obs-bar-fill" style={`width:${pct}%`} />
                 </div>

@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "preact/hooks";
+import { readAIConfig } from "../lib/aiConfig.js";
 import { settingsApi } from "../api/settings.js";
 import type { Site, Webhook, User, ShareLink, APIKeyInfo, MCPToken } from "../api/settings.js";
 import { get } from "../api/helpers.js";
@@ -1021,14 +1022,20 @@ function AISection() {
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
+  const mounted = useRef(true);
+  const pending = useRef(false);
   useEffect(() => {
+    mounted.current = true;
     fetch("/api/v1/ai/config", { headers: { Authorization: "Bearer " + localStorage.getItem("obs_token") } })
-      .then(r => r.json()).then(setCfg).catch(() => setCfg({ provider: "", endpoint: "", model: "", has_key: false }))
-      .finally(() => setLoading(false));
+      .then(readAIConfig).then(data => { if (mounted.current) setCfg(data); })
+      .catch(e => { if (mounted.current) setMessage("Error: " + e.message); })
+      .finally(() => { if (mounted.current) setLoading(false); });
+    return () => { mounted.current = false; };
   }, []);
 
   const save = async () => {
-    if (!cfg) return;
+    if (!cfg || pending.current) return;
+    pending.current = true;
     setSaving(true);
     setMessage(null);
     try {
@@ -1037,13 +1044,15 @@ function AISection() {
         headers: { "Content-Type": "application/json", Authorization: "Bearer " + localStorage.getItem("obs_token") },
         body: JSON.stringify(cfg),
       });
-      const data = await r.json();
+      const data = await readAIConfig(r);
+      if (!mounted.current) return;
       setCfg(data);
       setMessage("Saved");
     } catch (e: any) {
-      setMessage("Error: " + (e.message || "save failed"));
+      if (mounted.current) setMessage("Error: " + (e.message || "save failed"));
     } finally {
-      setSaving(false);
+      pending.current = false;
+      if (mounted.current) setSaving(false);
     }
   };
 
@@ -1057,19 +1066,19 @@ function AISection() {
       </p>
       <div style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "12px 16px", maxWidth: "640px", alignItems: "center" }}>
         <label>Provider</label>
-        <input class="obs-input" value={cfg?.provider || ""} onInput={(e) => setCfg({ ...cfg!, provider: (e.target as HTMLInputElement).value })} placeholder="openai / anthropic / ollama" />
+        <input class="obs-input" disabled={saving || !cfg} value={cfg?.provider || ""} onInput={(e) => setCfg({ ...cfg!, provider: (e.target as HTMLInputElement).value })} placeholder="openai / anthropic / ollama" />
         <label>Endpoint</label>
-        <input class="obs-input" value={cfg?.endpoint || ""} onInput={(e) => setCfg({ ...cfg!, endpoint: (e.target as HTMLInputElement).value })} placeholder="https://api.openai.com/v1/chat/completions" />
+        <input class="obs-input" disabled={saving || !cfg} value={cfg?.endpoint || ""} onInput={(e) => setCfg({ ...cfg!, endpoint: (e.target as HTMLInputElement).value })} placeholder="https://api.openai.com/v1/chat/completions" />
         <label>Model</label>
-        <input class="obs-input" value={cfg?.model || ""} onInput={(e) => setCfg({ ...cfg!, model: (e.target as HTMLInputElement).value })} placeholder="gpt-4o-mini" />
+        <input class="obs-input" disabled={saving || !cfg} value={cfg?.model || ""} onInput={(e) => setCfg({ ...cfg!, model: (e.target as HTMLInputElement).value })} placeholder="gpt-4o-mini" />
         <label>API Key</label>
-        <input class="obs-input" type="password"
+        <input class="obs-input" disabled={saving || !cfg} type="password"
           value={cfg?.api_key || ""}
           onInput={(e) => setCfg({ ...cfg!, api_key: (e.target as HTMLInputElement).value })}
           placeholder={cfg?.has_key ? "(stored) leave blank to keep" : "sk-..."} />
       </div>
       <div style={{ marginTop: "16px", display: "flex", gap: "12px", alignItems: "center" }}>
-        <button class="obs-btn obs-btn--primary" onClick={save} disabled={saving}>
+        <button class="obs-btn obs-btn--primary" onClick={save} disabled={saving || !cfg}>
           {saving ? "Saving..." : "Save"}
         </button>
         {message && <span style={{ color: message.startsWith("Error") ? "var(--obs-danger)" : "var(--obs-text-muted)" }}>{message}</span>}

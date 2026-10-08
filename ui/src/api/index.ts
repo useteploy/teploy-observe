@@ -22,3 +22,7 @@ export type * from "./settings.js";
 export { replaysApi } from "./replays.js";
 export type * from "./replays.js";
 export { authApi } from "./auth.js";
+
+// Analytics funnels keep the historical names; trace funnels are distinct.
+export type { FunnelResult, FunnelStep } from "./analytics.js";
+export type { FunnelResult as TraceFunnelResult, FunnelStep as TraceFunnelStep } from "./traces.js";

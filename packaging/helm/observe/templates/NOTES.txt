@@ -1,7 +1,7 @@
 Observe {{ default .Chart.AppVersion .Values.image.tag }} installed as a SINGLE INSTANCE (replicas are fixed at 1; there is no clustering).
 
 Dashboard (not public by default):
-  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "observe.fullname" . }} {{ .Values.service.port }}:3000
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "observe.fullname" . }} {{ .Values.service.port }}:http
   then open http://localhost:{{ .Values.service.port }}
 {{- if not .Values.secrets.adminPassword }}
 {{- if not .Values.secrets.existingSecret }}

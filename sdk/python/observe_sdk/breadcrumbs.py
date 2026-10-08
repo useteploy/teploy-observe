@@ -35,7 +35,7 @@ def _clone_data(data: Any) -> Optional[Dict[str, Any]]:
     if data is None:
         return None
     try:
-        raw = json.dumps(data, default=str)
+        raw = json.dumps(data, default=str, allow_nan=False)
     except (TypeError, ValueError):
         return {"_unserializable": True}
     if len(raw) > MAX_DATA_BYTES:
@@ -130,7 +130,7 @@ class BreadcrumbBuffer:
             used += size
             copy = dict(crumb)
             if "data" in copy:
-                copy["data"] = dict(copy["data"])
+                copy["data"] = json.loads(json.dumps(copy["data"], allow_nan=False))
             out.append(copy)
         out.reverse()
         return out

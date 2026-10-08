@@ -44,21 +44,26 @@ function TimeSeriesChart() {
   const padRef = useRef({ top: 20, right: 20, bottom: 40, left: 55 });
 
   useEffect(() => {
+    let active = true;
+    setData([]); setPrevData([]); dataRef.current = [];
     setLoading(true);
     setError(null);
     const fetchCurrent = api.timeseries(siteId, from, to, interval, filters);
     if (!compare) {
       fetchCurrent.then((d) => {
+        if (!active) return;
         const result = d || [];
         setData(result);
         setPrevData([]);
         dataRef.current = result;
         setLoading(false);
       }).catch((err) => {
+      if (!active) return;
+        if (!active) return;
         setError(err instanceof Error ? err.message : String(err));
         setLoading(false);
       });
-      return;
+      return () => { active = false; };
     }
     // Compare mode: fetch the previous-period window too.
     const fromMs = new Date(from).getTime();
@@ -68,8 +73,9 @@ function TimeSeriesChart() {
     const prevTo = new Date(fromMs).toISOString();
     Promise.all([
       fetchCurrent,
-      api.timeseries(siteId, prevFrom, prevTo, interval, filters).catch(() => [] as TimeSeriesPoint[]),
+      api.timeseries(siteId, prevFrom, prevTo, interval, filters),
     ]).then(([cur, prev]) => {
+      if (!active) return;
       const curList = cur || [];
       const prevList = prev || [];
       setData(curList);
@@ -78,28 +84,33 @@ function TimeSeriesChart() {
       dataRef.current = curList;
       setLoading(false);
     }).catch((err) => {
+      if (!active) return;
       setError(err instanceof Error ? err.message : String(err));
       setLoading(false);
     });
+    return () => { active = false; };
   }, [siteId, from, to, interval, compare, JSON.stringify(filters), reloadKey]);
 
   // Fetch incidents overlapping the current window. Best-effort — 404 / error
   // means "no markers," not a chart failure.
   useEffect(() => {
+    let active = true;
+    setMarkers([]);
     const fromMs = new Date(from).getTime();
     const toMs = new Date(to).getTime();
     fetch(`/api/v1/incidents?site_id=${encodeURIComponent(siteId)}&from=${fromMs}&to=${toMs}`, {
       headers: { Authorization: "Bearer " + (typeof localStorage !== "undefined" ? localStorage.getItem("obs_token") || "" : "") },
     })
       .then((r) => r.ok ? r.json() : [])
-      .then((list) => setMarkers(Array.isArray(list) ? list.map((inc: any) => ({
+      .then((list) => { if (active) setMarkers(Array.isArray(list) ? list.map((inc: any) => ({
         id: String(inc.incident_id ?? ""),
         title: String(inc.title ?? ""),
         severity: String(inc.severity ?? "info"),
         started_at: Number(inc.started_at),
         ended_at: Number(inc.ended_at),
-      })) : []))
-      .catch(() => setMarkers([]));
+      })) : []); })
+      .catch(() => { if (active) setMarkers([]); });
+    return () => { active = false; };
   }, [siteId, from, to]);
 
   const draw = useCallback(() => {
