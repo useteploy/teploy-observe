@@ -86,7 +86,8 @@ type DiskQueue struct {
 	// syncHook is the fsync seam: every fsync of a WAL segment goes through
 	// it. Production leaves it nil (direct file.Sync); tests count fsyncs
 	// or inject failures through it. Guarded by mu.
-	syncHook func(*os.File) error
+	syncHook    func(*os.File) error
+	dirSyncHook func(string) error
 	// lastErr is the first sticky WAL failure (audit F14). Once set it is
 	// never cleared automatically — a WAL-backed deployment that starts
 	// losing writes must stop claiming durability, and only a process
@@ -307,6 +308,11 @@ func NewDiskQueue(dir, name string, fsyncInterval time.Duration, maxBytes int64,
 // the cap therefore comes up intact, replays on Attach, and reclaims once
 // flushes advance the checkpoint.
 func NewDiskQueueWithLimits(dir, name string, fsyncInterval time.Duration, maxBytes, maxTotalBytes int64, logger *slog.Logger) (*DiskQueue, error) {
+	return newDiskQueueWithDirSync(dir, name, fsyncInterval, maxBytes, maxTotalBytes, logger, syncDir)
+}
+
+func newDiskQueueWithDirSync(dir, name string, fsyncInterval time.Duration, maxBytes, maxTotalBytes int64, logger *slog.Logger, directorySync func(string) error) (*DiskQueue, error) {
+
 	if maxBytes <= 0 {
 		return nil, fmt.Errorf("ingest queue: segment bytes cap must be positive (got %d)", maxBytes)
 	}
@@ -374,6 +380,12 @@ func NewDiskQueueWithLimits(dir, name string, fsyncInterval time.Duration, maxBy
 	if err != nil {
 		return nil, fmt.Errorf("ingest queue: open: %w", err)
 	}
+	// File fsync alone does not persist its name or newly created ancestors.
+	if err := syncQueueDirs(full, directorySync); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("ingest queue: directory sync: %w", err)
+	}
+
 	// Audit F18: same repair for the log file — reopen with 0o600 leaves a
 	// pre-upgrade 0644 mode in place. Also refuse anything that is not a
 	// regular file (a device or symlink the operator did not intend).
@@ -958,6 +970,11 @@ func (q *DiskQueue) rollLocked() error {
 		_ = f.Close()
 		return fmt.Errorf("WAL roll secure: %w", err)
 	}
+	if err := q.syncDirectoryLocked(); err != nil {
+		_ = f.Close()
+		return q.setErrLocked(fmt.Errorf("WAL roll directory sync: %w", err))
+	}
+
 	if err := q.writer.Flush(); err != nil {
 		_ = f.Close()
 		return q.setErrLocked(fmt.Errorf("WAL roll flush: %w", err))
@@ -973,11 +990,6 @@ func (q *DiskQueue) rollLocked() error {
 	if err := q.file.Close(); err != nil {
 		_ = f.Close()
 		return q.setErrLocked(fmt.Errorf("WAL roll close: %w", err))
-	}
-	if err := syncDir(q.dir); err != nil {
-		// The new segment's directory entry is not known-durable; its data
-		// fsyncs later through the normal loop. Warn, keep rolling.
-		q.logger.Warn("ingest queue: roll directory fsync failed", "queue", q.name, "err", err)
 	}
 	prev := q.segments[len(q.segments)-1]
 	q.file = f
@@ -1589,4 +1601,26 @@ func readCheckpoint(path string) (seg, off int64, err error) {
 		return 0, 0, fmt.Errorf("ingest queue: checkpoint is negative (%d)", n)
 	}
 	return 0, n, nil
+}
+
+// syncQueueDirs persists every ancestor because MkdirAll may have created
+// multiple directory entries, each requiring its parent's fsync.
+func syncQueueDirs(dir string, directorySync func(string) error) error {
+	for {
+		if err := directorySync(dir); err != nil {
+			return err
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return nil
+		}
+		dir = parent
+	}
+}
+
+func (q *DiskQueue) syncDirectoryLocked() error {
+	if q.dirSyncHook != nil {
+		return q.dirSyncHook(q.dir)
+	}
+	return syncDir(q.dir)
 }

@@ -244,12 +244,16 @@ func (s *LinkService) ClickHandler() http.HandlerFunc {
 
 // PixelHandler returns an http.HandlerFunc that serves a 1x1 transparent GIF
 // and records the request as a tracking event in the link_clicks table.
-// The link slug is expected as a path parameter.
+// Register GET /t/{slug}/pixel.gif. The legacy GET /t/pixel.gif?slug=...
+// form is also supported; a path slug takes precedence over the query.
 func (s *LinkService) PixelHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		slug := r.PathValue("slug")
+		if slug == "" {
+			slug = r.URL.Query().Get("slug")
+		}
 
-		if slug != "" {
+		if validSlug(slug) {
 			referrer := r.Referer()
 			country := r.Header.Get("CF-IPCountry")
 			browser := r.UserAgent()
@@ -265,4 +269,13 @@ func (s *LinkService) PixelHandler() http.HandlerFunc {
 		w.WriteHeader(http.StatusOK)
 		w.Write(transparentGIF)
 	}
+}
+
+// Slugs issued by CreateLink are four random bytes encoded as eight hex digits.
+func validSlug(slug string) bool {
+	if len(slug) != 8 {
+		return false
+	}
+	_, err := hex.DecodeString(slug)
+	return err == nil
 }

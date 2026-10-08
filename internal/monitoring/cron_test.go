@@ -128,7 +128,7 @@ func TestCheckMissed_HonoursTheSchedulePeriod(t *testing.T) {
 	site := fmt.Sprintf("test-sched-%d", time.Now().UnixNano())
 	hourly, err := svc.CreateCron(ctx, CronMonitor{
 		SiteID: site, Name: "hourly", Slug: "hourly", Enabled: true,
-		Schedule: "0 * * * *", GracePeriod: 1,
+		Schedule: "@every 1h", GracePeriod: 1,
 	})
 	if err != nil {
 		t.Fatalf("create hourly: %v", err)
@@ -159,6 +159,6 @@ func TestCheckMissed_HonoursTheSchedulePeriod(t *testing.T) {
 		t.Fatal("an hourly cron was reported missed 1.1s after checking in — the detector is judging it on its grace period alone, which reopens an incident between every pair of runs")
 	}
 	if !containsCron(missed, graceOnly.CronID) {
-		t.Fatal("a monitor with an unreadable schedule must still alert on grace alone")
+		t.Fatal("a monitor with an empty schedule must still alert on grace alone")
 	}
 }

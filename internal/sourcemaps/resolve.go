@@ -137,7 +137,7 @@ func lookupCandidates(filename string) []string {
 	canon := canonicalName(filename)
 	add(canon)
 	segs := strings.Split(canon, "/")
-	for i := 1; i < len(segs) && i <= maxSuffixSegments; i++ {
+	for i := 1; i < len(segs) && i <= maxSuffixSegments && len(out) < maxLookupCands-1; i++ {
 		add(strings.Join(segs[i:], "/"))
 	}
 	add(segs[len(segs)-1])

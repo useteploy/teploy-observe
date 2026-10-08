@@ -364,6 +364,10 @@ func (s *DashboardService) DeletePanel(ctx context.Context, panelID string) erro
 
 // ExecutePanel runs the query for a panel and returns JSON-serializable results.
 func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, panel Panel, from, to string) (any, error) {
+	fromMs, toMs, rangeErr := PanelTimeRange(from, to)
+	if rangeErr != nil {
+		return nil, rangeErr
+	}
 	var config PanelConfig
 	if panel.QueryConfig != "" {
 		// R36 (round 4): a config that cannot parse is a descriptive error,
@@ -387,14 +391,7 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 		if err != nil {
 			return nil, err
 		}
-		fromMs, _ := strconv.ParseInt(from, 10, 64)
-		toMs, _ := strconv.ParseInt(to, 10, 64)
-		if toMs == 0 {
-			toMs = time.Now().UTC().UnixMilli()
-		}
-		if fromMs == 0 {
-			fromMs = toMs - 60*60*1000
-		}
+
 		var groupBy []string
 		if config.GroupBy != "" {
 			groupBy = metrics.ParseGroupBy(config.GroupBy)
@@ -413,6 +410,29 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 		return series, nil
 	}
 
+	if panel.PanelType == "timeseries" && panel.QueryType == "errors" {
+		step := int64(3600000)
+		switch config.Interval {
+		case "day":
+			step = 86400000
+		case "week":
+			step = 604800000
+		case "month":
+			step = 2592000000
+		}
+		type point struct {
+			Bucket int64 `json:"bucket" db:"bucket"`
+			Errors int64 `json:"errors" db:"errors"`
+		}
+		rows, err := nucleus.Query[point](ctx, s.db.SQL(), fmt.Sprintf(`SELECT (CAST(timestamp AS BIGINT) / %d) * %d AS bucket, COUNT(*) AS errors FROM error_events WHERE site_id=$1 AND timestamp >= $2 AND timestamp < $3 GROUP BY (CAST(timestamp AS BIGINT) / %d) * %d ORDER BY bucket`, step, step, step, step), siteID, fromMs, toMs)
+		if err != nil {
+			return nil, fmt.Errorf("query panel (error series): %w", err)
+		}
+		if rows == nil {
+			rows = []point{}
+		}
+		return rows, nil
+	}
 	sql := s.db.SQL()
 
 	// Audit F27: a failed query is an error, not a healthy zero. The old
@@ -427,7 +447,7 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 		rows, err := nucleus.Query[r](ctx, sql,
 			`SELECT CAST(COUNT(*) AS TEXT) AS count FROM events
 			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3 AND event_type = 'pageview'`,
-			siteID, from, to)
+			siteID, fromMs, toMs)
 		if err != nil {
 			return nil, fmt.Errorf("query panel (pageviews): %w", err)
 		}
@@ -443,7 +463,7 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 		rows, err := nucleus.Query[r](ctx, sql,
 			`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count FROM events
 			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
-			siteID, from, to)
+			siteID, fromMs, toMs)
 		if err != nil {
 			return nil, fmt.Errorf("query panel (visitors): %w", err)
 		}
@@ -459,7 +479,7 @@ func (s *DashboardService) ExecutePanel(ctx context.Context, siteID string, pane
 		rows, err := nucleus.Query[r](ctx, sql,
 			`SELECT CAST(COUNT(*) AS TEXT) AS count FROM error_events
 			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
-			siteID, from, to)
+			siteID, fromMs, toMs)
 		if err != nil {
 			return nil, fmt.Errorf("query panel (errors): %w", err)
 		}
@@ -479,4 +499,33 @@ func genID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// PanelTimeRange accepts the two documented wire forms and binds numeric SQL bounds.
+func PanelTimeRange(from, to string) (int64, int64, error) {
+	parse := func(raw string, fallback int64) (int64, error) {
+		if raw == "" {
+			return fallback, nil
+		}
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			return n, nil
+		}
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return 0, fmt.Errorf("dashboards: invalid time bound %q", raw)
+		}
+		return t.UnixMilli(), nil
+	}
+	end, err := parse(to, time.Now().UTC().UnixMilli())
+	if err != nil {
+		return 0, 0, err
+	}
+	start, err := parse(from, end-3600000)
+	if err != nil {
+		return 0, 0, err
+	}
+	if start >= end {
+		return 0, 0, fmt.Errorf("dashboards: from must precede to")
+	}
+	return start, end, nil
 }

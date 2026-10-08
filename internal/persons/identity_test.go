@@ -47,12 +47,12 @@ func TestValidateProperties_Bounds(t *testing.T) {
 }
 
 func TestValidatePersonKey(t *testing.T) {
-	for _, k := range []string{"", "a b", "a/b", "a'b", strings.Repeat("a", MaxPersonKeyLen+1), "x;y"} {
+	for _, k := range []string{"", "a\x00b", string([]byte{0xff}), strings.Repeat("a", MaxPersonKeyLen+1)} {
 		if ValidatePersonKey(k) == nil {
 			t.Errorf("%q should be invalid", k)
 		}
 	}
-	for _, k := range []string{"0123456789abcdef", "u@x.io", "a_b-c.d:e"} {
+	for _, k := range []string{"0123456789abcdef", "u@x.io", "a_b-c.d:e", "a b", "a/b", "a'b", "x;y", "auth0|fixture-user", "用户"} {
 		if err := ValidatePersonKey(k); err != nil {
 			t.Errorf("%q should be valid: %v", k, err)
 		}
@@ -107,7 +107,7 @@ func TestMerge_Protections(t *testing.T) {
 	if _, err := s.Merge(bg, "", "a", "b", "u"); !errors.Is(err, ErrInvalid) {
 		t.Errorf("empty site: %v", err)
 	}
-	if _, err := s.Merge(bg, "s1", "a;b", "b", "u"); !errors.Is(err, ErrInvalid) {
+	if _, err := s.Merge(bg, "s1", "a\x00b", "b", "u"); !errors.Is(err, ErrInvalid) {
 		t.Errorf("bad key: %v", err)
 	}
 }

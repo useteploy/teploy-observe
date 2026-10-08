@@ -55,13 +55,20 @@ func NewSiteService(db *nucleus.Client) *SiteService {
 // reinstating raw-identity storage the operator had just turned off.
 // Serializing misses against invalidations removes that window.
 func (s *SiteService) PrivacyConfig(ctx context.Context, siteID string) (salt string, rawOptIn bool, ok bool) {
+	salt, rawOptIn, ok, _ = s.PrivacyConfigChecked(ctx, siteID)
+	return
+}
+
+// PrivacyConfigChecked distinguishes an unavailable policy from an unknown site.
+// Ingestion must refuse a lookup failure instead of changing identity salts.
+func (s *SiteService) PrivacyConfigChecked(ctx context.Context, siteID string) (salt string, rawOptIn bool, ok bool, err error) {
 	if siteID == "" {
-		return "", false, false
+		return "", false, false, nil
 	}
 	s.mu.RLock()
 	if site, hit := s.cache[siteID]; hit {
 		s.mu.RUnlock()
-		return site.SessionSalt, site.RawDistinctID, true
+		return site.SessionSalt, site.RawDistinctID, true, nil
 	}
 	s.mu.RUnlock()
 
@@ -70,14 +77,17 @@ func (s *SiteService) PrivacyConfig(ctx context.Context, siteID string) (salt st
 	// Re-check under the write lock: another goroutine may have filled the
 	// entry (or an invalidation may have raced) since the RLock read.
 	if site, hit := s.cache[siteID]; hit {
-		return site.SessionSalt, site.RawDistinctID, true
+		return site.SessionSalt, site.RawDistinctID, true, nil
 	}
 	site, err := s.Get(ctx, siteID)
-	if err != nil || site.SiteID == "" {
-		return "", false, false
+	if err != nil {
+		return "", false, false, err
+	}
+	if site.SiteID == "" {
+		return "", false, false, nil
 	}
 	s.cache[siteID] = site
-	return site.SessionSalt, site.RawDistinctID, true
+	return site.SessionSalt, site.RawDistinctID, true, nil
 }
 
 // InvalidatePrivacyConfig drops the cached entry for a site. Call after

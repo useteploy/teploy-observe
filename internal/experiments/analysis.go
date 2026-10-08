@@ -167,6 +167,11 @@ func analyzeWithHorizon(arms []VariantResult, weights []float64, h horizonSpec) 
 	rawP := make([]float64, 0, k-1)
 	fisherUsed := make([]bool, 0, k-1)
 	for _, v := range arms[1:] {
+		if control.Exposures == 0 || v.Exposures == 0 {
+			rawP = append(rawP, 1)
+			fisherUsed = append(fisherUsed, false)
+			continue
+		}
 		var p float64
 		usedFisher := false
 		pair := chiSquareOmnibus([]int64{control.Exposures, v.Exposures}, []int64{control.Conversions, v.Conversions})
@@ -181,7 +186,7 @@ func analyzeWithHorizon(arms []VariantResult, weights []float64, h horizonSpec) 
 	}
 	adj := holmAdjusted(rawP)
 	for i, v := range arms[1:] {
-		lift := float64(v.Conversions)/float64(v.Exposures) - float64(control.Conversions)/float64(control.Exposures)
+		lift := v.ConversionRate - control.ConversionRate
 		lo, hi := newcombeDifferenceCI(control.Conversions, control.Exposures, v.Conversions, v.Exposures, zAlphaTwoSided005)
 		pr := PairwiseResult{
 			Variant:       v.Variant,
@@ -332,7 +337,7 @@ func winnerByScore(res AnalysisResult, arms []VariantResult, scores []float64) s
 			bestIdx = i
 		}
 	}
-	if bestIdx == -1 || !res.Pairwise[bestIdx].Significant {
+	if bestIdx == -1 || scores[1+bestIdx] <= scores[0] || !res.Pairwise[bestIdx].Significant {
 		return ""
 	}
 	return arms[1+bestIdx].Variant

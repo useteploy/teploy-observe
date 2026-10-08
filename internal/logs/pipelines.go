@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"regexp"
@@ -20,6 +21,8 @@ import (
 // pipelineCacheTTL bounds how long the per-site pipeline set is cached on the
 // ingest hot path. ProcessLog runs on every log line, so a query-per-log would
 // be a severe regression; a few seconds of staleness on rule changes is fine.
+var ErrPipelineUnavailable = errors.New("log pipeline policy unavailable")
+
 const pipelineCacheTTL = 5 * time.Second
 
 type pipelineCacheEntry struct {
@@ -28,7 +31,8 @@ type pipelineCacheEntry struct {
 }
 
 type PipelineService struct {
-	db *nucleus.Client
+	db   *nucleus.Client
+	list func(context.Context, string) ([]Pipeline, error)
 
 	mu    sync.Mutex
 	cache map[string]pipelineCacheEntry
@@ -57,7 +61,11 @@ func (s *PipelineService) listCached(ctx context.Context, siteID string) ([]Pipe
 	}
 	s.mu.Unlock()
 
-	pipelines, err := s.List(ctx, siteID)
+	list := s.List
+	if s.list != nil {
+		list = s.list
+	}
+	pipelines, err := list(ctx, siteID)
 	if err != nil {
 		return nil, err
 	}
@@ -177,9 +185,17 @@ func (s *PipelineService) Delete(ctx context.Context, pipelineID string) error {
 // ProcessLog applies all pipelines to a log entry, modifying its attributes.
 // Returns false if the log should be dropped.
 func (s *PipelineService) ProcessLog(ctx context.Context, siteID, message string, attrs map[string]any) (string, map[string]any, bool) {
+	message, attrs, keep, _ := s.processLog(ctx, siteID, message, attrs)
+	return message, attrs, keep
+}
+
+func (s *PipelineService) processLog(ctx context.Context, siteID, message string, attrs map[string]any) (string, map[string]any, bool, error) {
 	pipelines, err := s.listCached(ctx, siteID)
-	if err != nil || len(pipelines) == 0 {
-		return message, attrs, true
+	if err != nil {
+		return "", nil, false, fmt.Errorf("%w: %v", ErrPipelineUnavailable, err)
+	}
+	if len(pipelines) == 0 {
+		return message, attrs, true, nil
 	}
 
 	if attrs == nil {
@@ -189,7 +205,7 @@ func (s *PipelineService) ProcessLog(ctx context.Context, siteID, message string
 	for _, pipeline := range pipelines {
 		var rules []Rule
 		if err := json.Unmarshal([]byte(pipeline.Rules), &rules); err != nil {
-			continue
+			return "", nil, false, fmt.Errorf("%w: invalid policy: %v", ErrPipelineUnavailable, err)
 		}
 		for _, rule := range rules {
 			switch rule.Type {
@@ -243,7 +259,7 @@ func (s *PipelineService) ProcessLog(ctx context.Context, siteID, message string
 				// Drop the log if message matches pattern
 				if rule.Pattern != "" {
 					if matched, _ := regexp.MatchString(rule.Pattern, message); matched {
-						return message, attrs, false
+						return message, attrs, false, nil
 					}
 				}
 
@@ -260,11 +276,11 @@ func (s *PipelineService) ProcessLog(ctx context.Context, siteID, message string
 					}
 				}
 				if matched {
-					if pct, _ := strconv.Atoi(rule.Value); pct > 0 {
+					if pct, err := strconv.Atoi(rule.Value); rule.Value != "" && err == nil {
 						h := fnv.New32a()
 						h.Write([]byte(message))
 						if int(h.Sum32()%100) >= pct {
-							return message, attrs, false
+							return message, attrs, false, nil
 						}
 					}
 				}
@@ -300,7 +316,7 @@ func (s *PipelineService) ProcessLog(ctx context.Context, siteID, message string
 		}
 	}
 
-	return message, attrs, true
+	return message, attrs, true, nil
 }
 
 func genPipelineID() string {

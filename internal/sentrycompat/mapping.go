@@ -21,9 +21,8 @@ import (
 // event_id can never collide with an Observe-native one.
 const ProducerID = "sentry"
 
-// Field caps. They keep one mapped record far below the error buffer's
-// 256 KiB admission cap (over which Push answers "buffer full", i.e. 429 and
-// an SDK retry for an event that can never be admitted).
+// Field caps limit individual values. mapEvent also enforces a serialized
+// aggregate budget before admission into the 256 KiB error record envelope.
 const (
 	maxFrames        = 100
 	maxBreadcrumbs   = 100
@@ -209,6 +208,22 @@ func mapEvent(payload []byte, headerEventID string) (obserrors.ErrorInput, strin
 	}
 
 	in.Breadcrumbs = mapBreadcrumbs(ev["breadcrumbs"])
+	// Budget the complete serialized record, keeping the newest breadcrumbs.
+	// Leave headroom for site identity and scrubber expansion before WAL admission.
+	for {
+		raw, err := json.Marshal(in)
+		if err != nil {
+			return obserrors.ErrorInput{}, "", err
+		}
+		if len(raw) <= 192<<10 {
+			break
+		}
+		if len(in.Breadcrumbs) > 0 {
+			in.Breadcrumbs = in.Breadcrumbs[1:]
+			continue
+		}
+		return obserrors.ErrorInput{}, "", fmt.Errorf("mapped event exceeds record budget")
+	}
 	return in, eventID, nil
 }
 
@@ -436,6 +451,9 @@ func toMillis(v any) int64 {
 			return 0
 		}
 		if t > 1e11 { // already milliseconds
+			if t >= float64(math.MaxInt64) {
+				return math.MaxInt64
+			}
 			return int64(t)
 		}
 		return int64(t * 1000)

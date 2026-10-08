@@ -39,7 +39,7 @@ func TestDeleteRemovesTheExportAndItsRunHistory(t *testing.T) {
 
 	e, err := svc.Create(ctx, CreateInput{
 		Name: "nightly", SQL: "SELECT 1", Cron: "@daily",
-		Destination: S3Destination{Region: "us-east-1", Bucket: "b"},
+		Destination: S3Destination{AccessKeyID: "synthetic-key", SecretAccessKey: "synthetic-secret", Region: "us-east-1", Bucket: "b"},
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)

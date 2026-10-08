@@ -158,8 +158,10 @@ interface Client {
   /** Newly recorded events not yet packed into a request (TO-032). Each
    * entry is an owned JSON snapshot taken at admission (TO-033). */
   buffer: string[];
-  /** Serialized bytes reserved by buffer + pending (TO-034). */
+  /** Bytes reserved by buffer, pending, and active requests. Buffered
+   * records include conservative envelope headroom until packing. */
   queuedBytes: number;
+  activeRequest: PendingEventRequest | null;
   /** Frozen, identity-stamped request envelopes awaiting first send or
    * retry (TO-032). A request retries its exact bytes; its events are
    * never merged back into the live buffer. */
@@ -386,14 +388,22 @@ function packEventRequests(
 
 /** fetch with a hard deadline (TO-034) and redirect refusal (TO-037: a
  * redirect would forward the X-API-Key credential to another origin). */
-async function fetchWithDeadline(url: string, init: RequestInit, deadlineMs: number = FETCH_DEADLINE_MS): Promise<Response> {
+async function fetchWithDeadline<T = Response>(url: string, init: RequestInit, deadlineMs: number = FETCH_DEADLINE_MS, consume?: (res: Response) => Promise<T>): Promise<T> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), deadlineMs);
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await fetch(url, { ...init, redirect: "error", signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
+    return await Promise.race([
+      fetch(url, { ...init, redirect: "error", signal: controller.signal }).then(res => consume ? consume(res) : res as T),
+      new Promise<T>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error("observe: request deadline reached")); }, deadlineMs); }),
+    ]);
+  } finally { if (timer !== undefined) clearTimeout(timer); }
+}
+
+function queuedEvents(target: Client): number {
+  return target.buffer.length + target.pending.reduce((n, r) => n + r.eventCount, 0) + (target.activeRequest?.eventCount ?? 0);
+}
+function safeUrl(value: string): string {
+  try { const url = new URL(value); return /^https?:$/.test(url.protocol) ? url.origin + url.pathname : ""; } catch { return ""; }
 }
 
 /**
@@ -441,7 +451,26 @@ function sendJSON(target: Client, path: string, payload: unknown, unloading = fa
  */
 async function readEventBatchAck(res: Response): Promise<{ ok: boolean; accepted?: number; rejected?: number; deduped?: boolean }> {
   if (!res.ok) throw new Error(`observe: ingest returned ${res.status}`);
-  const value: unknown = await res.json().catch(() => null);
+  let value: unknown;
+  if (res.body) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let text = "", bytes = 0;
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        bytes += chunk.value.byteLength;
+        if (bytes > 64 * 1024) throw new Error("observe: oversized batch acknowledgment");
+        text += decoder.decode(chunk.value, {stream:true});
+      }
+      text += decoder.decode();
+      try { value = JSON.parse(text); } catch { value = null; }
+    } finally { void reader.cancel().catch(() => {}); reader.releaseLock(); }
+  } else {
+    // Response doubles and bodyless older transports still expose json().
+    value = await res.json().catch(() => null);
+  }
   if (!value || typeof value !== "object" || (value as { ok?: unknown }).ok !== true) {
     throw new Error("observe: invalid batch acknowledgment");
   }
@@ -472,11 +501,11 @@ function reportRetry(target: Client, info: { attempt: number; delayMs: number; b
  * before the best-effort keepalive flush, because the page may die before
  * any delivery confirmation arrives. */
 function recordUnloadSnapshot(target: Client): void {
-  const queuedEvents = target.buffer.length + target.pending.reduce((n, r) => n + r.eventCount, 0);
-  if (queuedEvents > 0) {
-    target.stats.undeliveredAtUnload = queuedEvents;
+  const queued = queuedEvents(target);
+  if (queued > 0) {
+    target.stats.undeliveredAtUnload = queued;
     reportError(target, new Error(
-      `observe: page unloading with ${queuedEvents} undelivered event(s) — attempting keepalive flush; this count is the loss upper bound`));
+      `observe: page unloading with ${queued} undelivered event(s) — attempting keepalive flush; this count is the loss upper bound`));
   }
 }
 
@@ -521,6 +550,7 @@ export function init(options: InitOptions): void {
     },
     buffer: [],
     queuedBytes: 0,
+    activeRequest: null,
     pending: [],
     timer: null,
     userId: null,
@@ -634,7 +664,7 @@ export function pageview(pathname?: string): void {
   if (!client) return;
   const props: Record<string, unknown> = {
     url: pageUrl(),
-    referrer: typeof document !== "undefined" ? document.referrer : "",
+    referrer: typeof document !== "undefined" ? safeUrl(document.referrer) : "",
     title: typeof document !== "undefined" ? document.title : "",
     ...campaignFields(),
   };
@@ -719,12 +749,12 @@ export function track(eventType: string, props: Record<string, unknown> = {}): v
   // during retry backoff or a hanging request the buffer can no longer
   // grow without limit. Overflow drops the NEWEST record (the oldest data
   // is closest to delivery) and says so.
-  if (target.buffer.length >= MAX_QUEUED_EVENTS || target.queuedBytes + bytes > MAX_QUEUED_BYTES) {
+  if (queuedEvents(target) >= MAX_QUEUED_EVENTS || target.queuedBytes + bytes + 256 > MAX_QUEUED_BYTES) {
     countDrop(target, "queue_full", 1, "drop-newest overflow policy");
     return;
   }
   target.buffer.push(raw);
-  target.queuedBytes += bytes;
+  target.queuedBytes += bytes + 256;
   if (target.buffer.length >= target.opts.batchSize) flush();
 }
 
@@ -984,12 +1014,12 @@ function trimPending(target: Client): void {
  * reported but NOT retried — the rejected events are gone server-side and
  * the accepted neighbors must not be resent). */
 async function deliverRequest(target: Client, req: PendingEventRequest, unloading: boolean): Promise<{ ok: boolean; accepted?: number; rejected?: number; deduped?: boolean }> {
-  const res = await fetchWithDeadline(
+  const ack = await fetchWithDeadline(
     target.opts.endpoint.replace(/\/+$/, "") + "/api/v1/events/batch",
     requestInitFor(target, req.body, unloading),
     target.opts.requestTimeoutMs,
+    readEventBatchAck,
   );
-  const ack = await readEventBatchAck(res);
   target.stats.deliveredBatches++;
   const rejected = ack.rejected ?? 0;
   target.stats.deliveredEvents += Math.max(req.eventCount - rejected, 0);
@@ -1019,13 +1049,17 @@ function requestInitFor(target: Client, body: string, unloading: boolean): Reque
  * as visible losses and reported, never retried (the replacement owns the
  * timer from here on). */
 function drainClient(target: Client): void {
+  if (target.flushing) { void target.flushing.finally(() => drainClient(target)); return; }
   const requests = [...target.pending];
   target.pending = [];
   if (target.buffer.length > 0) {
     const entries = target.buffer.splice(0);
-    requests.push(...packEventRequests(target.producerId, entries, (why) => {
+    target.queuedBytes -= entries.reduce((n, raw) => n + textEncoder.encode(raw).byteLength + 256, 0);
+    const fresh = packEventRequests(target.producerId, entries, (why) => {
       countDrop(target, "pack_oversize", 1, `${why} on re-init`);
-    }));
+    });
+    target.queuedBytes += fresh.reduce((n, req) => n + req.bytes, 0);
+    requests.push(...fresh);
   }
   for (const req of requests) {
     deliverRequest(target, req, true)
@@ -1064,16 +1098,18 @@ function flushClient(target: Client, unloading = false): Promise<void> {
       // older requests keep FIFO order ahead of them.
       if (target.buffer.length > 0) {
         const entries = target.buffer.splice(0);
-        target.queuedBytes -= entries.reduce((n, raw) => n + textEncoder.encode(raw).byteLength, 0);
+        target.queuedBytes -= entries.reduce((n, raw) => n + textEncoder.encode(raw).byteLength + 256, 0);
         if (target.queuedBytes < 0) target.queuedBytes = 0;
         const fresh = packEventRequests(target.producerId, entries, (why) => {
           countDrop(target, "pack_oversize", 1, why);
         });
+        target.queuedBytes += fresh.reduce((n, req) => n + req.bytes, 0);
         target.pending.push(...fresh);
         trimPending(target);
       }
       const req = target.pending.shift();
       if (!req) return;
+      target.activeRequest = req;
       try {
         await deliverRequest(target, req, unloading);
         releaseRequest(target, req);
@@ -1098,9 +1134,11 @@ function flushClient(target: Client, unloading = false): Promise<void> {
           trimPending(target);
           reportRetry(target, { attempt: attempts, delayMs, batchSize: req.eventCount, error: sendErr });
         }
+        target.activeRequest = null;
         reportError(target, sendErr);
         return;
       }
+      target.activeRequest = null;
       if (unloading) return; // one best-effort request per unload
     }
   });
@@ -1113,6 +1151,7 @@ function flushClient(target: Client, unloading = false): Promise<void> {
 
 /** Force an immediate flush of buffered events. */
 export function flush(): Promise<void> {
+  if (client?.flushing) return client.flushing;
   if (!client || (client.buffer.length === 0 && client.pending.length === 0)) return Promise.resolve();
   return flushClient(client);
 }
@@ -1131,7 +1170,7 @@ export function getStats(): Stats | null {
     retries: client.stats.retries,
     dropped: { ...client.stats.dropped },
     undeliveredAtUnload: client.stats.undeliveredAtUnload,
-    queued: client.buffer.length + client.pending.reduce((n, r) => n + r.eventCount, 0),
+    queued: queuedEvents(client),
     producerId: client.producerId,
   };
   return snapshot;

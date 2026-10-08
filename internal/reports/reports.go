@@ -133,7 +133,11 @@ func (s *ReportService) RunScheduled(ctx context.Context, smtpHost, smtpPort, sm
 			continue
 		}
 
-		data := s.gatherData(ctx, sched)
+		data, err := s.gatherData(ctx, sched)
+		if err != nil {
+			s.logger.Error("report measurements unavailable; retaining due schedule", "schedule", sched.Name, "err", err)
+			continue
+		}
 		html := buildEmailHTML(data)
 
 		if err := sendEmail(smtpHost, smtpPort, smtpUser, smtpPass, fromEmail, sched.Recipients, "Observe Report: "+data.Period, html); err != nil {
@@ -150,7 +154,7 @@ func (s *ReportService) RunScheduled(ctx context.Context, smtpHost, smtpPort, sm
 	}
 }
 
-func (s *ReportService) gatherData(ctx context.Context, sched ReportSchedule) ReportData {
+func (s *ReportService) gatherData(ctx context.Context, sched ReportSchedule) (ReportData, error) {
 	now := time.Now().UTC()
 	var from time.Time
 	period := "Last 7 days"
@@ -171,30 +175,39 @@ func (s *ReportService) gatherData(ctx context.Context, sched ReportSchedule) Re
 	data := ReportData{SiteID: sched.SiteID, SiteName: sched.Name, Period: period}
 
 	// Pageviews
-	rows, _ := nucleus.Query[countRow](ctx, s.db.SQL(),
+	rows, err := nucleus.Query[countRow](ctx, s.db.SQL(),
 		`SELECT CAST(COUNT(*) AS TEXT) AS count FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3 AND event_type = 'pageview'`,
 		sched.SiteID, fromMs, toMs)
+	if err != nil {
+		return ReportData{}, fmt.Errorf("report measurements: %w", err)
+	}
 	if len(rows) > 0 {
 		data.Pageviews = rows[0].Count
 	}
 
 	// Visitors
-	rows, _ = nucleus.Query[countRow](ctx, s.db.SQL(),
+	rows, err = nucleus.Query[countRow](ctx, s.db.SQL(),
 		`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count FROM events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
 		sched.SiteID, fromMs, toMs)
+	if err != nil {
+		return ReportData{}, fmt.Errorf("report measurements: %w", err)
+	}
 	if len(rows) > 0 {
 		data.Visitors = rows[0].Count
 	}
 
 	// Errors
-	rows, _ = nucleus.Query[countRow](ctx, s.db.SQL(),
+	rows, err = nucleus.Query[countRow](ctx, s.db.SQL(),
 		`SELECT CAST(COUNT(*) AS TEXT) AS count FROM error_events WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3`,
 		sched.SiteID, fromMs, toMs)
+	if err != nil {
+		return ReportData{}, fmt.Errorf("report measurements: %w", err)
+	}
 	if len(rows) > 0 {
 		data.Errors = rows[0].Count
 	}
 
-	return data
+	return data, nil
 }
 
 func buildEmailHTML(data ReportData) string {

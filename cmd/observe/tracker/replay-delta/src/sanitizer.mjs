@@ -140,7 +140,7 @@ function isPrivateAttrs(tag, attrs) {
 }
 
 function placeholderElement(node) {
-  var out = { type: NODE_ELEMENT, tagName: 'div', attributes: {}, childNodes: [] };
+  var out = { type: NODE_ELEMENT, tagName: 'div', attributes: { 'data-observe-block': '' }, childNodes: [] };
   if (typeof node.id === 'number') out.id = node.id;
   if (node.isSVG === true) out.isSVG = true;
   return out;
@@ -149,14 +149,48 @@ function placeholderElement(node) {
 // collectPrivateIds walks a subtree that will NOT be emitted and records
 // every element/text id in it, so later characterData or attribute
 // mutations against those ids are masked rather than trusted.
-function collectPrivateIds(node, privateIds, budget) {
-  if (!isPlainObject(node)) return;
-  if (typeof node.id === 'number') privateIds.add(node.id);
-  if (budget.limited()) return;
-  var children = node.childNodes;
-  if (Array.isArray(children)) {
-    for (var i = 0; i < Math.min(children.length, MAX_CHILDREN); i++) {
-      collectPrivateIds(children[i], privateIds, budget);
+function collectPrivateIds(node, privateIds) {
+  var pending = [node];
+  while (pending.length) {
+    var current = pending.pop();
+    if (!isPlainObject(current)) continue;
+    if (typeof current.id === 'number') privateIds.add(current.id);
+    if (Array.isArray(current.childNodes)) {
+      for (var child of current.childNodes) pending.push(child);
+    }
+  }
+}
+
+// Index ancestry before any payload is emitted. Privacy is sticky within a
+// segment: removing a marker or moving a node cannot expose previously hidden
+// descendants. A full snapshot starts a new privacy/ancestry segment.
+function indexTree(node, parentId, state) {
+  var pending = [[node, parentId]];
+  while (pending.length) {
+    var [current, parent] = pending.pop();
+    if (!isPlainObject(current)) continue;
+    if (typeof current.id === 'number') {
+      state.parents.set(current.id, parent);
+      if (current.type === NODE_TEXT) state.textIds.add(current.id);
+      if (current.type === NODE_ELEMENT && isPrivateAttrs(
+          String(current.tagName || '').toLowerCase(), current.attributes)) {
+        state.privateIds.add(current.id);
+      }
+    }
+    if (Array.isArray(current.childNodes)) {
+      for (var child of current.childNodes) pending.push([child, current.id]);
+    }
+  }
+}
+
+function propagatePrivacy(state) {
+  for (var id of state.parents.keys()) {
+    var seen = new Set();
+    var ancestor = id;
+    while (typeof ancestor === 'number' && !seen.has(ancestor)) {
+      if (state.privateIds.has(ancestor)) { state.privateIds.add(id); break; }
+      seen.add(ancestor);
+      ancestor = state.parents.get(ancestor);
     }
   }
 }
@@ -175,7 +209,7 @@ function sanitizeNode(node, depth, ctx) {
   if (!isPlainObject(node)) return null;
   if (node.type === NODE_TEXT) {
     ctx.nodes++;
-    var outText = { type: NODE_TEXT, textContent: boundText(node.textContent) };
+    var outText = { type: NODE_TEXT, textContent: ctx.privateIds.has(node.id) ? '' : boundText(node.textContent) };
     // The id is load-bearing: characterData mutations target text nodes by
     // id, and the replayer's mirror must find the rebuilt node.
     if (typeof node.id === 'number') outText.id = node.id;
@@ -192,7 +226,7 @@ function sanitizeNode(node, depth, ctx) {
   var tag = String(node.tagName || '').toLowerCase();
   var attrs = isPlainObject(node.attributes) ? node.attributes : {};
 
-  if (isPrivateAttrs(tag, attrs) || depth > MAX_SNAPSHOT_DEPTH || ctx.nodes > MAX_SNAPSHOT_NODES) {
+  if (ctx.privateIds.has(node.id) || isPrivateAttrs(tag, attrs) || depth > MAX_SNAPSHOT_DEPTH || ctx.nodes > MAX_SNAPSHOT_NODES) {
     var ids = ctx.privateIds;
     collectPrivateIds(node, ids, ctx.budget);
     // The placeholder's own id is private too — later text mutations on it
@@ -225,10 +259,14 @@ function sanitizeNode(node, depth, ctx) {
   if (node.needBlock === true) out.needBlock = true;
 
   for (var i = 0; i < Math.min(children.length, MAX_CHILDREN); i++) {
-    if (ctx.nodes > MAX_SNAPSHOT_NODES) break;
+    if (ctx.nodes > MAX_SNAPSHOT_NODES) {
+      for (var omitted of children.slice(i)) collectPrivateIds(omitted, ctx.privateIds);
+      break;
+    }
     var child = sanitizeNode(children[i], depth + 1, ctx);
     if (child !== null) out.childNodes.push(child);
   }
+  for (var omitted of children.slice(MAX_CHILDREN)) collectPrivateIds(omitted, ctx.privateIds);
   return out;
 }
 
@@ -239,7 +277,10 @@ function sanitizeDocumentNode(node, ctx) {
   if (typeof node.id === 'number') out.id = node.id;
   var children = Array.isArray(node.childNodes) ? node.childNodes : [];
   for (var i = 0; i < Math.min(children.length, MAX_CHILDREN); i++) {
-    if (ctx.nodes > MAX_SNAPSHOT_NODES) break;
+    if (ctx.nodes > MAX_SNAPSHOT_NODES) {
+      for (var omitted of children.slice(i)) collectPrivateIds(omitted, ctx.privateIds);
+      break;
+    }
     var c = children[i];
     if (isPlainObject(c) && c.type === NODE_DOCUMENT_TYPE) {
       ctx.nodes++;
@@ -253,6 +294,7 @@ function sanitizeDocumentNode(node, ctx) {
     var s = sanitizeNode(c, 1, ctx);
     if (s !== null) out.childNodes.push(s);
   }
+  for (var omitted of children.slice(MAX_CHILDREN)) collectPrivateIds(omitted, ctx.privateIds);
   return out;
 }
 
@@ -264,6 +306,20 @@ function sanitizeIncrementalData(data, state) {
   if (source === SRC_MUTATION) {
     var next = { source: SRC_MUTATION };
     var changed = false;
+    // Process topology and markers first, including adds in reverse order and
+    // text/attribute changes arriving in the same rrweb mutation batch.
+    for (var add of data.adds || []) {
+      if (isPlainObject(add)) indexTree(add.node, add.parentId, state);
+    }
+    for (var attr of data.attributes || []) {
+      if (!isPlainObject(attr) || !isPlainObject(attr.attributes)) continue;
+      var markers = attr.attributes;
+      if ((Object.hasOwn(markers, 'data-observe-block') && markers['data-observe-block'] !== null) ||
+          (Object.hasOwn(markers, 'contenteditable') && markers.contenteditable !== null && markers.contenteditable !== 'false')) {
+        state.privateIds.add(attr.id);
+      }
+    }
+    propagatePrivacy(state);
 
     if (Array.isArray(data.texts)) {
       next.texts = data.texts.map(function (t) {
@@ -272,7 +328,7 @@ function sanitizeIncrementalData(data, state) {
         // lives in a private subtree (input value, blocked region,
         // contenteditable); otherwise bounded visible text, same policy as
         // snapshots.
-        if (state.privateIds.has(t.id)) return { id: t.id, value: '' };
+        if (state.privateIds.has(t.id) || !state.parents.has(t.id)) return { id: t.id, value: '' };
         return { id: t.id, value: boundText(t.value) };
       }).filter(function (t) { return t !== null; });
       changed = true;
@@ -281,6 +337,7 @@ function sanitizeIncrementalData(data, state) {
     if (Array.isArray(data.attributes)) {
       next.attributes = data.attributes.map(function (a) {
         if (!isPlainObject(a) || typeof a.id !== 'number' || !isPlainObject(a.attributes)) return null;
+        if (state.privateIds.has(a.id)) return { id: a.id, attributes: { 'data-observe-block': '' } };
         var tag = String(a.tagName || '').toLowerCase();
         // rrweb attribute mutations do not carry tagName; the id is all we
         // have, so the allowlist runs tag-less (img-src special casing is
@@ -335,6 +392,14 @@ function sanitizeIncrementalData(data, state) {
       changed = true;
     }
 
+    // Clear previously displayed descendant text when an ancestor becomes
+    // private, even when rrweb sends no characterData mutation for it.
+    if (Array.isArray(data.attributes) && data.attributes.length) {
+      next.texts = next.texts || [];
+      for (var id of state.privateIds) {
+        if (state.textIds.has(id) && !next.texts.some(t => t.id === id)) next.texts.push({ id: id, value: '' });
+      }
+    }
     if (!changed) return null;
     return next;
   }
@@ -356,7 +421,7 @@ function sanitizeIncrementalData(data, state) {
   if (source === SRC_MOUSE_INTERACTION) {
     // Flat shape {type, id, x, y, pointerType} — coordinates and ids only,
     // no text payload exists on this source.
-    var mi = { type: num(data.type) };
+    var mi = { source: SRC_MOUSE_INTERACTION, type: num(data.type) };
     if (typeof data.id === 'number') mi.id = data.id;
     if (typeof data.x === 'number') mi.x = data.x;
     if (typeof data.y === 'number') mi.y = data.y;
@@ -420,6 +485,8 @@ function fullSnapshotCtx(state) {
   // A fresh snapshot resets the id space (rrweb re-mints ids from 1 at each
   // checkout), so the private-id set is rebuilt from this snapshot alone.
   state.privateIds = new Set();
+  state.parents = new Map();
+  state.textIds = new Set();
   var count = 0;
   return {
     get nodes() { return count; },
@@ -439,6 +506,8 @@ function fullSnapshotCtx(state) {
 // pin).
 export function sanitizeEventWith(state, event) {
   if (!isPlainObject(event)) return { state: state, event: null };
+  state.parents = state.parents || new Map();
+  state.textIds = state.textIds || new Set();
   var type = event.type;
 
   if (type === EV_DOM_CONTENT_LOADED || type === EV_LOAD) {
@@ -449,7 +518,7 @@ export function sanitizeEventWith(state, event) {
   if (type === EV_META) {
     var data = isPlainObject(event.data) ? event.data : {};
     var href = sanitizePageURL(data.href);
-    var next = { privateIds: state.privateIds, baseURL: href || state.baseURL };
+    var next = { ...state, baseURL: href || state.baseURL };
     return {
       state: next,
       event: {
@@ -464,6 +533,8 @@ export function sanitizeEventWith(state, event) {
     var fdata = isPlainObject(event.data) ? event.data : null;
     if (!fdata || !isPlainObject(fdata.node)) return { state: state, event: null };
     var ctx = fullSnapshotCtx(state);
+    indexTree(fdata.node, undefined, state);
+    propagatePrivacy(state);
     var doc = sanitizeDocumentNode(fdata.node, ctx);
     if (doc === null) return { state: state, event: null };
     var outData = { node: doc, initialOffset: {} };
@@ -474,7 +545,7 @@ export function sanitizeEventWith(state, event) {
       };
     }
     return {
-      state: { privateIds: state.privateIds, baseURL: state.baseURL },
+      state: state,
       event: { type: EV_FULL_SNAPSHOT, data: outData, timestamp: event.timestamp }
     };
   }

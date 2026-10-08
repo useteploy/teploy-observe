@@ -2,6 +2,7 @@
 #
 # First time:
 #   teploy setup          # installs Docker + Caddy on the server
+#   use the volume_ownership contract below for a fresh state directory
 #   teploy deploy         # builds image, ships it, switches traffic
 #
 # Subsequent deploys:
@@ -55,6 +56,12 @@ publish:
 # and 404s everything else, so the dashboard is not merely unrouted there —
 # it isn't listening on it.
 port: 3000
+
+# Teploy readiness must probe SQL/WAL health rather than the SPA fallback.
+health:
+  mode: http
+  path: /healthz
+
 platform: linux/amd64
 
 # Build mode: with no `image` set, Teploy builds from the repo Dockerfile.
@@ -215,8 +222,25 @@ env:
   OBSERVE_HOURLY_RETENTION_DAYS: "365"
   OBSERVE_SEED_DEMO: "false"
 
+# Storage ownership is provisioned before container start by the supported
+# CLI contract below, under its deployment fence, using root/passwordless sudo.
+# It accepts an empty root or an already matching populated root; it refuses
+# mismatched populated roots and validates parent/final symlinks.
+# To migrate an existing root-owned store, as root provision ONLY this directory:
+#   state=/deployments/observe/volumes/observe-state
+#   install -d -m 0700 -o 10001 -g 10001 "$state"
+#   find "$state" -xdev -exec chown -h 10001:10001 {} +
+# The second command preserves existing audit keys and WAL bytes and does not
+# follow symlinks or cross filesystem boundaries. Keep this path in sync with
+# app: above and Teploy's deployment directory if either is customized.
+# Do not make this directory world-writable or run the application as root.
 volumes:
   observe-state: /var/lib/observe
+volume_ownership:
+  observe-state:
+    uid: 10001
+    gid: 10001
+    mode: "0700"
 
 # Optional: Slack webhook on deploy success/failure.
 # notifications:

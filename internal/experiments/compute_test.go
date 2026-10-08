@@ -21,7 +21,7 @@ func addUsers(in *resultInputs, prefix, variant string, n int, ts int64) {
 func baseInputs(minSample int) resultInputs {
 	return resultInputs{
 		Exp: Experiment{ExperimentID: "e1", SiteID: "s", MinSample: minSample,
-			Variants: `[{"key":"control"},{"key":"b"},{"key":"c"}]`},
+			Variants: `[{"key":"control"},{"key":"b"}]`},
 		Cfg:       DefaultConfig(),
 		WindowMs:  72 * hourMs,
 		Events:    map[string][]metricEvent{},
@@ -45,6 +45,9 @@ func TestLegacyBinaryJSONUnchanged(t *testing.T) {
 	}
 	for ci, arms := range cases {
 		in := baseInputs(100)
+		if len(arms) == 3 {
+			in.Exp.Variants = `[{"key":"control"},{"key":"b"},{"key":"c"}]`
+		}
 		for ai, a := range arms {
 			addUsers(&in, names[ai], names[ai], int(a[0]), 1000)
 			for i := int64(0); i < a[1]; i++ {
@@ -54,7 +57,8 @@ func TestLegacyBinaryJSONUnchanged(t *testing.T) {
 		res := computeResults(in)
 		got := normalizeJSON(t, mustJSON(t, res), true)
 		want := normalizeJSON(t, []byte(goldens[ci]), false)
-		if len(arms) == 3 {
+		want["experiment"].(map[string]any)["variants"] = in.Exp.Variants
+		{
 			// The golden generator passed nil weights (no SRM block); the
 			// real pipeline derives uniform weights from the variants JSON.
 			delete(got["analysis"].(map[string]any), "srm")
@@ -150,6 +154,7 @@ func TestLegacyAddedFields(t *testing.T) {
 
 func TestContaminatedUsersExcluded(t *testing.T) {
 	in := baseInputs(1)
+	in.Exp.Variants = `[{"key":"control"},{"key":"b"},{"key":"c"}]`
 	addUsers(&in, "c", "control", 40, 1000)
 	addUsers(&in, "b", "b", 40, 1000)
 	// 5 users exposed to both arms (and one to all three) are contaminated.
@@ -170,15 +175,15 @@ func TestContaminatedUsersExcluded(t *testing.T) {
 		t.Fatalf("contaminated = %d, want 6", res.ContaminatedUsers)
 	}
 	for _, v := range res.Variants {
-		if v.Exposures != 40 {
+		if v.Variant != "c" && v.Exposures != 40 || v.Variant == "c" && v.Exposures != 0 {
 			t.Fatalf("%s exposures = %d, contaminated users must be excluded", v.Variant, v.Exposures)
 		}
 		if v.Conversions != 0 {
 			t.Fatalf("%s conversions = %d, contaminated conversions must be excluded", v.Variant, v.Conversions)
 		}
 	}
-	if len(res.Variants) != 2 {
-		t.Fatalf("variant c has only contaminated users and must vanish: %+v", res.Variants)
+	if len(res.Variants) != 3 || res.Analysis.HorizonMet || res.Winner != "" {
+		t.Fatalf("zero-exposure declared arm must remain and gate winner: %+v", res)
 	}
 }
 
@@ -252,6 +257,7 @@ func TestPeekingWarningAndOverride(t *testing.T) {
 // continuousInputs builds a mean-metric experiment with per-user purchases.
 func continuousInputs(n int, effect float64) resultInputs {
 	in := baseInputs(1)
+	in.Exp.Variants = `[{"key":"control"},{"key":"b"},{"key":"c"}]`
 	in.Cfg.MetricKind = KindMean
 	for _, arm := range []struct {
 		name string

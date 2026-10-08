@@ -191,13 +191,16 @@ func truncateUTF8(s string, limit int) string {
 // useful in tests.
 func Handler(buf *Buffer, salt string, siteSvc *sites.SiteService) neutron.HandlerFunc[IngestInput, IngestResponse] {
 	return func(ctx context.Context, input IngestInput) (IngestResponse, error) {
-		e, err := prepareEvent(ctx, input, salt, siteSvc)
+		e, err := prepareEvent(ctx, input, salt, optionalPrivacyLookup(siteSvc))
 		if err != nil {
 			return IngestResponse{}, err
 		}
 		if e == nil {
 			// Bot traffic: dropped silently with OK so bots don't retry.
 			return IngestResponse{OK: true}, nil
+		}
+		if err := buf.checkErasure(ctx, e); err != nil {
+			return IngestResponse{}, err
 		}
 		if err := buf.Push(*e); err != nil {
 			return IngestResponse{}, admissionError(err)
@@ -225,17 +228,26 @@ func admissionError(err error) error {
 	}
 }
 
+type privacyLookup interface {
+	PrivacyConfigChecked(context.Context, string) (string, bool, bool, error)
+}
+
 // prepareEvent validates and normalizes one input into a storage-ready
 // Event WITHOUT any admission side effect (AUD-010, round 2): BatchHandler
 // prepares every event first, then admits the survivors in ONE atomic
 // Buffer.PushBatch, so a mid-batch admission failure can never leave an
 // accepted prefix behind. A nil Event means "silently skip" (bot traffic).
-func prepareEvent(ctx context.Context, input IngestInput, salt string, siteSvc *sites.SiteService) (*Event, error) {
+func prepareEvent(ctx context.Context, input IngestInput, salt string, siteSvc privacyLookup) (*Event, error) {
+	return prepareEventWithMode(ctx, input, salt, siteSvc, false)
+}
+
+func prepareEventWithMode(ctx context.Context, input IngestInput, salt string, siteSvc privacyLookup, historical bool) (*Event, error) {
+
 	now := time.Now().UTC()
 	ip := ClientIPFromContext(ctx)
 	ua := UserAgentFromContext(ctx)
 
-	if IsBot(ua) {
+	if !historical && IsBot(ua) {
 		return nil, nil
 	}
 
@@ -293,10 +305,12 @@ func prepareEvent(ctx context.Context, input IngestInput, salt string, siteSvc *
 		privSalt := salt
 		rawOptIn := false
 		if siteSvc != nil {
-			if s, raw, ok := siteSvc.PrivacyConfig(ctx, siteID); ok {
-				privSalt = s
-				rawOptIn = raw
+			s, raw, ok, err := siteSvc.PrivacyConfigChecked(ctx, siteID)
+			if err != nil || !ok {
+				return nil, &neutron.AppError{Status: http.StatusServiceUnavailable,
+					Code: "privacy_unavailable", Title: "Service Unavailable", Detail: "site privacy policy unavailable, retry later"}
 			}
+			privSalt, rawOptIn = s, raw
 		}
 		distinctID = identity.MaybeHashDistinctID(input.DistinctID, privSalt, rawOptIn)
 	}
@@ -635,7 +649,7 @@ func BatchHandler(buf *Buffer, salt string, siteSvc *sites.SiteService, deduper 
 		prepared := make([]Event, 0, len(input.Events))
 		accepted, rejected := 0, 0
 		for _, ev := range input.Events {
-			e, err := prepareEvent(ctx, ev, salt, siteSvc)
+			e, err := prepareEvent(ctx, ev, salt, optionalPrivacyLookup(siteSvc))
 			if err != nil {
 				// A permanent per-event client error (4xx, e.g. a malformed
 				// event) must not fail the whole batch — that previously left
@@ -651,10 +665,17 @@ func BatchHandler(buf *Buffer, salt string, siteSvc *sites.SiteService, deduper 
 				return IngestResponse{}, err
 			}
 			if e == nil {
-				// Bot traffic: silently skipped, reported accepted so bots
-				// don't retry.
-				accepted++
+				// Bot traffic is skipped and explicitly counted as rejected.
+				rejected++
 				continue
+			}
+			if err := buf.checkErasure(ctx, e); err != nil {
+				var appErr *neutron.AppError
+				if errors.As(err, &appErr) && appErr.Status == 410 {
+					rejected++
+					continue
+				}
+				return IngestResponse{}, err
 			}
 			prepared = append(prepared, *e)
 		}
@@ -744,4 +765,11 @@ func BoundSite(ctx context.Context, requested string) (string, error) {
 		return "", ErrSiteMismatch
 	}
 	return authenticated, nil
+}
+
+func optionalPrivacyLookup(s *sites.SiteService) privacyLookup {
+	if s == nil {
+		return nil
+	}
+	return s
 }

@@ -114,7 +114,7 @@ test('full snapshot: private subtrees become opaque placeholders, ids preserved'
   assert.ok(head, 'head node kept');
   assert.equal(head.tagName, 'div');
   assert.deepEqual(head.childNodes, []);
-  assert.deepEqual(head.attributes, {});
+  assert.deepEqual(head.attributes, { 'data-observe-block': '' });
 
   // password input / textarea: placeholder divs
   for (const id of [15, 16]) {
@@ -141,7 +141,7 @@ test('full snapshot: attribute allowlist drops everything URL/token-bearing exce
   const blob = JSON.stringify(out);
 
   // attribute names that must never ride
-  for (const forbidden of ['data-observe-block', 'contenteditable', 'value', 'href', '"content"']) {
+  for (const forbidden of ['contenteditable', 'value', 'href', '"content"']) {
     assert.ok(!blob.includes(forbidden), `attribute/key ${forbidden} survived: ${blob.slice(0, 400)}`);
   }
 
@@ -290,7 +290,7 @@ test('incremental sources: input text dropped; coordinates and ids pass; style/l
   assert.equal(input.data.id, 15);
 
   const mouse = s.sanitize({ type: 3, timestamp: 2, data: { source: 2, type: 2, id: 9, x: 120, y: 40 } });
-  assert.deepEqual(mouse.data, { type: 2, id: 9, x: 120, y: 40 });
+  assert.deepEqual(mouse.data, { source: 2, type: 2, id: 9, x: 120, y: 40 });
 
   const move = s.sanitize({
     type: 3, timestamp: 3,

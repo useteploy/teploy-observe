@@ -2445,7 +2445,6 @@ Open items this slice deliberately leaves (programme O12 tails):
 - Spans/logs attribute JSONB cardinality at ingest (metrics + event
   properties are guarded; span/log attributes are not) — next slice
   candidate, same pattern applies.
-||||||| 00b141f
 ## O11 SDK-trust slice — 2026-09-23
 
 Branch `o11-sdk-trust`. Closes the programme's O11 line ("SDK and
@@ -2581,3 +2580,152 @@ replaced; go test ./cmd/observe ./internal/share green post-embed.
 Note: the representation-Vary framework fix (Neutron TS-33) is NOT in this
 build — propagating it requires a submodule pin bump plus vendor/ parity
 (X01), tracked with the @neutron-build/core 0.3.2 release wave.
+
+## 2026-10-07 — campaign reconciliation in progress
+
+The campaign has reconciled all 140 Observe issue-index entries against the
+current source, prepared patches, and earlier audit history. The source repairs
+cover admission, identity privacy, replay capture, SDK transport, analytics,
+WAL handling, exports, monitoring, MCP authorization, and dashboard flows.
+Older “deferred” statements above describe their original slices and do not
+replace the current per-finding implementation record. Logical person erasure
+continues to follow IDENTITY_MODEL_ADR; historical physical erasure is not a
+shipped product capability.
+
+This is an implementation update, not final acceptance. Package-level checks
+and a supported pinned ui-sync have passed, and the compiled share capability
+creation/revocation flow has been exercised against a real native engine.
+The initial serial native suite failed, exposing ingest cleanup, source-map,
+metric schema, and trace fixture tails. Repairs and their regression checks
+remain subject to the final source build, vet, unit, race, and serial live
+engine gates. A UI source change after the successful ui-sync requires a final
+refresh. Do not infer current-source acceptance from earlier passing checks.
+
+The Neutron pin remains eb19df636041550bc3ba267237563a0dee69fa3a. Application
+mitigations do not close upstream driver, framework, or transport findings.
+Container acceptance is still pending after the Docker storage I/O failure.
+The new named-volume ownership contract also requires acceptance against the
+immutable CLI consumer snapshot and real Linux filesystem. Signed release
+publication and adoption gates remain external work. No deployment, commit,
+or push has been performed by this lane.
+
+## 2026-10-07 — recovery finisher: three-slice landing review (analytics R5, security R5, UI R3)
+
+The recovery finisher session verified the stacked dirty tree on
+`2954c95` (642 paths), completed the unfinished analytics fix-R5 against the
+three withheld R4 objections, executed the full observe validation stack
+fresh, reviewed the pending security R5 and unreviewed UI R3 slices, and
+leaves the tree dirty and segmentable for the orchestrator. Evidence and
+receipts: `.audits/2026-10-07-final/teploy-observe-analytics-fix-r5.md` and
+`…-fix-r5-receipt.json` (private, not for commit), plus fresh validation
+logs `teploy-observe-r5-recovery-{unit,race,ui-tests}.log`.
+
+**Stack verification.** The three lane manifests segment the tree with zero
+path overlap: analytics R3 frozen aggregate 118 paths (matches the R5
+before-snapshot byte-for-byte except the five R4-objection targets, which
+held a partial unvalidated R5 start plus seven new helper/test files);
+security R5 receipt 42/42 paths byte-identical, and its complete patch still
+reverse-applies clean; UI R3 frozen patch `124f5e73…` byte-identical on
+58/59 paths (the single divergence is this session's test scope completion,
+below). The remaining ~500 dirty paths are inherited shared-lane work (the
+13:33 compiled-UI rebuild under `cmd/observe/ui/dist`, tracker, SDKs,
+fixtures, workflows, docs), plus the `Neutron` gitlink `eb19df63` and an
+untracked `internal/geo/generator/` pair.
+
+**Analytics fix-R5 (OBS26-44/45/50 tails of the R4 withheld review).**
+R4-1: `EventPropertyKeys` post-read work is now a cancellable kernel
+(`internal/query/property_keys.go`) with a bounded context-aware JSON reader,
+per-event/per-work explicit refusals and a cooperative merge sort with total
+tie ordering; `AttributionByModel` uses a shared context-aware kernel with
+checkpoints through copy/sort/credit/output. R4-2: goal counts are read as
+nullable wire text and strictly parsed (`internal/query/goal_counts.go`) —
+blank/NULL/missing/non-digit/negative/overflow refuse with contextual errors
+before rate/revenue construction while valid empty-window zero is preserved.
+R4-3: the LLM aggregates scan through an owned raw-text boundary
+(`internal/llm/aggregate_scan.go`) that rejects blank/NULL/missing/nonfinite/
+negative cells before any success DTO, proves emptiness before synthesizing
+explicit zeros, and counts invalid legacy numeric rows in SQL so sums cannot
+hide them; raw trace strings unchanged; pinned vendor untouched. Two
+finishing corrections were required beyond the dead lane's partial start:
+the candidate-key cardinality cap was re-keyed from the raw row budget to
+the expanded work budget (the ordinary 50-properties/event domain is an
+accepted complete answer per the R4 contract), and a cancelled
+`property-complete` checkpoint now discards the result. One further repair:
+the frozen R3 candidate did not compile — `internal/metrics/query.go` used
+`math` without importing it (first execution in this session; import added,
+no behavior change). A new independent review of the exact 125-path
+aggregate is still required before landing; native-engine fixtures skip
+without a DSN and fail closed under `OBSERVE_REQUIRE_NUCLEUS=1`.
+
+**Security R5 slice (SR4-01/OBS26-85, SR4-02/OBS26-89) — source verified,
+runtime open.** SR4-01: `activeMerges` streams every active latest-version
+mapping in one ordered SQL statement with no LIMIT; scan/tail faults never
+publish a partial map; ambiguous tenant collisions refuse; the merge cache
+reseed is revision-guarded (fetch time taken before the read) and lifecycle
+counts key on a SHA256 of the complete issue scope, so membership changes
+and unmerge invalidate inside the TTL. The separate assignment read cap is
+retained and renamed `maxAssignmentsPerSite` as a declared limitation.
+SR4-02: legacy adoption establishes/reuses the forward identity, then runs
+the same locked canonical path as `IndexError` and requires successful
+`IndexFaceted` acceptance BEFORE removing a differing legacy document;
+identity/reverse/index faults return before retirement, and search paths
+grow site-filtered prefixes until unique event/issue budgets fill, with
+reverse/hydration faults returned as errors and integer overflow refused.
+Verdict: both R4 source objections are repaired in the current source;
+unit-level R5 regressions pass, but the native 9,999/10,000/10,001 and
+canonical-survivor fixtures remain DSN-gated, so engine acceptance stays
+open exactly as the R5 handoff states.
+
+**UI R3 slice — source reviewed, dist freshness verified, X01 open.** The
+59-path delta carries the R2-UI-01..05 repairs (SDK absolute deadline,
+failure-vs-empty separation, catalogue reset/request ownership, the 21-field
+LLM provenance receiver with strict nonnegative decimal/integer validation
+and CSV partition exports, and the release-assurance architecture). The
+whole suite passes 143/143. One regression was found and repaired: the R3
+edit added `detailError`/`trendError` state to `dashboards.tsx` after the
+13:33 full-suite run, so `auditContracts.test.ts` (untracked, authored 13:31)
+failed its VM-contract extraction; its scope now provides the two state
+cells — no assertion weakened, product repair preserved; this is the single
+byte the UI slice now differs from the frozen patch. Freshness: the embedded
+`cmd/observe/ui/dist` is the supported 13:33 ui-sync rebuild (it includes
+the 13:04–13:33 source wave) but predates the R3 source delta (14:22+), so
+the served bundle does not yet contain the R3 UI repairs; per the X01
+ordering (approved pin/vendor parity first) it was deliberately NOT rebuilt
+— `scripts/ui-sync.sh` must be re-run by the parent after all source slices
+freeze, before any release claim.
+
+**Validation evidence (fresh, isolated GOCACHE, `-p=2`).** gofmt clean;
+`go build ./...` PASS; `go vet ./...` PASS; `go test -count=1 ./...` PASS
+57/57 packages; `go test -race -count=1` PASS on internal/query, llm,
+metrics, errors, tracing, cohorts and cmd/observe; `ui/ npm test` PASS
+143/143. Logs retained under `.audits/2026-10-07-final/`.
+
+**Slicing plan for the orchestrator (commit order; keep .audits and
+`internal/geo/generator/` decisions explicit).**
+
+1. *Analytics slice* — 125 paths: the 118-path R3 manifest
+   (`.audits/…/teploy-observe-analytics-fix-r5-before.json` path list) plus
+   `internal/query/{property_keys,goal_counts,review_r5_test,
+   review_r5_nucleus_test}.go` and
+   `internal/llm/{aggregate_scan,review_r5_test,review_r5_nucleus_test}.go`.
+   Includes this session's `metrics/query.go` import repair.
+2. *Security slice* — the 42-path receipt list
+   (`.audits/…/teploy-observe-security-fix-r5-receipt.json`), byte-identical
+   to the frozen R5; commit as reviewed.
+3. *UI source slice* — the 59-path `teploy-observe-ui-fix-r3.patch` list
+   (note `auditContracts.test.ts` includes the scope completion).
+4. *Inherited shared remainder* — the ~500 remaining dirty paths (dist
+   rebuild, tracker, SDKs, fixtures, workflows, docs, geo generator,
+   `Neutron` gitlink): land per-origin or hold for the X01 wave; the dist
+   will be superseded by the post-freeze ui-sync, so committing it now only
+   makes sense as its own labeled slice.
+
+**PROGRESS / continuation notes.** All six assigned steps completed in
+session. Remaining for the parent: new independent reviews of the analytics
+125-path aggregate and the UI 59-path delta; native-engine execution of the
+R5 DSN-gated fixtures (merge bounds, canonical FTS survivor, goal HTTP
+parity, LLM legacy numerics) when the USERSTOP engine hold lifts; the
+post-freeze `scripts/ui-sync.sh` run plus final build/test re-verification;
+and the pre-existing open gates (browser matrix, CSV, image, release
+assurance). No commits, pushes, engine starts, vendor/pin changes, or other
+repos were touched.

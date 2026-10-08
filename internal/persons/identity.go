@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // Bounds. Every limit is enforced before any write.
@@ -32,8 +33,6 @@ const (
 	MaxTombstonesPerSite = 50000
 	// resolveScanCap bounds the Go-side fold of a resolved list read.
 	resolveScanCap = 5000
-	// maxResolveHops bounds an alias chain walk.
-	maxResolveHops = 16
 )
 
 // Sentinel errors; handlers map them to HTTP statuses.
@@ -46,8 +45,7 @@ var (
 )
 
 var (
-	personKeyRe = regexp.MustCompile(`^[A-Za-z0-9_.:@+=-]{1,256}$`)
-	propKeyRe   = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_.$-]{0,63}$`)
+	propKeyRe = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_.$-]{0,63}$`)
 )
 
 // reservedPropertyKeys are rejected so the raw identify value (which the
@@ -56,10 +54,11 @@ var (
 // other key (including email) is the customer's choice.
 var reservedPropertyKeys = map[string]bool{"distinct_id": true, "user_id": true}
 
-// ValidatePersonKey checks a person_key shape (already-hashed id).
+// ValidatePersonKey accepts hashed keys and raw opt-in identities without rewriting them.
+// SQL binds these values; only the storage encoding and byte bound are constrained.
 func ValidatePersonKey(k string) error {
-	if !personKeyRe.MatchString(k) {
-		return fmt.Errorf("%w: person key must match %s", ErrInvalid, personKeyRe.String())
+	if k == "" || len(k) > MaxPersonKeyLen || !utf8.ValidString(k) || strings.ContainsRune(k, 0) {
+		return fmt.Errorf("%w: person key must be valid UTF-8, without NUL, and 1-%d bytes", ErrInvalid, MaxPersonKeyLen)
 	}
 	return nil
 }
@@ -105,12 +104,13 @@ type AliasRow struct {
 }
 
 // Resolver maps alias keys to their canonical person. Built once per read
-// from a bounded alias set; chains are followed with a hop cap and cycle
+// from a bounded alias set; chains are followed across the complete set with cycle
 // detection (a corrupt cycle resolves to the key itself - fail safe, no
 // merge).
 type Resolver struct {
 	direct  map[string]string
 	members map[string][]string
+	roots   map[string]string
 }
 
 // NewResolver builds a resolver from active alias edges.
@@ -119,6 +119,37 @@ func NewResolver(rows []AliasRow) *Resolver {
 	for _, a := range rows {
 		if a.AliasKey != "" && a.CanonicalKey != "" && a.AliasKey != a.CanonicalKey {
 			r.direct[a.AliasKey] = a.CanonicalKey
+		}
+	}
+	// Memoize complete paths once. Empty roots mark corrupt cycles and paths
+	// entering them, so even a 10,000-edge legacy chain resolves in linear work.
+	r.roots = make(map[string]string, len(r.direct))
+	for alias := range r.direct {
+		if _, known := r.roots[alias]; known {
+			continue
+		}
+		var path []string
+		seen := map[string]bool{}
+		cur, root := alias, ""
+		for {
+			if known, ok := r.roots[cur]; ok {
+				root = known
+				break
+			}
+			if seen[cur] {
+				break
+			}
+			next, ok := r.direct[cur]
+			if !ok {
+				root = cur
+				break
+			}
+			seen[cur] = true
+			path = append(path, cur)
+			cur = next
+		}
+		for _, key := range path {
+			r.roots[key] = root
 		}
 	}
 	r.members = make(map[string][]string)
@@ -142,20 +173,10 @@ func (r *Resolver) IsAlias(key string) bool { _, ok := r.direct[key]; return ok 
 
 // Canonical returns the root person key for key.
 func (r *Resolver) Canonical(key string) string {
-	cur := key
-	seen := map[string]bool{key: true}
-	for hops := 0; hops < maxResolveHops; hops++ {
-		next, ok := r.direct[cur]
-		if !ok {
-			return cur
-		}
-		if seen[next] {
-			return key // cycle: refuse to merge
-		}
-		seen[next] = true
-		cur = next
+	if root, ok := r.roots[key]; ok && root != "" {
+		return root
 	}
-	return key // chain too deep: refuse to merge
+	return key // service rejects corrupt cycles before exposing resolved reads
 }
 
 // Members returns every alias whose root is canonical (sorted, excluding

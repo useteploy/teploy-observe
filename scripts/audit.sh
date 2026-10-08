@@ -2,6 +2,35 @@
 # Full audit of T001-T022 completed tasks.
 # For each: verify backend API returns expected shape, UI dist contains feature code.
 
+# A missing source file is a failed check, never evidence of safety.
+source_lacks() {
+  [ -f "$2" ] && [ -r "$2" ] || return 1
+  grep -E "$1" "$2" >/dev/null
+  local result=$?
+  [ "$result" -eq 1 ]
+}
+
+change_password_updates() {
+  [ -f "$1" ] && [ -r "$1" ] || return 1
+  local body
+  body=$(sed -n '/^func .*ChangePassword(/,/^}/p' "$1") || return 1
+  [ -n "$body" ] || return 1
+  printf '%s\n' "$body" | grep -q 'INSERT INTO admin_users'
+  local result=$?
+  [ "$result" -eq 1 ]
+}
+
+# Run the source predicates in isolation for positive/negative test fixtures.
+if [ "${1:-}" = --source-check ]; then
+  case "${2:-}" in
+    H1) source_lacks 'escapeSQL' "$3" ;;
+    H2) source_lacks 'Sprintf.*INSERT' "$3" ;;
+    H12) change_password_updates "$3" ;;
+    *) exit 2 ;;
+  esac
+  exit $?
+fi
+
 BASE="${OBSERVE_BASE:-http://localhost:3000}"
 SITE="default"
 TOKEN=$(curl -s -X POST $BASE/api/v1/auth/login -H "Content-Type: application/json" \
@@ -401,9 +430,9 @@ check "meta CSS shipped" \
 echo "[H] Phase 1 hardening"
 
 check "H1 buffer.go has no escapeSQL" \
-  bash -c '! grep -q "escapeSQL" "$REPO"/internal/ingest/buffer.go'
+  source_lacks "escapeSQL" "$REPO/internal/ingest/buffer.go"
 check "H2 buffer.go has no Sprintf INSERT" \
-  bash -c '! grep -E "Sprintf.*INSERT" "$REPO"/internal/ingest/buffer.go > /dev/null'
+  source_lacks "Sprintf.*INSERT" "$REPO/internal/ingest/buffer.go"
 
 check "H3 disk queue package exists" \
   test -f "$REPO"/internal/ingest/queue.go
@@ -479,8 +508,8 @@ try:
 except urllib.error.HTTPError as e:
     sys.exit(0 if e.code == 401 else 1)"
 
-check "H12 ChangePassword UPDATE not INSERT" \
-  bash -c '! grep -A3 "ChangePassword" "$REPO"/internal/auth/auth.go | grep -q "INSERT INTO admin_users"'
+check "H12 ChangePassword has no direct INSERT" \
+  change_password_updates "$REPO/internal/auth/auth.go"
 
 # ================ Phase 2 differentiation checks (D1–D9) ================
 echo "[D] Phase 2 differentiation"

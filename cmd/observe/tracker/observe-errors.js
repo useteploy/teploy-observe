@@ -6,6 +6,8 @@
 
   var origin = script.src ? new URL(script.src).origin : '';
   var endpoint = script.getAttribute('data-endpoint') || origin + '/api/v1/errors';
+  var apiKey = script.getAttribute('data-api-key') || '';
+  var delivery = { status: 'idle', httpStatus: 0 };
   var siteId = script.getAttribute('data-site-id') || '';
   var release = script.getAttribute('data-release') || '';
   var environment = script.getAttribute('data-environment') || '';
@@ -41,14 +43,42 @@
   ['log', 'warn', 'error', 'info', 'debug'].forEach(function(level) {
     origConsole[level] = console[level];
     console[level] = function() {
-      var args = Array.prototype.slice.call(arguments);
-      var msg = args.map(function(a) {
-        return typeof a === 'string' ? a : JSON.stringify(a);
-      }).join(' ');
-      addBreadcrumb('console', 'console', msg.substring(0, 256));
-      origConsole[level].apply(console, arguments);
+      try {
+        var args = Array.prototype.slice.call(arguments);
+        var msg = args.map(safeString).join(' ');
+        addBreadcrumb('console', 'console', msg.substring(0, 256));
+      } catch (e) { /* instrumentation must not interrupt application logging */ }
+      return origConsole[level].apply(console, arguments);
     };
   });
+
+  function safeString(value) {
+    // Bound object traversal as well as output. Do not invoke getters or
+    // toJSON hooks just to collect a breadcrumb from application objects.
+    var remaining = 32;
+    var seen = [];
+    function bounded(item, depth) {
+      if (typeof item === 'string') return item.slice(0, 256);
+      if (item === null || typeof item === 'boolean' || typeof item === 'number') return item;
+      if (typeof item !== 'object') return String(item).slice(0, 256);
+      if (depth >= 3 || remaining <= 0) return '[truncated]';
+      if (seen.indexOf(item) !== -1) return '[circular]';
+      seen.push(item);
+      var out = Object.create(null);
+      for (var name in item) {
+        if (remaining-- <= 0) break;
+        var descriptor = Object.getOwnPropertyDescriptor(item, name);
+        if (!descriptor) continue;
+        out[name.slice(0, 64)] = 'value' in descriptor ? bounded(descriptor.value, depth + 1) : '[getter]';
+      }
+      seen.pop();
+      return out;
+    }
+    try {
+      if (typeof value === 'string') return value.slice(0, 2048);
+      return JSON.stringify(bounded(value, 0)).slice(0, 2048);
+    } catch (e) { return '[unserializable]'; }
+  }
 
   // Click breadcrumbs
   document.addEventListener('click', function(e) {
@@ -224,14 +254,41 @@
     } catch (e) { /* localStorage may be disabled */ }
 
     var body = JSON.stringify(payload);
-    if (navigator.sendBeacon) {
-      navigator.sendBeacon(endpoint, new Blob([body], { type: 'application/json' }));
-    } else {
-      var xhr = new XMLHttpRequest();
-      xhr.open('POST', endpoint, true);
-      xhr.setRequestHeader('Content-Type', 'application/json');
-      xhr.send(body);
+    if (!apiKey) { delivery = { status: 'missing-key', httpStatus: 0 }; return; }
+    // Beacons cannot carry the mandatory ingest header. Retry only transient
+    // failures, once, using the same event_id for server-side deduplication.
+    function complete(status, attempt) {
+      delivery = { status: status >= 200 && status < 300 ? 'sent' : 'rejected', httpStatus: status };
+      if (attempt === 0 && (status === 0 || status === 429 || status >= 500)) {
+        delivery.status = 'retrying';
+        setTimeout(function () { send(1); }, 1000);
+      }
     }
+    function send(attempt) {
+      delivery = { status: 'sending', httpStatus: 0 };
+      if (typeof origFetch === 'function') {
+        try {
+          origFetch(endpoint, { method: 'POST', headers: {
+            'Content-Type': 'application/json', 'X-API-Key': apiKey
+          }, body: body, keepalive: true }).then(function (response) {
+            complete(response.status, attempt);
+          }, function () { complete(0, attempt); });
+        } catch (e) { complete(0, attempt); }
+      } else {
+        try {
+          var xhr = new XMLHttpRequest();
+          xhr.open('POST', endpoint, true);
+          xhr.setRequestHeader('Content-Type', 'application/json');
+          xhr.setRequestHeader('X-API-Key', apiKey);
+          xhr.onload = function () { complete(xhr.status, attempt); };
+          xhr.onerror = function () { complete(0, attempt); };
+          xhr.ontimeout = xhr.onerror;
+          xhr.timeout = 10000;
+          xhr.send(body);
+        } catch (e) { complete(0, attempt); }
+      }
+    }
+    send(0);
   }
 
   // --- Global Error Handlers ---
@@ -247,7 +304,7 @@
 
   window.addEventListener('unhandledrejection', function(event) {
     var reason = event.reason;
-    if (!reason) return;
+    if (reason === undefined) return;
     var type, value, stack;
     if (reason instanceof Error) {
       type = reason.name || 'UnhandledRejection';
@@ -255,7 +312,7 @@
       stack = reason.stack || '';
     } else {
       type = 'UnhandledRejection';
-      value = typeof reason === 'string' ? reason : JSON.stringify(reason);
+      value = safeString(reason);
       stack = '';
     }
     reportError(type, value, stack, false, 'unhandledrejection');
@@ -264,6 +321,7 @@
   // --- Public API ---
 
   window.observeErrors = {
+    getDeliveryStatus: function() { return { status: delivery.status, httpStatus: delivery.httpStatus }; },
     captureException: function(err, extra) {
       if (!err) return;
       var type = err.name || 'Error';

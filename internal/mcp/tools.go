@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"github.com/useteploy/teploy-observe/internal/aiquery"
 	"sort"
 	"strings"
 )
@@ -197,6 +198,9 @@ func Tools(b Backend) []Tool {
 			Run: func(ctx context.Context, args map[string]interface{}) (string, error) {
 				question, err := strArg(args, "question")
 				if err != nil {
+					return "", err
+				}
+				if err := aiquery.ValidateQuestion(question); err != nil {
 					return "", err
 				}
 				// The model is shown the ALLOWLIST as its schema, not the real

@@ -176,9 +176,7 @@ func o10Bind(db *nucleus.Client, clk *o10Clock) (*AlertService, *incidents.Servi
 	inc := incidents.NewService(db)
 	hooks := NewWebhookService(db, logger)
 	maint := NewMaintenanceService(db, logger)
-	notify := NewNotifier(db, logger, maint, func(ctx context.Context, incidentID, kind, actor, detail string) error {
-		return inc.RecordEvent(ctx, incidentID, kind, actor, detail)
-	})
+	notify := NewNotifier(db, logger, maint, inc.RecordEventTx)
 	notify.client = &http.Client{Timeout: 5 * time.Second}
 	alerts := NewAlertService(db, logger, hooks, inc, notify)
 	alerts.now = clk.now

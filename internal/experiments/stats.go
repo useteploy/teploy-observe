@@ -160,8 +160,8 @@ func chiSquareOmnibus(exposures, conversions []int64) ChiSquareResult {
 		if exposures[i] == 0 {
 			continue
 		}
-		for _, observed := range []int64{conversions[i], exposures[i] - conversions[i]} {
-			expected := float64(exposures[i]) * map[bool]float64{true: overall, false: 1 - overall}[observed == conversions[i]]
+		for column, observed := range []int64{conversions[i], exposures[i] - conversions[i]} {
+			expected := float64(exposures[i]) * map[bool]float64{true: overall, false: 1 - overall}[column == 0]
 			if expected > 0 && expected < 5 {
 				res.SmallCells = true
 			}

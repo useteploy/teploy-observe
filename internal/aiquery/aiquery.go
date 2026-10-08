@@ -7,7 +7,7 @@
 //  1. Admin-supplied API key: Observe never sees user credentials.
 //  2. LLM output is post-processed by explorer.classifyReadOnlySQL so
 //     write statements are rejected even if the model drafts one.
-//  3. Rate limit applies per user (enforced at the HTTP layer).
+//  3. Admission applies per verified caller and across all transports (admission.go).
 package aiquery
 
 import (
@@ -51,6 +51,8 @@ type Service struct {
 	db     *nucleus.Client
 	logger *slog.Logger
 	client *http.Client
+	// Typed config seam for bounded provider tests; production loads Nucleus.
+	generateConfig func(context.Context) (Config, error)
 }
 
 // NewService creates an AI query service.
@@ -157,7 +159,16 @@ type GenerateResult struct {
 // markdown fences but has NOT been validated — callers must run it
 // through the explorer lexer before executing.
 func (s *Service) Generate(ctx context.Context, question, schemaCard string) (GenerateResult, error) {
-	cfg, err := s.loadFullConfig(ctx)
+	release, err := admit(ctx, question)
+	if err != nil {
+		return GenerateResult{}, err
+	}
+	defer release()
+	loadConfig := s.generateConfig
+	if loadConfig == nil {
+		loadConfig = s.loadFullConfig
+	}
+	cfg, err := loadConfig(ctx)
 	if err != nil {
 		return GenerateResult{}, err
 	}

@@ -489,6 +489,11 @@ func validateCron(c CronMonitor) error {
 	if len(c.Schedule) > 64 {
 		return fmt.Errorf("monitoring: schedule is at most 64 characters")
 	}
+	if strings.TrimSpace(c.Schedule) != "" {
+		if _, ok := NextScheduledRun(c.Schedule, time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)); !ok {
+			return fmt.Errorf("monitoring: unsupported or impossible UTC schedule")
+		}
+	}
 	if c.GracePeriod < 0 || c.GracePeriod > 86400 {
 		return fmt.Errorf("monitoring: grace_period must be between 0 and 86400 seconds")
 	}
@@ -633,20 +638,9 @@ func (s *CronService) insertCheckin(ctx context.Context, cron CronMonitor, statu
 // on.
 const checkinHookTimeout = 15 * time.Second
 
-// CheckMissed returns the enabled cron monitors whose next run is overdue.
-//
-// A monitor is overdue when now is past `last check-in + its schedule's period +
-// its grace period`. The period term is the whole point: this used to compare
-// against the grace period alone, so a cron that legitimately runs hourly with a
-// five-minute grace was "missed" for fifty-five minutes out of every hour. Its
-// incident opened, the next hourly ping closed it, and the cycle repeated — one
-// incident per cron run, forever. Ten monitors produced 12,398 incident rows
-// that way on the live instance, which is what buried the analytics chart under
-// overlapping markers.
-//
-// A schedule that cannot be read as a period contributes 0, which is exactly the
-// old behaviour, so an unparseable or empty schedule still alerts on grace alone.
-// A monitor that has never checked in is measured from its creation time.
+// CheckMissed returns enabled monitors past their actual next UTC run plus
+// grace. Invalid historical schedules are logged and skipped; empty schedules
+// retain their explicit grace-only mode.
 func (s *CronService) CheckMissed(ctx context.Context) ([]CronMonitor, error) {
 	crons, err := nucleus.Query[CronMonitor](ctx, s.db.SQL(),
 		`SELECT cron_id, tenant_id, site_id, name, slug, schedule,
@@ -673,23 +667,17 @@ func (s *CronService) CheckMissed(ctx context.Context) ([]CronMonitor, error) {
 		if last == 0 {
 			continue
 		}
-		if nowMs > last+DueAfterMs(c.Schedule, c.GracePeriod) {
+		deadline, ok := CronDeadline(c.Schedule, time.UnixMilli(last), c.GracePeriod)
+		if !ok {
+			s.logger.Error("monitoring: unsupported cron schedule", "cron", c.CronID)
+			continue
+		}
+		if nowMs > deadline.UnixMilli() {
 			missed = append(missed, c)
 		}
 	}
 
 	return missed, nil
-}
-
-// DueAfterMs is how long after a check-in a monitor may stay silent before it
-// counts as missed: its schedule's period plus its grace period. Exported so the
-// detector's arithmetic is testable without a database.
-func DueAfterMs(schedule string, graceSecs int) int64 {
-	if graceSecs <= 0 {
-		graceSecs = 300
-	}
-	period, _ := SchedulePeriod(schedule)
-	return period.Milliseconds() + int64(graceSecs)*1000
 }
 
 // lastCheckinMs is the timestamp of the monitor's most recent check-in, or 0 if

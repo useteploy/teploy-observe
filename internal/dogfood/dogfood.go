@@ -169,6 +169,9 @@ type statusRecorder struct {
 	wrote  bool
 }
 
+// Unwrap lets ResponseController reach flush, deadline and hijack support.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 func (r *statusRecorder) WriteHeader(code int) {
 	if !r.wrote {
 		r.status = code

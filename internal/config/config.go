@@ -172,6 +172,23 @@ func (c Config) Validate() error {
 	if c.RateLimit < 1 {
 		return fmt.Errorf("OBSERVE_RATE_LIMIT must be >= 1, got %d", c.RateLimit)
 	}
+	// Bound every day count before any conversion to time.Duration.
+	// 100,000 days is below duration's maximum (~106,751 days).
+	for name, days := range map[string]int{
+		"OBSERVE_RAW_RETENTION_DAYS":            c.RawRetentionDays,
+		"OBSERVE_HOURLY_RETENTION_DAYS":         c.HourlyRetentionDays,
+		"OBSERVE_LLM_RETENTION_DAYS":            c.LLMRetentionDays,
+		"OBSERVE_METRICS_RETENTION_DAYS":        c.MetricsRetentionDays,
+		"OBSERVE_INFRA_RETENTION_DAYS":          c.InfraRetentionDays,
+		"OBSERVE_UPTIME_RETENTION_DAYS":         c.UptimeRetentionDays,
+		"OBSERVE_ERROR_INBOX_RETENTION_DAYS":    c.ErrorInboxRetentionDays,
+		"OBSERVE_REPLAY_BATCHES_RETENTION_DAYS": c.ReplayBatchesRetentionDays,
+		"OBSERVE_DERIVED_OUTBOX_RETENTION_DAYS": c.DerivedOutboxRetentionDays,
+	} {
+		if days > 100000 {
+			return fmt.Errorf("%s must be <= 100000 days", name)
+		}
+	}
 	if c.RawRetentionDays < 1 {
 		return fmt.Errorf("OBSERVE_RAW_RETENTION_DAYS must be >= 1, got %d", c.RawRetentionDays)
 	}

@@ -62,6 +62,9 @@ const DefaultKeepReleases = 10
 // `b:c`, silently overwriting another logical map. Reads fall back to the
 // legacy key so pre-upgrade maps stay resolvable until pruned.
 func (s *SourceMapService) Upload(ctx context.Context, siteID, release, filename string, mapData []byte) error {
+	if _, err := ParseSourceMap(mapData); err != nil {
+		return err
+	}
 	kv := s.db.KV()
 	// Store under the canonical name (no query/fragment/host/leading slash)
 	// so lookups can match a frame's full URL, path or basename to it.
@@ -289,13 +292,20 @@ func loadSourceMap(ctx context.Context, kv kvGetter, siteID, release, filename s
 		return nil, fmt.Errorf("read source map: %w", err)
 	}
 	if data == nil {
-		if legacy, lerr := kv.Get(ctx, kvKey(siteID, release, filename)); lerr == nil && legacy != nil {
-			data = legacy
+		legacy, lerr := kv.Get(ctx, kvKey(siteID, release, filename))
+		if lerr != nil {
+			return nil, fmt.Errorf("read legacy source map: %w", lerr)
 		}
+		data = legacy
 	}
 	if data == nil {
 		return nil, nil
 	}
+	return ParseSourceMap(data)
+}
+
+// ParseSourceMap is the shared upload and resolution admission contract.
+func ParseSourceMap(data []byte) (*SourceMapMeta, error) {
 	if len(data) > maxSourceMapBytes {
 		return nil, fmt.Errorf("source map exceeds the %d byte parse budget", maxSourceMapBytes)
 	}

@@ -228,10 +228,10 @@ NOT supported / honest limits:
   Nucleus are unproven. Erasure therefore hides and de-identifies the person
   at the persons surface only; the hashed `distinct_id` still sits on event
   rows, and in session/funnel/retention aggregates, until retention expires
-  them. A new event with the same identify value re-creates a visible
-  person, because ingest does not consult tombstones (only property writes
-  do). A true erasure that removes event rows needs an upstream-verified
-  per-key DELETE plus ingest-side tombstone checks; neither is built.
+  them. New live, batch and historical event admissions consult tombstones after
+  deriving the stored identity key, refuse erased identities, and fail closed
+  when that lookup fails. Physical event removal remains outside this logical
+  erasure contract and needs verified per-key deletion and multi-surface cleanup.
 - Auto-merge on identify, pre-identify anonymous linkage, un-merge, and
   person-level funnels/retention remain residual scope (section 7).
 

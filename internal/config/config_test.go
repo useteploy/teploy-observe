@@ -28,6 +28,7 @@ func TestValidateRejectsBrokenNumericConfig(t *testing.T) {
 		{"zero metrics retention", func(c *Config) { c.MetricsRetentionDays = 0 }, "OBSERVE_METRICS_RETENTION_DAYS"},
 		{"zero infra retention", func(c *Config) { c.InfraRetentionDays = 0 }, "OBSERVE_INFRA_RETENTION_DAYS"},
 		{"negative uptime retention", func(c *Config) { c.UptimeRetentionDays = -1 }, "OBSERVE_UPTIME_RETENTION_DAYS"},
+		{"overflow retention", func(c *Config) { c.RawRetentionDays = 106752 }, "OBSERVE_RAW_RETENTION_DAYS"},
 		{"zero retention", func(c *Config) { c.RawRetentionDays = 0 }, "OBSERVE_RAW_RETENTION_DAYS"},
 		{"malformed integer", func(c *Config) {
 			c.parseErr = fmt.Errorf("OBSERVE_BUFFER_SIZE must be an integer, got %q", "big")

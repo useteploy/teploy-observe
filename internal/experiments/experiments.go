@@ -22,8 +22,9 @@ type ExperimentService struct {
 	// Optional per-site privacy lookup for EventDistinctID; nil means the
 	// helper falls back to the global salt (matches the ingest path for
 	// unknown sites).
-	privacy PrivacyLookup
-	salt    string
+	privacy        PrivacyLookup
+	privacyChecked func(context.Context, string) (string, bool, bool, error)
+	salt           string
 }
 
 // PrivacyLookup resolves a site's distinct_id hashing config: the per-site
@@ -35,6 +36,13 @@ type PrivacyLookup func(ctx context.Context, siteID string) (salt string, rawOpt
 // by EventDistinctID. Returns the receiver for fluent boot-time setup.
 func (s *ExperimentService) WithPrivacy(lookup PrivacyLookup, fallbackSalt string) *ExperimentService {
 	s.privacy = lookup
+	s.salt = fallbackSalt
+	return s
+}
+
+// WithPrivacyChecked preserves policy-store failures instead of changing identity salts.
+func (s *ExperimentService) WithPrivacyChecked(lookup func(context.Context, string) (string, bool, bool, error), fallbackSalt string) *ExperimentService {
+	s.privacyChecked = lookup
 	s.salt = fallbackSalt
 	return s
 }
@@ -54,16 +62,29 @@ func (s *ExperimentService) WithPrivacy(lookup PrivacyLookup, fallbackSalt strin
 // endpoints from the start. Stored values are deliberately not rewritten
 // (D5: no silent history rewrites).
 func (s *ExperimentService) EventDistinctID(ctx context.Context, siteID, rawUserID string) string {
+	id, _ := s.EventDistinctIDChecked(ctx, siteID, rawUserID)
+	return id
+}
+
+// EventDistinctIDChecked returns no identity when the site's policy cannot be read.
+// Exposure/conversion rows retain their documented raw user_id contract.
+func (s *ExperimentService) EventDistinctIDChecked(ctx context.Context, siteID, rawUserID string) (string, error) {
 	if rawUserID == "" {
-		return ""
+		return "", nil
 	}
 	salt, rawOptIn := s.salt, false
-	if s.privacy != nil {
+	if s.privacyChecked != nil {
+		ps, raw, found, err := s.privacyChecked(ctx, siteID)
+		if err != nil || !found {
+			return "", fmt.Errorf("experiment identity policy unavailable")
+		}
+		salt, rawOptIn = ps, raw
+	} else if s.privacy != nil {
 		if ps, raw, ok := s.privacy(ctx, siteID); ok {
 			salt, rawOptIn = ps, raw
 		}
 	}
-	return identity.MaybeHashDistinctID(rawUserID, salt, rawOptIn)
+	return identity.MaybeHashDistinctID(rawUserID, salt, rawOptIn), nil
 }
 
 func NewExperimentService(db *nucleus.Client) *ExperimentService {
@@ -139,7 +160,10 @@ func (s *ExperimentService) Create(ctx context.Context, siteID, name, flagKey, g
 	id := genID()
 	now := time.Now().UTC()
 	nowMs := strconv.FormatInt(now.UnixMilli(), 10)
-	if minSample <= 0 {
+	if err := ValidateExperimentDefinition(variants, minSample); err != nil {
+		return nil, err
+	}
+	if minSample == 0 {
 		minSample = 100
 	}
 
@@ -414,33 +438,6 @@ func timeMsOrZero(t time.Time) int64 {
 	return t.UnixMilli()
 }
 
-// allocationWeights extracts the declared arm allocation from the variants
-// JSON ("rollout_pct" or "weight" per entry, normalized by the caller's GoF)
-// and returns a slice matching the arms' order when every arm is covered;
-// nil when the JSON does not declare weights for all arms (uniform assumed).
-func allocationWeights(variantsJSON string, armCount int) []float64 {
-	if variantsJSON == "" || armCount == 0 {
-		return nil
-	}
-	var vs []struct {
-		Key        string  `json:"key"`
-		RolloutPct float64 `json:"rollout_pct"`
-		Weight     float64 `json:"weight"`
-	}
-	if err := json.Unmarshal([]byte(variantsJSON), &vs); err != nil || len(vs) != armCount {
-		return nil
-	}
-	weights := make([]float64, len(vs))
-	for i, v := range vs {
-		if v.Weight > 0 {
-			weights[i] = v.Weight
-		} else {
-			weights[i] = v.RolloutPct
-		}
-	}
-	return weights
-}
-
 // controlKey returns the key of the control variant: the one keyed "control"
 // if present, else the first declared variant. Empty if variantsJSON is blank
 // or unparseable.
@@ -484,4 +481,34 @@ func genID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// ValidateExperimentDefinition refuses inert or ambiguous arm declarations.
+func ValidateExperimentDefinition(raw string, minSample int) error {
+	if minSample < 0 || minSample > maxPlannedSample {
+		return fmt.Errorf("min_sample out of range")
+	}
+	var arms []struct {
+		Key        string  `json:"key"`
+		RolloutPct float64 `json:"rollout_pct"`
+		Weight     float64 `json:"weight"`
+	}
+	if err := json.Unmarshal([]byte(raw), &arms); err != nil || len(arms) < 2 || len(arms) > 20 {
+		return fmt.Errorf("variants must be a JSON array of 2 to 20 keyed arms")
+	}
+	seen := map[string]bool{}
+	allocated := 0
+	for _, a := range arms {
+		if a.Key == "" || seen[a.Key] || a.RolloutPct < 0 || a.RolloutPct > 100 || a.Weight < 0 || a.Weight > 1e9 {
+			return fmt.Errorf("variants require unique nonempty keys and positive allocations")
+		}
+		seen[a.Key] = true
+		if a.Weight > 0 || a.RolloutPct > 0 {
+			allocated++
+		}
+	}
+	if allocated != 0 && allocated != len(arms) {
+		return fmt.Errorf("all arms must have positive allocation weights, or all omit weights for uniform allocation")
+	}
+	return nil
 }

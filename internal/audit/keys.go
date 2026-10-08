@@ -147,27 +147,27 @@ func LoadKeyring(env KeyEnv) (*Keyring, error) {
 	// rotation procedure moves exactly such keys here).
 	var historical [][]byte
 
-	for _, entry := range strings.Split(env.KeyringSpec, ",") {
+	for pos, entry := range strings.Split(env.KeyringSpec, ",") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
 		}
 		id, b64, ok := strings.Cut(entry, ":")
 		if !ok {
-			return nil, fmt.Errorf("OBSERVE_AUDIT_KEYRING entry %q is not id:base64key", entry)
+			return nil, fmt.Errorf("OBSERVE_AUDIT_KEYRING entry %d is not id:base64key", pos+1)
 		}
 		id = strings.TrimSpace(id)
 		if len(id) < 1 || len(id) > 32 || !isKeyIDShape(id) {
-			return nil, fmt.Errorf("OBSERVE_AUDIT_KEYRING id %q must be 1-32 chars of a-z0-9", id)
+			return nil, fmt.Errorf("OBSERVE_AUDIT_KEYRING entry %d id must be 1-32 chars of a-z0-9", pos+1)
 		}
-		km, err := parseKeyMaterial(fmt.Sprintf("OBSERVE_AUDIT_KEYRING entry %q", id), b64)
+		km, err := parseKeyMaterial(fmt.Sprintf("OBSERVE_AUDIT_KEYRING entry %d", pos+1), b64)
 		if err != nil {
 			return nil, err
 		}
 		if km.ID != id {
 			// A mistyped rotation entry would silently fail to verify
 			// every row it should cover; the id must BE the derived id.
-			return nil, fmt.Errorf("OBSERVE_AUDIT_KEYRING entry %q: id does not match the key material (derived id is %s)", id, km.ID)
+			return nil, fmt.Errorf("OBSERVE_AUDIT_KEYRING entry %d: id does not match the key material", pos+1)
 		}
 		if err := kr.putVerificationKey(id, km.Key); err != nil {
 			return nil, err

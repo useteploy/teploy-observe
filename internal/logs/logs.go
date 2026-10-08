@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -77,6 +78,7 @@ type Log struct {
 
 // LogInput is the payload accepted for log ingestion.
 type LogInput struct {
+	TimestampNs int64          `json:"timestamp_ns,omitempty"`
 	SiteID      string         `json:"site_id"`
 	Level       string         `json:"level"`
 	Message     string         `json:"message"`
@@ -108,7 +110,10 @@ func (s *LogService) prepareLog(ctx context.Context, input LogInput) (*preparedL
 	// A drop/sample rule that returns keep=false skips the insert silently
 	// (no error to the client). SiteID must already be resolved by the caller.
 	if s.pipelines != nil {
-		msg, attrs, keep := s.pipelines.ProcessLog(ctx, input.SiteID, input.Message, input.Attributes)
+		msg, attrs, keep, err := s.pipelines.processLog(ctx, input.SiteID, input.Message, input.Attributes)
+		if err != nil {
+			return nil, err
+		}
 		if !keep {
 			return nil, nil
 		}
@@ -131,6 +136,12 @@ func (s *LogService) prepareLog(ctx context.Context, input LogInput) (*preparedL
 	}
 
 	now := time.Now().UTC()
+	if input.TimestampNs < 0 || input.TimestampNs > now.Add(24*time.Hour).UnixNano() {
+		return nil, fmt.Errorf("invalid log event timestamp")
+	}
+	if input.TimestampNs != 0 {
+		now = time.Unix(0, input.TimestampNs).UTC()
+	}
 	return &preparedLog{
 		id:        id,
 		input:     input,
@@ -209,6 +220,9 @@ func (s *LogService) IngestLogs(ctx context.Context, inputs []LogInput) (LogBatc
 	for _, input := range inputs {
 		p, err := s.prepareLog(ctx, input)
 		if err != nil {
+			if errors.Is(err, ErrPipelineUnavailable) {
+				return LogBatchResult{}, err
+			}
 			result.Rejected++
 			continue
 		}

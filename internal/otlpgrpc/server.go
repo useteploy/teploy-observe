@@ -78,8 +78,10 @@ type Limiter interface {
 // classified by the server: wrap permanent client errors with Invalid;
 // everything else is treated as retryable storage failure (Unavailable).
 type Ingesters struct {
-	Traces  func(ctx context.Context, siteID string, req *tracepb.ExportTraceServiceRequest) error
-	Metrics func(ctx context.Context, siteID string, req *metricspb.ExportMetricsServiceRequest) error
+	// MetricsResult reports rejected points; preferred over the legacy Metrics sink.
+	MetricsResult func(ctx context.Context, siteID string, req *metricspb.ExportMetricsServiceRequest) (int, error)
+	Traces        func(ctx context.Context, siteID string, req *tracepb.ExportTraceServiceRequest) error
+	Metrics       func(ctx context.Context, siteID string, req *metricspb.ExportMetricsServiceRequest) error
 	// Logs also returns the number of records the service rejected, reported
 	// as partial_success.rejected_log_records.
 	Logs func(ctx context.Context, siteID string, req *logspb.ExportLogsServiceRequest) (rejected int, err error)
@@ -158,6 +160,7 @@ func New(cfg Config, deps Deps) (*Server, error) {
 	s := &Server{cfg: cfg, deps: deps, log: cfg.Logger}
 
 	opts := []grpc.ServerOption{
+		grpc.ForceServerCodec(admissionCodec{}),
 		grpc.MaxRecvMsgSize(cfg.MaxRecvMsgSize),
 		grpc.MaxConcurrentStreams(cfg.MaxConcurrentStreams),
 		grpc.MaxHeaderListSize(cfg.MaxHeaderListSize),
@@ -385,10 +388,21 @@ type metricsService struct {
 }
 
 func (m *metricsService) Export(ctx context.Context, req *metricspb.ExportMetricsServiceRequest) (*metricspb.ExportMetricsServiceResponse, error) {
-	if err := mapIngestErr(ctx, m.s.deps.Ingester.Metrics(ctx, siteFrom(ctx), req)); err != nil {
+	var rejected int
+	var err error
+	if sink := m.s.deps.Ingester.MetricsResult; sink != nil {
+		rejected, err = sink(ctx, siteFrom(ctx), req)
+	} else {
+		err = m.s.deps.Ingester.Metrics(ctx, siteFrom(ctx), req)
+	}
+	if err := mapIngestErr(ctx, err); err != nil {
 		return nil, err
 	}
-	return &metricspb.ExportMetricsServiceResponse{}, nil
+	resp := &metricspb.ExportMetricsServiceResponse{}
+	if rejected > 0 {
+		resp.PartialSuccess = &metricspb.ExportMetricsPartialSuccess{RejectedDataPoints: int64(rejected), ErrorMessage: "points rejected by admission policy"}
+	}
+	return resp, nil
 }
 
 type logsService struct {

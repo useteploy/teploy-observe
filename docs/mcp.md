@@ -88,7 +88,7 @@ The rules, in `internal/mcp/allowlist.go`:
 
 1. Every table named after `FROM` or `JOIN` — at any nesting depth, in any
    subquery, CTE or set operation — must be on the allowlist.
-2. Every column must be on the allowlist for one of the tables the query reads.
+2. Every column must be on the allowlist for its resolved input relation. Output aliases never grant permission to read withheld input columns. CTE and derived projections are checked independently.
    A column left off is unreachable even though its table is allowed: that is
    how `sites.session_salt`, `cron_monitors.ping_token` and
    `feature_flags.targeting` stay out.
@@ -162,12 +162,12 @@ A read-only token does not merely have mutating tools hidden from
 
 **Every MCP call is recorded** in Observe's append-only, tamper-evident audit
 trail (**Settings → Audit**, or `GET /api/v1/audit`), alongside every other
-admin action. One event per call, carrying:
+admin action. A durable `started` intent is required before a permitted tool executes, followed by a separate completion event. An unavailable intent refuses execution; an unavailable completion withholds the result and reports the audit failure. Records carry:
 
 - `actor` — the token id; `actor_type` — `agent`
 - `action` — `mcp.<tool_name>` (`mcp.auth` for a rejected credential)
 - `target` — the token's name
-- `result` — `success`, `failure` or `denied`
+- `result` — `started`, `success`, `failure` or `denied`
 - `source_ip`, `user_agent`
 - `metadata` — the tool, the token id/name/role, the arguments as given
   (truncated at 2 KB), and the reason for any refusal
@@ -176,7 +176,17 @@ Denials are recorded, not just successes: a refused query, a read-only token
 reaching for a mutating tool, and an invalid or revoked bearer token all leave a
 record. Filter the audit log by `actor` to get one token's whole history.
 
-Revoking a token keeps its row, so the trail can still name what acted.
+Revoking a token keeps its row, so the trail can still name what acted. Revocation is irreversible across last-used refreshes and stale rows.
+
+MCP SQL supports an intentionally bounded SELECT dialect with explicitly
+allowlisted pure functions. KV reads/writes, unknown functions, qualified
+function calls, and unsupported syntax are refused. Use `observe_tables` for
+the permitted input schema; aliases never expand it.
+
+POST `/api/mcp` accepts at most 64 KiB. AI questions are limited to 4,000 bytes,
+ten requests per authenticated principal per minute (burst ten), and four
+in-flight provider requests shared across REST and MCP. Refusals are visible
+before provider work.
 
 ## Not in scope
 

@@ -75,7 +75,7 @@ func TestO10SeverityRouting(t *testing.T) {
 }
 
 // TestO10CronNotificationsThroughOutbox: the missed-cron path enqueues one
-// durable intent per severity-matched webhook (created-gated), the drain
+// durable intent per severity-matched webhook atomically with the incident, the drain
 // delivers it with the stable delivery id, and the payload receivers parse
 // is the same NotificationPayload shape alerts use.
 func TestO10CronNotificationsThroughOutbox(t *testing.T) {
@@ -85,20 +85,16 @@ func TestO10CronNotificationsThroughOutbox(t *testing.T) {
 	e := newO10Engine(t, db, recv, clk)
 
 	cronRef := CronMonitorRef{CronID: "cron-xyz", SiteID: e.site, Name: "nightly backup", Slug: "nightly-backup"}
-	incidentID := "inc-cron-1"
-
-	// The main.go wiring: enqueue on the missed transition (created-gated).
-	id, err := e.notify.Enqueue(context.Background(), NotificationIntent{
-		Kind: NotifyCronMissed, RuleID: "cron:" + cronRef.CronID, IncidentID: incidentID,
-		SiteID: e.site, WebhookID: "hook-1", TargetType: "http",
-		TargetURL: e.server.URL, Secret: "",
-		Payload: BuildCronPayload(NotifyCronMissed, cronRef, incidentID, 300, clk.now()),
-	})
-	if err != nil {
-		t.Fatalf("enqueue cron missed: %v", err)
+	inc, created, err := e.alerts.EnsureCronMissed(context.Background(), cronRef, 300)
+	if err != nil || !created {
+		t.Fatalf("cron transition: %+v %v %v", inc, created, err)
 	}
-	if id == "" {
-		t.Fatalf("enqueue returned no delivery id")
+	incidentID := inc.IncidentID
+	if _, created, err := e.alerts.EnsureCronMissed(context.Background(), cronRef, 300); err != nil || created {
+		t.Fatalf("repeat missed: %v %v", created, err)
+	}
+	if rows := e.intents(t, "cron:"+cronRef.CronID); len(rows) != 1 {
+		t.Fatalf("opening intents: %+v", rows)
 	}
 
 	// Before the drain the intent is durable: a REBOUND notifier (the
@@ -123,15 +119,14 @@ func TestO10CronNotificationsThroughOutbox(t *testing.T) {
 		t.Fatalf("payload carries no severity/message: %+v", p)
 	}
 
-	// The recovery side: same outbox, same shape.
-	if _, err := e.notify.Enqueue(context.Background(), NotificationIntent{
-		Kind: NotifyCronRecovered, RuleID: "cron:" + cronRef.CronID, IncidentID: incidentID,
-		SiteID: e.site, WebhookID: "hook-1", TargetType: "http",
-		TargetURL: e.server.URL, Secret: "",
-		Payload: BuildCronPayload(NotifyCronRecovered, cronRef, incidentID, 0, clk.now()),
-	}); err != nil {
-		t.Fatalf("enqueue cron recovered: %v", err)
+	// The production recovery operation owns the close and correlated intent.
+	if count, err := e.alerts.RecoverCron(context.Background(), cronRef, 300); err != nil || count != 1 {
+		t.Fatalf("recover: %d %v", count, err)
 	}
+	if count, err := e.alerts.RecoverCron(context.Background(), cronRef, 300); err != nil || count != 0 {
+		t.Fatalf("repeat recovery: %d %v", count, err)
+	}
+
 	e.drain(t)
 	if recv.count() != 2 {
 		t.Fatalf("POSTs after recovery = %d, want 2", recv.count())
@@ -139,6 +134,9 @@ func TestO10CronNotificationsThroughOutbox(t *testing.T) {
 	var p2 NotificationPayload
 	if err := json.Unmarshal([]byte(recv.body(1)), &p2); err != nil {
 		t.Fatalf("decode recovery payload: %v", err)
+	}
+	if p.IncidentID != incidentID || p2.IncidentID != incidentID {
+		t.Fatalf("incident correlation lost: %+v %+v", p, p2)
 	}
 	if p2.Kind != NotifyCronRecovered {
 		t.Fatalf("recovery payload kind = %s", p2.Kind)

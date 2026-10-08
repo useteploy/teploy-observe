@@ -15,7 +15,7 @@ type SlogHandler struct {
 	client     *Client
 	wrapped    slog.Handler
 	level      slog.Level
-	groupAttrs []slog.Attr
+	groupAttrs []scopedAttr
 	groupName  string
 
 	// crumbLevel/crumbs enable breadcrumb recording (WithBreadcrumbs);
@@ -78,10 +78,10 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 		attrs := make(map[string]any)
 		// Include any group-scoped attrs added via WithAttrs.
 		for _, a := range h.groupAttrs {
-			addAttr(attrs, a)
+			crumbAttr(attrs, a.prefix, a.attr)
 		}
 		r.Attrs(func(a slog.Attr) bool {
-			addAttr(attrs, a)
+			crumbAttr(attrs, groupPrefix(h.groupName), a)
 			return true
 		})
 		entry := LogEntry{
@@ -109,10 +109,10 @@ func (h *SlogHandler) recordBreadcrumb(r slog.Record) {
 	defer func() { _ = recover() }()
 	data := make(map[string]any)
 	for _, a := range h.groupAttrs {
-		crumbAttr(data, "", a)
+		crumbAttr(data, a.prefix, a.attr)
 	}
 	r.Attrs(func(a slog.Attr) bool {
-		crumbAttr(data, "", a)
+		crumbAttr(data, groupPrefix(h.groupName), a)
 		return true
 	})
 	lvl := "debug"
@@ -144,7 +144,11 @@ func crumbAttr(m map[string]any, prefix string, a slog.Attr) {
 	key := prefix + a.Key
 	if a.Value.Kind() == slog.KindGroup {
 		for _, g := range a.Value.Group() {
-			crumbAttr(m, key+".", g)
+			next := prefix
+			if a.Key != "" {
+				next = groupPrefix(key)
+			}
+			crumbAttr(m, next, g)
 		}
 		return
 	}
@@ -161,8 +165,10 @@ func crumbAttr(m map[string]any, prefix string, a slog.Attr) {
 // WithAttrs returns a handler whose records will have the given attrs added.
 func (h *SlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	clone := *h
-	clone.groupAttrs = append([]slog.Attr(nil), h.groupAttrs...)
-	clone.groupAttrs = append(clone.groupAttrs, attrs...)
+	clone.groupAttrs = append([]scopedAttr(nil), h.groupAttrs...)
+	for _, a := range attrs {
+		clone.groupAttrs = append(clone.groupAttrs, scopedAttr{groupPrefix(h.groupName), a})
+	}
 	if h.wrapped != nil {
 		clone.wrapped = h.wrapped.WithAttrs(attrs)
 	}
@@ -173,6 +179,9 @@ func (h *SlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 // group name into the attribute key so it round-trips through Observe's
 // JSON-blob attribute storage.
 func (h *SlogHandler) WithGroup(name string) slog.Handler {
+	if name == "" {
+		return h
+	}
 	clone := *h
 	if h.groupName != "" {
 		clone.groupName = h.groupName + "." + name
@@ -185,11 +194,16 @@ func (h *SlogHandler) WithGroup(name string) slog.Handler {
 	return &clone
 }
 
-func addAttr(m map[string]any, a slog.Attr) {
-	if a.Equal(slog.Attr{}) {
-		return
+type scopedAttr struct {
+	prefix string
+	attr   slog.Attr
+}
+
+func groupPrefix(name string) string {
+	if name == "" {
+		return ""
 	}
-	m[a.Key] = a.Value.Any()
+	return name + "."
 }
 
 func slogLevelString(l slog.Level) string {

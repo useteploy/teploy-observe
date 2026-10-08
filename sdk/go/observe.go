@@ -128,8 +128,12 @@ type Client struct {
 	// closeOnce + closeErr make Close safe under concurrent callers (audit
 	// F35: the select/default + close pair let two closers both take the
 	// default path and the second close panicked).
-	closeOnce sync.Once
-	closeErr  error
+	closeOnce        sync.Once
+	shutdownLossOnce sync.Once
+	closeErr         error
+	finalized        chan struct{}
+	workerCtx        context.Context
+	workerCancel     context.CancelFunc
 	// O11 retry/loss state. Per-signal attempt counters and backoff gates
 	// (a retryable failure holds that signal's flush until notBefore);
 	// statsMtx guards the Stats snapshot counters.
@@ -137,6 +141,7 @@ type Client struct {
 	stats            Stats
 	logAttempts      int
 	spanAttempts     int
+	spanBatchN       int
 	metricAttempts   int
 	logNotBefore     time.Time
 	spanNotBefore    time.Time
@@ -166,21 +171,36 @@ type Stats struct {
 	Dropped               map[string]int64 `json:"dropped"`
 	QueuedLogs            int              `json:"queued_logs"`
 	QueuedSpans           int              `json:"queued_spans"`
+	QueuedMetricPoints    int              `json:"queued_metric_points"`
 }
 
 // Stats returns a deep copy of the current diagnostics counters (O11).
 func (c *Client) Stats() Stats {
 	c.statsMtx.Lock()
-	defer c.statsMtx.Unlock()
 	out := c.stats
 	out.Dropped = make(map[string]int64, len(c.stats.Dropped))
 	for k, v := range c.stats.Dropped {
 		out.Dropped[k] = v
 	}
+	c.statsMtx.Unlock()
 	c.mu.Lock()
 	out.QueuedLogs = c.logsN
 	out.QueuedSpans = c.spansN
+	mb := c.metrics
+	for _, req := range c.pendingMetrics {
+		out.QueuedMetricPoints += req.points
+	}
 	c.mu.Unlock()
+	if mb != nil {
+		mb.mu.Lock()
+		out.QueuedMetricPoints += len(mb.gauges) + len(mb.histograms)
+		for _, st := range mb.counters {
+			if st.dirty {
+				out.QueuedMetricPoints++
+			}
+		}
+		mb.mu.Unlock()
+	}
 	return out
 }
 
@@ -354,7 +374,9 @@ func New(opts Options) (*Client, error) {
 	if opts.RetryBackoff <= 0 {
 		opts.RetryBackoff = time.Second
 	}
+	workerCtx, workerCancel := context.WithCancel(context.Background())
 	c := &Client{
+		workerCtx: workerCtx, workerCancel: workerCancel, finalized: make(chan struct{}),
 		opts:             opts,
 		http:             &owned,
 		crumbs:           newBreadcrumbRing(opts.MaxBreadcrumbs, opts.BeforeBreadcrumb),
@@ -394,36 +416,77 @@ func (c *Client) Close() error {
 func (c *Client) Shutdown(ctx context.Context) error {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
-		c.closing = true // new admissions rejected from here on
+		c.closing = true
 		c.mu.Unlock()
 		close(c.closed)
-		<-c.done // includes ALL owned flush work, not only the ticker
-		c.closeErr = errors.Join(
-			c.flushSpans(ctx),
-			c.FlushMetrics(ctx),
-			c.flushLogs(ctx),
-		)
-		if ctx.Err() != nil {
-			c.closeErr = errors.Join(c.closeErr, ctx.Err())
+		c.workerCancel()
+		go func() {
+			defer close(c.finalized)
+			<-c.done
+			c.closeErr = errors.Join(c.flushSpans(ctx), c.FlushMetrics(ctx), c.flushLogs(ctx), ctx.Err())
+			left := c.Stats()
+			c.recordShutdownLoss()
+			if left.QueuedLogs > 0 || left.QueuedSpans > 0 || left.QueuedMetricPoints > 0 {
+				c.closeErr = errors.Join(c.closeErr, errors.New("observe: shutdown incomplete: telemetry queued"))
+			}
+			if summary := c.lossSummary(); summary != "" {
+				c.reportError(errors.New(summary))
+			}
+		}()
+	})
+	select {
+	case <-c.finalized:
+		return c.closeErr
+	case <-ctx.Done():
+		c.recordShutdownLoss()
+		return ctx.Err()
+	}
+}
+
+func (c *Client) recordShutdownLoss() {
+	c.shutdownLossOnce.Do(func() {
+		s := c.Stats()
+		if s.QueuedLogs > 0 {
+			c.countLoss("logs_shutdown_unflushed", int64(s.QueuedLogs), "shutdown incomplete")
 		}
-		// O11: honest shutdown accounting. Anything still queued when the
-		// deadline hit is lost with the process — count and report it
-		// rather than returning a clean-looking result.
-		c.mu.Lock()
-		leftLogs, leftSpans := c.logsN, c.spansN
-		c.mu.Unlock()
-		if leftLogs > 0 {
-			c.countLoss("logs_shutdown_unflushed", int64(leftLogs), "shutdown deadline reached with logs queued")
+		if s.QueuedSpans > 0 {
+			c.countLoss("spans_shutdown_unflushed", int64(s.QueuedSpans), "shutdown incomplete")
 		}
-		if leftSpans > 0 {
-			c.countLoss("spans_shutdown_unflushed", int64(leftSpans), "shutdown deadline reached with spans queued")
+		if s.QueuedMetricPoints > 0 {
+			c.countLoss("metrics_shutdown_unflushed", int64(s.QueuedMetricPoints), "shutdown incomplete")
 		}
-		if s := c.lossSummary(); s != "" {
-			c.reportError(errors.New(s))
+		if summary := c.lossSummary(); summary != "" {
+			c.reportError(errors.New(summary))
 		}
 	})
-	return c.closeErr
 }
+
+// lockContext includes export ownership contention in the caller's budget.
+func lockContext(ctx context.Context, mu *sync.Mutex) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if mu.TryLock() {
+		return nil
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if mu.TryLock() {
+				if err := ctx.Err(); err != nil {
+					mu.Unlock()
+					return err
+				}
+				return nil
+			}
+		}
+	}
+}
+func (c *Client) isClosing() bool { c.mu.Lock(); defer c.mu.Unlock(); return c.closing }
 
 // lossSummary renders a one-line shutdown summary of all counted losses,
 // or "" when nothing was lost.
@@ -458,23 +521,23 @@ func (c *Client) loop() {
 			// silently dropped chunk used to look identical to success at
 			// Close time. TO-038: span/metric export failures are
 			// reported the same way.
-			if err := c.flushLogs(context.Background()); err != nil {
+			if err := c.flushLogs(c.workerCtx); err != nil {
 				c.reportError(err)
 			}
-			if err := c.flushSpans(context.Background()); err != nil {
+			if err := c.flushSpans(c.workerCtx); err != nil {
 				c.reportError(err)
 			}
-			if err := c.FlushMetrics(context.Background()); err != nil {
+			if err := c.FlushMetrics(c.workerCtx); err != nil {
 				c.reportError(err)
 			}
 		case <-t.C:
-			if err := c.flushLogs(context.Background()); err != nil {
+			if err := c.flushLogs(c.workerCtx); err != nil {
 				c.reportError(err)
 			}
-			if err := c.flushSpans(context.Background()); err != nil {
+			if err := c.flushSpans(c.workerCtx); err != nil {
 				c.reportError(err)
 			}
-			if err := c.FlushMetrics(context.Background()); err != nil {
+			if err := c.FlushMetrics(c.workerCtx); err != nil {
 				c.reportError(err)
 			}
 		}
@@ -623,7 +686,9 @@ const maxLogRequestBytes = 1 << 20
 // (the server already skipped those rows; resending would only duplicate
 // the accepted neighbors).
 func (c *Client) flushLogs(ctx context.Context) error {
-	c.logFlushMu.Lock()
+	if err := lockContext(ctx, &c.logFlushMu); err != nil {
+		return err
+	}
 	defer c.logFlushMu.Unlock()
 
 	c.mu.Lock()
@@ -633,7 +698,7 @@ func (c *Client) flushLogs(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if backoffGated(c.logAttempts, c.logNotBefore) {
+		if !c.isClosing() && backoffGated(c.logAttempts, c.logNotBefore) {
 			return nil // mid-backoff; the ticker or a later Flush retries
 		}
 		c.mu.Lock()
@@ -674,6 +739,9 @@ func (c *Client) flushLogs(ctx context.Context) error {
 		}
 		err := c.postJSON(ctx, "/api/v1/logs/batch", logBatchWire{Logs: batch}, &ack)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err() // cancellation retains work without spending a send attempt
+			}
 			if !retryableSendErr(err) {
 				c.dropLogPrefix(n, "logs_non_retryable", err.Error())
 				remaining -= n

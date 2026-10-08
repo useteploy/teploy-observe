@@ -55,7 +55,7 @@ func TestStartStopWriteOneRowAndResolveLatest(t *testing.T) {
 	svc := NewExperimentService(db)
 	const site = "expsite"
 
-	exp, err := svc.Create(ctx, site, "Checkout copy", "new-checkout", "pageview", "", "", 100)
+	exp, err := svc.Create(ctx, site, "Checkout copy", "new-checkout", "pageview", "", `[{"key":"control"},{"key":"treatment"}]`, 100)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestSameMillisecondCreateStartStopResolvesCompleted(t *testing.T) {
 	const site = "exp-tie-site"
 
 	for i := 0; i < 5; i++ {
-		exp, err := svc.Create(ctx, site, "Tie test", "tie-key", "pageview", "", "", 100)
+		exp, err := svc.Create(ctx, site, "Tie test", "tie-key", "pageview", "", `[{"key":"control"},{"key":"treatment"}]`, 100)
 		if err != nil {
 			t.Fatalf("iter %d create: %v", i, err)
 		}

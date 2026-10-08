@@ -264,14 +264,21 @@ export interface ShimStats {
 }
 
 let stats: ShimStats = { delivered: 0, lost: {}, unconfirmedAtFlush: 0, inFlight: 0 };
-const inFlightSends = new Set<Promise<void>>();
+let inFlightSends = new Set<Promise<void>>();
+type Owner = { config: ResolvedConfig; stats: ShimStats; sends: Set<Promise<void>> };
+function currentOwner(): Owner | null { return config ? { config, stats, sends: inFlightSends } : null; }
+function track(owner: Owner, work: Promise<void>): Promise<void> {
+  owner.stats.inFlight++; owner.sends.add(work);
+  return work.finally(() => { owner.sends.delete(work); owner.stats.inFlight--; });
+}
 
-function countLoss(reason: string, detail?: string): void {
-  stats.lost[reason] = (stats.lost[reason] ?? 0) + 1;
-  if (!config || config.debug) return;
+function countLoss(reason: string, detail?: string, owner = currentOwner()): void {
+  if (!owner) return;
+  owner.stats.lost[reason] = (owner.stats.lost[reason] ?? 0) + 1;
+  if (owner.config.debug) return;
   const err = new Error(`observe-sentry-shim: lost 1 envelope (${reason})${detail ? ` — ${detail}` : ""}`);
   try {
-    config.onError?.(err);
+    owner.config.onError?.(err);
   } catch {
     /* an onError hook that throws must not break the SDK */
   }
@@ -340,6 +347,7 @@ export function init(options: InitOptions): void {
   scopeStack = [];
   warnedNoOps.clear();
   stats = { delivered: 0, lost: {}, unconfirmedAtFlush: 0, inFlight: 0 };
+  inFlightSends = new Set();
   // O11: accepted-but-ignored Sentry options tell the truth once, with a
   // pointer to the compatibility table.
   if (options.tracesSampleRate !== undefined) {
@@ -361,38 +369,52 @@ export function getClient(): ResolvedConfig | null {
   return config;
 }
 
-async function postJSON(path: string, body: unknown): Promise<void> {
-  if (!config) return;
-  if (config.debug) return; // dry-run mode
+// Go's prepared-record encoder escapes these characters even when JS does not.
+function preparedErrorBytes(raw: string): number {
+  return Buffer.byteLength(raw.replace(/[<>&\u2028\u2029]/g, () => "\\u0000"), "utf8");
+}
+
+async function postJSON(path: string, body: unknown, owner = currentOwner(), tracked = true): Promise<void> {
+  if (!owner || owner.config.debug) return;
+  const cfg = owner.config;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (config.apiKey) headers["X-API-Key"] = config.apiKey;
-  // O11: failures are counted and reported through onError — the shim
-  // still never throws out of capture* calls (Sentry compat), but a lost
-  // envelope is no longer indistinguishable from a delivered one.
+  if (cfg.apiKey) headers["X-API-Key"] = cfg.apiKey;
   const send = (async () => {
     try {
-      const res = await config.fetchImpl(config.endpoint + path, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) {
-        countLoss(`http_${res.status}`, `POST ${path} returned ${res.status}`);
-        return;
+      let raw = JSON.stringify(body);
+      if (path === "/api/v1/errors") {
+        // Leave headroom below the server's 256 KiB prepared-record cap.
+        // Keep the newest breadcrumbs; never retry an oversized payload.
+        const payload = JSON.parse(raw) as ErrorEnvelope;
+        if (preparedErrorBytes(raw) > 192 * 1024 && Array.isArray(payload.breadcrumbs)) {
+          const crumbs = payload.breadcrumbs;
+          payload.breadcrumbs = [];
+          let used = preparedErrorBytes(JSON.stringify(payload));
+          let start = crumbs.length;
+          for (let i = crumbs.length - 1; i >= 0; i--) {
+            const cost = preparedErrorBytes(JSON.stringify(crumbs[i])) + 1;
+            if (used + cost > 192 * 1024) break;
+            used += cost;
+            start = i;
+          }
+          payload.breadcrumbs = crumbs.slice(start);
+          raw = JSON.stringify(payload);
+        }
+        if (preparedErrorBytes(raw) > 192 * 1024) {
+          countLoss("payload_oversize", "error exceeds aggregate byte budget", owner);
+          return;
+        }
       }
-      stats.delivered++;
+      const res = await cfg.fetchImpl(cfg.endpoint + path, {
+        method: "POST", headers, body: raw, redirect: "error",
+      });
+      if (!res.ok) { countLoss(`http_${res.status}`, `POST ${path} returned ${res.status}`, owner); return; }
+      owner.stats.delivered++;
     } catch (err) {
-      countLoss("send_failed", err instanceof Error ? err.message : String(err));
+      countLoss("send_failed", err instanceof Error ? err.message : String(err), owner);
     }
   })();
-  stats.inFlight++;
-  inFlightSends.add(send);
-  try {
-    await send;
-  } finally {
-    inFlightSends.delete(send);
-    stats.inFlight--;
-  }
+  await (tracked ? track(owner, send) : send);
 }
 
 function parseStack(stack: string | undefined): StackFrame[] | undefined {
@@ -468,18 +490,19 @@ export function captureException(
   hint?: { mechanism?: string; level?: SeverityLevel }
 ): string {
   if (!config) return "";
+  const owner = currentOwner()!;
   const env = buildErrorEnvelope(err, activeScope(), hint);
-  void (async () => {
+  void track(owner, (async () => {
     let payload: ErrorEnvelope | null = env;
-    if (config?.beforeSend) {
+    if (owner.config.beforeSend) {
       try {
-        payload = (await config.beforeSend(env)) ?? null;
+        payload = (await owner.config.beforeSend(env)) ?? null;
       } catch {
         payload = env;
       }
     }
-    if (payload) await postJSON("/api/v1/errors", payload);
-  })();
+    if (payload) await postJSON("/api/v1/errors", payload, owner, false);
+  })());
   // The returned id IS the envelope's event_id (previously a synthetic id
   // the server never saw).
   return env.event_id ?? "";
@@ -578,8 +601,9 @@ export function addBreadcrumb(crumb: Breadcrumb): void {
   if (!config) return;
   const scope = activeScope();
   scope.breadcrumbs.push({
-    timestamp: crumb.timestamp ?? Date.now() / 1000,
     ...crumb,
+    timestamp: crumb.timestamp !== undefined && Number.isFinite(crumb.timestamp)
+      ? Math.round(crumb.timestamp * 1000) : Date.now(),
   });
   if (scope.breadcrumbs.length > config.maxBreadcrumbs) {
     scope.breadcrumbs.splice(0, scope.breadcrumbs.length - config.maxBreadcrumbs);
@@ -589,6 +613,7 @@ export function addBreadcrumb(crumb: Breadcrumb): void {
 /** Sentry: run `fn` against a forked scope. Mutations don't leak out. */
 export function withScope<T>(fn: (scope: Scope) => T): T {
   const fork = activeScope().clone();
+  if (requestScope.getStore()) return requestScope.run(fork, () => fn(fork));
   scopeStack.push(fork);
   try {
     return fn(fork);
@@ -695,38 +720,33 @@ export class Span {
  * onError — the honest upper bound, because Node process exit may still
  * complete some of them. Returns false when anything was unconfirmed.
  */
-export async function flush(timeout: number = 2000): Promise<boolean> {
-  const sends = [...inFlightSends];
-  if (sends.length === 0) return Object.keys(stats.lost).length === 0;
-  const all = Promise.all(sends);
-  const bounded = await Promise.race([
-    all.then(() => "done" as const),
-    new Promise<"timeout">((r) => setTimeout(() => r("timeout"), timeout)),
-  ]);
-  if (bounded === "timeout") {
-    // Sends still in flight when the budget expired: the honest upper
-    // bound — some may complete after the caller stops waiting.
-    stats.unconfirmedAtFlush = [...inFlightSends].length;
-    if (stats.unconfirmedAtFlush > 0 && config && !config.debug) {
-      try {
-        config.onError?.(new Error(
-          `observe-sentry-shim: flush gave up with ${stats.unconfirmedAtFlush} send(s) unconfirmed`));
-      } catch {
-        /* hook must not break the SDK */
-      }
+async function flushOwner(owner: Owner | null, timeout: number): Promise<boolean> {
+  if (!owner) return true;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      Promise.all([...owner.sends]).then(() => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), Math.max(0, timeout)); }),
+    ]);
+    owner.stats.unconfirmedAtFlush = owner.sends.size;
+    if (!result && owner.sends.size) {
+      try { owner.config.onError?.(new Error(`observe-sentry-shim: flush gave up with ${owner.sends.size} send(s) unconfirmed`)); } catch {}
     }
-    return false;
-  }
-  return Object.keys(stats.lost).length === 0;
+    return result && Object.keys(owner.stats.lost).length === 0;
+  } finally { if (timer !== undefined) clearTimeout(timer); }
+}
+export async function flush(timeout: number = 2000): Promise<boolean> {
+  return flushOwner(currentOwner(), timeout);
 }
 
-/** Sentry compat: close the client (awaits in-flight like flush). */
+/** Sentry compat: close the client (awaits the entire capture pipeline). */
 export async function close(timeout: number = 2000): Promise<boolean> {
-  await flush(timeout);
+  const owner = currentOwner();
+  // Stop new admissions; admitted work retains its immutable destination.
   config = null;
-  rootScope = new Scope();
-  scopeStack = [];
-  return true;
+  const result = await flushOwner(owner, timeout);
+  if (!config) { rootScope = new Scope(); scopeStack = []; }
+  return result;
 }
 
 /** Sentry compat: getCurrentHub() shim returning a minimal Hub-like object. */

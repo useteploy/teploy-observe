@@ -7,6 +7,7 @@ package platform
 
 import (
 	"context"
+	"github.com/useteploy/teploy-observe/internal/incidents"
 	"testing"
 	"time"
 )
@@ -15,13 +16,17 @@ import (
 // path is covered by the engine suites; these tests pin the drain).
 func o10Enqueue(t *testing.T, n *Notifier, site, url string) string {
 	t.Helper()
+	inc, err := incidents.NewService(n.db).Create(context.Background(), incidents.CreateInput{SiteID: site, Title: "Notifier fixture", RuleID: "o10-notify-rule"}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
 	id, err := n.enqueueTx(context.Background(), n.db.SQL(), NotificationIntent{
-		Kind: NotifyIncidentOpened, RuleID: "o10-notify-rule", IncidentID: "o10-incident",
+		Kind: NotifyIncidentOpened, RuleID: "o10-notify-rule", IncidentID: inc.IncidentID,
 		SiteID: site, WebhookID: "o10-hook", TargetType: "http", TargetURL: url,
 		Payload: BuildNotificationPayload(NotifyIncidentOpened, AlertRule{
 			RuleID: "o10-notify-rule", SiteID: site, Name: "retry rule", Metric: "error_count",
 			Threshold: 2, Severity: "critical",
-		}, 7, 30, StateHealthy, StateFiring, "o10-incident", time.Now()),
+		}, 7, 30, StateHealthy, StateFiring, inc.IncidentID, time.Now()),
 	})
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)

@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
@@ -103,7 +104,9 @@ const lastUsedInterval = 5 * time.Minute
 // updated_at — the same shape internal/incidents uses, and for the same reason:
 // a ReplacingMergeTree's collapse is not something this codebase can rely on.
 type TokenStore struct {
-	db *nucleus.Client
+	db         *nucleus.Client
+	mu         sync.Mutex
+	repository tokenRepository
 }
 
 // NewTokenStore wires the token store to the shared Nucleus client.
@@ -145,7 +148,7 @@ func (s *TokenStore) Create(ctx context.Context, name, role string) (string, Tok
 // path that returns the plaintext — RBAC rule 3: secret values never cross a
 // read boundary.
 func (s *TokenStore) List(ctx context.Context) ([]Token, error) {
-	rows, err := nucleus.Query[Token](ctx, s.db.SQL(), latestTokens(""))
+	rows, err := s.read(ctx, "")
 	if err != nil {
 		return nil, fmt.Errorf("mcp: listing tokens: %w", err)
 	}
@@ -165,7 +168,9 @@ func (s *TokenStore) List(ctx context.Context) ([]Token, error) {
 // would take its audit-trail identity with it, and the trail has to be able to
 // name what acted.
 func (s *TokenStore) Revoke(ctx context.Context, id string) error {
-	rows, err := nucleus.Query[Token](ctx, s.db.SQL(), latestTokens("token_id = $1"), id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.read(ctx, "token_id = $1", id)
 	if err != nil {
 		return fmt.Errorf("mcp: revoking token: %w", err)
 	}
@@ -187,10 +192,12 @@ func (s *TokenStore) Revoke(ctx context.Context, id string) error {
 // (Token{}, false). Brute force is not a practical concern — 256-bit secrets
 // compared in constant time — so there is no lockout.
 func (s *TokenStore) Verify(ctx context.Context, plaintext string) (Token, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !strings.HasPrefix(plaintext, TokenPrefix) {
 		return Token{}, false
 	}
-	rows, err := nucleus.Query[Token](ctx, s.db.SQL(), latestTokens(""))
+	rows, err := s.read(ctx, "")
 	if err != nil {
 		return Token{}, false
 	}
@@ -243,6 +250,9 @@ func nextUpdatedAt(prior, now int64) int64 {
 }
 
 func (s *TokenStore) write(ctx context.Context, t Token, priorUpdatedAt, now int64) error {
+	if s.repository != nil {
+		return s.repository.write(ctx, t, nextUpdatedAt(priorUpdatedAt, now))
+	}
 	_, err := s.db.SQL().Exec(ctx,
 		`INSERT INTO mcp_tokens (`+tokenColumns+`)
 		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8)`,
@@ -256,7 +266,8 @@ func (s *TokenStore) write(ctx context.Context, t Token, priorUpdatedAt, now int
 }
 
 // latestTokens collapses mcp_tokens to one row per token_id, keeping the
-// highest-updated_at version of every column. See internal/incidents for the
+// highest-updated_at version of each mutable column. Revocation uses MAX so
+// it can never be undone by a newer stale last-used append. See internal/incidents for the
 // same shape and the reasoning: FINAL parses but is silently ignored by
 // Nucleus, so an explicit argMax is the only form that collapses.
 //
@@ -273,7 +284,7 @@ func latestTokens(whereFrag string) string {
 	               argMax(role, updated_at)         AS role,
 	               argMax(created_at, updated_at)   AS created_at,
 	               argMax(last_used_at, updated_at) AS last_used_at,
-	               argMax(revoked_at, updated_at)   AS revoked_at,
+	               MAX(revoked_at)                   AS revoked_at,
 	               MAX(updated_at)                  AS updated_at
 	        FROM mcp_tokens WHERE ` + whereFrag + `
 	        GROUP BY token_id`
@@ -282,4 +293,18 @@ func latestTokens(whereFrag string) string {
 func hashToken(plaintext string) string {
 	sum := sha256.Sum256([]byte(plaintext))
 	return hex.EncodeToString(sum[:])
+}
+
+// Narrow persistence seam keeps credential lifecycle concurrency testable without
+// relying on a database scheduler. The production path always uses Nucleus.
+type tokenRepository interface {
+	read(context.Context, string, ...any) ([]Token, error)
+	write(context.Context, Token, int64) error
+}
+
+func (s *TokenStore) read(ctx context.Context, where string, args ...any) ([]Token, error) {
+	if s.repository != nil {
+		return s.repository.read(ctx, where, args...)
+	}
+	return nucleus.Query[Token](ctx, s.db.SQL(), latestTokens(where), args...)
 }

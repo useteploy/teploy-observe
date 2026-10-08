@@ -67,11 +67,12 @@ func hashDistinctID(raw, salt string, rawOptIn bool) string {
 type PrivacyLookup func(ctx context.Context, siteID string) (salt string, rawOptIn bool, ok bool)
 
 type ReplayService struct {
-	db       *nucleus.Client
-	heatmaps *heatmaps.Service
-	logger   *slog.Logger
-	privacy  PrivacyLookup
-	salt     string
+	db             *nucleus.Client
+	heatmaps       *heatmaps.Service
+	logger         *slog.Logger
+	privacy        PrivacyLookup
+	privacyChecked func(context.Context, string) (string, bool, bool, error)
+	salt           string
 	// replayLocks stripe serialization per replay ID (AUD-018, round 2).
 	// The session upsert is a read-merge-insert with no engine-side
 	// compare-and-swap: two concurrent first batches could insert different
@@ -112,6 +113,13 @@ func NewReplayService(db *nucleus.Client) *ReplayService {
 // fallback global salt for sites the lookup doesn't know about.
 func (s *ReplayService) WithPrivacy(lookup PrivacyLookup, fallbackSalt string) *ReplayService {
 	s.privacy = lookup
+	s.salt = fallbackSalt
+	return s
+}
+
+// WithPrivacyChecked refuses policy-store failures before identity storage.
+func (s *ReplayService) WithPrivacyChecked(lookup func(context.Context, string) (string, bool, bool, error), fallbackSalt string) *ReplayService {
+	s.privacyChecked = lookup
 	s.salt = fallbackSalt
 	return s
 }
@@ -566,7 +574,13 @@ func (s *ReplayService) Ingest(ctx context.Context, input IngestInput) (Result, 
 	if input.DistinctID != "" {
 		salt := s.salt
 		rawOptIn := false
-		if s.privacy != nil {
+		if s.privacyChecked != nil {
+			siteSalt, raw, ok, err := s.privacyChecked(ctx, input.SiteID)
+			if err != nil || !ok {
+				return Result{}, &neutron.AppError{Status: 503, Title: "Service Unavailable", Detail: "replay identity policy unavailable"}
+			}
+			salt, rawOptIn = siteSalt, raw
+		} else if s.privacy != nil {
 			if siteSalt, raw, ok := s.privacy(ctx, input.SiteID); ok {
 				salt = siteSalt
 				rawOptIn = raw

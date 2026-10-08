@@ -421,3 +421,16 @@ func TestLoadKeyring_CollidingKeyIDsRefused(t *testing.T) {
 		t.Fatal("re-inserting the same bytes must be harmless")
 	}
 }
+
+func TestMalformedKeyringNeverEchoesMaterial(t *testing.T) {
+	secret := b64key(197)
+	for _, spec := range []string{secret, secret + ":id", "bad/id:" + secret, "a:" + secret, "a:tiny", secret + ":tiny"} {
+		_, err := LoadKeyring(KeyEnv{KeyringSpec: spec})
+		if err == nil {
+			t.Fatalf("malformed spec accepted")
+		}
+		if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "tiny") || strings.Contains(err.Error(), "bad/id") {
+			t.Fatalf("material reflected in startup error: %v", err)
+		}
+	}
+}

@@ -113,7 +113,7 @@ func (rl *RateLimiter) Allow(siteID, ip string) bool {
 
 	// nil bucket = the cardinality budget is full and this is a NEW key
 	// (audit F23): deny rather than grow the map without bound.
-	if composite == nil {
+	if composite == nil || (hasSiteCap && aggregate == nil) {
 		return false
 	}
 	if composite.tokens <= 0 {

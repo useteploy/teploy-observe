@@ -141,8 +141,8 @@ func (s *FlagService) Create(ctx context.Context, siteID, flagKey, name, descrip
 	if flagType == "" {
 		flagType = "boolean"
 	}
-	if rolloutPct <= 0 {
-		rolloutPct = 100
+	if rolloutPct < 0 || rolloutPct > 100 {
+		return nil, &ValidationError{Err: fmt.Errorf("rollout_pct must be between 0 and 100")}
 	}
 
 	// O08 write boundary: invalid rules must not be storable. The store's

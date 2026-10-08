@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
@@ -65,9 +67,27 @@ func (s *GroupService) List(ctx context.Context, siteID string) ([]Group, error)
 		 FROM groups WHERE site_id = $1 ORDER BY name ASC`, siteID)
 }
 
-// AddMember associates a session/user with a group.
+var ErrInvalidMember = errors.New("site_id, group_id and session_id are required; user_id is an annotation")
+var ErrGroupNotFound = errors.New("group not found in site")
+
+// AddMember associates a session with a group. userID is an optional annotation;
+// user-only membership is unsupported because group activity uses session IDs.
 func (s *GroupService) AddMember(ctx context.Context, siteID, groupID, sessionID, userID string) error {
-	_, err := s.db.SQL().Exec(ctx,
+	if strings.TrimSpace(siteID) == "" || strings.TrimSpace(groupID) == "" || strings.TrimSpace(sessionID) == "" {
+		return ErrInvalidMember
+	}
+	type groupRow struct {
+		GroupID string `db:"group_id"`
+	}
+	rows, err := nucleus.Query[groupRow](ctx, s.db.SQL(),
+		`SELECT group_id FROM groups WHERE group_id = $1 AND site_id = $2`, groupID, siteID)
+	if err != nil {
+		return fmt.Errorf("find membership group: %w", err)
+	}
+	if len(rows) == 0 {
+		return ErrGroupNotFound
+	}
+	_, err = s.db.SQL().Exec(ctx,
 		`INSERT INTO group_members (tenant_id, site_id, group_id, session_id, user_id, joined_at)
 		 VALUES ('default', $1, $2, $3, $4, $5)`,
 		siteID, groupID, sessionID, userID, time.Now().UTC().UnixMilli(),
@@ -92,20 +112,26 @@ func (s *GroupService) GroupMetrics(ctx context.Context, siteID string, from, to
 		}
 
 		// Member count
-		memberRows, _ := nucleus.Query[countRow](ctx, s.db.SQL(),
-			`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count FROM group_members WHERE group_id = $1 AND site_id = $2`,
+		memberRows, err := nucleus.Query[countRow](ctx, s.db.SQL(),
+			`SELECT CAST(COUNT(DISTINCT session_id) AS TEXT) AS count FROM group_members WHERE group_id = $1 AND site_id = $2 AND session_id != ''`,
 			g.GroupID, siteID)
+		if err != nil {
+			return nil, fmt.Errorf("group member count: %w", err)
+		}
 		memberCount := "0"
 		if len(memberRows) > 0 {
 			memberCount = memberRows[0].Count
 		}
 
 		// Event count for members in time range
-		eventRows, _ := nucleus.Query[countRow](ctx, s.db.SQL(),
+		eventRows, err := nucleus.Query[countRow](ctx, s.db.SQL(),
 			`SELECT CAST(COUNT(*) AS TEXT) AS count FROM events
 			 WHERE site_id = $1 AND timestamp >= $2 AND timestamp < $3
-			   AND session_id IN (SELECT session_id FROM group_members WHERE group_id = $4 AND site_id = $1)`,
+			   AND session_id IN (SELECT session_id FROM group_members WHERE group_id = $4 AND site_id = $1 AND session_id != '')`,
 			siteID, fromMs, toMs, g.GroupID)
+		if err != nil {
+			return nil, fmt.Errorf("group event count: %w", err)
+		}
 		eventCount := "0"
 		if len(eventRows) > 0 {
 			eventCount = eventRows[0].Count

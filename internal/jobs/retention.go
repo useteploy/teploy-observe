@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strconv"
+	"math"
 	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
@@ -18,6 +18,9 @@ import (
 // internal/ingest/buffer.go, internal/tracing/ingest.go, internal/logs/logs.go,
 // internal/metrics/metrics.go) exists to avoid.
 const retentionChunkSize = 5000
+
+// MaxRetentionDays fits duration arithmetic and the supported configuration.
+const MaxRetentionDays = 100000
 
 // TimeUnit is the unit of a policy's BIGINT time column. The zero value is
 // epoch milliseconds, which is what nearly every table stores, so existing
@@ -36,8 +39,14 @@ const (
 // CutoffAt returns the cutoff for a retention window of days ending at now,
 // expressed in the unit of the column it will be compared against.
 func (u TimeUnit) CutoffAt(now time.Time, days int) int64 {
+	if days <= 0 || days > MaxRetentionDays {
+		return math.MinInt64
+	}
 	t := now.Add(-time.Duration(days) * 24 * time.Hour)
 	if u == UnitNanos {
+		if t.Before(time.Unix(0, math.MinInt64)) || t.After(time.Unix(0, math.MaxInt64)) {
+			return math.MinInt64
+		}
 		return t.UnixNano()
 	}
 	return t.UnixMilli()
@@ -68,6 +77,7 @@ func (p RetentionPolicy) and() string {
 
 // RetentionService cleans up old data according to configured retention periods.
 type RetentionService struct {
+	now      func() time.Time
 	db       *nucleus.Client
 	logger   *slog.Logger
 	policies []RetentionPolicy
@@ -188,6 +198,9 @@ func (r *RetentionService) Policies() []RetentionPolicy {
 func (r *RetentionService) RunCleanup(ctx context.Context) error {
 	sql := r.db.SQL()
 	now := time.Now().UTC()
+	if r.now != nil {
+		now = r.now().UTC()
+	}
 	var firstErr error
 
 	for _, p := range r.policies {
@@ -195,6 +208,22 @@ func (r *RetentionService) RunCleanup(ctx context.Context) error {
 			continue
 		}
 		cutoff := p.Unit.CutoffAt(now, p.Days)
+		if cutoff == math.MinInt64 || (p.Unit != UnitMillis && p.Unit != UnitNanos) {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("retention: %s: unsupported retention window or unit", p.Table)
+			}
+			continue
+		}
+		if p.Table == "replay_sessions" {
+			if err := r.cleanupReplayPayloads(ctx, cutoff); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				// Preserve parents until child disposition is complete, so a
+				// failed/restarted cleanup still has the lifecycle evidence.
+				continue
+			}
+		}
 		// Bind the cutoff as an int64 and compare against the BIGINT column
 		// directly. The old form (quoted text literal vs CAST(col AS BIGINT))
 		// matched nothing — Nucleus compared the column's numeric value against
@@ -215,76 +244,12 @@ func (r *RetentionService) RunCleanup(ctx context.Context) error {
 	return firstErr
 }
 
-// cleanupTable deletes rows older than cutoff in chunks of at most
-// retentionChunkSize instead of one unbounded DELETE. The retention tables
-// don't share a common single-column primary key (events has event_id,
-// logs has log_id, service_stats/stats_hourly have none at all — they're
-// rollup facts keyed by a composite), so chunking can't key off "id IN
-// (SELECT id ... LIMIT N)" generically. Instead each iteration finds the
-// value of the chunkSize-th oldest surviving row in the policy's own cutoff
-// column (already BIGINT in the policy's Unit, already used for the WHERE bound) and
-// deletes everything up to and including it; once fewer than a full chunk
-// remain, one final small DELETE clears the rest.
+// cleanupTable uses stable composite identities plus a physical-row budget,
+// so timestamp ties cannot expand a DELETE beyond retentionChunkSize.
 func (r *RetentionService) cleanupTable(ctx context.Context, sql *nucleus.SQLModel, p RetentionPolicy, cutoff int64) (int64, error) {
-	var total int64
-	for {
-		boundary, ok, err := chunkBoundary(ctx, sql, p.Table, p.Column, p.and(), cutoff, retentionChunkSize)
-		if err != nil {
-			return total, err
-		}
-		if !ok {
-			// Fewer than a full chunk remain below cutoff — clear the rest
-			// in one final (bounded) statement and stop.
-			query := fmt.Sprintf(`DELETE FROM %s WHERE %s < $1%s`, p.Table, p.Column, p.and())
-			affected, err := sql.Exec(ctx, query, cutoff)
-			if err != nil {
-				return total, err
-			}
-			return total + affected, nil
-		}
-
-		// boundary ties (many rows sharing the exact same column value, e.g.
-		// a 60s ts_bucket) mean this DELETE can remove somewhat more than
-		// chunkSize rows — still bounded to "one bucket's worth", nowhere
-		// near the size of an unbounded whole-policy DELETE.
-		query := fmt.Sprintf(`DELETE FROM %s WHERE %s <= $1%s`, p.Table, p.Column, p.and())
-		affected, err := sql.Exec(ctx, query, boundary)
-		if err != nil {
-			return total, err
-		}
-		total += affected
-		if affected == 0 {
-			// Defensive: a boundary was found but nothing was deleted (e.g.
-			// a concurrent cleanup already won the race) — stop instead of
-			// looping forever.
-			return total, nil
-		}
-	}
+	return r.cleanupWhere(ctx, p.Table, fmt.Sprintf("%s < $1%s", p.Column, p.and()), []any{cutoff}, append(append([]string(nil), retentionKeys[p.Table]...), p.Column))
 }
 
 type boundaryRow struct {
 	C string `db:"c"`
-}
-
-// chunkBoundary returns the cutoff column's value at the chunkSize-th
-// oldest surviving row (ok=true), so the caller can DELETE ... WHERE col <=
-// boundary as one bounded batch. ok=false means fewer than chunkSize rows
-// remain below cutoff — the caller should do one final, already-small
-// DELETE instead.
-func chunkBoundary(ctx context.Context, sql *nucleus.SQLModel, table, column, extraWhere string, cutoff int64, chunkSize int) (int64, bool, error) {
-	query := fmt.Sprintf(
-		`SELECT %s AS c FROM %s WHERE %s < $1%s ORDER BY %s ASC LIMIT 1 OFFSET %d`,
-		column, table, column, extraWhere, column, chunkSize-1)
-	rows, err := nucleus.Query[boundaryRow](ctx, sql, query, cutoff)
-	if err != nil {
-		return 0, false, err
-	}
-	if len(rows) == 0 {
-		return 0, false, nil
-	}
-	v, err := strconv.ParseInt(rows[0].C, 10, 64)
-	if err != nil {
-		return 0, false, fmt.Errorf("chunk boundary: parse %q: %w", rows[0].C, err)
-	}
-	return v, true, nil
 }

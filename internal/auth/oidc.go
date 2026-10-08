@@ -322,7 +322,7 @@ func (o *OIDCAuth) ensure(ctx context.Context) error {
 	if o.provider != nil {
 		return nil
 	}
-	p, err := oidc.NewProvider(ctx, o.issuer)
+	p, err := oidc.NewProvider(oidcHTTPContext(ctx), o.issuer)
 	if err != nil {
 		return err
 	}
@@ -603,7 +603,7 @@ func (o *OIDCAuth) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg := o.oauthConfig(o.effectiveRedirect(r))
-	tok, err := cfg.Exchange(ctx, q.Get("code"), oauth2.VerifierOption(flow.verifier))
+	tok, err := cfg.Exchange(oidcHTTPContext(ctx), q.Get("code"), oauth2.VerifierOption(flow.verifier))
 	if err != nil {
 		o.logger.Error("OIDC token exchange failed", "err", err)
 		o.failAudit(w, r, "", auditResultFailure, "code_exchange_failed", "SSO sign-in failed — please try again")
@@ -718,4 +718,19 @@ func oidcRandToken() string {
 		panic(fmt.Sprintf("crypto/rand failed: %v", err))
 	}
 	return hex.EncodeToString(b)
+}
+
+// RemoteKeySet retains configuration while intentionally removing request
+// cancellation. A finite client timeout therefore bounds its shared refresh
+// even after the login that initiated it has gone away.
+func oidcHTTPContext(ctx context.Context) context.Context {
+	client := http.DefaultClient
+	if configured, ok := ctx.Value(oauth2.HTTPClient).(*http.Client); ok && configured != nil {
+		client = configured
+	}
+	bounded := *client
+	if bounded.Timeout <= 0 || bounded.Timeout > 10*time.Second {
+		bounded.Timeout = 10 * time.Second
+	}
+	return oidc.ClientContext(ctx, &bounded)
 }

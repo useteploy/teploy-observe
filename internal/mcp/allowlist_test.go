@@ -216,3 +216,38 @@ func TestAllowlistExcludesPersonLevelTables(t *testing.T) {
 		}
 	}
 }
+
+func TestCredentialAndFunctionBoundaries(t *testing.T) {
+	denied := []string{
+		"SELECT (*) FROM sites", "SELECT sum(*) FROM sites", "SELECT coalesce(*) FROM sites", "SELECT KV_GET('audit-fixture-only')", "SELECT KV_SET('audit-fixture-only','value')", "SELECT KV_DEL('audit-fixture-only')",
+		`SELECT "KV_GET"('fixture')`, "EXPLAIN SELECT coalesce(KV_GET('fixture'), 'x')",
+		"SELECT future_storage_function('fixture')", "SELECT s.domain('fixture') FROM sites AS s",
+		"SELECT session_salt AS session_salt FROM sites", "SELECT ping_token AS ping_token FROM cron_monitors",
+		"SELECT targeting AS targeting FROM feature_flags", "SELECT attributes AS attributes FROM metric_points",
+		"SELECT s.session_salt AS session_salt FROM sites AS s",
+		"WITH x AS (SELECT session_salt AS session_salt FROM sites) SELECT session_salt FROM x",
+		"SELECT session_salt FROM sites WHERE EXISTS (SELECT domain AS session_salt FROM sites)",
+		"SELECT s.value FROM sites AS s JOIN metric_points AS m ON s.site_id=m.site_id",
+		"SELECT value FROM sites WHERE EXISTS (SELECT value FROM metric_points)",
+		`SELECT "session_salt" AS "session_salt" FROM sites`,
+		"SELECT domain AS session_salt, session_salt AS leaked FROM sites",
+		"SELECT domain FROM sites UNION ALL SELECT session_salt AS domain FROM sites",
+		"WITH sites AS (SELECT 1 AS session_salt) SELECT session_salt FROM sites",
+	}
+	for _, sql := range denied {
+		if err := Check(sql); err == nil {
+			t.Errorf("boundary accepted %s", sql)
+		}
+	}
+	for _, sql := range []string{
+		"SELECT domain AS session_salt FROM sites ORDER BY session_salt",
+		"WITH x AS (SELECT domain AS session_salt FROM sites) SELECT session_salt FROM x",
+		"SELECT x.session_salt FROM (SELECT domain AS session_salt FROM sites) AS x",
+		"SELECT s.domain, m.value FROM sites AS s JOIN metric_points AS m ON s.site_id=m.site_id",
+		"SELECT domain AS n FROM sites WHERE EXISTS (SELECT count(*) AS n FROM metric_points)",
+	} {
+		if err := Check(sql); err != nil {
+			t.Errorf("safe query refused %s: %v", sql, err)
+		}
+	}
+}

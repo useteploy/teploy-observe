@@ -1,150 +1,154 @@
 package monitoring
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// SchedulePeriod estimates how often a cron schedule is expected to run.
-//
-// It is deliberately an estimate and not a cron evaluator. The only consumer is
-// the missed-run detector, which adds this to the monitor's grace period to get
-// a deadline, so being a little generous costs a slightly late alert while being
-// wrong in the other direction costs a false one — and a false one repeats on
-// every tick, which is how the incident flood happened. Anything it cannot read
-// returns (0, false) and the caller falls back to grace alone.
-//
-// Understood forms: the @-shorthands, `@every <go duration>`, and 5- or 6-field
-// cron expressions (a 6-field expression is read as seconds-first, the Quartz /
-// robfig convention).
-func SchedulePeriod(schedule string) (time.Duration, bool) {
-	s := strings.ToLower(strings.TrimSpace(schedule))
-	if s == "" {
-		return 0, false
-	}
+type cronField struct {
+	values  []int
+	allowed map[int]bool
+	star    bool
+}
 
+func parseCronField(raw string, lo, hi int) (cronField, error) {
+	f := cronField{allowed: map[int]bool{}, star: strings.HasPrefix(raw, "*") || raw == "?"}
+	for _, part := range strings.Split(raw, ",") {
+		base, stepText, stepped := strings.Cut(part, "/")
+		step := 1
+		if stepped {
+			n, err := strconv.Atoi(stepText)
+			if err != nil || n <= 0 || n > hi-lo+1 {
+				return f, fmt.Errorf("invalid step")
+			}
+			step = n
+		}
+		start, end := lo, hi
+		if base != "*" && base != "?" {
+			a, b, ranged := strings.Cut(base, "-")
+			n, err := strconv.Atoi(a)
+			if err != nil {
+				return f, err
+			}
+			start = n
+			end = n
+			if ranged {
+				end, err = strconv.Atoi(b)
+				if err != nil {
+					return f, err
+				}
+			} else if stepped {
+				end = hi
+			}
+		}
+		if start < lo || end > hi || start > end {
+			return f, fmt.Errorf("field outside range")
+		}
+		for n := start; n <= end; n += step {
+			f.allowed[n] = true
+		}
+	}
+	for n := lo; n <= hi; n++ {
+		if f.allowed[n] {
+			f.values = append(f.values, n)
+		}
+	}
+	if len(f.values) == 0 {
+		return f, fmt.Errorf("empty field")
+	}
+	return f, nil
+}
+
+// NextScheduledRun returns the first run strictly after after. Calendar schedules
+// use UTC, including six-field seconds-first expressions. Day-of-month and
+// weekday follow Vixie cron: OR when both restricted, AND otherwise. An empty
+// schedule is the explicit grace-only mode; unsupported/impossible schedules
+// fail closed instead of generating incidents on every grace interval.
+func NextScheduledRun(schedule string, after time.Time) (time.Time, bool) {
+	s := strings.ToLower(strings.TrimSpace(schedule))
+	after = after.UTC()
 	if strings.HasPrefix(s, "@every ") {
 		d, err := time.ParseDuration(strings.TrimSpace(strings.TrimPrefix(s, "@every ")))
 		if err != nil || d <= 0 {
-			return 0, false
+			return time.Time{}, false
 		}
-		return d, true
+		return after.Add(d), true
 	}
 	switch s {
 	case "@yearly", "@annually":
-		return 365 * 24 * time.Hour, true
+		s = "0 0 1 1 *"
 	case "@monthly":
-		return 30 * 24 * time.Hour, true
+		s = "0 0 1 * *"
 	case "@weekly":
-		return 7 * 24 * time.Hour, true
+		s = "0 0 * * 0"
 	case "@daily", "@midnight":
-		return 24 * time.Hour, true
+		s = "0 0 * * *"
 	case "@hourly":
-		return time.Hour, true
-	case "@reboot":
-		return 0, false
+		s = "0 * * * *"
 	}
-
-	fields := strings.Fields(s)
-	if len(fields) == 6 {
-		// Seconds-first. The seconds field only shortens the period, and a
-		// sub-minute period is noise next to any sane grace, so read the
-		// minute-first tail and let the seconds field go.
-		fields = fields[1:]
+	s = strings.NewReplacer("jan", "1", "feb", "2", "mar", "3", "apr", "4", "may", "5", "jun", "6", "jul", "7", "aug", "8", "sep", "9", "oct", "10", "nov", "11", "dec", "12", "sun", "0", "mon", "1", "tue", "2", "wed", "3", "thu", "4", "fri", "5", "sat", "6").Replace(s)
+	parts := strings.Fields(s)
+	if len(parts) == 5 {
+		parts = append([]string{"0"}, parts...)
 	}
-	if len(fields) != 5 {
-		return 0, false
+	if len(parts) != 6 {
+		return time.Time{}, false
 	}
-	minute, hour, dom, _, dow := fields[0], fields[1], fields[2], fields[3], fields[4]
-
-	// The period is set by the finest field that repeats. Walk from finest to
-	// coarsest and stop at the first one that is not pinned to a single value.
-	if d, ok := fieldPeriod(minute, time.Minute); ok {
-		return d, true
-	}
-	if d, ok := fieldPeriod(hour, time.Hour); ok {
-		return d, true
-	}
-	// Both minute and hour are pinned, so it runs at a fixed time of day. How
-	// often depends on which day fields are open.
-	domOpen := isOpen(dom)
-	dowOpen := isOpen(dow)
-	switch {
-	case domOpen && dowOpen:
-		return 24 * time.Hour, true
-	case dowOpen:
-		// Specific day-of-month, any weekday: monthly.
-		return 31 * 24 * time.Hour, true
-	case domOpen:
-		if d, ok := fieldPeriod(dow, 24*time.Hour); ok {
-			return d, true
+	bounds := [][2]int{{0, 59}, {0, 59}, {0, 23}, {1, 31}, {1, 12}, {0, 7}}
+	fields := make([]cronField, 6)
+	for i, part := range parts {
+		f, err := parseCronField(part, bounds[i][0], bounds[i][1])
+		if err != nil {
+			return time.Time{}, false
 		}
-		return 7 * 24 * time.Hour, true
-	default:
-		// Both pinned. Vixie cron ORs them, so it fires on whichever comes
-		// first; a week is the safe upper bound for that.
-		return 7 * 24 * time.Hour, true
+		fields[i] = f
 	}
-}
-
-// isOpen reports whether a cron field matches every value in its range.
-func isOpen(field string) bool {
-	return field == "*" || field == "?"
-}
-
-// fieldPeriod turns one cron field into the interval between its firings, in
-// units of `unit`, and reports false when the field names exactly one value
-// (in which case the period is set by a coarser field, not this one).
-//
-//   - -> every unit
-//     */n    -> every n units
-//     a,b,c  -> the widest gap between consecutive values (the conservative one)
-//     a-b    -> every unit across the range
-//     5      -> false, this field is pinned
-func fieldPeriod(field string, unit time.Duration) (time.Duration, bool) {
-	if isOpen(field) {
-		return unit, true
+	if fields[5].allowed[7] {
+		fields[5].allowed[0] = true
 	}
-	if base, step, ok := strings.Cut(field, "/"); ok {
-		n, err := strconv.Atoi(strings.TrimSpace(step))
-		if err != nil || n <= 0 {
-			return 0, false
+	day := time.Date(after.Year(), after.Month(), after.Day(), 0, 0, 0, 0, time.UTC)
+	// Eight years include the leap-day gap across a non-leap century (2096-2104).
+	limit := day.AddDate(8, 0, 1)
+	for ; day.Before(limit); day = day.AddDate(0, 0, 1) {
+		if !fields[4].allowed[int(day.Month())] {
+			continue
 		}
-		// `a-b/n` only steps within the range, but the gap between firings
-		// inside it is still n units and that is the bound we want.
-		_ = base
-		return time.Duration(n) * unit, true
-	}
-	if strings.Contains(field, "-") {
-		return unit, true
-	}
-	if strings.Contains(field, ",") {
-		vals := make([]int, 0, 8)
-		for _, part := range strings.Split(field, ",") {
-			n, err := strconv.Atoi(strings.TrimSpace(part))
-			if err != nil {
-				return 0, false
-			}
-			vals = append(vals, n)
+		dom, dow := fields[3].allowed[day.Day()], fields[5].allowed[int(day.Weekday())]
+		match := dom || dow
+		if fields[3].star || fields[5].star {
+			match = dom && dow
 		}
-		if len(vals) < 2 {
-			return 0, false
+		if !match {
+			continue
 		}
-		gap := 0
-		for i := 1; i < len(vals); i++ {
-			g := vals[i] - vals[i-1]
-			if g > gap {
-				gap = g
+		for _, hour := range fields[2].values {
+			for _, minute := range fields[1].values {
+				for _, second := range fields[0].values {
+					candidate := day.Add(time.Duration(hour)*time.Hour + time.Duration(minute)*time.Minute + time.Duration(second)*time.Second)
+					if candidate.After(after) {
+						return candidate, true
+					}
+				}
 			}
 		}
-		if gap <= 0 {
-			return 0, false
+	}
+	return time.Time{}, false
+}
+
+// CronDeadline includes grace after the actual next scheduled run.
+func CronDeadline(schedule string, last time.Time, graceSecs int) (time.Time, bool) {
+	if graceSecs <= 0 {
+		graceSecs = 300
+	}
+	next := last.UTC()
+	if strings.TrimSpace(schedule) != "" {
+		var ok bool
+		next, ok = NextScheduledRun(schedule, last)
+		if !ok {
+			return time.Time{}, false
 		}
-		return time.Duration(gap) * unit, true
 	}
-	if _, err := strconv.Atoi(field); err == nil {
-		return 0, false // pinned to one value
-	}
-	return 0, false
+	return next.Add(time.Duration(graceSecs) * time.Second), true
 }

@@ -506,7 +506,16 @@ func TestEveryCallIsAudited(t *testing.T) {
 	callTool(t, srv.URL, editor, "observe_live_stats", nil)
 	callTool(t, srv.URL, editor, "does_not_exist", nil)
 
-	events := rec.all()
+	all := rec.all()
+	if len(all) != 9 {
+		t.Fatalf("want four intent/completion pairs and one unknown-tool event, got %d", len(all))
+	}
+	events := []audit.AuditEvent{}
+	for _, ev := range all {
+		if ev.Result != "started" {
+			events = append(events, ev)
+		}
+	}
 	if len(events) != 5 {
 		t.Fatalf("expected 5 audit events, got %d: %+v", len(events), events)
 	}

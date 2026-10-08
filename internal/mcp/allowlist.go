@@ -23,19 +23,10 @@ import (
 // remembers. This file is that decision point. Adding a table here is a
 // deliberate act with a reviewer.
 //
-// The rules:
-//
-//  1. Every table named after FROM or JOIN — at any nesting depth, in any
-//     subquery, CTE or set operation — must appear in allowedTables.
-//  2. Every column identifier must appear in the allowlist of one of the
-//     tables the query references (or be a CTE name, an alias, a function or a
-//     SQL keyword). A column left out of a table's list is unreachable even
-//     though the table is allowed: that is how `sites.session_salt`,
-//     `cron_monitors.ping_token` and `feature_flags.targeting` stay out.
-//  3. A bare `*` is refused. `count(*)` is fine; `SELECT *` is not, because a
-//     wildcard would defeat rule 2 the moment a migration adds a column.
-//  4. A schema-qualified table reference is refused outright, which is what
-//     keeps `information_schema.columns` and `pg_catalog.*` unreachable.
+// Each SELECT resolves source columns against its own relations. Derived tables
+// and CTEs expose only validated projections; output aliases grant no input
+// privilege. Only explicitly approved pure functions are callable. Unsupported
+// syntax fails closed. Wildcards (except count(*)) and schema names are refused.
 //
 // Read-only is a SEPARATE axis from sensitivity and does not overlap with any
 // of this: a read-only token governs mutation, and these rules govern what
@@ -238,153 +229,8 @@ func Check(sql string) error {
 		return err
 	}
 
-	// Names the query itself introduces, kept in TWO sets that are deliberately
-	// not interchangeable.
-	//
-	// ctes are the only query-local names a FROM may target. Column and table
-	// aliases go in declared, which the identifier check consults and the table
-	// check does not — because if an alias satisfied a table reference, then
-	// `SELECT 1 AS events FROM events` would name the real events table and
-	// walk straight past the allowlist.
-	//
-	// Both are collected before anything is validated, because a name can be
-	// used before its definition is scanned (an ORDER BY alias, a CTE
-	// referenced by a later CTE, a recursive CTE referencing itself).
-	//
-	// Only `AS`-spelled aliases are recognised. An implicit alias
-	// (`count(*) hits`) is refused rather than guessed at: telling an implicit
-	// alias from a column reference needs a real parser, and the wrong guess in
-	// that direction is a hole rather than an inconvenience.
-	ctes := map[string]bool{}
-	declared := map[string]bool{}
-	for i, t := range toks {
-		// `name AS (` introduces a CTE; `expr AS name` introduces an alias.
-		if t.kind == tokIdent && isWord(toks, i+1, "AS") {
-			if n := next(toks, i+2); n != nil && n.kind == tokPunct && n.text == "(" {
-				ctes[t.text] = true
-				declared[t.text] = true
-				continue
-			}
-		}
-		if t.kind != tokIdent || t.upper != "AS" {
-			continue
-		}
-		if n := next(toks, i+1); n != nil && n.kind == tokIdent {
-			declared[n.text] = true
-		}
-	}
-
-	referenced := map[string]bool{}
-	if err := walkTableRefs(toks, ctes, declared, referenced); err != nil {
-		return err
-	}
-
-	// Every allowlisted column of every table the query touches.
-	columns := map[string]bool{}
-	for table := range referenced {
-		for _, c := range allowedTables[table].columns {
-			columns[c] = true
-		}
-		columns[table] = true // `stats_daily.pageviews` qualifies by table name
-	}
-
-	return checkIdentifiers(toks, declared, columns)
-}
-
-// walkTableRefs validates every table named after FROM or JOIN, at any depth.
-// A subquery's FROM is reached by the same linear scan, so nesting needs no
-// recursion — which also means there is no depth at which the check stops.
-func walkTableRefs(toks []token, ctes, declared, referenced map[string]bool) error {
-	for i := 0; i < len(toks); i++ {
-		t := toks[i]
-		if t.kind != tokIdent || (t.upper != "FROM" && t.upper != "JOIN") {
-			continue
-		}
-		// EXTRACT(epoch FROM ts) and SUBSTRING(x FROM 1) spell FROM without
-		// naming a table. Those are the only such forms in standard SQL.
-		if t.upper == "FROM" && insideValueFunction(toks, i) {
-			continue
-		}
-		for {
-			j, err := checkOneTableRef(toks, i+1, ctes, declared, referenced)
-			if err != nil {
-				return err
-			}
-			// A comma-separated FROM list continues with another table ref.
-			if n := next(toks, j); n != nil && n.kind == tokPunct && n.text == "," {
-				i = j
-				continue
-			}
-			i = j - 1
-			break
-		}
-	}
-	return nil
-}
-
-// checkOneTableRef validates the table reference starting at toks[i] and
-// returns the index just past it (including any alias).
-func checkOneTableRef(toks []token, i int, ctes, declared, referenced map[string]bool) (int, error) {
-	t := next(toks, i)
-	if t == nil {
-		return i, fmt.Errorf("malformed query: nothing follows FROM/JOIN")
-	}
-	if t.kind == tokPunct && t.text == "(" {
-		// A derived table. Its own FROM is validated by the outer scan.
-		return i + 1, nil
-	}
-	if t.kind != tokIdent {
-		return i, fmt.Errorf("only a plain table name may follow FROM/JOIN, got %q", t.text)
-	}
-	// A qualified name is refused outright — this is what makes
-	// information_schema.columns and pg_catalog.* unreachable, rather than
-	// relying on their base names being absent from the allowlist.
-	if n := next(toks, i+1); n != nil && n.kind == tokPunct && n.text == "." {
-		return i, fmt.Errorf("schema-qualified table references are not permitted over MCP: %q", t.text)
-	}
-	// A CTE name satisfies a table reference; an ALIAS does not. See Check.
-	if !ctes[t.text] {
-		if _, ok := allowedTables[t.text]; !ok {
-			return i, fmt.Errorf("table %q is not readable over MCP — Observe's MCP server reaches "+
-				"analytics aggregates only. Readable tables: %s", t.text, strings.Join(AllowedTables(), ", "))
-		}
-		referenced[t.text] = true
-	}
-	// Consume an optional alias, with or without AS.
-	j := i + 1
-	if isWord(toks, j, "AS") {
-		j++
-	}
-	if n := next(toks, j); n != nil && n.kind == tokIdent && !sqlKeywords[n.upper] {
-		declared[n.text] = true
-		j++
-	}
-	return j, nil
-}
-
-// checkIdentifiers refuses any name that is not a permitted column, a name the
-// query declared, a function, or a SQL keyword — and refuses a bare `*`,
-// because a wildcard would smuggle out every column a later migration adds to
-// an allowlisted table.
-func checkIdentifiers(toks []token, declared, columns map[string]bool) error {
-	for i, t := range toks {
-		if t.kind == tokPunct && t.text == "*" && isWildcard(toks, i) {
-			return fmt.Errorf("SELECT * is not permitted over MCP — name the columns you need " +
-				"(count(*) is fine). Use observe_tables to see them")
-		}
-		if t.kind != tokIdent || sqlKeywords[t.upper] {
-			continue
-		}
-		if n := next(toks, i+1); n != nil && n.kind == tokPunct && n.text == "(" {
-			continue // function call
-		}
-		if declared[t.text] || columns[t.text] {
-			continue
-		}
-		return fmt.Errorf("column %q is not readable over MCP — it is either absent from the "+
-			"allowlist for the tables this query reads, or withheld as personal data or a credential", t.text)
-	}
-	return nil
+	_, err = checkScope(toks, nil)
+	return err
 }
 
 // isWildcard distinguishes the `*` of `SELECT *` from the `*` of `a * b`.
@@ -404,37 +250,9 @@ func isWildcard(toks []token, i int) bool {
 	case tokIdent:
 		return sqlKeywords[p.upper]
 	case tokPunct:
-		return p.text == "," || p.text == "."
+		return p.text == "," || p.text == "." || p.text == "("
 	}
 	return true
-}
-
-// insideValueFunction reports whether toks[i] sits inside the parentheses of a
-// function that takes FROM as a separator rather than a table clause.
-func insideValueFunction(toks []token, i int) bool {
-	depth := 0
-	for j := i - 1; j >= 0; j-- {
-		t := toks[j]
-		if t.kind != tokPunct {
-			continue
-		}
-		switch t.text {
-		case ")":
-			depth++
-		case "(":
-			if depth > 0 {
-				depth--
-				continue
-			}
-			p := prev(toks, j-1)
-			return p != nil && p.kind == tokIdent && valueFunctions[p.upper]
-		}
-	}
-	return false
-}
-
-var valueFunctions = map[string]bool{
-	"EXTRACT": true, "SUBSTRING": true, "TRIM": true, "POSITION": true, "OVERLAY": true,
 }
 
 func next(toks []token, i int) *token {
@@ -462,9 +280,10 @@ const (
 )
 
 type token struct {
-	kind  tokKind
-	text  string // identifiers lowercased; punctuation verbatim
-	upper string
+	quoted bool
+	kind   tokKind
+	text   string // identifiers lowercased; punctuation verbatim
+	upper  string
 }
 
 // lex tokenizes SQL into identifiers, numbers and single-character
@@ -494,6 +313,7 @@ func lex(sql string) ([]token, error) {
 			i += 2
 		case c == '\'':
 			i++
+			closed := false
 			for i < n {
 				if sql[i] == '\'' {
 					if i+1 < n && sql[i+1] == '\'' {
@@ -501,9 +321,16 @@ func lex(sql string) ([]token, error) {
 						continue
 					}
 					i++
+					closed = true
 					break
 				}
+				if sql[i] == '\\' {
+					return nil, fmt.Errorf("backslash string escapes are not supported over MCP")
+				}
 				i++
+			}
+			if !closed {
+				return nil, fmt.Errorf("unterminated string literal")
 			}
 		case c == '"':
 			// A quoted identifier is still an identifier. The explorer's lexer
@@ -515,10 +342,13 @@ func lex(sql string) ([]token, error) {
 				i++
 			}
 			word := sql[start:i]
+			if i >= n {
+				return nil, fmt.Errorf("unterminated quoted identifier")
+			}
 			if i < n {
 				i++
 			}
-			out = append(out, token{kind: tokIdent, text: strings.ToLower(word), upper: strings.ToUpper(word)})
+			out = append(out, token{kind: tokIdent, quoted: true, text: strings.ToLower(word), upper: strings.ToUpper(word)})
 		case c >= '0' && c <= '9':
 			start := i
 			for i < n && ((sql[i] >= '0' && sql[i] <= '9') || sql[i] == '.') {

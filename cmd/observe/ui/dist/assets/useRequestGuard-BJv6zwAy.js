@@ -1,0 +1,1 @@
+import{A as t,y as u,q as o}from"./hooks-7ZZ1pRoA.js";function a(r){const e=t({key:r,generation:0,mounted:!0});return e.current.key!==r&&(e.current.key=r,e.current.generation++),u(()=>(e.current.mounted=!0,()=>{e.current.mounted=!1,e.current.generation++}),[]),o(()=>{const n=++e.current.generation;return()=>e.current.mounted&&e.current.generation===n},[])}export{a as u};

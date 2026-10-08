@@ -47,9 +47,16 @@ var auditSkipExact = map[string]bool{
 	"POST /api/v1/surveys/respond": true,
 	// Public per-pageview widget exposure and API-key telemetry writes: same
 	// flood the respond skip avoids, with an empty or key-only actor.
-	"POST /api/v1/surveys/expose":     true,
-	"POST /api/v1/experiments/metric": true,
-	"POST /api/v1/persons/properties": true,
+	"POST /api/v1/surveys/expose":      true,
+	"POST /api/v1/experiments/metric":  true,
+	"POST /api/v1/persons/properties":  true,
+	"POST /api/v1/errors":              true,
+	"POST /api/v1/logs":                true,
+	"POST /api/v1/logs/batch":          true,
+	"POST /api/v1/replays":             true,
+	"POST /api/v1/llm/ingest":          true,
+	"POST /api/v1/experiments/expose":  true,
+	"POST /api/v1/experiments/convert": true,
 }
 
 // parseActorFunc resolves the acting username from a bearer token. It returns

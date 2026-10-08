@@ -105,8 +105,8 @@ type kvZEntry struct {
 // kvSnapshot is one full read of the namespace, key-sorted for
 // byte-identical archives.
 type kvSnapshot struct {
-	keys  []string
-	lines map[string]kvLine
+	keys []string
+	path string
 }
 
 // maxKVValueBytes bounds one restored string blob: the dump side carries
@@ -129,26 +129,13 @@ func dumpKVSrcmap(ctx context.Context, r pgxRunner, tw *tar.Writer) (int64, erro
 		return 0, err
 	}
 
-	tmp, err := os.CreateTemp("", "observe-backup-kv-srcmap-*.jsonl")
+	defer os.Remove(snap.path)
+	tmp, err := os.Open(snap.path)
 	if err != nil {
-		return 0, fmt.Errorf("create temp file: %w", err)
+		return 0, err
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
 	defer tmp.Close()
-
-	bw := bufio.NewWriter(tmp)
-	enc := json.NewEncoder(bw)
-	var n int64
-	for _, key := range snap.keys {
-		if err := enc.Encode(snap.lines[key]); err != nil {
-			return 0, fmt.Errorf("marshal kv row %s: %w", key, err)
-		}
-		n++
-	}
-	if err := bw.Flush(); err != nil {
-		return 0, fmt.Errorf("flush temp file: %w", err)
-	}
+	n := int64(len(snap.keys))
 
 	info, err := tmp.Stat()
 	if err != nil {
@@ -183,6 +170,11 @@ var errKVChurning = fmt.Errorf("kv srcmap namespace kept changing during the dum
 // errKVChurning instead of guessing a moment.
 func stableKVSnapshot(ctx context.Context, r pgxRunner) (*kvSnapshot, error) {
 	var prev *kvSnapshot
+	defer func() {
+		if prev != nil {
+			os.Remove(prev.path)
+		}
+	}()
 	for attempt := 0; attempt < kvConvergenceAttempts; attempt++ {
 		if attempt > 0 {
 			select {
@@ -196,12 +188,23 @@ func stableKVSnapshot(ctx context.Context, r pgxRunner) (*kvSnapshot, error) {
 			if isKVReadRetryable(err) {
 				// A writer deleted a key between list and read; the pair
 				// cannot agree, so restart it.
+				if prev != nil {
+					os.Remove(prev.path)
+				}
 				prev = nil
 				continue
 			}
 			return nil, err
 		}
-		if prev != nil && reflect.DeepEqual(prev.keys, snap.keys) && kvLinesEqual(prev.lines, snap.lines) {
+		equal := false
+		if prev != nil && reflect.DeepEqual(prev.keys, snap.keys) {
+			equal, err = equalKVSpools(prev.path, snap.path)
+			if err != nil {
+				os.Remove(snap.path)
+				return nil, err
+			}
+		}
+		if equal {
 			// Closing relist: the STRING key set must STILL match, or a
 			// writer landed after the agreeing reads and before
 			// acceptance. (KV_KEYS cannot see collection keys — upstream —
@@ -209,14 +212,21 @@ func stableKVSnapshot(ctx context.Context, r pgxRunner) (*kvSnapshot, error) {
 			// agreeing reads above, and only the blob keys by this relist.)
 			now, err := kvListKeys(ctx, r, kvSrcmapPattern)
 			if err != nil {
+				os.Remove(snap.path)
 				return nil, err
 			}
-			sort.Strings(now)
+			now = stringKeysOf(&kvSnapshot{keys: now})
 			if !reflect.DeepEqual(now, stringKeysOf(snap)) {
+				os.Remove(prev.path)
 				prev = snap
 				continue
 			}
+			os.Remove(prev.path)
+			prev = nil
 			return snap, nil
+		}
+		if prev != nil {
+			os.Remove(prev.path)
 		}
 		prev = snap
 	}
@@ -260,38 +270,52 @@ func readKVSnapshot(ctx context.Context, r pgxRunner) (*kvSnapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	snap := &kvSnapshot{lines: make(map[string]kvLine, len(blobKeys))}
-	for _, key := range blobKeys {
+	keys := append([]string(nil), blobKeys...)
+	for _, site := range srcmapSites(blobKeys) {
+		keys = append(keys, "srcmap:releases:"+site, "srcmap:relage:"+site)
+	}
+	sort.Strings(keys)
+	tmp, err := os.CreateTemp("", "observe-backup-kv-srcmap-*.jsonl")
+	if err != nil {
+		return nil, err
+	}
+	snap := &kvSnapshot{path: tmp.Name()}
+	complete := false
+	defer func() {
+		tmp.Close()
+		if !complete {
+			os.Remove(snap.path)
+		}
+	}()
+	bw := bufio.NewWriter(tmp)
+	enc := json.NewEncoder(bw)
+	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		line, err := dumpKVKey(ctx, r, key)
 		if err != nil {
 			return nil, err
 		}
-		snap.lines[key] = line
-	}
-	for _, site := range srcmapSites(blobKeys) {
-		members, err := kvSMembers(ctx, r, "srcmap:releases:"+site)
-		if err != nil {
+		if line.Type == "set" && len(line.Members) == 0 || line.Type == "zset" && len(line.Entries) == 0 {
+			continue
+		}
+		if len(snap.keys) > 0 && snap.keys[len(snap.keys)-1] == key {
+			continue
+		}
+		if err := enc.Encode(line); err != nil {
 			return nil, err
 		}
-		if len(members) > 0 {
-			key := "srcmap:releases:" + site
-			sort.Strings(members)
-			snap.lines[key] = kvLine{Key: key, Type: "set", Members: members}
-		}
-		entries, err := kvZRangeAll(ctx, r, "srcmap:relage:"+site)
-		if err != nil {
-			return nil, err
-		}
-		if len(entries) > 0 {
-			key := "srcmap:relage:" + site
-			snap.lines[key] = kvLine{Key: key, Type: "zset", Entries: entries}
-		}
-	}
-	snap.keys = make([]string, 0, len(snap.lines))
-	for key := range snap.lines {
 		snap.keys = append(snap.keys, key)
 	}
-	sort.Strings(snap.keys)
+	if err := bw.Flush(); err != nil {
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, err
+	}
+	complete = true
+
 	return snap, nil
 }
 
@@ -340,20 +364,35 @@ func isSrcmapReserved(component string) bool {
 	return false
 }
 
-func kvLinesEqual(a, b map[string]kvLine) bool {
-	if len(a) != len(b) {
-		return false
+// equalKVSpools compares canonical snapshots byte-for-byte with fixed buffers.
+func equalKVSpools(a, b string) (bool, error) {
+	fa, err := os.Open(a)
+	if err != nil {
+		return false, err
 	}
-	for k, av := range a {
-		bv, ok := b[k]
-		if !ok || av.Key != bv.Key || av.Type != bv.Type || av.Value != bv.Value {
-			return false
+	defer fa.Close()
+	fb, err := os.Open(b)
+	if err != nil {
+		return false, err
+	}
+	defer fb.Close()
+	ba, bb := make([]byte, 64<<10), make([]byte, 64<<10)
+	for {
+		na, ea := io.ReadFull(fa, ba)
+		nb, eb := io.ReadFull(fb, bb)
+		if ea != nil && ea != io.EOF && ea != io.ErrUnexpectedEOF {
+			return false, ea
 		}
-		if !reflect.DeepEqual(av.Members, bv.Members) || !reflect.DeepEqual(av.Entries, bv.Entries) {
-			return false
+		if eb != nil && eb != io.EOF && eb != io.ErrUnexpectedEOF {
+			return false, eb
+		}
+		if na != nb || !bytes.Equal(ba[:na], bb[:nb]) {
+			return false, nil
+		}
+		if ea != nil || eb != nil {
+			return ea == eb, nil
 		}
 	}
-	return true
 }
 
 // dumpKVKey reads one key's full content in its native type.
@@ -529,14 +568,26 @@ func decodeKVRow(line []byte) (kvLine, error) {
 // upstream — so a listing-based proof would only vouch for the blobs.)
 func applyKVSection(ctx context.Context, db *nucleus.Client, r io.Reader) error {
 	kv := db.KV()
-	var rows []kvLine
+	// The validated namespace is replayed from disk for completeness checking;
+	// no aggregate payload slice survives the apply pass.
+	spool, err := os.CreateTemp("", "observe-restore-kv-srcmap-*.jsonl")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(spool.Name())
+	defer spool.Close()
+	if _, err := io.Copy(spool, r); err != nil {
+		return err
+	}
+	if _, err := spool.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 	seen := make(map[string]bool)
-	if err := eachKVLine(r, func(row kvLine) error {
+	if err := eachKVLine(spool, func(row kvLine) error {
 		if seen[row.Key] {
 			return fmt.Errorf("duplicate kv key %s in archive", row.Key)
 		}
 		seen[row.Key] = true
-		rows = append(rows, row)
 		switch row.Type {
 		case "string":
 			raw, err := base64.StdEncoding.DecodeString(row.Value)
@@ -610,12 +661,10 @@ func applyKVSection(ctx context.Context, db *nucleus.Client, r io.Reader) error 
 		}
 		return nil
 	}
-	for _, row := range rows {
-		if err := verify(row); err != nil {
-			return err
-		}
+	if _, err := spool.Seek(0, io.SeekStart); err != nil {
+		return err
 	}
-	return nil
+	return eachKVLine(spool, verify)
 }
 
 // eachKVLine streams an archive entry's JSONL lines through fn. The scanner

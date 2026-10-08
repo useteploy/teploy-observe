@@ -11,7 +11,8 @@
   var color = script.getAttribute('data-color') || '#6366f1';
 
   var widget = null;
-  var form = null;
+  var generation = 0;
+  var pending = false;
 
   function createWidget() {
     widget = document.createElement('div');
@@ -34,41 +35,63 @@
 
     document.getElementById('obs-fb-btn').addEventListener('click', function() {
       var f = document.getElementById('obs-fb-form');
+      generation++;
+      document.getElementById('obs-fb-status').style.display = 'none';
       f.style.display = f.style.display === 'none' ? 'block' : 'none';
     });
 
     document.getElementById('obs-fb-cancel').addEventListener('click', function() {
+      generation++;
       document.getElementById('obs-fb-form').style.display = 'none';
     });
 
     document.getElementById('obs-fb-submit').addEventListener('click', function() {
-      var msg = document.getElementById('obs-fb-msg').value.trim();
+      if (pending) return;
+      var messageInput = document.getElementById('obs-fb-msg');
+      var emailInput = document.getElementById('obs-fb-email');
+      var capturedMessage = messageInput.value;
+      var capturedEmail = emailInput.value;
+      var msg = capturedMessage.trim();
       if (!msg) return;
-      var email = document.getElementById('obs-fb-email').value.trim();
-
+      var requestGeneration = generation;
+      var submit = document.getElementById('obs-fb-submit');
+      var status = document.getElementById('obs-fb-status');
+      pending = true;
+      submit.disabled = true;
+      status.style.display = 'none';
       var payload = {
         site_id: siteId,
         url: (function(){ try { return location.origin + location.pathname; } catch (e) { return ''; } })(),
-        message: msg,
-        email: email,
-        category: 'feedback'
+        message: msg, email: capturedEmail.trim(), category: 'feedback'
       };
-
-      fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      }).then(function() {
-        document.getElementById('obs-fb-msg').value = '';
-        document.getElementById('obs-fb-email').value = '';
-        var status = document.getElementById('obs-fb-status');
+      Promise.resolve().then(function() {
+        return fetch(endpoint, {
+          method: 'POST', redirect: 'error',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+      }).then(function(response) {
+        if (!response.ok) throw new Error('submission refused');
+        return response.json();
+      }).then(function(ack) {
+        if (!ack || ack.ok !== true) throw new Error('submission not confirmed');
+        if (generation !== requestGeneration || messageInput.value !== capturedMessage || emailInput.value !== capturedEmail) return;
+        messageInput.value = '';
+        emailInput.value = '';
         status.textContent = 'Thanks for your feedback!';
+        status.style.color = '#22c55e';
         status.style.display = 'block';
         setTimeout(function() {
+          if (generation !== requestGeneration || messageInput.value || emailInput.value) return;
           document.getElementById('obs-fb-form').style.display = 'none';
           status.style.display = 'none';
         }, 2000);
-      });
+      }).catch(function() {
+        if (generation !== requestGeneration) return;
+        status.textContent = 'Feedback could not be sent. Your draft is saved; please try again.';
+        status.style.color = '#ef4444';
+        status.style.display = 'block';
+      }).then(function() { pending = false; submit.disabled = false; });
     });
   }
 

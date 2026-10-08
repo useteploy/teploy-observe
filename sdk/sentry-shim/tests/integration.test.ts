@@ -14,7 +14,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { init, captureException, flush } from "../src/index.js";
+import { init, captureException, addBreadcrumb, flush } from "../src/index.js";
 
 const OBSERVE_URL = process.env.OBSERVE_URL ?? "http://localhost:3000";
 const USERNAME = process.env.OBSERVE_USER ?? "admin";
@@ -77,6 +77,14 @@ test("integration: captureException lands as an issue in the running Observe sta
   }
 
   const token = await login();
+  const keyResponse = await fetch(`${OBSERVE_URL}/api/v1/sites/default/keys`, {
+    method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({label:"sdk-shim-integration"}),
+  });
+  assert.equal(keyResponse.ok, true, `API key creation failed: ${keyResponse.status}`);
+  const {key} = await keyResponse.json() as {key:string};
+  assert.ok(key);
+
   // Use a fully unique error type so the group_hash is brand-new (won't collide
   // with prior runs' identical stacks/types — Observe groups by error_type +
   // in-app stack, so the title only matches our needle when the issue is fresh).
@@ -86,6 +94,7 @@ test("integration: captureException lands as an issue in the running Observe sta
 
   init({
     endpoint: OBSERVE_URL,
+    apiKey: key,
     siteId: "default",
     release: "shim-test",
     environment: "ci",
@@ -96,8 +105,10 @@ test("integration: captureException lands as an issue in the running Observe sta
 
   const err = new Error(needle);
   err.name = errorType;
+  addBreadcrumb({message:"default timestamp"});
+  addBreadcrumb({message:"fractional seconds",timestamp:1700000000.123});
   captureException(err);
-  await flush();
+  assert.equal(await flush(), true, "authenticated exception with breadcrumbs must be accepted");
   await new Promise((r) => setTimeout(r, 200));
 
   const found = await findIssue(token, needle);

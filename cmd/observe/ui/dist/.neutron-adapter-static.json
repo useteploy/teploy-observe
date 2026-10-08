@@ -7,8 +7,8 @@
   },
   "compression": {
     "enabled": true,
-    "files": 78,
-    "gzipBytesSaved": 657441,
-    "brotliBytesSaved": 719638
+    "files": 79,
+    "gzipBytesSaved": 664905,
+    "brotliBytesSaved": 727361
   }
 }

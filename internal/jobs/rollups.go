@@ -13,6 +13,7 @@ import (
 
 // RollupService aggregates raw events into hourly and daily summary tables.
 type RollupService struct {
+	now    func() time.Time
 	db     *nucleus.Client
 	logger *slog.Logger
 }
@@ -159,23 +160,27 @@ func (r *RollupService) RunDailyRollup(ctx context.Context) error {
 
 // sessionEvent is a raw event row used during session rollup.
 type sessionEvent struct {
-	TenantID     string `db:"tenant_id"`
-	SiteID       string `db:"site_id"`
-	SessionID    string `db:"session_id"`
-	Timestamp    int64  `db:"timestamp"`
-	Pathname     string `db:"pathname"`
-	Referrer     string `db:"referrer"`
-	Browser      string `db:"browser"`
-	OS           string `db:"os"`
-	Device       string `db:"device"`
-	Country      string `db:"country"`
-	Language     string `db:"language"`
-	ScreenWidth  int64  `db:"screen_width"`
-	ScreenHeight int64  `db:"screen_height"`
-	UTMSource    string `db:"utm_source"`
-	UTMMedium    string `db:"utm_medium"`
-	UTMCampaign  string `db:"utm_campaign"`
-	ReleaseTag   string `db:"release_tag"`
+	TenantID         string `db:"tenant_id"`
+	SiteID           string `db:"site_id"`
+	SessionID        string `db:"session_id"`
+	Timestamp        int64  `db:"timestamp"`
+	Pathname         string `db:"pathname"`
+	Referrer         string `db:"referrer"`
+	Browser          string `db:"browser"`
+	OS               string `db:"os"`
+	Device           string `db:"device"`
+	Country          string `db:"country"`
+	Language         string `db:"language"`
+	ScreenWidth      int64  `db:"screen_width"`
+	ScreenHeight     int64  `db:"screen_height"`
+	UTMSource        string `db:"utm_source"`
+	UTMMedium        string `db:"utm_medium"`
+	UTMCampaign      string `db:"utm_campaign"`
+	ReleaseTag       string `db:"release_tag"`
+	SummaryLastTS    int64  `db:"summary_last_ts"`
+	SummaryPageviews int64  `db:"summary_pageviews"`
+	SummaryEvents    int64  `db:"summary_events"`
+	SummaryVersion   int64  `db:"summary_version"`
 }
 
 // RunSessionRollup aggregates events into session summaries.
@@ -187,6 +192,9 @@ type sessionEvent struct {
 // since Nucleus doesn't support window functions or correlated subqueries.
 func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 	now := time.Now().UTC()
+	if r.now != nil {
+		now = r.now().UTC()
+	}
 	cutoff := now.Add(-30 * time.Minute).UnixMilli()
 	version := now.UnixMilli()
 
@@ -271,68 +279,85 @@ func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 		is_bounce, version, release_tag
 	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`
 
-	// Drop the previous computation of every session we are about to rewrite.
-	// sessions is a ReplacingMergeTree, but Nucleus only collapses versions
-	// when it merges the segments holding them, which for this table it does
-	// not do in practice — a session still receiving events was accumulating
-	// one row every five minutes, and every COUNT(*) over the table counted
-	// them all. See RunHourlyRollup for the full note.
-	for i := 0; i < len(sids); i += chunk {
-		end := i + chunk
-		if end > len(sids) {
-			end = len(sids)
-		}
-		batch := sids[i:end]
-		ph := make([]string, len(batch))
-		args := make([]any, len(batch))
-		for j, s := range batch {
-			ph[j] = fmt.Sprintf("$%d", j+1)
-			args[j] = s
-		}
-		if _, err := sql.Exec(ctx,
-			`DELETE FROM sessions WHERE session_id IN (`+strings.Join(ph, ",")+`)`,
-			args...,
-		); err != nil {
-			return fmt.Errorf("session rollup clear: %w", err)
-		}
-	}
-
 	inserted := 0
 	for _, events := range grouped {
-		sort.Slice(events, func(i, j int) bool {
-			return events[i].Timestamp < events[j].Timestamp
-		})
-		first := events[0]
-		last := events[len(events)-1]
-		isBounce := "false"
-		if len(events) <= 1 {
-			isBounce = "true"
-		}
-		// Pick the first non-empty release_tag in the session — the SDK
-		// includes it on every event but we only need one.
-		releaseTag := first.ReleaseTag
-		if releaseTag == "" {
-			for _, e := range events {
-				if e.ReleaseTag != "" {
-					releaseTag = e.ReleaseTag
-					break
+		err := func() error {
+			tx, err := r.db.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback(ctx)
+			sql := tx.SQL()
+			sort.Slice(events, func(i, j int) bool {
+				return events[i].Timestamp < events[j].Timestamp
+			})
+			first := events[0]
+			last := events[len(events)-1]
+			pageviews, eventsCount := int64(len(events)), int64(len(events))
+			previousQuery := strings.Replace(selectCols, "timestamp,", "first_ts AS timestamp,", 1)
+			previousQuery = strings.Replace(previousQuery, " FROM events", ", last_ts AS summary_last_ts, pageviews AS summary_pageviews, events_count AS summary_events, version AS summary_version FROM sessions", 1)
+			prior, err := nucleus.Query[sessionEvent](ctx, sql, previousQuery+" WHERE tenant_id = $1 AND site_id = $2 AND session_id = $3 ORDER BY summary_version DESC LIMIT 1", first.TenantID, first.SiteID, first.SessionID)
+			if err != nil {
+				return fmt.Errorf("session rollup prior: %w", err)
+			}
+			if len(prior) > 0 && prior[0].Timestamp < first.Timestamp {
+				// Raw retention has removed the entry event. Preserve the retained
+				// summary and add only events newer than its committed watermark.
+				// Repeated ticks are idempotent; late events behind that watermark
+				// cannot reconstruct expired history and leave this summary intact.
+				previous := prior[0]
+				newCount := int64(0)
+				for _, e := range events {
+					if e.Timestamp > previous.SummaryLastTS {
+						newCount++
+					}
+				}
+				if newCount == 0 {
+					return nil
+				}
+				first = previous
+				pageviews = previous.SummaryPageviews + newCount
+				eventsCount = previous.SummaryEvents + newCount
+			}
+
+			isBounce := "false"
+			if pageviews <= 1 {
+				isBounce = "true"
+			}
+			// Pick the first non-empty release_tag in the session — the SDK
+			// includes it on every event but we only need one.
+			releaseTag := first.ReleaseTag
+			if releaseTag == "" {
+				for _, e := range events {
+					if e.ReleaseTag != "" {
+						releaseTag = e.ReleaseTag
+						break
+					}
 				}
 			}
-		}
 
-		_, err := sql.Exec(ctx, insertSQL,
-			first.TenantID, first.SiteID, first.SessionID,
-			first.Timestamp, last.Timestamp,
-			len(events), len(events),
-			first.Pathname, last.Pathname,
-			first.Referrer, first.Browser, first.OS, first.Device,
-			first.Country, first.Language,
-			first.ScreenWidth, first.ScreenHeight,
-			first.UTMSource, first.UTMMedium, first.UTMCampaign,
-			isBounce, version, releaseTag,
-		)
+			if _, err := sql.Exec(ctx, "DELETE FROM sessions WHERE tenant_id = $1 AND site_id = $2 AND session_id = $3", first.TenantID, first.SiteID, first.SessionID); err != nil {
+				return fmt.Errorf("session rollup clear: %w", err)
+			}
+
+			_, err = sql.Exec(ctx, insertSQL,
+				first.TenantID, first.SiteID, first.SessionID,
+				first.Timestamp, last.Timestamp,
+				pageviews, eventsCount,
+				first.Pathname, last.Pathname,
+				first.Referrer, first.Browser, first.OS, first.Device,
+				first.Country, first.Language,
+				first.ScreenWidth, first.ScreenHeight,
+				first.UTMSource, first.UTMMedium, first.UTMCampaign,
+				isBounce, version, releaseTag,
+			)
+			if err != nil {
+				return fmt.Errorf("session rollup insert: %w", err)
+			}
+			return tx.Commit(ctx)
+		}()
 		if err != nil {
-			return fmt.Errorf("session rollup insert: %w", err)
+			return err
 		}
 		inserted++
 	}

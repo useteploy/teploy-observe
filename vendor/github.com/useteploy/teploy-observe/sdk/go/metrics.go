@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -121,6 +122,7 @@ func (h *Histogram) Observe(value float64, labels ...Label) {
 type counterState struct {
 	value     float64
 	startNano int64
+	dirty     bool
 }
 
 // gaugePoint is a single buffered gauge observation. It carries its own
@@ -151,6 +153,8 @@ type metricsBuf struct {
 	gauges     []gaugePoint
 	histograms map[string]*histogramState
 	seriesKeys map[string]seriesIdentity
+	bounds     map[string][]float64
+	bytes      int64
 }
 
 // seriesIdentity remembers the name/labels behind each series key, for
@@ -216,6 +220,7 @@ func newMetricsBuf() *metricsBuf {
 		counters:   map[string]*counterState{},
 		histograms: map[string]*histogramState{},
 		seriesKeys: map[string]seriesIdentity{},
+		bounds:     map[string][]float64{},
 	}
 }
 
@@ -236,14 +241,23 @@ func (c *Client) ensureMetricsBuf() *metricsBuf {
 
 // registerSeries books a series key against the budget (TO-043); over
 // budget, the observation is refused with a report.
+func metricCost(name string, labels []Label, bounds []float64) int64 {
+	n := len(name)
+	for _, l := range labels {
+		n += len(l.Key) + len(l.Value)
+	}
+	return int64(2048 + 6*n + 64*len(bounds))
+}
 func (mb *metricsBuf) registerSeries(key string, id seriesIdentity) bool {
 	if _, ok := mb.seriesKeys[key]; ok {
 		return true
 	}
-	if len(mb.seriesKeys) >= maxMetricSeries {
+	if metricCost(id.name, id.labels, nil) > 512<<10 || len(mb.seriesKeys) >= maxMetricSeries || mb.bytes+metricCost(id.name, id.labels, nil) > 4<<20 {
 		return false
 	}
+	id.labels = append([]Label(nil), id.labels...)
 	mb.seriesKeys[key] = id
+	mb.bytes += metricCost(id.name, id.labels, nil)
 	return true
 }
 
@@ -258,22 +272,32 @@ func (c *Client) recordCounter(name string, value float64, labels []Label) {
 		return
 	}
 	mb.mu.Lock()
-	defer mb.mu.Unlock()
+	var notify func()
+	defer func() {
+		mb.mu.Unlock()
+		if notify != nil {
+			notify()
+		}
+	}()
+	if c.isClosing() {
+		return
+	}
 	st, ok := mb.counters[key]
 	if !ok {
 		if !mb.registerSeries(key, seriesIdentity{name: name, labels: labels}) {
-			c.reportError(errors.New("observe: metric series budget reached — observation dropped"))
+			notify = func() { c.countLoss("metric_series_budget", 1, "metric series budget reached") }
 			return
 		}
 		st = &counterState{startNano: time.Now().UnixNano()}
 		mb.counters[key] = st
 	}
 	next := st.value + value
-	if next < st.value { // overflow to +Inf across finite addends
-		c.reportError(errors.New("observe: counter overflowed — increment rejected"))
+	if !finiteMetric(next) { // overflow to +Inf across finite addends
+		notify = func() { c.reportError(errors.New("observe: counter overflowed — increment rejected")) }
 		return
 	}
 	st.value = next
+	st.dirty = true
 }
 
 func (c *Client) recordGauge(name string, value float64, labels []Label) {
@@ -287,21 +311,31 @@ func (c *Client) recordGauge(name string, value float64, labels []Label) {
 		return
 	}
 	mb.mu.Lock()
-	defer mb.mu.Unlock()
+	var notify func()
+	defer func() {
+		mb.mu.Unlock()
+		if notify != nil {
+			notify()
+		}
+	}()
+	if c.isClosing() {
+		return
+	}
 	if _, ok := mb.counters[key]; !ok {
 		// Gauges have no persistent state; the series still counts against
 		// the budget (cleaned up when the point list drains).
 		if _, ok := mb.seriesKeys[key]; !ok {
 			if !mb.registerSeries(key, seriesIdentity{name: name, labels: labels}) {
-				c.reportError(errors.New("observe: metric series budget reached — observation dropped"))
+				notify = func() { c.countLoss("metric_series_budget", 1, "metric series budget reached") }
 				return
 			}
 		}
 	}
-	if len(mb.gauges) >= maxBufferedGaugePts {
-		c.reportError(errors.New("observe: gauge point budget reached — observation dropped"))
+	if metricCost(name, labels, nil) > 512<<10 || len(mb.gauges) >= maxBufferedGaugePts || mb.bytes+metricCost(name, labels, nil) > 4<<20 {
+		notify = func() { c.countLoss("gauge_point_budget", 1, "gauge point budget reached") }
 		return
 	}
+	mb.bytes += metricCost(name, labels, nil)
 	mb.gauges = append(mb.gauges, gaugePoint{
 		name:   name,
 		tsNano: time.Now().UnixNano(),
@@ -321,11 +355,32 @@ func (c *Client) recordHistogram(name string, bounds []float64, value float64, l
 		return
 	}
 	mb.mu.Lock()
-	defer mb.mu.Unlock()
+	var notify func()
+	defer func() {
+		mb.mu.Unlock()
+		if notify != nil {
+			notify()
+		}
+	}()
+	if c.isClosing() {
+		return
+	}
+	if prior, ok := mb.bounds[key]; ok && !slices.Equal(prior, bounds) {
+		notify = func() { c.reportError(errors.New("observe: histogram bounds redefined")) }
+		return
+	}
+	if _, ok := mb.bounds[key]; !ok {
+		if metricCost(name, labels, bounds) > 512<<10 || mb.bytes+metricCost(name, labels, bounds) > 4<<20 || !mb.registerSeries(key, seriesIdentity{name: name, labels: labels}) {
+			notify = func() { c.countLoss("metric_series_budget", 1, "histogram byte/series budget reached") }
+			return
+		}
+		mb.bounds[key] = append([]float64(nil), bounds...)
+		mb.bytes += int64(64 * len(bounds))
+	}
 	st, ok := mb.histograms[key]
 	if !ok {
 		if !mb.registerSeries(key, seriesIdentity{name: name, labels: labels}) {
-			c.reportError(errors.New("observe: metric series budget reached — observation dropped"))
+			notify = func() { c.countLoss("metric_series_budget", 1, "metric series budget reached") }
 			return
 		}
 		st = &histogramState{
@@ -334,12 +389,18 @@ func (c *Client) recordHistogram(name string, bounds []float64, value float64, l
 			intervalStartNano: time.Now().UnixNano(),
 		}
 		mb.histograms[key] = st
-	} else if len(st.bounds) != len(bounds) {
+	} else if !slices.Equal(st.bounds, bounds) {
 		// TO-042: two handles over the same series with different bounds
 		// silently shared whichever state existed first — reject the
 		// incompatible definition instead of switching schemas between
 		// flushes.
-		c.reportError(fmt.Errorf("observe: histogram %q redefined with %d bounds (series has %d) — observation dropped", name, len(bounds), len(st.bounds)))
+		notify = func() {
+			c.reportError(fmt.Errorf("observe: histogram %q redefined with %d bounds (series has %d) — observation dropped", name, len(bounds), len(st.bounds)))
+		}
+		return
+	}
+	if !finiteMetric(st.sum + value) {
+		notify = func() { c.reportError(errors.New("observe: histogram sum overflow — observation rejected")) }
 		return
 	}
 	idx := sort.SearchFloat64s(st.bounds, value)
@@ -355,9 +416,8 @@ func (c *Client) recordHistogram(name string, bounds []float64, value float64, l
 // failed flush re-sends the same body instead of having already cleared
 // the gauges/histogram state it described.
 type frozenMetrics struct {
-	body         string
-	points       int
-	histogramInt bool
+	body   string
+	points int
 }
 
 // FlushMetrics emits any buffered metric points to the server. Called
@@ -372,34 +432,55 @@ type frozenMetrics struct {
 // is dropped and counted (metrics_retry_exhausted); a permanent 4xx is
 // dropped immediately (metrics_non_retryable).
 func (c *Client) FlushMetrics(ctx context.Context) error {
+	if err := lockContext(ctx, &c.metricFlushMu); err != nil {
+		return err
+	}
+	defer c.metricFlushMu.Unlock()
+	if !c.isClosing() && backoffGated(c.metricAttempts, c.metricNotBefore) {
+		return nil
+	}
 	c.mu.Lock()
-	closing := c.closing
 	mb := c.metrics
-	pending := c.pendingMetrics
 	c.mu.Unlock()
 	if mb == nil {
 		return nil
 	}
-
-	c.metricFlushMu.Lock()
-	defer c.metricFlushMu.Unlock()
-
-	if backoffGated(c.metricAttempts, c.metricNotBefore) {
-		return nil // mid-backoff (O11)
-	}
-
-	// Retry the retained envelope first; only when it clears may a new
-	// snapshot be taken (order is preserved).
-	if len(pending) > 0 {
+	snapshotted := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		pending := c.pendingMetrics
+		c.mu.Unlock()
+		if len(pending) == 0 {
+			if snapshotted {
+				return nil
+			}
+			envelopes, err := c.snapshotMetricRequests(mb)
+			if err != nil {
+				return err
+			}
+			snapshotted = true
+			if len(envelopes) == 0 {
+				return nil
+			}
+			c.mu.Lock()
+			c.pendingMetrics = envelopes
+			pending = envelopes
+			c.mu.Unlock()
+		}
 		req := pending[0]
 		if err := c.postMetricsBody(ctx, req.body); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if !retryableSendErr(err) {
 				c.dropPendingMetric(req, "metrics_non_retryable", err.Error())
 			} else {
 				c.metricAttempts++
 				if c.metricAttempts >= c.maxSendAttempts {
-					c.dropPendingMetric(req, "metrics_retry_exhausted",
-						fmt.Sprintf("%d attempts, last error: %v", c.maxSendAttempts, err))
+					c.dropPendingMetric(req, "metrics_retry_exhausted", err.Error())
 				} else {
 					c.countDelivered(func(s *Stats) { s.Retries++ })
 					c.metricNotBefore = time.Now().Add(c.backoffFor(c.metricAttempts))
@@ -413,32 +494,6 @@ func (c *Client) FlushMetrics(ctx context.Context) error {
 		c.pendingMetrics = c.pendingMetrics[1:]
 		c.mu.Unlock()
 	}
-
-	if closing {
-		return nil
-	}
-
-	envelope, err := c.snapshotMetrics(mb)
-	if err != nil {
-		return err
-	}
-	if envelope == nil {
-		return nil
-	}
-	if err := c.postMetricsBody(ctx, envelope.body); err != nil {
-		if !retryableSendErr(err) {
-			c.dropPendingMetric(envelope, "metrics_non_retryable", err.Error())
-			return err
-		}
-		// Retain the exact body for the next attempt (TO-039); the
-		// bounded budget above disposes of it when exhausted (O11).
-		c.mu.Lock()
-		c.pendingMetrics = append(c.pendingMetrics, envelope)
-		c.mu.Unlock()
-		return err
-	}
-	c.countDelivered(func(s *Stats) { s.DeliveredMetricPoints += int64(envelope.points) })
-	return nil
 }
 
 // dropPendingMetric removes the head retained envelope (the one whose send
@@ -458,45 +513,91 @@ func (c *Client) dropPendingMetric(req *frozenMetrics, reason, detail string) {
 // serializes it. Counters are re-seeded (cumulative); gauges and
 // histograms are cleared — the frozen envelope now carries them. A fully
 // idle buffer exports nothing (an empty envelope is not a data point).
-func (c *Client) snapshotMetrics(mb *metricsBuf) (*frozenMetrics, error) {
+func (c *Client) snapshotMetricRequests(mb *metricsBuf) ([]*frozenMetrics, error) {
 	mb.mu.Lock()
-	if len(mb.counters) == 0 && len(mb.gauges) == 0 && len(mb.histograms) == 0 {
-		mb.mu.Unlock()
+	defer mb.mu.Unlock()
+	if len(mb.counters)+len(mb.gauges)+len(mb.histograms) == 0 {
 		return nil, nil
 	}
-	counters := mb.counters
-	gauges := mb.gauges
-	histograms := mb.histograms
-	series := mb.seriesKeys
-
-	newCounters := make(map[string]*counterState, len(counters))
-	for key, st := range counters {
-		newCounters[key] = &counterState{value: st.value, startNano: st.startNano}
+	// Serialize before detaching so errors leave interval state recoverable.
+	var reqs []*frozenMetrics
+	cs := map[string]*counterState{}
+	var gs []gaugePoint
+	hs := map[string]*histogramState{}
+	overhead := int64(1024 + 6*(len(c.opts.ServiceName)+len(c.opts.Environment)))
+	size := overhead
+	flush := func() error {
+		if len(cs)+len(gs)+len(hs) == 0 {
+			return nil
+		}
+		raw, err := json.Marshal(buildMetricsOTLP(c.opts.ServiceName, c.opts.Environment, cs, gs, hs, mb.seriesKeys))
+		if err != nil {
+			return err
+		}
+		if len(raw) > 1<<20 {
+			return errors.New("observe: metric envelope exceeds byte budget")
+		}
+		reqs = append(reqs, &frozenMetrics{body: string(raw), points: len(cs) + len(gs) + len(hs)})
+		cs = map[string]*counterState{}
+		gs = nil
+		hs = map[string]*histogramState{}
+		size = overhead
+		return nil
 	}
-	mb.counters = newCounters
+	reserve := func(cost int64) error {
+		if size+cost > 1<<20 {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		size += cost
+		return nil
+	}
+	for k, st := range mb.counters {
+		if !st.dirty {
+			continue
+		}
+		id := mb.seriesKeys[k]
+		if err := reserve(metricCost(id.name, id.labels, nil)); err != nil {
+			return nil, err
+		}
+		cs[k] = st
+	}
+	for _, g := range mb.gauges {
+		if err := reserve(metricCost(g.name, g.labels, nil)); err != nil {
+			return nil, err
+		}
+		gs = append(gs, g)
+	}
+	for k, st := range mb.histograms {
+		id := mb.seriesKeys[k]
+		if err := reserve(metricCost(id.name, id.labels, st.bounds)); err != nil {
+			return nil, err
+		}
+		hs[k] = st
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	for _, st := range mb.counters {
+		st.dirty = false
+	}
 	mb.gauges = nil
 	mb.histograms = map[string]*histogramState{}
-	// Series bookkeeping: counter series persist (cumulative); gauge and
-	// histogram series ended with the points that defined them.
-	newSeries := map[string]seriesIdentity{}
-	for key, id := range series {
-		if _, ok := counters[key]; ok {
-			newSeries[key] = id
+	mb.bytes = 0
+	for key, id := range mb.seriesKeys {
+		_, counter := mb.counters[key]
+		_, histogram := mb.bounds[key]
+		if !counter && !histogram {
+			delete(mb.seriesKeys, key)
+			continue
 		}
+		mb.bytes += metricCost(id.name, id.labels, nil)
 	}
-	mb.seriesKeys = newSeries
-	mb.mu.Unlock()
-
-	body, err := json.Marshal(buildMetricsOTLP(c.opts.ServiceName, c.opts.Environment, counters, gauges, histograms, series))
-	if err != nil {
-		// TO-042 isolation: a serialization failure of one series would
-		// have lost the whole interval; with admission-time validation
-		// (finite values, valid labels/bounds) this is unreachable, but
-		// the error surfaces instead of silently dropping the export.
-		return nil, fmt.Errorf("observe: metric export serialization: %w", err)
+	for _, bounds := range mb.bounds {
+		mb.bytes += int64(64 * len(bounds))
 	}
-	points := len(gauges) + len(histograms)
-	return &frozenMetrics{body: string(body), points: points}, nil
+	return reqs, nil
 }
 
 // postMetricsBody sends one frozen envelope body to the OTLP metrics

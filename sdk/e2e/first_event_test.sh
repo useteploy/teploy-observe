@@ -8,6 +8,9 @@
 #
 #   bash sdk/e2e/first_event_test.sh
 #
+# Set OBSERVE_E2E_BINARY to test a supplied executable without rebuilding
+# the shared server tree. Record the binary provenance with such a run.
+#
 # Own fixture only (never 55432/55433): nucleus on :55446, observe on :38080.
 #
 # UPSTREAM FIXED (2026-09-23): the Neutron lifecycle success-path
@@ -57,8 +60,14 @@ for _ in $(seq 1 60); do
 done
 (echo > /dev/tcp/127.0.0.1/$NUCLEUS_PORT) 2>/dev/null || fail "nucleus did not come up"
 
-log "building observe binary"
-(cd "$REPO_ROOT" && go build -o "$WORK/observe" ./cmd/observe) || fail "go build observe"
+if [ -n "${OBSERVE_E2E_BINARY:-}" ]; then
+  log "using supplied Observe binary: $OBSERVE_E2E_BINARY"
+  [ -x "$OBSERVE_E2E_BINARY" ] || fail "OBSERVE_E2E_BINARY is not executable"
+  cp "$OBSERVE_E2E_BINARY" "$WORK/observe" || fail "copy supplied Observe binary"
+else
+  log "building observe binary"
+  (cd "$REPO_ROOT" && go build -o "$WORK/observe" ./cmd/observe) || fail "go build observe"
+fi
 
 log "starting observe on :$OBSERVE_PORT"
 OBSERVE_NUCLEUS_URL="postgres://nucleus@127.0.0.1:$NUCLEUS_PORT/observe?sslmode=disable" \
@@ -118,10 +127,12 @@ visible=1
 for _ in $(seq 1 30); do
   EVENTS=$(curl -fs "$BASE/api/v1/stats/events?site_id=default" -H "Authorization: Bearer $TOKEN")
   LOGS=$(curl -fs "$BASE/api/v1/logs/search?site_id=default&q=o11&limit=50" -H "Authorization: Bearer $TOKEN" || echo "{}")
+  ISSUES=$(curl -fs "$BASE/api/v1/issues?site_id=default&limit=100" -H "Authorization: Bearer $TOKEN" || echo "[]")
   if echo "$EVENTS" | grep -q "o11_browser_first_event" \
      && echo "$LOGS" | grep -q "o11 go first event" \
      && echo "$LOGS" | grep -q "o11 python first event" \
-     && echo "$LOGS" | grep -q "o11 sentry-shim first event"; then
+     && echo "$LOGS" | grep -q "o11 sentry-shim first event" \
+     && echo "$ISSUES" | grep -q "o11 sentry-shim error event"; then
     visible=0
     break
   fi
@@ -129,6 +140,7 @@ for _ in $(seq 1 30); do
 done
 [ "$visible" = "0" ] || fail "SDK records not query-visible:
 events: $EVENTS
-logs: $LOGS"
+logs: $LOGS
+issues: $ISSUES"
 
 log "PASS: capture -> credential -> first event -> query-visible for browser/shim/Go/Python"

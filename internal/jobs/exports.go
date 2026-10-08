@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
@@ -32,6 +33,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/jackc/pgx/v5"
 	"github.com/neutron-build/neutron/go/nucleus"
 
@@ -57,22 +59,31 @@ type S3Destination struct {
 // to surface only at the first scheduled run, minutes after the admin
 // walked away from the form.
 func (d S3Destination) validate() error {
+	if strings.TrimSpace(d.AccessKeyID) == "" || strings.TrimSpace(d.SecretAccessKey) == "" {
+		return fmt.Errorf("destination static access key and secret are required")
+	}
+	if d.Region != strings.TrimSpace(d.Region) {
+		return fmt.Errorf("destination region must not contain surrounding whitespace")
+	}
 	if strings.TrimSpace(d.Region) == "" {
 		return fmt.Errorf("destination region is required")
 	}
 	if strings.TrimSpace(d.Bucket) == "" {
 		return fmt.Errorf("destination bucket is required")
 	}
+	if strings.HasPrefix(d.Bucket, "arn:") || strings.HasSuffix(d.Bucket, "--x-s3") || strings.HasSuffix(d.Bucket, ".mrap") {
+		return fmt.Errorf("advanced S3 endpoints are unsupported; use a general purpose bucket")
+	}
 	if d.Endpoint != "" {
 		u, err := url.Parse(d.Endpoint)
 		if err != nil {
-			return fmt.Errorf("destination endpoint: %w", err)
+			return fmt.Errorf("destination endpoint is not a valid URL")
 		}
 		if u.Scheme != "http" && u.Scheme != "https" {
 			return fmt.Errorf("destination endpoint scheme must be http or https")
 		}
-		if u.User != nil {
-			return fmt.Errorf("destination endpoint must not carry userinfo (use access_key_id/secret_access_key)")
+		if u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+			return fmt.Errorf("destination endpoint must not carry userinfo, query, or fragment")
 		}
 		if u.Hostname() == "" {
 			return fmt.Errorf("destination endpoint must have a host")
@@ -594,6 +605,13 @@ func (s *ExportService) executeAndUpload(ctx context.Context, e ExportRun) (int6
 	if err := json.Unmarshal([]byte(e.DestinationCfg), &dest); err != nil {
 		return 0, 0, "", fmt.Errorf("parse destination: %w", err)
 	}
+	if err := dest.validate(); err != nil {
+		return 0, 0, "", err
+	}
+	if dest.AccessKeyID == "" || dest.SecretAccessKey == "" {
+		return 0, 0, "", fmt.Errorf("destination requires static access_key_id and secret_access_key")
+	}
+
 	if dest.SecretAccessKey != "" {
 		dec, err := secretbox.Decrypt(dest.SecretAccessKey)
 		if err != nil {
@@ -669,19 +687,14 @@ func (s *ExportService) executeAndUpload(ctx context.Context, e ExportRun) (int6
 	// Key derived from the RUN id: every attempt of this run writes the same
 	// object, so a retry overwrites its own partial upload (idempotent
 	// delivery side) instead of accumulating one object per attempt.
-	key := dest.Prefix + time.Now().UTC().Format("2006/01/02/") + e.Name + "-" + e.RunID
-	switch strings.ToLower(e.Format) {
-	case "csv":
-		key += ".csv"
-	default:
-		key += ".ndjson"
-	}
+	key := exportObjectKey(dest, e)
 
 	sum := sha256.Sum256(buf.Bytes())
 	sumHex := hex.EncodeToString(sum[:])
 
 	cfg := aws.Config{
 		Region:      dest.Region,
+		HTTPClient:  exportHTTPClient,
 		Credentials: credentials.NewStaticCredentialsProvider(dest.AccessKeyID, dest.SecretAccessKey, ""),
 		// One attempt per drain-level try: the run ledger owns retry policy
 		// (visible backoff, budget, dead letters). The SDK's silent internal
@@ -694,11 +707,13 @@ func (s *ExportService) executeAndUpload(ctx context.Context, e ExportRun) (int6
 		}
 		o.UsePathStyle = dest.ForcePathStyle
 	})
-	if _, err = client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(dest.Bucket),
-		Key:         aws.String(key),
-		Body:        bytes.NewReader(buf.Bytes()),
-		ContentType: aws.String(contentType(e.Format)),
+	if _, err = putExportObject(ctx, client, &s3.PutObjectInput{
+		Bucket:            aws.String(dest.Bucket),
+		Key:               aws.String(key),
+		ChecksumSHA256:    aws.String(base64.StdEncoding.EncodeToString(sum[:])),
+		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+		Body:              bytes.NewReader(buf.Bytes()),
+		ContentType:       aws.String(contentType(e.Format)),
 		Metadata: map[string]string{
 			"observe-export-run":    e.RunID,
 			"observe-export-id":     e.ExportID,
@@ -720,11 +735,14 @@ func (s *ExportService) executeAndUpload(ctx context.Context, e ExportRun) (int6
 		Generator: "teploy-observe scheduled export",
 	}
 	manifestJSON, _ := json.Marshal(manifest)
-	if _, err = client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(dest.Bucket),
-		Key:         aws.String(key + ".manifest.json"),
-		Body:        bytes.NewReader(manifestJSON),
-		ContentType: aws.String("application/json"),
+	manifestSum := sha256.Sum256(manifestJSON)
+	if _, err = putExportObject(ctx, client, &s3.PutObjectInput{
+		Bucket:            aws.String(dest.Bucket),
+		Key:               aws.String(key + ".manifest.json"),
+		ChecksumSHA256:    aws.String(base64.StdEncoding.EncodeToString(manifestSum[:])),
+		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+		Body:              bytes.NewReader(manifestJSON),
+		ContentType:       aws.String("application/json"),
 	}); err != nil {
 		return n, 0, "", fmt.Errorf("upload manifest sidecar: %w", err)
 	}
@@ -811,4 +829,27 @@ func genID() string {
 		out[i*2+1] = hex[v&0x0f]
 	}
 	return string(out)
+}
+
+// An explicit request checksum lets the provider validate bytes; when it
+// returns a checksum, reject any disagreement before marking the run complete.
+func putExportObject(ctx context.Context, client *s3.Client, input *s3.PutObjectInput) (*s3.PutObjectOutput, error) {
+	out, err := client.PutObject(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	if out.ChecksumSHA256 != nil && *out.ChecksumSHA256 != aws.ToString(input.ChecksumSHA256) {
+		return nil, fmt.Errorf("export provider returned mismatched SHA256 checksum")
+	}
+	return out, nil
+}
+
+// Retry refreshes the frozen SQL against current data, overwriting this one
+// run destination; it is delivery-idempotent, not a frozen database snapshot.
+func exportObjectKey(dest S3Destination, e ExportRun) string {
+	key := dest.Prefix + time.UnixMilli(e.CreatedAt).UTC().Format("2006/01/02/") + e.Name + "-" + e.RunID
+	if strings.EqualFold(e.Format, "csv") {
+		return key + ".csv"
+	}
+	return key + ".ndjson"
 }

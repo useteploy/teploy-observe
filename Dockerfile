@@ -29,8 +29,10 @@ COPY --from=builder /observe /usr/local/bin/observe
 # Audit F50: run as a dedicated unprivileged identity instead of the image's
 # default root. Only the data directory (WAL queue, backup temp files) must
 # be writable; existing volumes chowned by an earlier root-mode deployment
-# need a one-time `chown -R 10001:10001 /var/lib/observe` on the host —
-# the application deliberately does not chown host paths itself.
+# need host provisioning, as do fresh Teploy bind mounts. The host path is
+# /deployments/observe/volumes/observe-state, not the container mount path.
+# See the ownership contract in teploy.yml; the application deliberately does
+# not chown host paths itself.
 RUN addgroup -S -g 10001 observe \
  && adduser -S -D -H -u 10001 -G observe observe \
  && mkdir -p /var/lib/observe \

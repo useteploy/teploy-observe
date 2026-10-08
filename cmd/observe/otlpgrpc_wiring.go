@@ -110,6 +110,10 @@ func configureOTLPGRPC(logger *slog.Logger, authSvc *auth.AuthService, limiter *
 			Traces: func(ctx context.Context, siteID string, req *tracepb.ExportTraceServiceRequest) error {
 				return classifyOTLPErr(tracing.IngestOTLPProto(ctx, traceIngest, siteID, req))
 			},
+			MetricsResult: func(ctx context.Context, siteID string, req *metricspb.ExportMetricsServiceRequest) (int, error) {
+				n, err := metrics.IngestOTLPProtoResult(ctx, metricsSvc, siteID, req)
+				return n, classifyOTLPErr(err)
+			},
 			Metrics: func(ctx context.Context, siteID string, req *metricspb.ExportMetricsServiceRequest) error {
 				return classifyOTLPErr(metrics.IngestOTLPProto(ctx, metricsSvc, siteID, req))
 			},

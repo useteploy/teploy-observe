@@ -46,7 +46,11 @@ func main() {
 
 - **Bounded queues.** Logs, spans, and metric series/points are capped in
   count and bytes. Admission overflow drops the NEW record (documented
-  drop-newest policy) and counts it.
+  drop-newest policy) and counts it. Span exports and metric envelopes
+  are packed below 1 MiB; spans retain their byte reservations while
+  sending. Metrics allow at most 4 MiB of conservatively charged live
+  state plus one frozen interval. Histogram definitions remain fixed
+  for the lifetime of their series.
 - **Bounded retry with backoff.** Retryable failures (429/5xx/network)
   retry: the first retry is immediate, further consecutive failures back
   off exponentially (1 s base, 30 s cap) up to `MaxSendAttempts` (default
@@ -61,7 +65,8 @@ func main() {
   through `OnError`; at shutdown a one-line loss summary is emitted when
   anything was lost.
 - **Shutdown deadlines.** `Shutdown(ctx)` carries YOUR deadline for the
-  final drain; leftovers when it expires are counted per signal as
+  ownership waits, worker cancellation/join, and final drain. Closing
+  bypasses retry pacing to make a final delivery attempt; leftovers when it expires are counted per signal as
   `<signal>_shutdown_unflushed` and reported, never swallowed. Signal-path
   recipe:
 

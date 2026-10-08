@@ -117,3 +117,8 @@ but do nothing:
 ## License
 
 MIT
+
+Error envelopes use a 192 KiB aggregate serialized budget, leaving headroom below
+Observe's 256 KiB prepared-record limit. The budget includes Go JSON escaping. Oldest breadcrumbs are removed first
+until the envelope fits. If the remaining error itself exceeds the budget,
+no request is sent and `getStats().lost.payload_oversize` records the loss.

@@ -290,7 +290,16 @@ func personsPropertiesHandler(svc *persons.Service, priv personsPrivacy, globalS
 			return
 		}
 		salt, raw := globalSalt, false
-		if priv != nil {
+		if checked, ok := priv.(interface {
+			PrivacyConfigChecked(context.Context, string) (string, bool, bool, error)
+		}); ok {
+			ps, ro, found, err := checked.PrivacyConfigChecked(r.Context(), site)
+			if err != nil || !found {
+				neutron.WriteError(w, r, &neutron.AppError{Status: 503, Title: "Service Unavailable", Detail: "person identity policy unavailable"})
+				return
+			}
+			salt, raw = ps, ro
+		} else if priv != nil {
 			if s, ro, ok := priv.PrivacyConfig(r.Context(), site); ok {
 				salt, raw = s, ro
 			}

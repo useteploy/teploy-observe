@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/neutron-build/neutron/go/nucleus"
@@ -60,6 +61,7 @@ type TimelineEvent struct {
 
 type Service struct {
 	db *nucleus.Client
+	mu sync.Mutex
 }
 
 func NewService(db *nucleus.Client) *Service {
@@ -93,6 +95,8 @@ const MaxInRange = 1000
 // a detector on a 45s tick that is one incident per tick for as long as the
 // query keeps failing.
 func (s *Service) EnsureOpen(ctx context.Context, in CreateInput, createdBy string) (Incident, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if in.RuleID == "" {
 		return Incident{}, false, fmt.Errorf("EnsureOpen requires a rule_id")
 	}
@@ -103,7 +107,7 @@ func (s *Service) EnsureOpen(ctx context.Context, in CreateInput, createdBy stri
 	if len(active) > 0 {
 		return active[0], false, nil
 	}
-	inc, err := s.Create(ctx, in, createdBy)
+	inc, err := s.CreateTx(ctx, s.db.SQL(), in, createdBy)
 	if err != nil {
 		return Incident{}, false, err
 	}
@@ -115,6 +119,30 @@ func (s *Service) EnsureOpen(ctx context.Context, in CreateInput, createdBy stri
 // Callers driven by a repeating detector must use EnsureOpen instead — Create
 // always writes a new incident.
 func (s *Service) Create(ctx context.Context, in CreateInput, createdBy string) (Incident, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.CreateTx(ctx, s.db.SQL(), in, createdBy)
+}
+
+// Transaction serializes incident transitions in this process and commits all
+// their state, timeline and notification obligations atomically. The callback
+// must use the supplied SQLModel for writes and must not call Create/Close/Ack.
+func (s *Service) Transaction(ctx context.Context, fn func(*nucleus.SQLModel) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
+	if err := fn(tx.SQL()); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// CreateTx contributes a new incident to an originating transition transaction.
+func (s *Service) CreateTx(ctx context.Context, sql *nucleus.SQLModel, in CreateInput, createdBy string) (Incident, error) {
 	if in.SiteID == "" {
 		in.SiteID = "default"
 	}
@@ -132,7 +160,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput, createdBy string) 
 	}
 	id := genID()
 	now := time.Now().UnixMilli()
-	_, err := s.db.SQL().Exec(ctx,
+	_, err := sql.Exec(ctx,
 		`INSERT INTO incidents (incident_id, tenant_id, site_id, title, description, severity,
 		 source, rule_id, started_at, ended_at, created_by, updated_at)
 		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
@@ -174,8 +202,15 @@ func (s *Service) Create(ctx context.Context, in CreateInput, createdBy string) 
 // close time. The ack columns ride along (051): an explicit column list that
 // omitted them would drop the acknowledgment on close.
 func (s *Service) Close(ctx context.Context, incidentID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.CloseTx(ctx, s.db.SQL(), incidentID)
+}
+
+// CloseTx contributes a close to a transition transaction, preserving ack state.
+func (s *Service) CloseTx(ctx context.Context, sql *nucleus.SQLModel, incidentID string) error {
 	now := dbutil.IntParam(time.Now().UnixMilli())
-	_, err := s.db.SQL().Exec(ctx,
+	_, err := sql.Exec(ctx,
 		`INSERT INTO incidents (incident_id, tenant_id, site_id, title, description, severity,
 		 source, rule_id, started_at, ended_at, acknowledged_at, acknowledged_by, created_by, updated_at)
 		 SELECT incident_id, tenant_id, site_id, title, description, severity,
@@ -333,32 +368,70 @@ func (s *Service) Get(ctx context.Context, incidentID string) (*Incident, error)
 // with actor and time. The version-rewriting insert follows Close's
 // pattern, ack columns and all, so nothing rides on a stale row.
 func (s *Service) Ack(ctx context.Context, incidentID, actor string) error {
-	known, err := s.Get(ctx, incidentID)
-	if err != nil {
-		return err
+	return s.ack(ctx, incidentID, actor, nil)
+}
+
+// ack's optional barrier lets regression tests interrupt the persistence seam.
+func (s *Service) ack(ctx context.Context, incidentID, actor string, beforeEvent func() error) error {
+	return s.Transaction(ctx, func(sql *nucleus.SQLModel) error {
+		known, err := s.Get(ctx, incidentID)
+		if err != nil {
+			return err
+		}
+		if known == nil {
+			return fmt.Errorf("incident %s not found", incidentID)
+		}
+		at := known.AcknowledgedAt
+		if at == 0 {
+			at = time.Now().UnixMilli()
+			if actor == "" {
+				actor = "unknown"
+			}
+			_, err := sql.Exec(ctx,
+				`INSERT INTO incidents (incident_id, tenant_id, site_id, title, description, severity,
+     source, rule_id, started_at, ended_at, acknowledged_at, acknowledged_by, created_by, updated_at)
+     SELECT incident_id, tenant_id, site_id, title, description, severity,
+            source, rule_id, started_at, ended_at, $2, $3, created_by,
+            GREATEST(CAST($2 AS BIGINT), updated_at + 1)
+     FROM incidents WHERE incident_id = $1 ORDER BY updated_at DESC LIMIT 1`,
+				incidentID, dbutil.IntParam(at), actor)
+			if err != nil {
+				return err
+			}
+		} else {
+			actor = known.AcknowledgedBy
+			// Repair historical partially-committed acknowledgments using their
+			// original actor/time; successful legacy random-id events are retained.
+			timeline, err := s.Timeline(ctx, incidentID)
+			if err != nil {
+				return err
+			}
+			for _, event := range timeline {
+				if event.Kind == EventAck {
+					return nil
+				}
+			}
+		}
+		if beforeEvent != nil {
+			if err := beforeEvent(); err != nil {
+				return err
+			}
+		}
+		return s.RecordEventTx(ctx, sql, "ack-"+incidentID, incidentID, at, EventAck, actor, "incident acknowledged")
+	})
+}
+
+// RecordEventTx appends a stable event as part of its state transition. The
+// caller owns incident existence and event identity/idempotency checks.
+func (s *Service) RecordEventTx(ctx context.Context, sql *nucleus.SQLModel, eventID, incidentID string, at int64, kind, actor, detail string) error {
+	if incidentID == "" {
+		return fmt.Errorf("incident_id required")
 	}
-	if known == nil {
-		return fmt.Errorf("incident %s not found", incidentID)
-	}
-	if known.AcknowledgedAt > 0 {
-		return nil
-	}
-	if actor == "" {
-		actor = "unknown"
-	}
-	now := dbutil.IntParam(time.Now().UnixMilli())
-	_, err = s.db.SQL().Exec(ctx,
-		`INSERT INTO incidents (incident_id, tenant_id, site_id, title, description, severity,
-		 source, rule_id, started_at, ended_at, acknowledged_at, acknowledged_by, created_by, updated_at)
-		 SELECT incident_id, tenant_id, site_id, title, description, severity,
-		        source, rule_id, started_at, ended_at, $2, $3, created_by,
-		        GREATEST(CAST($2 AS BIGINT), updated_at + 1)
-		 FROM incidents WHERE incident_id = $1 ORDER BY updated_at DESC LIMIT 1`,
-		incidentID, now, actor)
-	if err != nil {
-		return err
-	}
-	return s.RecordEvent(ctx, incidentID, EventAck, actor, "incident acknowledged")
+	_, err := sql.Exec(ctx,
+		`INSERT INTO incident_events (event_id, tenant_id, incident_id, at, kind, actor, detail)
+   VALUES ($1, 'default', $2, $3, $4, $5, $6)`,
+		eventID, incidentID, dbutil.IntParam(at), kind, actor, detail)
+	return err
 }
 
 // RecordEvent appends one timeline event. Unknown incident ids are refused

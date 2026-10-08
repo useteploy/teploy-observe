@@ -13,6 +13,7 @@
 // <= 100 kB gz effective, <= 100 ms p95 LCP delta, session <= 2 MiB / 5 min
 // sampled) is computed by the operator/CI reading these numbers - the
 // harness measures, it does not grade itself.
+import { parsePhase } from './args.mjs';
 import { chromium } from 'playwright-core';
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -24,8 +25,7 @@ const root = path.resolve(here, '..');
 const pageDir = path.join(root, 'page');
 const PORT = 4590;
 
-const args = new Set(process.argv.slice(2));
-const phase = args.has('--phase=session') ? 'session' : 'lcp';
+const phase = parsePhase(process.argv.slice(2));
 const lcpRuns = 20;
 
 function serve() {

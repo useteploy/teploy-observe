@@ -331,6 +331,12 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, legacyStore bool
 			h.conflicts.Add(1)
 		case errors.Is(perr, obserrors.ErrInvalidEventID):
 			h.malformed.Add(1)
+		case errors.Is(perr, obserrors.ErrErrorRecordTooLarge):
+			fail(w, http.StatusRequestEntityTooLarge, "event exceeds record budget")
+			return
+		case errors.Is(perr, obserrors.ErrBadTimestamp):
+			fail(w, http.StatusBadRequest, "invalid event timestamp")
+			return
 		case errors.Is(perr, obserrors.ErrErrorBufferFull):
 			h.limited(w, "error buffer full")
 			return

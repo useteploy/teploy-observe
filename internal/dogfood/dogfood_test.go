@@ -1,9 +1,14 @@
 package dogfood
 
 import (
+	"bufio"
+	"context"
+	"fmt"
+	observe "github.com/useteploy/teploy-observe/sdk/go"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestShouldSkipExcludesIngestPaths(t *testing.T) {
@@ -126,4 +131,45 @@ func TestEmptySelfCloseIsNoop(t *testing.T) {
 	if err := s2.Close(); err != nil {
 		t.Errorf("empty Self Close should be no-op, got %v", err)
 	}
+}
+
+// A controller must be able to traverse the tracing wrapper, including when
+// the request is the live analytics stream rather than a skipped ingest path.
+func TestTraceMiddlewarePreservesStreaming(t *testing.T) {
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer sink.Close()
+	client, err := observe.New(observe.Options{Endpoint: sink.URL, APIKey: "test", SiteID: "_meta"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	self := &Self{Client: client}
+	handler := self.TraceMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctl := http.NewResponseController(w)
+		if err := ctl.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Errorf("deadline: %v", err)
+			return
+		}
+		fmt.Fprint(w, "data: first\n\n")
+		if err := ctl.Flush(); err != nil {
+			t.Errorf("flush: %v", err)
+			return
+		}
+		<-r.Context().Done()
+	}))
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", server.URL+"/api/v1/stats/live", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	line, err := bufio.NewReader(resp.Body).ReadString('\n')
+	if err != nil || line != "data: first\n" {
+		t.Fatalf("first frame %q: %v", line, err)
+	}
+	cancel()
 }

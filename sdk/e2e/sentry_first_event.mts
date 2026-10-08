@@ -16,11 +16,16 @@ if (!endpoint || !apiKey) {
 
 Sentry.init({ endpoint, siteId: "default", apiKey, release: "o11-e2e" });
 Sentry.captureMessage("o11 sentry-shim first event");
+Sentry.addBreadcrumb({message:"sdk-e2e breadcrumb"});
+Sentry.addBreadcrumb({message:"fractional seconds", timestamp:1700000000.123});
+const exception = new Error("o11 sentry-shim error event");
+exception.name = "O11ShimFirstEventError";
+Sentry.captureException(exception);
 const ok = await Sentry.flush(5000);
 
 const stats = Sentry.getStats();
-if (!ok || stats.delivered !== 1 || Object.keys(stats.lost).length !== 0) {
+if (!ok || stats.delivered !== 2 || Object.keys(stats.lost).length !== 0) {
   console.error(`sentry-first-event: unexpected stats ${JSON.stringify(stats)}`);
   process.exit(1);
 }
-console.log("sentry-first-event: delivered=1 losses=0");
+console.log("sentry-first-event: delivered=2 losses=0");

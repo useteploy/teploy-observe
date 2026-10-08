@@ -83,7 +83,8 @@ const (
 // single writer (one observe instance owns the chain). A multi-writer setup
 // would need a shared sequence — documented, not supported here.
 type Service struct {
-	db *nucleus.Client
+	db           *nucleus.Client
+	verification verificationReader
 	// keys is the resolved chain-key state (F46). A nil keyring behaves as
 	// the unkeyed legacy service (empty signer, empty-key legacy
 	// verification) — NewService without keys keeps old call sites working.
@@ -313,26 +314,24 @@ const narrowIntactDetail = "chain internally consistent from seq 1 through %d; a
 // serialized behind mu).
 func (s *Service) Verify(ctx context.Context) (VerifyResult, error) {
 	const pageSize = 500
+	reader := s.verification
+	if reader == nil {
+		reader = nucleusVerificationReader{s}
+	}
 
-	// Capture the watermark before scanning: appends past this point belong
-	// to the next verification, not this one.
-	head, err := nucleus.Query[struct {
-		Seq int64 `db:"seq"`
-	}](ctx, s.db.SQL(), "SELECT CAST(seq AS BIGINT) AS seq FROM audit_events ORDER BY CAST(seq AS BIGINT) DESC LIMIT 1")
+	// Pair the watermark and checkpoint under the same writer lock.
+	s.mu.Lock()
+	head, checkpoint, invalid, err := verificationSnapshot(ctx, reader)
+	s.mu.Unlock()
 	if err != nil {
 		return VerifyResult{}, err
 	}
-	var through int64
-	if len(head) > 0 {
-		through = head[0].Seq
+	if invalid != nil {
+		return VerifyResult{BrokenAtSeq: invalid.Seq, Detail: "audit record outside the positive sequence domain"}, nil
 	}
 
-	checkpoint, err := s.latestCheckpoint(ctx)
-	if err != nil {
-		// A checkpoint-table read failure must not weaken the chain walk's
-		// report - it degrades to no-checkpoint, and the error says so.
-		return VerifyResult{}, fmt.Errorf("audit: latest checkpoint read: %w", err)
-	}
+	through := head
+
 	var hashAtCheckpoint string
 	var checkpointReached bool
 
@@ -345,11 +344,7 @@ func (s *Service) Verify(ctx context.Context) (VerifyResult, error) {
 		// TO-011: fetch one row PAST the page so a duplicate sequence
 		// straddling the page boundary is caught here instead of being
 		// skipped by the next page's `> last` cursor.
-		rows, err := nucleus.Query[AuditEvent](ctx, s.db.SQL(),
-			"SELECT "+auditColumns+" FROM audit_events "+
-				"WHERE CAST(seq AS BIGINT) > $1 AND CAST(seq AS BIGINT) <= $2 "+
-				"ORDER BY CAST(seq AS BIGINT) ASC LIMIT "+strconv.Itoa(pageSize+1),
-			dbutil.IntParam(last), dbutil.IntParam(through))
+		rows, err := reader.page(ctx, last, through, pageSize+1)
 		if err != nil {
 			return VerifyResult{}, err
 		}

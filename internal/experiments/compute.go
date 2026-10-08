@@ -5,6 +5,7 @@ package experiments
 // a number or a gate happens here so it is unit-testable without a database.
 
 import (
+	"encoding/json"
 	"sort"
 )
 
@@ -183,7 +184,29 @@ func computeResults(in resultInputs) *ExperimentResults {
 	// Per-variant clean exposure counts, sorted by variant name (the legacy
 	// ORDER BY variant) before the declared control is moved to the front.
 	counts := make(map[string]int64)
+	var declared []struct {
+		Key        string  `json:"key"`
+		RolloutPct float64 `json:"rollout_pct"`
+		Weight     float64 `json:"weight"`
+	}
+	invalidDeclaration := exp.Variants != "" && ValidateExperimentDefinition(exp.Variants, 0) != nil
+	json.Unmarshal([]byte(exp.Variants), &declared)
+	keyedWeights := make(map[string]float64)
+	for _, v := range declared {
+		counts[v.Key] = 0
+		w := v.RolloutPct
+		if v.Weight > 0 {
+			w = v.Weight
+		}
+		keyedWeights[v.Key] = w
+	}
+	unknown := false
 	for _, c := range cohort {
+		if len(declared) > 0 {
+			if _, ok := counts[c.Variant]; !ok {
+				unknown = true
+			}
+		}
 		counts[c.Variant]++
 	}
 	names := make([]string, 0, len(counts))
@@ -206,7 +229,13 @@ func computeResults(in resultInputs) *ExperimentResults {
 		Planned:   cfg.PlannedSamplePerArm,
 		Override:  in.Opts.AllowEarly || cfg.AllowEarlyWinner,
 	}
-	weights := allocationWeights(exp.Variants, len(base))
+	var weights []float64
+	if len(declared) > 0 {
+		weights = make([]float64, len(base))
+		for i, a := range base {
+			weights[i] = keyedWeights[a.Variant]
+		}
+	}
 
 	// Primary goal.
 	var primaryVals map[string]float64
@@ -239,6 +268,10 @@ func computeResults(in resultInputs) *ExperimentResults {
 		winner = winnerByScore(analysis, variants, continuousScores(variants))
 		significant = analysis.HorizonMet && !analysis.SRM.Detected &&
 			analysis.Test != "none" && analysis.PValue < alphaOmnibus
+	}
+	if unknown || invalidDeclaration {
+		winner, significant = "", false
+		analysis.WinnerRule += " - unknown exposure arm or invalid declaration; assignment is invalid"
 	}
 	if in.Truncated[PrimaryMetricKey] {
 		winner, significant = "", false

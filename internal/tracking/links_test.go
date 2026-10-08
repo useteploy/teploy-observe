@@ -2,12 +2,19 @@ package tracking
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"github.com/neutron-build/neutron/go/nucleus"
+	"github.com/useteploy/teploy-observe/internal/nucleustest"
+	"github.com/useteploy/teploy-observe/internal/schema"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestListLinks_EmptySiteReturns200 locks in the contract that a fresh-install
@@ -110,4 +117,53 @@ func login(t *testing.T, base string) string {
 		t.Fatalf("login returned empty token")
 	}
 	return out.Token
+}
+
+func TestRegisteredPixelsPersistClicks(t *testing.T) {
+	ctx := context.Background()
+	db, err := nucleus.Connect(ctx, nucleustest.DSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := schema.Apply(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewLinkService(db)
+	tenant := fmt.Sprintf("pixel-%d", time.Now().UnixNano())
+	link, err := svc.CreateLink(ctx, tenant, "site", "test", "https://example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /t/{slug}/pixel.gif", svc.PixelHandler())
+	mux.HandleFunc("GET /t/pixel.gif", svc.PixelHandler())
+	for _, path := range []string{"/t/" + link.Slug + "/pixel.gif?slug=unknown", "/t/pixel.gif?slug=" + link.Slug, "/t/pixel.gif", "/t/deadbeef/pixel.gif"} {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		if w.Code != 200 || w.Header().Get("Content-Type") != "image/gif" || !bytes.Equal(w.Body.Bytes(), transparentGIF) || w.Header().Get("Cache-Control") == "" {
+			t.Fatalf("pixel %s: %d %v", path, w.Code, w.Header())
+		}
+	}
+	links, err := svc.ListLinks(ctx, tenant, "site")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(links) != 1 || links[0].ClickCount != "2" {
+		t.Fatalf("clicks=%+v", links)
+	}
+}
+
+func TestPixelMissingOrMalformedIdentityStillServesGIF(t *testing.T) {
+	svc := NewLinkService(nil) // Invalid identity must not touch storage.
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /t/{slug}/pixel.gif", svc.PixelHandler())
+	mux.HandleFunc("GET /t/pixel.gif", svc.PixelHandler())
+	for _, path := range []string{"/t/pixel.gif", "/t/pixel.gif?slug=invalid", "/t/not-hex!/pixel.gif?slug=12345678", "/t/pixel.gif?slug=0123456789"} {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		if w.Code != 200 || !bytes.Equal(w.Body.Bytes(), transparentGIF) {
+			t.Fatalf("pixel %s: %d %q", path, w.Code, w.Body.Bytes())
+		}
+	}
 }

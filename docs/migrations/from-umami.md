@@ -54,7 +54,10 @@ no personal data stored; the session_id is a salted hash of IP + UA per day.
 
 ## Historical data import
 
-Umami stores events in Postgres / MySQL. Export + transform via the provided
+This helper supports Umami on PostgreSQL (`website_event` and `session`);
+MySQL sources need a separate export. Stop source writes for the import: the
+UUID cursor represents static history rather than ongoing replication.
+Export and transform via the provided
 `scripts/migrate-umami.sh`:
 
 ```bash
@@ -67,7 +70,23 @@ OBSERVE_SITE_ID="default" \
 
 The script pages through Umami's `website_event` table, transforms rows to
 Observe's event schema, and POSTs them in batches of 100 to
-`/api/v1/events/batch`. Resumable via a checkpoint file at `.umami-migrate.state`.
+`/api/v1/events/import`, authenticated by a site-scoped API key. Original event
+IDs, session IDs, timestamps and paths are preserved; transport user-agent
+bot classification does not discard imported records. `BATCH` may be 1–100.
+
+The checkpoint at `.umami-migrate.state` advances only after the response
+confirms every record was accepted. Checkpoints bind the website filter,
+destination endpoint and site; keep the source database fixed on resume.
+Legacy UUID checkpoints remain readable. Retries preserve source IDs for
+target deduplication. The target must still retain the imported time range: set
+retention before importing and verify the historical dates in analytics.
+
+The helper requires POSIX shell, `psql`, `jq`, `mktemp` and curl 7.55 or later.
+It serializes checkpoint writers using a lock directory and writes private
+checkpoints atomically. After a hard kill, remove that lock only when no importer
+still owns it. Response bodies and source stderr are withheld from terminal
+output to avoid reflecting credentials. Query target history after acceptance
+before retiring the source.
 
 ## Feature comparison
 

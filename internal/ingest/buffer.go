@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/neutron-build/neutron/go/neutron"
 	"github.com/neutron-build/neutron/go/nucleus"
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 )
@@ -62,6 +63,7 @@ type Event struct {
 // crash recovery: events pushed since the last successful flush are replayed
 // after a restart.
 type Buffer struct {
+	erasureLookup    func(context.Context, string, string) (bool, error)
 	mu               sync.Mutex
 	events           []Event
 	eventBytes       []int
@@ -685,6 +687,9 @@ const flushDedupeHorizon = 24 * time.Hour
 // interleave with another flush of the same ids. Fails OPEN on a lookup
 // error (a possible duplicate beats certain data loss).
 func (b *Buffer) filterUncommitted(ctx context.Context, sqlc *nucleus.SQLModel, chunk []Event) []Event {
+	if len(chunk) == 0 {
+		return nil
+	}
 	minTS := chunk[0].Timestamp
 	for _, e := range chunk {
 		if e.Timestamp < minTS {
@@ -692,13 +697,20 @@ func (b *Buffer) filterUncommitted(ctx context.Context, sqlc *nucleus.SQLModel, 
 		}
 	}
 	existing := existingEventKeys(ctx, sqlc, chunk, minTS-flushDedupeHorizon.Milliseconds(), b.logger)
-	if len(existing) == 0 {
-		return chunk
+	return dedupePending(chunk, existing)
+}
+
+func dedupePending(chunk []Event, existing map[eventKey]struct{}) []Event {
+	if existing == nil {
+		existing = make(map[eventKey]struct{}, len(chunk))
 	}
-	out := chunk[:0]
+	// Retry-owned chunk storage must remain unchanged on transaction failure.
+	// Track retained identities too: pending duplicates have no persisted row.
+	out := make([]Event, 0, len(chunk))
 	for _, e := range chunk {
 		if _, dup := existing[eventKey{SiteID: e.SiteID, EventID: e.EventID}]; !dup {
 			out = append(out, e)
+			existing[eventKey{SiteID: e.SiteID, EventID: e.EventID}] = struct{}{}
 		}
 	}
 	return out
@@ -732,42 +744,80 @@ func (b *Buffer) insertBatch(ctx context.Context, batch []Event) (committed int,
 		if txErr != nil {
 			return committed, fmt.Errorf("batch begin tx %d-%d: %w", start+1, end, txErr)
 		}
-		txSQL := tx.SQL()
-
-		chunk = b.filterUncommitted(ctx, txSQL, chunk)
-		if len(chunk) == 0 {
-			// Every event in this span is already stored; committing the
-			// empty transaction is fine (and keeps rollback handling
-			// uniform), the span still counts as processed.
-			_ = tx.Commit(ctx)
-			committed = end
-			continue
+		txErr = withIngestTransaction(ctx, tx, func(txSQL *nucleus.SQLModel) error {
+			filtered := b.filterUncommitted(ctx, txSQL, chunk)
+			if len(filtered) == 0 {
+				return nil
+			}
+			eventsQuery := "INSERT INTO events (" + eventsColList + ") VALUES " + buildPlaceholders(len(filtered), eventsCols)
+			recentQuery := "INSERT INTO events_recent (" + eventsRecentColList + ") VALUES " + buildPlaceholders(len(filtered), eventsRecentCols)
+			eventsArgs := make([]any, 0, len(filtered)*eventsCols)
+			recentArgs := make([]any, 0, len(filtered)*eventsRecentCols)
+			for i := range filtered {
+				eventsArgs = eventArgs(eventsArgs, &filtered[i])
+				recentArgs = eventsRecentArgs(recentArgs, &filtered[i])
+			}
+			if _, err := txSQL.Exec(ctx, eventsQuery, eventsArgs...); err != nil {
+				return fmt.Errorf("batch insert events %d-%d: %w", start+1, end, err)
+			}
+			if _, err := txSQL.Exec(ctx, recentQuery, recentArgs...); err != nil {
+				return fmt.Errorf("batch insert recent %d-%d: %w", start+1, end, err)
+			}
+			return nil
+		})
+		if txErr != nil {
+			return committed, fmt.Errorf("batch transaction %d-%d: %w", start+1, end, txErr)
 		}
 
-		eventsQuery := "INSERT INTO events (" + eventsColList + ") VALUES " +
-			buildPlaceholders(len(chunk), eventsCols)
-		recentQuery := "INSERT INTO events_recent (" + eventsRecentColList + ") VALUES " +
-			buildPlaceholders(len(chunk), eventsRecentCols)
-
-		eventsArgs := make([]any, 0, len(chunk)*eventsCols)
-		recentArgs := make([]any, 0, len(chunk)*eventsRecentCols)
-		for i := range chunk {
-			eventsArgs = eventArgs(eventsArgs, &chunk[i])
-			recentArgs = eventsRecentArgs(recentArgs, &chunk[i])
-		}
-
-		if _, e := txSQL.Exec(ctx, eventsQuery, eventsArgs...); e != nil {
-			_ = tx.Rollback(ctx)
-			return committed, fmt.Errorf("batch insert events %d-%d: %w", start+1, end, e)
-		}
-		if _, e := txSQL.Exec(ctx, recentQuery, recentArgs...); e != nil {
-			_ = tx.Rollback(ctx)
-			return committed, fmt.Errorf("batch insert recent %d-%d: %w", start+1, end, e)
-		}
-		if e := tx.Commit(ctx); e != nil {
-			return committed, fmt.Errorf("batch commit %d-%d: %w", start+1, end, e)
-		}
 		committed = end
 	}
 	return committed, nil
+}
+
+// SetErasureLookup installs the identity tombstone check without a persons
+// dependency. Handler admission checks the already-hashed stored identity.
+func (b *Buffer) SetErasureLookup(lookup func(context.Context, string, string) (bool, error)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.erasureLookup = lookup
+}
+
+func (b *Buffer) checkErasure(ctx context.Context, e *Event) error {
+	if e.DistinctID == "" {
+		return nil
+	}
+	b.mu.Lock()
+	lookup := b.erasureLookup
+	b.mu.Unlock()
+	if lookup == nil {
+		return nil
+	}
+	erased, err := lookup(ctx, e.SiteID, e.DistinctID)
+	if err != nil {
+		return &neutron.AppError{Status: 503, Title: "Service Unavailable", Detail: "identity privacy policy unavailable, retry later"}
+	}
+	if erased {
+		return &neutron.AppError{Status: 410, Title: "Gone", Detail: "identity has been erased"}
+	}
+	return nil
+}
+
+// Deferred rollback releases the pooled connection on EVERY exit, including
+// panic and expired flush contexts. Commit/rollback after completion is safe.
+type ingestTransaction interface {
+	SQL() *nucleus.SQLModel
+	Commit(context.Context) error
+	Rollback(context.Context) error
+}
+
+func withIngestTransaction(ctx context.Context, tx ingestTransaction, work func(*nucleus.SQLModel) error) error {
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tx.Rollback(cleanup)
+	}()
+	if err := work(tx.SQL()); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }

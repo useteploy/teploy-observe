@@ -11,6 +11,7 @@ import {
   init,
   captureException,
   captureMessage,
+  startTransaction,
   setUser,
   startSession,
   withRequestScope,
@@ -159,4 +160,25 @@ test("flush(timeout) counts unconfirmed sends against a slow endpoint", async ()
   assert.ok(errors.some((e) => e.message.includes("unconfirmed")));
   // Wait out the server so afterEach teardown is clean.
   await new Promise((r) => setTimeout(r, 600));
+});
+
+
+test("redirect refusal protects every capture path on same and different origins", async () => {
+  const sink = new FaultServer();
+  await sink.start();
+  try {
+    for (const destination of [server.url("/redirect-target"), sink.url("/redirect-target")]) {
+      server.requests = [];
+      server.mode = { kind: "redirect", location: destination };
+      initShim();
+      captureException(new Error("redirect exception"));
+      captureMessage("redirect message");
+      startTransaction({name:"redirect span"}).finish();
+      assert.equal(await flush(1000), false);
+      assert.equal(server.requests.length, 3, "exactly one attempt per capture");
+      assert.equal(sink.requests.length, 0, "no credentials or body reach other origin");
+      assert.ok(server.requests.every(r => !r.path.includes("redirect-target")));
+      assert.equal(getStats().lost.send_failed, 3);
+    }
+  } finally { await sink.close(); }
 });

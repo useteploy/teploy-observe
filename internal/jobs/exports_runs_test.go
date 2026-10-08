@@ -361,14 +361,14 @@ func TestO14ExportDestinationScoping(t *testing.T) {
 		dest S3Destination
 		want bool // want accepted
 	}{
-		{"aws minimal", S3Destination{Region: "us-east-1", Bucket: "b"}, true},
-		{"r2 endpoint", S3Destination{Region: "auto", Bucket: "b", Endpoint: "https://abc.r2.cloudflarestorage.com"}, true},
-		{"minio http lan", S3Destination{Region: "us-east-1", Bucket: "b", Endpoint: "http://10.0.0.5:9000"}, true},
-		{"missing region", S3Destination{Bucket: "b"}, false},
-		{"missing bucket", S3Destination{Region: "us-east-1"}, false},
-		{"ftp endpoint", S3Destination{Region: "r", Bucket: "b", Endpoint: "ftp://x"}, false},
-		{"userinfo endpoint", S3Destination{Region: "r", Bucket: "b", Endpoint: "https://key:secret@host"}, false},
-		{"hostless endpoint", S3Destination{Region: "r", Bucket: "b", Endpoint: "https://"}, false},
+		{"aws minimal", S3Destination{AccessKeyID: "synthetic-key", SecretAccessKey: "synthetic-secret", Region: "us-east-1", Bucket: "b"}, true},
+		{"r2 endpoint", S3Destination{AccessKeyID: "synthetic-key", SecretAccessKey: "synthetic-secret", Region: "auto", Bucket: "b", Endpoint: "https://abc.r2.cloudflarestorage.com"}, true},
+		{"minio http lan", S3Destination{AccessKeyID: "synthetic-key", SecretAccessKey: "synthetic-secret", Region: "us-east-1", Bucket: "b", Endpoint: "http://10.0.0.5:9000"}, true},
+		{"missing region", S3Destination{AccessKeyID: "synthetic-key", SecretAccessKey: "synthetic-secret", Bucket: "b"}, false},
+		{"missing bucket", S3Destination{AccessKeyID: "synthetic-key", SecretAccessKey: "synthetic-secret", Region: "us-east-1"}, false},
+		{"ftp endpoint", S3Destination{AccessKeyID: "synthetic-key", SecretAccessKey: "synthetic-secret", Region: "r", Bucket: "b", Endpoint: "ftp://x"}, false},
+		{"userinfo endpoint", S3Destination{AccessKeyID: "synthetic-key", SecretAccessKey: "synthetic-secret", Region: "r", Bucket: "b", Endpoint: "https://key:secret@host"}, false},
+		{"hostless endpoint", S3Destination{AccessKeyID: "synthetic-key", SecretAccessKey: "synthetic-secret", Region: "r", Bucket: "b", Endpoint: "https://"}, false},
 	}
 	for _, tc := range cases {
 		err := tc.dest.validate()

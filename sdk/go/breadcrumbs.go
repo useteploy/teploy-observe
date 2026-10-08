@@ -146,10 +146,9 @@ func (r *breadcrumbRing) snapshot() []Breadcrumb {
 	out := items[start:]
 	for i := range out {
 		if out[i].Data != nil {
-			d := make(map[string]any, len(out[i].Data))
-			for k, v := range out[i].Data {
-				d[k] = v
-			}
+			raw, _ := json.Marshal(out[i].Data)
+			var d map[string]any
+			_ = json.Unmarshal(raw, &d)
 			out[i].Data = d
 		}
 	}

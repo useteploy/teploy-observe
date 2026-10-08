@@ -207,8 +207,8 @@ func (s *Store) Enqueue(ctx context.Context, sql *nucleus.SQLModel, siteID, kind
 
 // ProcessDue runs one drain pass over due intents (pending, under the
 // attempt budget, retry time reached), looping until the table stops
-// yielding. Per-intent failures are recorded on their rows; only a scan
-// failure returns an error. The return value counts processed intents
+// yielding. Per-intent failures are recorded on their rows; scan and disposition
+// failures return an error and stop the pass before another side effect. The return value counts processed intents
 // (successes and failures alike — each was worked on).
 func (s *Store) ProcessDue(ctx context.Context) (int, error) {
 	s.processMu.Lock()
@@ -223,8 +223,13 @@ func (s *Store) ProcessDue(ctx context.Context) (int, error) {
 			return total, nil
 		}
 		for i := range rows {
-			s.processOne(ctx, &rows[i])
+			if err := ctx.Err(); err != nil {
+				return total, err
+			}
 			total++
+			if err := s.processOne(ctx, &rows[i]); err != nil {
+				return total, err
+			}
 		}
 		if len(rows) < s.batchSize {
 			return total, nil
@@ -250,7 +255,12 @@ func (s *Store) ProcessIDs(ctx context.Context, ids ...string) error {
 		if row == nil {
 			continue
 		}
-		s.processOne(ctx, row)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.processOne(ctx, row); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -292,7 +302,7 @@ func (s *Store) byID(ctx context.Context, id string) (*intentRow, error) {
 // row version (strictly-monotonic stamp: max(now, prior+1) — the version-tie
 // convention). A missing handler is a wiring failure: recorded as an error,
 // never a silent skip.
-func (s *Store) processOne(ctx context.Context, row *intentRow) {
+func (s *Store) processOne(ctx context.Context, row *intentRow) error {
 	h, ok := s.handlers[row.Kind]
 	var err error
 	if !ok {
@@ -305,8 +315,9 @@ func (s *Store) processOne(ctx context.Context, row *intentRow) {
 		if derr := s.markProcessed(ctx, row); derr != nil {
 			s.logger.Error("outbox: mark processed failed",
 				"intent", row.ID, "kind", row.Kind, "err", derr)
+			return fmt.Errorf("outbox: mark processed %s: %w", row.ID, derr)
 		}
-		return
+		return nil
 	}
 
 	attempts := row.Attempts + 1
@@ -324,12 +335,14 @@ func (s *Store) processOne(ctx context.Context, row *intentRow) {
 	if derr := s.markAttempt(ctx, row, attempts, next, err); derr != nil {
 		s.logger.Error("outbox: record failure failed",
 			"intent", row.ID, "kind", row.Kind, "err", derr)
+		return fmt.Errorf("outbox: mark attempt %s: %w", row.ID, derr)
 	}
 	if dead {
 		s.logger.Error("outbox: intent dead-lettered — derived work keeps failing",
 			"intent", row.ID, "kind", row.Kind, "site", row.SiteID,
 			"attempts", attempts, "err", err)
 	}
+	return nil
 }
 
 // invoke runs a handler, converting a panic into a recorded failure (a

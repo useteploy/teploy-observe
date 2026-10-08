@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/useteploy/teploy-observe/internal/config"
 	"net/http"
 	"path"
 	"strings"
@@ -33,15 +34,16 @@ import (
 // ingestRoutes are the exact "METHOD /path" pairs the ingest listener serves.
 var ingestRoutes = map[string]bool{
 	// Browser + SDK telemetry writes.
-	"POST /api/v1/events":       true,
-	"POST /api/v1/events/batch": true,
-	"POST /api/v1/errors":       true,
-	"POST /api/v1/logs":         true,
-	"POST /api/v1/logs/batch":   true,
-	"POST /api/v1/replays":      true,
-	"POST /api/v1/feedback":     true,
-	"POST /api/v1/llm/ingest":   true,
-	"POST /api/v1/infra/report": true,
+	"POST /api/v1/events":        true,
+	"POST /api/v1/events/batch":  true,
+	"POST /api/v1/events/import": true,
+	"POST /api/v1/errors":        true,
+	"POST /api/v1/logs":          true,
+	"POST /api/v1/logs/batch":    true,
+	"POST /api/v1/replays":       true,
+	"POST /api/v1/feedback":      true,
+	"POST /api/v1/llm/ingest":    true,
+	"POST /api/v1/infra/report":  true,
 
 	// Client-SDK support. These read, but only what an SDK needs to function
 	// (which flag/survey is live) — never stored telemetry — and they are
@@ -67,7 +69,7 @@ var ingestRoutes = map[string]bool{
 // isIngestPath reports whether method+p may be served on the ingest listener.
 // p must already be cleaned — see ingestOnly.
 func isIngestPath(method, p string) bool {
-	if ingestRoutes[method+" "+p] {
+	if config.TelemetryWriteAllowed(method, p) || ingestRoutes[method+" "+p] {
 		return true
 	}
 	switch {

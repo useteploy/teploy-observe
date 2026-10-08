@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/useteploy/teploy-observe/internal/aiquery"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/useteploy/teploy-observe/internal/audit"
 )
@@ -218,21 +221,34 @@ func (h *Handler) callTool(r *http.Request, name string, args map[string]interfa
 		// mutation -> editor, per the Teploy RBAC contract.
 		if tok.ReadOnly() && !t.ReadOnly {
 			msg := fmt.Sprintf("token %q is read-only (role %s); %s requires role %s", tok.Name, tok.Role, name, RoleEditor)
-			h.record(r, tok, name, audit.ResultDenied, args, msg)
+			if err := h.record(r, tok, name, audit.ResultDenied, args, msg); err != nil {
+				return toolError("audit unavailable; tool denied")
+			}
 			return toolError(msg)
 		}
-		out, err := t.Run(r.Context(), args)
+		// Persist intent before allowing backend work. Completion is separately
+		// recorded, so a failed result append cannot look like a completed call.
+		if err := h.record(r, tok, name, "started", args, ""); err != nil {
+			return toolError("audit unavailable; tool was not executed")
+		}
+		out, err := t.Run(aiquery.WithPrincipal(r.Context(), "mcp:"+tok.ID), args)
 		if err != nil {
-			h.record(r, tok, name, audit.ResultFailure, args, err.Error())
+			if aerr := h.record(r, tok, name, audit.ResultFailure, args, err.Error()); aerr != nil {
+				return toolError("audit completion unavailable; tool failed")
+			}
 			return toolError(err.Error())
 		}
-		h.record(r, tok, name, audit.ResultSuccess, args, "")
+		if err := h.record(r, tok, name, audit.ResultSuccess, args, ""); err != nil {
+			return toolError("audit completion unavailable; tool executed but result withheld")
+		}
 		return map[string]interface{}{
 			"content": []map[string]string{{"type": "text", "text": out}},
 		}
 	}
 	msg := fmt.Sprintf("unknown tool: %s", name)
-	h.record(r, tok, name, audit.ResultFailure, args, msg)
+	if err := h.record(r, tok, name, audit.ResultFailure, args, msg); err != nil {
+		return toolError("audit unavailable; unknown tool")
+	}
 	return toolError(msg)
 }
 
@@ -248,9 +264,10 @@ const maxAuditArg = 2000
 // tool=%s")`) and has no audit package at all, so its MCP calls leave no
 // durable trail. Recorded synchronously: a call that could not be audited is
 // worth failing loudly about, and audit.Record is a single insert.
-func (h *Handler) record(r *http.Request, tok Token, tool, result string, args map[string]interface{}, detail string) {
+func (h *Handler) record(r *http.Request, tok Token, tool, result string, args map[string]interface{}, detail string) error {
 	if h.audit == nil {
-		return
+		slog.Error("MCP audit recorder unavailable")
+		return fmt.Errorf("MCP audit recorder is required")
 	}
 	meta := map[string]any{
 		"tool":       tool,
@@ -282,7 +299,9 @@ func (h *Handler) record(r *http.Request, tok Token, tool, result string, args m
 		ip = r.RemoteAddr
 	}
 
-	_ = h.audit.Record(r.Context(), audit.AuditEvent{
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
+	defer cancel()
+	err := h.audit.Record(ctx, audit.AuditEvent{
 		SiteID:    siteID,
 		Actor:     tok.ID,
 		ActorType: audit.ActorAgent,
@@ -293,6 +312,10 @@ func (h *Handler) record(r *http.Request, tok Token, tool, result string, args m
 		UserAgent: r.UserAgent(),
 		Metadata:  audit.MarshalMetadata(meta),
 	})
+	if err != nil {
+		slog.Error("MCP audit write failed", "tool", tool, "result", result)
+	}
+	return err
 }
 
 func truncate(s string, n int) string {

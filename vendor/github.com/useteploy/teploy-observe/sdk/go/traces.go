@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -239,6 +240,10 @@ func (s *Span) End() {
 // budget so a stalled endpoint cannot grow memory without limit.
 func (c *Client) queueSpan(ps pendingSpan) {
 	cost := pendingSpanBytes(ps)
+	if cost > 1<<20 {
+		c.countLoss("spans_entry_oversize", 1, "span exceeds export byte budget")
+		return
+	}
 	c.mu.Lock()
 	if c.closing {
 		c.mu.Unlock()
@@ -271,75 +276,84 @@ const maxPendingSpans = 10000
 
 // pendingSpanBytes is the serialized-size estimate for one queued span.
 func pendingSpanBytes(ps pendingSpan) int64 {
-	n := 256
-	for _, a := range ps.attributes {
-		n += len(a.key) + 64
-	}
-	return int64(n)
+	raw, _ := json.Marshal(buildOTLPRequest("", "", []pendingSpan{ps}))
+	return int64(len(raw))
 }
-
-// spanFlushMu serializes span flushes (TO-038): the public Close path, the
-// owned worker, and any final flush take turns; a failed export leaves its
-// batch queued for the next attempt instead of being dropped.
-
 func (c *Client) flushSpans(ctx context.Context) error {
-	c.logFlushMu.Lock()
-	defer c.logFlushMu.Unlock()
-
-	if backoffGated(c.spanAttempts, c.spanNotBefore) {
-		return nil // mid-backoff (O11); the ticker or a later flush retries
-	}
-	c.mu.Lock()
-	if len(c.spans) == 0 {
-		c.mu.Unlock()
-		return nil
-	}
-	batch := c.spans
-	var batchBytes int64
-	for _, ps := range batch {
-		batchBytes += pendingSpanBytes(ps)
-	}
-	c.spans = nil
-	c.spansN = 0
-	c.pendingSpanBytes -= batchBytes
-	if c.pendingSpanBytes < 0 {
-		c.pendingSpanBytes = 0
-	}
-	c.mu.Unlock()
-
-	// Build a single OTLP ExportTraceRequest grouping all spans under one
-	// resource (we only have one ServiceName per Client). Use the standard
-	// OTLP endpoint /v1/traces so SDK consumers can also point this Client
-	// at a non-Observe OTLP collector if needed.
-	otlp := buildOTLPRequest(c.opts.ServiceName, c.opts.Environment, batch)
-	err := c.postOTLP(ctx, otlp)
-	if err != nil {
-		// O11: retryable failures requeue the whole detached batch
-		// (at-least-once) inside a bounded attempt budget with backoff;
-		// when the budget is exhausted — or the refusal is permanent
-		// (non-retryable 4xx, see retryableSendErr) — the batch is
-		// dropped and counted instead of blocking the queue forever.
-		if !retryableSendErr(err) {
-			c.countLoss("spans_non_retryable", int64(len(batch)), err.Error())
-			return err
-		}
-		c.spanAttempts++
-		if c.spanAttempts >= c.maxSendAttempts {
-			c.countLoss("spans_retry_exhausted", int64(len(batch)),
-				fmt.Sprintf("%d attempts, last error: %v", c.maxSendAttempts, err))
-			return err
-		}
-		c.countDelivered(func(s *Stats) { s.Retries++ })
-		c.spanNotBefore = time.Now().Add(c.backoffFor(c.spanAttempts))
-		c.mu.Lock()
-		c.spans = append(batch, c.spans...)
-		c.spansN += len(batch)
-		c.pendingSpanBytes += batchBytes
-		c.mu.Unlock()
+	if err := lockContext(ctx, &c.logFlushMu); err != nil {
 		return err
 	}
-	c.spanAttempts = 0
-	c.countDelivered(func(s *Stats) { s.DeliveredSpans += int64(len(batch)) })
+	defer c.logFlushMu.Unlock()
+	if !c.isClosing() && backoffGated(c.spanAttempts, c.spanNotBefore) {
+		return nil
+	}
+	c.mu.Lock()
+	remaining := c.spansN
+	c.mu.Unlock()
+	for remaining > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		n := c.spanBatchN
+		size := int64(1024 + 6*(len(c.opts.ServiceName)+len(c.opts.Environment)))
+		for c.spanBatchN == 0 && n < remaining && n < len(c.spans) {
+			cost := pendingSpanBytes(c.spans[n])
+			if size+cost > 1<<20 {
+				break
+			}
+			size += cost
+			n++
+		}
+		if n == 0 {
+			ps := c.spans[0]
+			c.spans = c.spans[1:]
+			c.spansN--
+			c.pendingSpanBytes -= pendingSpanBytes(ps)
+			c.mu.Unlock()
+			remaining--
+			c.spanAttempts = 0
+			c.countLoss("spans_entry_oversize", 1, "span exceeds export budget")
+			continue
+		}
+		c.spanBatchN = n // retry exactly this prefix; newer spans keep their own budget
+		batch := append([]pendingSpan(nil), c.spans[:n]...)
+		c.mu.Unlock()
+		err := c.postOTLP(ctx, buildOTLPRequest(c.opts.ServiceName, c.opts.Environment, batch))
+		reason := ""
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !retryableSendErr(err) {
+				reason = "spans_non_retryable"
+			} else {
+				c.spanAttempts++
+				if c.spanAttempts >= c.maxSendAttempts {
+					reason = "spans_retry_exhausted"
+				} else {
+					c.countDelivered(func(s *Stats) { s.Retries++ })
+					c.spanNotBefore = time.Now().Add(c.backoffFor(c.spanAttempts))
+					return err
+				}
+			}
+		}
+		c.mu.Lock()
+		for _, ps := range batch {
+			c.pendingSpanBytes -= pendingSpanBytes(ps)
+		}
+		c.spans = c.spans[n:]
+		c.spansN -= n
+		c.mu.Unlock()
+		remaining -= n
+		c.spanBatchN = 0
+		c.spanAttempts = 0
+		if reason != "" {
+			c.countLoss(reason, int64(n), err.Error())
+			return err
+		}
+		c.countDelivered(func(s *Stats) { s.DeliveredSpans += int64(n) })
+	}
 	return nil
 }
 

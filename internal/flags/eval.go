@@ -108,9 +108,23 @@ func ParseDefinition(f FeatureFlag) (FlagDefinition, *ConfigError) {
 // variants, plus the cross-check that a group's variant override names a
 // declared variant of a multivariate flag.
 func ValidateConfig(flagType, variants, targeting string) error {
+	if flagType != "boolean" && flagType != "multivariate" {
+		return fmt.Errorf("flag_type must be boolean or multivariate")
+	}
+	if flagType == "multivariate" && (variants == "" || variants == "[]") {
+		return fmt.Errorf("multivariate flags require variants")
+	}
 	_, groups, err := parseTargetingConfig(targeting)
 	if err != nil {
 		return err
+	}
+	if variants != "" {
+		dec := json.NewDecoder(strings.NewReader(variants))
+		dec.DisallowUnknownFields()
+		var wire []Variant
+		if err := dec.Decode(&wire); err != nil {
+			return fmt.Errorf("variants: invalid JSON: %w", err)
+		}
 	}
 	vs, err := ValidateVariants(variants)
 	if err != nil {

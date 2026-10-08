@@ -5,79 +5,58 @@ import (
 	"time"
 )
 
-func TestSchedulePeriod(t *testing.T) {
-	cases := []struct {
-		schedule string
-		want     time.Duration
-		ok       bool
-	}{
-		{"", 0, false},
-		{"not a schedule", 0, false},
-		{"@reboot", 0, false},
-
-		{"@hourly", time.Hour, true},
-		{"@daily", 24 * time.Hour, true},
-		{"@midnight", 24 * time.Hour, true},
-		{"@weekly", 7 * 24 * time.Hour, true},
-		{"@monthly", 30 * 24 * time.Hour, true},
-		{"@yearly", 365 * 24 * time.Hour, true},
-		{"@every 90s", 90 * time.Second, true},
-		{"@every 15m", 15 * time.Minute, true},
-		{"@every nonsense", 0, false},
-
-		{"* * * * *", time.Minute, true},
-		{"*/5 * * * *", 5 * time.Minute, true},
-		{"0,30 * * * *", 30 * time.Minute, true},
-		{"15-45 * * * *", time.Minute, true},
-
-		// Minute pinned: the hour field sets the period.
-		{"0 * * * *", time.Hour, true},
-		{"30 */6 * * *", 6 * time.Hour, true},
-
-		// Minute and hour both pinned: the day fields do.
-		{"0 3 * * *", 24 * time.Hour, true},
-		{"0 3 * * 1", 7 * 24 * time.Hour, true},
-		{"0 3 1 * *", 31 * 24 * time.Hour, true},
-
-		// Six fields is seconds-first; the minute-onward tail is what counts.
-		{"0 */5 * * * *", 5 * time.Minute, true},
+func TestNextScheduledRunCommonForms(t *testing.T) {
+	after := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, c := range []struct{ schedule, next string }{
+		{"@hourly", "2026-01-01T01:00:00Z"},
+		{"@daily", "2026-01-02T00:00:00Z"},
+		{"@midnight", "2026-01-02T00:00:00Z"},
+		{"@weekly", "2026-01-04T00:00:00Z"},
+		{"@monthly", "2026-02-01T00:00:00Z"},
+		{"@yearly", "2027-01-01T00:00:00Z"},
+		{"@every 90s", "2026-01-01T00:01:30Z"},
+		{"@every 15m", "2026-01-01T00:15:00Z"},
+		{"* * * * *", "2026-01-01T00:01:00Z"},
+		{"*/5 * * * *", "2026-01-01T00:05:00Z"},
+		{"0,30 * * * *", "2026-01-01T00:30:00Z"},
+		{"15-45 * * * *", "2026-01-01T00:15:00Z"},
+		{"0 * * * *", "2026-01-01T01:00:00Z"},
+		{"30 */6 * * *", "2026-01-01T00:30:00Z"},
+		{"0 3 * * *", "2026-01-01T03:00:00Z"},
+		{"0 3 * * 1", "2026-01-05T03:00:00Z"},
+		{"0 3 1 * *", "2026-01-01T03:00:00Z"},
+		{"0 */5 * * * *", "2026-01-01T00:05:00Z"},
+	} {
+		next, ok := NextScheduledRun(c.schedule, after)
+		want, _ := time.Parse(time.RFC3339, c.next)
+		if !ok || !next.Equal(want) {
+			t.Errorf("next(%q)=%v %v want %v", c.schedule, next, ok, want)
+		}
 	}
-	for _, c := range cases {
-		got, ok := SchedulePeriod(c.schedule)
-		if ok != c.ok || got != c.want {
-			t.Errorf("SchedulePeriod(%q) = %v, %v; want %v, %v", c.schedule, got, ok, c.want, c.ok)
+	for _, schedule := range []string{"", "not a schedule", "@reboot", "@every nonsense"} {
+		if _, ok := NextScheduledRun(schedule, after); ok {
+			t.Errorf("accepted %q", schedule)
 		}
 	}
 }
 
-// TestDueAfterMs is the arithmetic behind the incident flood.
-//
-// The detector used to allow a monitor only its GRACE PERIOD of silence,
-// ignoring its schedule entirely. An hourly cron with a five-minute grace was
-// therefore "missed" for fifty-five minutes out of every hour: an incident
-// opened, the next hourly run closed it, and the cycle repeated forever — one
-// incident per cron run. That is how ten monitors produced 12,398 incident rows
-// on the live instance.
-func TestDueAfterMs(t *testing.T) {
-	const grace = 300 // seconds
-
-	hourly := DueAfterMs("0 * * * *", grace)
-	if want := int64((time.Hour + 300*time.Second) / time.Millisecond); hourly != want {
-		t.Fatalf("hourly cron may be silent for %dms, want %dms", hourly, want)
+func TestCronDeadlineGraceOnlyAndHourly(t *testing.T) {
+	last := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, c := range []struct {
+		schedule string
+		grace    int
+		silence  time.Duration
+	}{
+		{"0 * * * *", 300, time.Hour + 5*time.Minute},
+		{"", 300, 5 * time.Minute},
+		{"", 0, 5 * time.Minute},
+	} {
+		got, ok := CronDeadline(c.schedule, last, c.grace)
+		if !ok || !got.Equal(last.Add(c.silence)) {
+			t.Fatalf("deadline(%q)=%v %v", c.schedule, got, ok)
+		}
 	}
-	if hourly <= int64(grace)*1000 {
-		t.Fatal("an hourly cron is judged on its grace period alone — it will be declared missed between every pair of runs")
-	}
-
-	// An unreadable schedule keeps the old grace-only behaviour, which is the
-	// only safe fallback: it alerts earlier, never later.
-	if got, want := DueAfterMs("", grace), int64(grace)*1000; got != want {
-		t.Fatalf("empty schedule allows %dms of silence, want the grace period %dms", got, want)
-	}
-
-	// A zero or negative grace falls back to the 300s default rather than
-	// making every monitor instantly overdue.
-	if got, want := DueAfterMs("", 0), int64(300)*1000; got != want {
-		t.Fatalf("zero grace allows %dms, want the %dms default", got, want)
+	if _, ok := CronDeadline("invalid", last, 300); ok {
+		t.Fatal("invalid historical schedule would create false grace-only incidents")
 	}
 }

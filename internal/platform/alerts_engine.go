@@ -33,16 +33,9 @@ package platform
 // dedupe) - a firing -> no_data -> firing flap with the incident still open
 // does not re-notify.
 //
-// Atomicity: the evaluation row, the alert_history row and the notification
-// intents commit in ONE transaction (the 046 outbox boundary applied to
-// alerting - an intent can never orphan ahead of its edge, and an edge
-// never lands without the notification it owes). The incident-service
-// writes (EnsureOpen/Close/RecordEvent) run OUTSIDE that transaction,
-// serialized instead by evalMu (single-process posture, AUD-018): a failure
-// between the two halves is visible in logs and self-heals - a committed
-// edge whose incident write failed re-runs the sweep next tick, and a
-// committed incident whose intents failed re-notifies on the first repeat
-// tick past the cooldown.
+// Atomicity: incident state, evaluation, timeline, history and target intents
+// commit together. Target lookup failures prevent the transition; a retry sees
+// the prior incident state and can admit the complete notification again.
 
 import (
 	"context"
@@ -67,8 +60,7 @@ const (
 // CheckRules evaluates all enabled rules and drives the state machine. It
 // is the background worker's entry point (the "alert-check" job).
 func (s *AlertService) CheckRules(ctx context.Context) error {
-	// Single-flight: the incident writes outside the edge transaction rely
-	// on evaluations being serialized in-process (see the file comment).
+	// Single-flight keeps decisions serialized in this process.
 	s.evalMu.Lock()
 	defer s.evalMu.Unlock()
 
@@ -182,39 +174,17 @@ func (s *AlertService) evaluateFiring(ctx context.Context, rule AlertRule, prev 
 	}
 
 	if len(active) == 0 {
-		// Opening path: ensure the incident first (its id rides the edge
-		// and the intents), then commit edge + history + intents in one
-		// transaction. The opening notification is gated on created:
-		// re-firing with the incident still open must not re-notify.
-		inc, created, err := s.incidents.EnsureOpen(ctx, incidents.CreateInput{
-			SiteID:      rule.SiteID,
-			Title:       rule.Name,
-			Description: fmt.Sprintf("alert rule fired: %s=%.2f (threshold %s %.2f)", rule.Metric, value, rule.Operator, rule.Threshold),
-			Severity:    rule.severityOrDefault(),
-			Source:      incidents.SourceAlert,
-			RuleID:      rule.RuleID,
-		}, "alert")
+		hooks, err := s.listHooks(ctx, rule.SiteID, rule.severityOrDefault())
 		if err != nil {
-			return fmt.Errorf("ensure incident: %w", err)
+			return err
 		}
-		kind := ""
-		if created {
-			kind = NotifyIncidentOpened
-		}
-		hooks := s.listHooks(ctx, rule.SiteID, rule.severityOrDefault())
 		if err := s.commitEdge(ctx, edgeInput{
-			rule: rule, from: prev.State, to: StateFiring,
-			value: value, samples: samples, now: now,
-			incidentID: inc.IncidentID, notifyKind: kind, hooks: hooks,
+			rule: rule, from: prev.State, to: StateFiring, value: value, samples: samples, now: now,
+			notifyKind: NotifyIncidentOpened, hooks: hooks, openIncident: true,
 		}); err != nil {
 			return err
 		}
-		if created {
-			s.recordIncidentEvent(ctx, inc.IncidentID, incidents.EventOpened, "alert",
-				fmt.Sprintf("rule %s fired: %s=%.2f samples=%d", rule.RuleID, rule.Metric, value, samples))
-			// FIRE only, after the edge committed, never blocking the tick.
-			s.fireIntegrations(rule, value, fmt.Sprintf("alert rule fired: %s=%.2f (threshold %s %.2f)", rule.Metric, value, rule.Operator, rule.Threshold))
-		}
+		s.fireIntegrations(rule, value, fmt.Sprintf("alert rule fired: %s=%.2f (threshold %s %.2f)", rule.Metric, value, rule.Operator, rule.Threshold))
 		return nil
 	}
 
@@ -235,10 +205,14 @@ func (s *AlertService) evaluateFiring(ctx context.Context, rule AlertRule, prev 
 			})
 		}
 		if now.UnixMilli()-last >= int64(rule.Cooldown)*60*1000 {
+			hooks, err := s.listHooks(ctx, rule.SiteID, rule.severityOrDefault())
+			if err != nil {
+				return err
+			}
 			return s.commitEdge(ctx, edgeInput{
 				rule: rule, from: prev.State, to: StateFiring,
 				value: value, samples: samples, now: now, incidentID: inc.IncidentID,
-				notifyKind: NotifyIncidentRepeat, hooks: s.listHooks(ctx, rule.SiteID, rule.severityOrDefault()),
+				notifyKind: NotifyIncidentRepeat, hooks: hooks,
 			})
 		}
 	}
@@ -248,13 +222,9 @@ func (s *AlertService) evaluateFiring(ctx context.Context, rule AlertRule, prev 
 	})
 }
 
-// evaluateHealthy handles a healthy decision. The recovery sweep is keyed
-// on "a healthy decision while an incident for the rule is still open",
-// not just the firing -> healthy edge: that covers the plain edge AND
-// self-heals a missed one (an unavailable streak between firing and
-// healthy, or a close that failed after the intents committed - the next
-// healthy tick retries the close; a duplicate recovery notification in
-// that rare window is bounded by the tick rate and logged).
+// evaluateHealthy closes each active incident atomically with its correlated
+// recovery notification and timeline. Any failed admission leaves it open for
+// the next healthy tick, without producing duplicate intents for closed ones.
 func (s *AlertService) evaluateHealthy(ctx context.Context, rule AlertRule, prev ruleState, value float64, samples int64, now time.Time) error {
 	active, err := s.incidents.ActiveByRule(ctx, rule.RuleID)
 	if err != nil {
@@ -267,107 +237,150 @@ func (s *AlertService) evaluateHealthy(ctx context.Context, rule AlertRule, prev
 		})
 	}
 
-	hooks := s.listHooks(ctx, rule.SiteID, rule.severityOrDefault())
-	if err := s.commitEdge(ctx, edgeInput{
-		rule: rule, from: prev.State, to: StateHealthy,
-		value: value, samples: samples, now: now,
-		notifyKind: NotifyIncidentRecovered, hooks: hooks,
-	}); err != nil {
+	hooks, err := s.listHooks(ctx, rule.SiteID, rule.severityOrDefault())
+	if err != nil {
 		return err
 	}
+	// Historical stores can contain multiple active incidents. Each receives its
+	// own correlated recovery and atomically closes with its frozen intents.
 	for _, inc := range active {
-		if err := s.incidents.Close(ctx, inc.IncidentID); err != nil {
-			s.logger.Error("incident close after recovery failed; the sweep retries next tick",
-				"incident", inc.IncidentID, "rule", rule.RuleID, "err", err)
-			continue
+		if err := s.commitEdge(ctx, edgeInput{
+			rule: rule, from: prev.State, to: StateHealthy, value: value, samples: samples, now: now,
+			incidentID: inc.IncidentID, notifyKind: NotifyIncidentRecovered, hooks: hooks,
+			closeIncident: true,
+		}); err != nil {
+			return err
 		}
-		s.recordIncidentEvent(ctx, inc.IncidentID, incidents.EventRecovered, "alert",
-			fmt.Sprintf("rule %s recovered: %s=%.2f samples=%d", rule.RuleID, rule.Metric, value, samples))
 	}
+
 	return nil
 }
 
 // edgeInput is one transition to persist, with its optional notification.
 type edgeInput struct {
-	rule       AlertRule
-	from, to   string
-	value      float64
-	samples    int64
-	now        time.Time
-	detail     string
-	incidentID string
-	notifyKind string // "" records the edge only
-	hooks      []Webhook
+	rule          AlertRule
+	from, to      string
+	value         float64
+	samples       int64
+	now           time.Time
+	detail        string
+	incidentID    string
+	notifyKind    string // "" records the edge only
+	hooks         []Webhook
+	openIncident  bool
+	closeIncident bool
 }
 
 // commitEdge appends the evaluation row, and for a notification-bearing
 // edge the alert_history row plus one frozen intent per webhook target, in
 // ONE transaction.
 func (s *AlertService) commitEdge(ctx context.Context, in edgeInput) error {
-	tx, err := s.db.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin edge tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	sqlc := tx.SQL()
-
-	evalID := genID()
-	evalAt := in.now.UnixMilli()
-	if _, err := sqlc.Exec(ctx,
-		`INSERT INTO alert_evaluations (eval_id, tenant_id, rule_id, site_id, evaluated_at,
-		 from_state, to_state, value, threshold, samples, detail, incident_id)
-		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-		evalID, in.rule.RuleID, in.rule.SiteID, dbutil.IntParam(evalAt),
-		in.from, in.to,
-		strconv.FormatFloat(in.value, 'f', -1, 64),
-		strconv.FormatFloat(in.rule.Threshold, 'f', -1, 64),
-		dbutil.IntParam(in.samples), in.detail, in.incidentID,
-	); err != nil {
-		return fmt.Errorf("record evaluation: %w", err)
-	}
-
-	if in.notifyKind != "" && len(in.hooks) > 0 {
-		if _, err := sqlc.Exec(ctx,
-			`INSERT INTO alert_history (alert_id, tenant_id, rule_id, site_id, triggered_at, metric_value, threshold, status)
-			 VALUES ($1, 'default', $2, $3, $4, $5, $6, 'triggered')`,
-			genID(), in.rule.RuleID, in.rule.SiteID, dbutil.IntParam(evalAt),
-			strconv.FormatFloat(in.value, 'f', 2, 64),
-			strconv.FormatFloat(in.rule.Threshold, 'f', -1, 64),
-		); err != nil {
-			return fmt.Errorf("record alert history: %w", err)
-		}
-		payload := BuildNotificationPayload(in.notifyKind, in.rule, in.value, in.samples, in.from, in.to, in.incidentID, in.now)
-		for _, hook := range in.hooks {
-			if _, err := s.notifier.enqueueTx(ctx, sqlc, NotificationIntent{
-				Kind: in.notifyKind, RuleID: in.rule.RuleID, IncidentID: in.incidentID,
-				SiteID: in.rule.SiteID, WebhookID: hook.WebhookID,
-				TargetType: hook.WebhookType, TargetURL: hook.URL, Secret: hook.Secret,
-				Payload: payload,
-			}); err != nil {
-				return fmt.Errorf("enqueue notification: %w", err)
+	return s.incidents.Transaction(ctx, func(sqlc *nucleus.SQLModel) error {
+		if in.openIncident {
+			active, err := s.incidents.ActiveByRule(ctx, in.rule.RuleID)
+			if err != nil {
+				return err
+			}
+			if len(active) > 0 {
+				in.incidentID = active[0].IncidentID
+				in.openIncident = false
+				in.notifyKind = ""
 			}
 		}
-	}
+		if in.openIncident {
+			inc, err := s.incidents.CreateTx(ctx, sqlc, incidents.CreateInput{
+				SiteID: in.rule.SiteID, Title: in.rule.Name,
+				Description: fmt.Sprintf("alert rule fired: %s=%.2f (threshold %s %.2f)", in.rule.Metric, in.value, in.rule.Operator, in.rule.Threshold),
+				Severity:    in.rule.severityOrDefault(), Source: incidents.SourceAlert, RuleID: in.rule.RuleID,
+			}, "alert")
+			if err != nil {
+				return err
+			}
+			in.incidentID = inc.IncidentID
+		}
+		if in.closeIncident {
+			known, err := s.incidents.Get(ctx, in.incidentID)
+			if err != nil {
+				return err
+			}
+			if known == nil {
+				return fmt.Errorf("incident %s missing during recovery", in.incidentID)
+			}
+			if known.EndedAt > 0 {
+				in.closeIncident = false
+				in.notifyKind = ""
+			}
+		}
+		if in.closeIncident {
+			if err := s.incidents.CloseTx(ctx, sqlc, in.incidentID); err != nil {
+				return err
+			}
+		}
+		if in.openIncident || in.closeIncident {
+			kind := incidents.EventOpened
+			if in.closeIncident {
+				kind = incidents.EventRecovered
+			}
+			if err := s.incidents.RecordEventTx(ctx, sqlc, genID(), in.incidentID, in.now.UnixMilli(), kind, "alert", fmt.Sprintf("rule %s %s: %s=%.2f samples=%d", in.rule.RuleID, kind, in.rule.Metric, in.value, in.samples)); err != nil {
+				return err
+			}
+		}
 
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit edge tx: %w", err)
-	}
-	return nil
+		evalID := genID()
+		evalAt := in.now.UnixMilli()
+		if _, err := sqlc.Exec(ctx,
+			`INSERT INTO alert_evaluations (eval_id, tenant_id, rule_id, site_id, evaluated_at,
+		 from_state, to_state, value, threshold, samples, detail, incident_id)
+		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			evalID, in.rule.RuleID, in.rule.SiteID, dbutil.IntParam(evalAt),
+			in.from, in.to,
+			strconv.FormatFloat(in.value, 'f', -1, 64),
+			strconv.FormatFloat(in.rule.Threshold, 'f', -1, 64),
+			dbutil.IntParam(in.samples), in.detail, in.incidentID,
+		); err != nil {
+			return fmt.Errorf("record evaluation: %w", err)
+		}
+
+		if in.notifyKind != "" && len(in.hooks) > 0 {
+			if _, err := sqlc.Exec(ctx,
+				`INSERT INTO alert_history (alert_id, tenant_id, rule_id, site_id, triggered_at, metric_value, threshold, status)
+			 VALUES ($1, 'default', $2, $3, $4, $5, $6, 'triggered')`,
+				genID(), in.rule.RuleID, in.rule.SiteID, dbutil.IntParam(evalAt),
+				strconv.FormatFloat(in.value, 'f', 2, 64),
+				strconv.FormatFloat(in.rule.Threshold, 'f', -1, 64),
+			); err != nil {
+				return fmt.Errorf("record alert history: %w", err)
+			}
+			payload := BuildNotificationPayload(in.notifyKind, in.rule, in.value, in.samples, in.from, in.to, in.incidentID, in.now)
+			for _, hook := range in.hooks {
+				if _, err := s.notifier.enqueueTx(ctx, sqlc, NotificationIntent{
+					Kind: in.notifyKind, RuleID: in.rule.RuleID, IncidentID: in.incidentID,
+					SiteID: in.rule.SiteID, WebhookID: hook.WebhookID,
+					TargetType: hook.WebhookType, TargetURL: hook.URL, Secret: hook.Secret,
+					Payload: payload,
+				}); err != nil {
+					return fmt.Errorf("enqueue notification: %w", err)
+				}
+			}
+		}
+
+		return nil
+	})
 }
 
 // listHooks returns the site's enabled webhook targets that ROUTE the
-// given severity (O10: a webhook's severities filter, empty = all),
-// frozen per notification at commit time. A listing failure logs and
-// returns nil: the edge still records, and the first repeat tick past the
-// cooldown re-notifies (LastIntentAt reads 0 with no intents).
-func (s *AlertService) listHooks(ctx context.Context, siteID, severity string) []Webhook {
+// given severity, frozen per notification. Errors stop transitions so
+// recovery/opening obligations cannot disappear as an empty target list.
+func (s *AlertService) listHooks(ctx context.Context, siteID, severity string) ([]Webhook, error) {
+	if s.listHooksHook != nil {
+		return s.listHooksHook(ctx, siteID, severity)
+	}
 	if s.webhookSvc == nil {
-		return nil
+		return nil, nil
 	}
 	hooks, err := s.webhookSvc.List(ctx, siteID)
 	if err != nil {
-		s.logger.Error("webhook listing failed; notification deferred to the repeat tick", "site", siteID, "err", err)
-		return nil
+		return nil, fmt.Errorf("webhook listing: %w", err)
 	}
 	out := hooks[:0]
 	for _, h := range hooks {
@@ -375,17 +388,7 @@ func (s *AlertService) listHooks(ctx context.Context, siteID, severity string) [
 			out = append(out, h)
 		}
 	}
-	return out
-}
-
-// recordIncidentEvent is a nil-safe timeline append.
-func (s *AlertService) recordIncidentEvent(ctx context.Context, incidentID, kind, actor, detail string) {
-	if s.incidents == nil || incidentID == "" {
-		return
-	}
-	if err := s.incidents.RecordEvent(ctx, incidentID, kind, actor, detail); err != nil {
-		s.logger.Warn("incident timeline write failed", "incident", incidentID, "kind", kind, "err", err)
-	}
+	return out, nil
 }
 
 // thresholdBreached evaluates the rule's operator against the value.

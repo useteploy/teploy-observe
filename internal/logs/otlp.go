@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"strconv"
@@ -39,13 +40,14 @@ type otlpLogsJSON struct {
 		} `json:"resource"`
 		ScopeLogs []struct {
 			LogRecords []struct {
-				TimeUnixNano   string   `json:"timeUnixNano"`
-				SeverityNumber int      `json:"severityNumber"`
-				SeverityText   string   `json:"severityText"`
-				Body           otlpAny  `json:"body"`
-				Attributes     []otlpKV `json:"attributes"`
-				TraceID        string   `json:"traceId"`
-				SpanID         string   `json:"spanId"`
+				ObservedTimeUnixNano string   `json:"observedTimeUnixNano"`
+				TimeUnixNano         string   `json:"timeUnixNano"`
+				SeverityNumber       int      `json:"severityNumber"`
+				SeverityText         string   `json:"severityText"`
+				Body                 otlpAny  `json:"body"`
+				Attributes           []otlpKV `json:"attributes"`
+				TraceID              string   `json:"traceId"`
+				SpanID               string   `json:"spanId"`
 			} `json:"logRecords"`
 		} `json:"scopeLogs"`
 	} `json:"resourceLogs"`
@@ -342,7 +344,12 @@ func jsonLogInputs(body []byte, siteID string) ([]LogInput, error) {
 				for _, kv := range lr.Attributes {
 					attrs[kv.Key] = kv.Value.text()
 				}
+				ts, err := logEventTime(lr.TimeUnixNano, lr.ObservedTimeUnixNano)
+				if err != nil {
+					return nil, err
+				}
 				out = append(out, LogInput{
+					TimestampNs: ts,
 					SiteID:      siteID,
 					Level:       severityToLevel(lr.SeverityNumber, lr.SeverityText),
 					Message:     lr.Body.text(),
@@ -381,7 +388,15 @@ func protoLogInputs(body []byte, siteID string) ([]LogInput, error) {
 				for _, kv := range lr.GetAttributes() {
 					attrs[kv.GetKey()] = anyText(kv.GetValue())
 				}
+				if lr.GetTimeUnixNano() > math.MaxInt64 || lr.GetObservedTimeUnixNano() > math.MaxInt64 {
+					return nil, fmt.Errorf("invalid log event timestamp")
+				}
+				ts := lr.GetTimeUnixNano()
+				if ts == 0 {
+					ts = lr.GetObservedTimeUnixNano()
+				}
 				out = append(out, LogInput{
+					TimestampNs: int64(ts),
 					SiteID:      siteID,
 					Level:       severityToLevel(int(lr.GetSeverityNumber()), lr.GetSeverityText()),
 					Message:     anyText(lr.GetBody()),
@@ -413,4 +428,30 @@ func anyText(v *commonpb.AnyValue) string {
 	default:
 		return v.String()
 	}
+}
+
+// Event time wins; observed time is the fallback; zero means receipt time.
+func logEventTime(event, observed string) (int64, error) {
+	parse := func(v string) (int64, error) {
+		if v == "" {
+			return 0, nil
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			return 0, fmt.Errorf("invalid log event timestamp")
+		}
+		return n, nil
+	}
+	n, err := parse(event)
+	if err != nil {
+		return 0, err
+	}
+	o, err := parse(observed)
+	if err != nil {
+		return 0, err
+	}
+	if n == 0 {
+		n = o
+	}
+	return n, nil
 }

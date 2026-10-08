@@ -23,7 +23,39 @@ func (s *Service) loadResolver(ctx context.Context, siteID string) (*Resolver, e
 	if err != nil {
 		return nil, err
 	}
-	return NewResolver(rows), nil
+	return checkedResolver(rows)
+}
+
+// checkedResolver refuses incomplete maps and corrupt cycles rather than exposing
+// broken aliases as independent people. Historical deep chains remain resolvable.
+func checkedResolver(rows []AliasRow) (*Resolver, error) {
+	if len(rows) > MaxAliasesPerSite {
+		return nil, fmt.Errorf("%w: alias set exceeds %d", ErrLimit, MaxAliasesPerSite)
+	}
+	r := NewResolver(rows)
+	for _, row := range rows {
+		if row.AliasKey == row.CanonicalKey || r.Canonical(row.AliasKey) == row.AliasKey {
+			return nil, fmt.Errorf("%w: corrupt alias graph", ErrConflict)
+		}
+	}
+	return r, nil
+}
+
+// IsErased is the admission gate for already-derived stored identities. Callers
+// must reject erased identities and fail closed on errors before accepting data.
+func (s *Service) IsErased(ctx context.Context, siteID, key string) (bool, error) {
+	if siteID == "" || key == "" {
+		return false, nil
+	}
+	r, err := s.loadResolver(ctx, siteID)
+	if err != nil {
+		return false, err
+	}
+	tomb, err := s.loadTombstones(ctx, siteID)
+	if err != nil {
+		return false, err
+	}
+	return tomb[key] || tomb[r.Canonical(key)], nil
 }
 
 func (s *Service) loadTombstones(ctx context.Context, siteID string) (map[string]bool, error) {
@@ -129,7 +161,7 @@ func (s *Service) PersonDetail(ctx context.Context, siteID, distinctID string) (
 		}
 	}
 	if len(members) > MaxAliasesPerPerson+1 {
-		members = members[:MaxAliasesPerPerson+1]
+		return PersonDetail{}, fmt.Errorf("%w: merged group exceeds detail read bound", ErrLimit)
 	}
 
 	var agg Person
@@ -207,7 +239,7 @@ func (s *Service) SetProperties(ctx context.Context, siteID, key string, in map[
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if gone, err := s.st.IsTombstoned(ctx, siteID, key); err != nil {
+	if gone, err := s.IsErased(ctx, siteID, key); err != nil {
 		return nil, err
 	} else if gone {
 		return nil, ErrErased
@@ -329,7 +361,10 @@ func (s *Service) Merge(ctx context.Context, siteID, fromKey, intoKey, actor str
 	if len(rows) >= MaxAliasesPerSite {
 		return MergeResult{}, fmt.Errorf("%w: site already has %d aliases", ErrLimit, MaxAliasesPerSite)
 	}
-	res := NewResolver(rows)
+	res, err := checkedResolver(rows)
+	if err != nil {
+		return MergeResult{}, err
+	}
 	if res.IsAlias(fromKey) {
 		return MergeResult{}, fmt.Errorf("%w: %s is already merged into %s", ErrConflict, fromKey, res.Canonical(fromKey))
 	}
@@ -340,7 +375,7 @@ func (s *Service) Merge(ctx context.Context, siteID, fromKey, intoKey, actor str
 	if tomb[root] {
 		return MergeResult{}, ErrErased
 	}
-	if len(res.Members(root))+1+len(res.Members(fromKey))+1 > MaxAliasesPerPerson {
+	if len(res.Members(root))+len(res.Members(fromKey))+1 > MaxAliasesPerPerson {
 		return MergeResult{}, fmt.Errorf("%w: a person holds at most %d aliases", ErrLimit, MaxAliasesPerPerson)
 	}
 	for _, k := range []string{fromKey, intoKey} {
@@ -368,9 +403,9 @@ type EraseResult struct {
 	EventsDeleted bool `json:"events_deleted"`
 }
 
-// Erase is the GDPR erasure path. For the key and, if it is a canonical
-// person, every alias merged into it: write a tombstone, deactivate the
-// alias edge and blank the stored properties. Idempotent. Events are NOT
+// Erase is the logical erasure path. Resolve any supplied member to its
+// canonical group, tombstone every key, blank every property document, then
+// deactivate alias edges. Idempotent. Events are NOT
 // deleted (no proven per-key DELETE on events; see the ADR).
 func (s *Service) Erase(ctx context.Context, siteID, key, actor string) (EraseResult, error) {
 	if siteID == "" {
@@ -386,12 +421,33 @@ func (s *Service) Erase(ctx context.Context, siteID, key, actor string) (EraseRe
 	if err != nil {
 		return EraseResult{}, err
 	}
-	keys := []string{key}
-	keys = append(keys, res.Members(key)...)
+	root := res.Canonical(key)
+	keys := []string{root}
+	keys = append(keys, res.Members(root)...)
+	tomb, err := s.loadTombstones(ctx, siteID)
+	if err != nil {
+		return EraseResult{}, err
+	}
+	additions := 0
+	for _, k := range keys {
+		if !tomb[k] {
+			additions++
+		}
+	}
+	if len(tomb)+additions > MaxTombstonesPerSite {
+		return EraseResult{}, fmt.Errorf("%w: tombstone set would exceed %d", ErrLimit, MaxTombstonesPerSite)
+	}
 	// Tombstones first: the exclusion is the load-bearing part, so a later
 	// failure leaves the person hidden rather than half-cleared and visible.
 	for _, k := range keys {
 		if err := s.st.PutTombstone(ctx, siteID, k, actor); err != nil {
+			return EraseResult{}, err
+		}
+	}
+	// Clear ALL properties before detaching ANY edge. Until this phase completes,
+	// retrying either the root or an alias can still discover its cleanup work.
+	for _, k := range keys {
+		if err := s.st.PutProps(ctx, siteID, k, "{}"); err != nil {
 			return EraseResult{}, err
 		}
 	}
@@ -401,13 +457,7 @@ func (s *Service) Erase(ctx context.Context, siteID, key, actor string) (EraseRe
 				return EraseResult{}, err
 			}
 		}
-		if _, found, err := s.st.GetProps(ctx, siteID, k); err != nil {
-			return EraseResult{}, err
-		} else if found {
-			if err := s.st.PutProps(ctx, siteID, k, "{}"); err != nil {
-				return EraseResult{}, err
-			}
-		}
 	}
+
 	return EraseResult{SiteID: siteID, Erased: keys}, nil
 }

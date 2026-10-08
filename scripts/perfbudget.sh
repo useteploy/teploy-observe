@@ -37,6 +37,8 @@ if [ ! -x "$BENCH_BIN" ]; then
 fi
 
 OUT_FILE="$REPO_ROOT/bench_results.json"
+export OUT_FILE BUDGET_MIN_RPS BUDGET_MAX_P95_MS BUDGET_MAX_FAIL_PCT
+rm -f "$OUT_FILE"
 
 echo "==> Running bench: $BUDGET_DURATION @ concurrency=$BUDGET_CONCURRENCY"
 (
@@ -52,39 +54,34 @@ echo "==> Running bench: $BUDGET_DURATION @ concurrency=$BUDGET_CONCURRENCY"
 
 echo
 echo "==> Checking thresholds..."
-python3 - <<PY
-import json, sys
-with open("$OUT_FILE") as f:
-    results = json.load(f)
-if not isinstance(results, list) or not results:
-    print("FAIL: bench did not produce a results array")
+python3 - <<'PY'
+import json, math, os, sys
+try:
+    with open(os.environ["OUT_FILE"]) as f:
+        results = json.load(f)
+    if not isinstance(results, list) or len(results) != 1:
+        raise ValueError("bench must produce exactly one analytics result")
+    r = results[0]
+    if r["mode"] != "analytics":
+        raise ValueError("unexpected benchmark mode")
+    total, failed = r["total_requests"], r["failed_requests"]
+    if type(total) is not int or type(failed) is not int or total <= 0 or not 0 <= failed <= total:
+        raise ValueError("invalid request counts")
+    rps, p95 = float(r["throughput_rps"]), float(r["latency_p95_ms"])
+    minimum = float(os.environ["BUDGET_MIN_RPS"])
+    maximum = float(os.environ["BUDGET_MAX_P95_MS"])
+    failures = float(os.environ["BUDGET_MAX_FAIL_PCT"])
+    if not all(math.isfinite(v) and v >= 0 for v in (rps, p95, minimum, maximum, failures)):
+        raise ValueError("nonfinite or negative metric/budget")
+    fail_pct = failed / total * 100
+except (OSError, ValueError, KeyError, TypeError) as e:
+    print(f"FAIL: invalid benchmark results: {e}")
     sys.exit(1)
 
-r = results[0]  # analytics
-total = r.get("total_requests", 0)
-failed = r.get("failed_requests", 0)
-rps = r.get("throughput_rps", 0.0)
-p95 = r.get("latency_p95_ms", 0.0)
-fail_pct = (failed / total * 100) if total else 0
-
-print(f"  throughput: {rps:.0f} req/s  (min required: $BUDGET_MIN_RPS)")
-print(f"  p95:        {p95:.2f} ms      (max allowed:  $BUDGET_MAX_P95_MS)")
-print(f"  failures:   {fail_pct:.2f}%    (max allowed:  $BUDGET_MAX_FAIL_PCT%)")
-
-ok = True
-if rps < $BUDGET_MIN_RPS:
-    print(f"  FAIL: throughput below budget")
-    ok = False
-if p95 > $BUDGET_MAX_P95_MS:
-    print(f"  FAIL: p95 above budget")
-    ok = False
-if fail_pct > $BUDGET_MAX_FAIL_PCT:
-    print(f"  FAIL: failure rate above budget")
-    ok = False
-
-if ok:
-    print("  PASS: all thresholds met")
-    sys.exit(0)
-else:
-    sys.exit(1)
+print(f"  throughput: {rps:.0f} req/s  (min required: {minimum})")
+print(f"  p95:        {p95:.2f} ms      (max allowed: {maximum})")
+print(f"  failures:   {fail_pct:.2f}%    (max allowed: {failures}%)")
+ok = rps >= minimum and p95 <= maximum and fail_pct <= failures
+print("  PASS: all thresholds met" if ok else "  FAIL: performance budget exceeded")
+sys.exit(0 if ok else 1)
 PY

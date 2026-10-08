@@ -34,7 +34,9 @@ type AlertService struct {
 	// scalarHook, when set, replaces the database in scalarMetric (unit
 	// tests inject a fake query layer). integrationsHook is the optional
 	// FIRE-only integrations dispatcher (SetIntegrationsHook).
-	scalarHook       func(ctx context.Context, q string, args ...any) (float64, error)
+	scalarHook func(ctx context.Context, q string, args ...any) (float64, error)
+	// listHooksHook injects target-lookup failures in transition regressions.
+	listHooksHook    func(context.Context, string, string) ([]Webhook, error)
 	integrationsHook func(ctx context.Context, ev AlertFireEvent)
 }
 
