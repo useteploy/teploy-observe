@@ -143,5 +143,11 @@ func newIngestServer(addr string, h http.Handler) *http.Server {
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
+		// Must exceed the fronting proxy's idle keep-alive (cloudflared:
+		// 90 s) so the proxy, not this server, closes idle connections.
+		// Unset, it falls back to ReadTimeout and the proxy sends POSTs
+		// down connections already closed here; it answers those with a
+		// CORS-less 502. See TestIngestServerIdleTimeoutOutlivesProxyKeepAlive.
+		IdleTimeout: 120 * time.Second,
 	}
 }
