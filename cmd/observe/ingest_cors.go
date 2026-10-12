@@ -36,10 +36,13 @@ func ingestPreflight(w http.ResponseWriter, _ *http.Request) {
 // response lacks it. Auth runs before the limiter so the limiter can key on
 // site_id; the body cap rejects oversized payloads before they are decoded;
 // RetryAfterOnUnavailable (O01 ADR §5.2) stamps Retry-After on durable-mode
-// 503s.
-func ingestMiddleware(apiKeyMW neutron.Middleware, rl *ingest.RateLimiter) []neutron.Middleware {
+// 503s. Deadline sits directly inside CORS so a Nucleus stall anywhere below
+// it (key lookup, handler write) answers a CORS-readable 503 before the
+// listener's WriteTimeout kills the connection.
+func ingestMiddleware(apiKeyMW neutron.Middleware, rl *ingest.RateLimiter, deadline time.Duration) []neutron.Middleware {
 	return []neutron.Middleware{
 		neutron.CORS(ingestCORSOptions),
+		ingest.Deadline(deadline, 5*time.Second),
 		apiKeyMW,
 		rl.Middleware,
 		boundedRequestBody(2 << 20),

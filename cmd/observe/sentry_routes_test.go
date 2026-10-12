@@ -16,7 +16,7 @@ func TestSentryRoutesNoPatternConflict(t *testing.T) {
 	mux.Handle("OPTIONS /api/v1/{path...}", noop)
 	mux.Handle("GET /api/v1/{path...}", noop)
 	mux.Handle("POST /api/v1/infra/report", noop)
-	registerSentryRoutes(mux, nil, nil, nil, nil)
+	registerSentryRoutes(mux, nil, nil, nil, nil, nil)
 
 	for _, p := range []string{"/api/1/envelope/", "/api/1/envelope", "/api/abc/store/", "/api/abc/store"} {
 		rr := httptest.NewRecorder()

@@ -411,6 +411,7 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 | `OBSERVE_BUFFER_SIZE` | `100000` | Max buffered events in memory. |
 | `OBSERVE_FLUSH_SIZE` | `500` | Flush threshold (events). |
 | `OBSERVE_FLUSH_INTERVAL_MS` | `2000` | Flush threshold (time). |
+| `OBSERVE_INGEST_DEADLINE_MS` | `10000` | Per-request deadline on public ingest routes, 1000-25000. A store stall past it answers 503 + `Retry-After` (with CORS) instead of holding the connection until the ingest listener's 30 s write timeout kills it. |
 | `OBSERVE_DATA_DIR` | `./data` | Root dir for WAL, queue, local state. |
 | `OBSERVE_QUEUE_DIR` | `$OBSERVE_DATA_DIR/queue` | Ingest WAL directory. |
 | `OBSERVE_WAL_MAX_SEGMENT_BYTES` | `67108864` | Per-segment cap: appends past it roll to a fresh numbered WAL segment. |

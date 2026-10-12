@@ -833,8 +833,12 @@ func main() {
 	}
 	r.HandleFunc("OPTIONS /api/v1/{path...}", ingestPreflight)
 	apiKeyMW := auth.APIKeyAuthMiddleware(authSvc)
-	registerSentryRoutes(r, authSvc, errorBuf, rateLimiter, logger)
-	ingestGroup := r.Group("/api/v1", ingestMiddleware(apiKeyMW, rateLimiter)...)
+	// Every public ingest route is bounded by ingestDeadline (see
+	// ingest.Deadline): a Nucleus stall answers 503 + Retry-After well inside
+	// the ingest listener's WriteTimeout instead of a killed connection.
+	ingestDeadline := ingest.Deadline(cfg.IngestDeadline, 5*time.Second)
+	registerSentryRoutes(r, authSvc, errorBuf, rateLimiter, logger, ingestDeadline)
+	ingestGroup := r.Group("/api/v1", ingestMiddleware(apiKeyMW, rateLimiter, cfg.IngestDeadline)...)
 	neutron.Post(ingestGroup, "/events", ingest.Handler(buf, cfg.SessionSalt, siteSvc),
 		neutron.WithTags("ingest"),
 		neutron.WithSummary("Ingest analytics event"),
@@ -1185,7 +1189,7 @@ func main() {
 	// ingest endpoint; the implementation just never actually required one.
 	// apiKeyMW resolves site_id from the validated key (never from the
 	// request body) exactly like the analytics/OTLP ingest routes do.
-	r.Handle("POST /api/v1/infra/report", apiKeyMW(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+	r.Handle("POST /api/v1/infra/report", ingestDeadline(apiKeyMW(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// Audit F22: this route is registered on the root router, so it does
 		// not inherit the ingest group's 2 MiB BodyLimit — bound it here,
@@ -1212,7 +1216,7 @@ func main() {
 			return
 		}
 		fmt.Fprintf(w, `{"ok":true}`)
-	})))
+	}))))
 	infraGroup := r.Group("/api/v1/infra", jwtMW)
 	neutron.Get(infraGroup, "/hosts", infraHostsHandler(infraSvc),
 		neutron.WithTags("infra"), neutron.WithSummary("List monitored hosts"))
@@ -1239,7 +1243,7 @@ func main() {
 	// standard OTLP exporters require the exact /v1/<signal> path — and so
 	// previously inherited none of the group's middleware.
 	otlpChain := func(h http.Handler) http.Handler {
-		return apiKeyMW(rateLimiter.Middleware(boundedRequestBody(otlpMaxBodyBytes)(h)))
+		return ingestDeadline(apiKeyMW(rateLimiter.Middleware(boundedRequestBody(otlpMaxBodyBytes)(h))))
 	}
 	otlpHandler := tracing.NewOTLPHandler(traceIngest)
 	r.Handle("POST /v1/traces", otlpChain(otlpHandler))
@@ -1505,8 +1509,8 @@ func main() {
 		neutron.WithTags("crons"), neutron.WithSummary("Delete (disable) cron monitor"))
 	// Public checkin (no auth). Preferred form is an opaque per-cron ping token
 	// (returned at creation): possession of the token authorizes the heartbeat.
-	r.HandleFunc("POST /api/v1/checkin/token/{ping_token}", cronCheckinByTokenHandler(cronSvc))
-	r.HandleFunc("GET /api/v1/checkin/token/{ping_token}", cronCheckinByTokenHandler(cronSvc))
+	r.Handle("POST /api/v1/checkin/token/{ping_token}", ingestDeadline(cronCheckinByTokenHandler(cronSvc)))
+	r.Handle("GET /api/v1/checkin/token/{ping_token}", ingestDeadline(cronCheckinByTokenHandler(cronSvc)))
 	// R05 (round 4): the legacy guessable (site_id, slug) check-in routes are
 	// RETIRED — they recorded heartbeats for tokenized monitors without the
 	// token, so the token route never carried the authorization boundary its

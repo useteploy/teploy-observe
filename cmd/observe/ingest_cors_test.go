@@ -37,7 +37,7 @@ func ingestTestServer(t *testing.T, apiKeyMW neutron.Middleware, rl *ingest.Rate
 	app := neutron.New(neutron.WithMiddleware(queryRefusalMetadata, securityHeadersMiddleware(true)))
 	r := app.Router()
 	r.HandleFunc("OPTIONS /api/v1/{path...}", ingestPreflight)
-	g := r.Group("/api/v1", ingestMiddleware(apiKeyMW, rl)...)
+	g := r.Group("/api/v1", ingestMiddleware(apiKeyMW, rl, 10*time.Second)...)
 	neutron.Post(g, "/replays", replayIngestHandler(replays.NewReplayService(nil)))
 	// A handler-produced 503 (durable-mode refusal shape), on an allowlisted path.
 	g.HandleFunc("POST /logs", func(w http.ResponseWriter, r *http.Request) {

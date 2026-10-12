@@ -24,7 +24,10 @@ import (
 // preflight.
 func registerSentryRoutes(r interface {
 	Handle(pattern string, handler http.Handler)
-}, authSvc *auth.AuthService, buf *obserrors.ErrorBuffer, limiter *ingest.RateLimiter, logger *slog.Logger) {
+}, authSvc *auth.AuthService, buf *obserrors.ErrorBuffer, limiter *ingest.RateLimiter, logger *slog.Logger, mw func(http.Handler) http.Handler) {
+	if mw == nil {
+		mw = func(h http.Handler) http.Handler { return h }
+	}
 	h := &sentrycompat.Handler{
 		Keys:       authguard.New(authSvc, authguard.Config{}),
 		Sink:       buf,
@@ -41,6 +44,6 @@ func registerSentryRoutes(r interface {
 		{"/api/{project_id}/store/{$}", h.Store},
 		{"/api/{project_id}/store", h.Store},
 	} {
-		r.Handle("POST "+p.path, p.fn)
+		r.Handle("POST "+p.path, mw(p.fn))
 	}
 }

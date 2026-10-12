@@ -29,6 +29,11 @@ type Config struct {
 	BufferSize    int
 	FlushInterval time.Duration
 	FlushSize     int
+	// IngestDeadline bounds each public ingest request (see
+	// ingest.Deadline). It must stay well below the ingest listener's 30 s
+	// WriteTimeout so a stalled store answers a retryable 503 instead of
+	// the server killing the connection.
+	IngestDeadline time.Duration
 
 	// Retention
 	RawRetentionDays    int
@@ -125,6 +130,16 @@ func Load() Config {
 		c.FlushInterval = time.Duration(flushMs) * time.Millisecond
 	} else {
 		c.FlushInterval = 2000 * time.Millisecond
+	}
+	deadlineMs := 10000
+	set("OBSERVE_INGEST_DEADLINE_MS", 10000, &deadlineMs)
+	if err == nil && (deadlineMs < 1000 || deadlineMs > 25000) {
+		err = fmt.Errorf("OBSERVE_INGEST_DEADLINE_MS must be in [1000, 25000] milliseconds, got %d", deadlineMs)
+	}
+	if err == nil {
+		c.IngestDeadline = time.Duration(deadlineMs) * time.Millisecond
+	} else {
+		c.IngestDeadline = 10 * time.Second
 	}
 	c.parseErr = err
 	return c
