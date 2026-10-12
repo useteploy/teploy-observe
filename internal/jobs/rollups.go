@@ -183,6 +183,35 @@ type sessionEvent struct {
 	SummaryVersion   int64  `db:"summary_version"`
 }
 
+// sessionPriorQuery reads the retained summary for one session, shaped as a
+// sessionEvent so a summary can stand in for an expired entry event. It is
+// written against the sessions schema (migration 033), not derived from the
+// events SELECT: sessions stores the entry page as entry_url — there is no
+// pathname column, and the old string-rewritten events query failed every
+// tick with SQLSTATE 42703.
+const sessionPriorQuery = `SELECT tenant_id, site_id, session_id,
+		first_ts AS timestamp,
+		COALESCE(entry_url, '') AS pathname,
+		COALESCE(referrer, '') AS referrer,
+		COALESCE(browser, '') AS browser,
+		COALESCE(os, '') AS os,
+		COALESCE(device, '') AS device,
+		COALESCE(country, '') AS country,
+		COALESCE(language, '') AS language,
+		COALESCE(screen_width, 0) AS screen_width,
+		COALESCE(screen_height, 0) AS screen_height,
+		COALESCE(utm_source, '') AS utm_source,
+		COALESCE(utm_medium, '') AS utm_medium,
+		COALESCE(utm_campaign, '') AS utm_campaign,
+		COALESCE(release_tag, '') AS release_tag,
+		last_ts AS summary_last_ts,
+		pageviews AS summary_pageviews,
+		events_count AS summary_events,
+		version AS summary_version
+	 FROM sessions
+	 WHERE tenant_id = $1 AND site_id = $2 AND session_id = $3
+	 ORDER BY version DESC LIMIT 1`
+
 // RunSessionRollup aggregates events into session summaries.
 // Runs every 5 minutes. Sessions table uses ReplacingMergeTree — overlapping
 // re-computation is safe because the merge keeps the row with the highest
@@ -294,9 +323,7 @@ func (r *RollupService) RunSessionRollup(ctx context.Context) error {
 			first := events[0]
 			last := events[len(events)-1]
 			pageviews, eventsCount := int64(len(events)), int64(len(events))
-			previousQuery := strings.Replace(selectCols, "timestamp,", "first_ts AS timestamp,", 1)
-			previousQuery = strings.Replace(previousQuery, " FROM events", ", last_ts AS summary_last_ts, pageviews AS summary_pageviews, events_count AS summary_events, version AS summary_version FROM sessions", 1)
-			prior, err := nucleus.Query[sessionEvent](ctx, sql, previousQuery+" WHERE tenant_id = $1 AND site_id = $2 AND session_id = $3 ORDER BY summary_version DESC LIMIT 1", first.TenantID, first.SiteID, first.SessionID)
+			prior, err := nucleus.Query[sessionEvent](ctx, sql, sessionPriorQuery, first.TenantID, first.SiteID, first.SessionID)
 			if err != nil {
 				return fmt.Errorf("session rollup prior: %w", err)
 			}
