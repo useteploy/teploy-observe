@@ -129,14 +129,131 @@ func TestIssueSpikeDetector_PerIssueIsolation(t *testing.T) {
 	}
 }
 
+// --- Idle eviction (SF3, review round 2) ---
+
+// The failure being fixed: the tracked map was capped at 50,000 and never
+// evicted, so once full, spikes SILENTLY STOPPED for every new issue.
+// Now a full map first reclaims entries idle over an hour, and the
+// reclaim is counted for /healthz.
+func TestIssueSpikeDetector_FullMapEvictsIdleAndTracksNewIssue(t *testing.T) {
+	d, clk := newTestDetector(3, 4)
+	d.maxTracked = 3
+	// Fill the map: a, b, c each seen once, then idle for 90 minutes.
+	for _, id := range []string{"a", "b", "c"} {
+		d.observe("s", id)
+	}
+	clk.advance(90 * time.Minute)
+	// A NEW issue arrives while the map is full of idle entries.
+	fired := 0
+	for i := 0; i < 3; i++ {
+		if f, _ := d.observe("s", "new"); f {
+			fired++
+		}
+	}
+	if fired != 1 {
+		t.Fatalf("new issue fired %d times at min=3, want 1 - a full map of idle entries must not silence new issues", fired)
+	}
+	st := d.stats()
+	if st.Evicted != 3 {
+		t.Fatalf("evictions = %d, want 3 (a, b, c reclaimed)", st.Evicted)
+	}
+	if st.Tracked != 1 || st.MaxTrack != 3 {
+		t.Fatalf("stats = %+v, want tracked=1 max=3", st)
+	}
+}
+
+// A map full of ACTIVE issues is honestly at capacity: the new issue is
+// not tracked (and cannot fire), no eviction is claimed, and the counter
+// says so - silence with evidence, not silence by surprise.
+func TestIssueSpikeDetector_FullMapOfActiveIssuesDoesNotFireNewOnes(t *testing.T) {
+	d, clk := newTestDetector(3, 4)
+	d.maxTracked = 2
+	d.observe("s", "a")
+	clk.advance(time.Minute)
+	d.observe("s", "b")
+	// Both entries are recent (active): nothing is reclaimable.
+	for i := 0; i < 10; i++ {
+		if f, _ := d.observe("s", "c"); f {
+			t.Fatal("untracked issue fired past a full map of active entries")
+		}
+	}
+	st := d.stats()
+	if st.Evicted != 0 {
+		t.Fatalf("evictions = %d, want 0 (nothing was idle)", st.Evicted)
+	}
+	if st.Tracked != 2 {
+		t.Fatalf("tracked = %d, want 2", st.Tracked)
+	}
+	// Once a and b go idle, c is admitted and can fire.
+	clk.advance(61 * time.Minute)
+	fired := 0
+	for i := 0; i < 3; i++ {
+		if f, _ := d.observe("s", "c"); f {
+			fired++
+		}
+	}
+	if fired != 1 {
+		t.Fatalf("c fired %d times after eviction made room, want 1", fired)
+	}
+	if st := d.stats(); st.Evicted != 2 {
+		t.Fatalf("evictions = %d, want 2", st.Evicted)
+	}
+}
+
+// Eviction keeps its promise: an issue evicted while idle starts CLEAN
+// when it returns (no stale refire gate, no stale trail suppressing it).
+func TestIssueSpikeDetector_EvictedIssueReturnsClean(t *testing.T) {
+	d, clk := newTestDetector(3, 4)
+	d.maxTracked = 2
+	// a fires (consuming its one-per-hour gate), c fills the map.
+	for i := 0; i < 3; i++ {
+		d.observe("s", "a")
+	}
+	d.observe("s", "c")
+	clk.advance(30 * time.Minute) // inside a's refire gate
+	if f, _ := d.observe("s", "a"); f {
+		t.Fatal("re-fired inside the one-hour gate")
+	}
+	// a and c are both idle past the hour now; b's arrival evicts them.
+	clk.advance(61 * time.Minute)
+	d.observe("s", "b")
+	if got := d.stats().Evicted; got != 2 {
+		t.Fatalf("evictions = %d, want 2 (a and c reclaimed)", got)
+	}
+	clk.advance(2 * time.Minute)
+	// a returns: its old gate and trail are gone, so a fresh burst fires.
+	fired := 0
+	for i := 0; i < 3; i++ {
+		if f, _ := d.observe("s", "a"); f {
+			fired++
+		}
+	}
+	if fired != 1 {
+		t.Fatalf("returning issue fired %d times, want 1 (a clean re-entry)", fired)
+	}
+}
+
+// The stats snapshot is nil-safe on both the detector and the service.
+func TestIssueSpikeDetector_StatsNilSafety(t *testing.T) {
+	var nilD *issueSpikeDetector
+	if st := nilD.stats(); st.Tracked != 0 || st.Evicted != 0 {
+		t.Fatalf("nil detector stats = %+v", st)
+	}
+	s := &IssueService{}
+	if st := s.SpikeDetectorStats(); st.Tracked != 0 || st.Evicted != 0 {
+		t.Fatalf("service without detector stats = %+v", st)
+	}
+}
+
 // spikeDetected drives the notifier on fire (the wiring to issue_spike).
 func TestSpikeDetected_NotifiesOnce(t *testing.T) {
 	s := &IssueService{spikeAlerts: newTestDetectorPtr(3, 4)}
 	var got []IssueEvent
 	s.SetNotifier(func(_ context.Context, ev IssueEvent) { got = append(got, ev) })
 	stack := SummarizeStack([]StackFrame{{Filename: "app.go", Function: "boom", Lineno: 12, InApp: true}})
+	lazy := func() string { return stack }
 	for i := 0; i < 10; i++ {
-		s.spikeDetected(context.Background(), "site", "iss", "gh", "Boom", "app.go", "error", "r1", "prod", stack, int64(i+2))
+		s.spikeDetected(context.Background(), "site", "iss", "gh", "Boom", "app.go", "error", "r1", "prod", lazy, int64(i+2))
 	}
 	if len(got) != 1 {
 		t.Fatalf("issue_spike notifications = %d, want 1", len(got))
@@ -148,12 +265,28 @@ func TestSpikeDetected_NotifiesOnce(t *testing.T) {
 	}
 }
 
+// The stack callback is LAZY: a burst that never fires must never pay for
+// rendering one (SF5 - SummarizeStack was computed on every ingest event).
+func TestSpikeDetected_DoesNotRenderStackWhenNotFiring(t *testing.T) {
+	s := &IssueService{spikeAlerts: newTestDetectorPtr(1000, 4)}
+	rendered := 0
+	lazy := func() string { rendered++; return "app.go:1 boom" }
+	for i := 0; i < 50; i++ {
+		if s.spikeDetected(context.Background(), "site", "iss", "gh", "Boom", "app.go", "error", "r1", "prod", lazy, int64(i)) {
+			t.Fatal("fired below the threshold")
+		}
+	}
+	if rendered != 0 {
+		t.Fatalf("stack rendered %d times without a firing, want 0", rendered)
+	}
+}
+
 // A service with no detector (the &IssueService{} test posture) never
 // fires and never panics.
 func TestSpikeDetected_NoDetectorIsNoop(t *testing.T) {
 	s := &IssueService{}
 	s.SetNotifier(func(_ context.Context, ev IssueEvent) { t.Fatalf("unexpected %+v", ev) })
-	if s.spikeDetected(context.Background(), "s", "i", "gh", "t", "c", "error", "r", "e", "", 1) {
+	if s.spikeDetected(context.Background(), "s", "i", "gh", "t", "c", "error", "r", "e", func() string { return "" }, 1) {
 		t.Fatal("fired without a detector")
 	}
 }

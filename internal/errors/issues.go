@@ -197,6 +197,12 @@ type cachedIssue struct {
 	// can recognise the next event as a regression without a SQL read. The
 	// cache-miss path reads the real status and does not depend on it.
 	Resolved bool `json:"rs,omitempty"`
+	// Ignored marks an issue UpdateStatus ignored (SF4): the cache-hit
+	// path suppresses issue_spike for it without a SQL read. Entries
+	// cached before the field existed decode as not-ignored; the miss
+	// path re-reads the real status, so the staleness is bounded by one
+	// cache entry lifetime.
+	Ignored bool `json:"ig,omitempty"`
 }
 
 // lifecycleStore is the storage the ingest-time issue lifecycle needs. The
@@ -300,7 +306,20 @@ func (s *IssueService) ResolveIssue(ctx context.Context, siteID, groupHash, titl
 // signature for the seed, tooling and tests.
 func (s *IssueService) ResolveIssueEvent(ctx context.Context, siteID, groupHash, title, culprit, level, release string, ts int64, origin EventOrigin) (string, error) {
 	lc := s.lifecycle()
-	stack := SummarizeStack(origin.Frames)
+	// The sample stack is rendered LAZILY (SF5, review round 2): most
+	// events produce no notification at all (an open issue below the
+	// spike threshold), and SummarizeStack - scrubbing up to ten frames -
+	// ran on every single ingest event. The memo means a notification
+	// pays for the render at most once per event.
+	var memoStack string
+	memoDone := false
+	summarize := func() string {
+		if !memoDone {
+			memoStack = summarizeStack(origin.Frames)
+			memoDone = true
+		}
+		return memoStack
+	}
 	// Identifier-like fields, token-scrubbed defensively: the buffer path
 	// already scrubbed them at admission, but direct IngestErrorEvent
 	// callers (seed, tooling) bypass it, and a notification is a new
@@ -323,10 +342,14 @@ func (s *IssueService) ResolveIssueEvent(ctx context.Context, siteID, groupHash,
 			ci.Resolved = false
 			s.notify(ctx, IssueEvent{Kind: IssueEventRegression, SiteID: siteID, IssueID: ci.IssueID,
 				Title: title, Culprit: culprit, Level: level, Release: release, EventCount: newCount,
-				GroupHash: groupHash, Environment: environment, SampleStack: stack})
+				GroupHash: groupHash, Environment: environment, SampleStack: summarize()})
 		}
 		lc.cacheSet(ctx, siteID, groupHash, ci)
-		s.spikeDetected(ctx, siteID, ci.IssueID, groupHash, title, culprit, level, release, environment, stack, newCount)
+		// An issue the operator IGNORED gets no spike alerts (SF4): the
+		// ignore is the operator saying "stop telling me about this".
+		if !ci.Ignored {
+			s.spikeDetected(ctx, siteID, ci.IssueID, groupHash, title, culprit, level, release, environment, summarize, newCount)
+		}
 		return ci.IssueID, nil
 	}
 
@@ -341,13 +364,24 @@ func (s *IssueService) ResolveIssueEvent(ctx context.Context, siteID, groupHash,
 		if err := lc.bump(ctx, existing.IssueID, siteID, ts, newCount); err != nil {
 			return "", fmt.Errorf("bump issue: %w", err)
 		}
-		lc.cacheSet(ctx, siteID, groupHash, cachedIssue{IssueID: existing.IssueID, EventCount: newCount})
+		// The rebuilt cache entry carries the ignored flag (ignored
+		// survives a bump - bumpIssue leaves it ignored), so the hot
+		// path's spike suppression (SF4) keeps holding. Resolved is
+		// deliberately NOT set: the bump just reopened a resolved issue.
+		lc.cacheSet(ctx, siteID, groupHash, cachedIssue{
+			IssueID: existing.IssueID, EventCount: newCount,
+			Ignored: existing.Status == "ignored",
+		})
 		if existing.Status == "resolved" {
 			s.notify(ctx, IssueEvent{Kind: IssueEventRegression, SiteID: siteID, IssueID: existing.IssueID,
 				Title: existing.Title, Culprit: existing.Culprit, Level: existing.Level, Release: release, EventCount: newCount,
-				GroupHash: groupHash, Environment: environment, SampleStack: stack})
+				GroupHash: groupHash, Environment: environment, SampleStack: summarize()})
 		}
-		s.spikeDetected(ctx, siteID, existing.IssueID, groupHash, existing.Title, existing.Culprit, existing.Level, release, environment, stack, newCount)
+		// Ignored issues do not spike (SF4) - same rule as the cache-hit
+		// path, judged on the row's real status here.
+		if existing.Status != "ignored" {
+			s.spikeDetected(ctx, siteID, existing.IssueID, groupHash, existing.Title, existing.Culprit, existing.Level, release, environment, summarize, newCount)
+		}
 		return existing.IssueID, nil
 	}
 
@@ -364,15 +398,17 @@ func (s *IssueService) ResolveIssueEvent(ctx context.Context, siteID, groupHash,
 
 	s.notify(ctx, IssueEvent{Kind: IssueEventNew, SiteID: siteID, IssueID: issueID,
 		Title: title, Culprit: culprit, Level: level, Release: release, EventCount: 1,
-		GroupHash: groupHash, Environment: environment, SampleStack: stack})
+		GroupHash: groupHash, Environment: environment, SampleStack: summarize()})
 	return issueID, nil
 }
 
-// markCachedResolved records on the grouphash cache entry (when one exists)
-// whether the issue is now resolved. Best-effort: a miss only costs the
-// cache-hit path a regression notification until the entry is rebuilt from
-// the database, which reads the real status.
-func (s *IssueService) markCachedResolved(ctx context.Context, issueID, siteID string, resolved bool) {
+// markCachedStatus records on the grouphash cache entry (when one exists)
+// the issue's operator-set status, so the cache-hit path can judge both
+// regression (resolved) and spike suppression (ignored) without a SQL
+// read. Best-effort: a miss only costs the cache-hit path a regression
+// notification until the entry is rebuilt from the database, which reads
+// the real status.
+func (s *IssueService) markCachedStatus(ctx context.Context, issueID, siteID, status string) {
 	rows, err := nucleus.Query[issueScan](ctx, s.db.SQL(),
 		`SELECT `+issueSelectCols+`
 		 FROM `+issuesLatest("issue_id = $1 AND site_id = $2"),
@@ -388,10 +424,11 @@ func (s *IssueService) markCachedResolved(ctx context.Context, issueID, siteID s
 		return
 	}
 	var ci cachedIssue
-	if json.Unmarshal(data, &ci) != nil || ci.IssueID != issueID || ci.Resolved == resolved {
+	resolved, ignored := status == "resolved", status == "ignored"
+	if json.Unmarshal(data, &ci) != nil || ci.IssueID != issueID || (ci.Resolved == resolved && ci.Ignored == ignored) {
 		return
 	}
-	ci.Resolved = resolved
+	ci.Resolved, ci.Ignored = resolved, ignored
 	if raw, err := json.Marshal(ci); err == nil {
 		_ = kv.Set(ctx, key, raw)
 	}
@@ -483,7 +520,7 @@ func (s *IssueService) UpdateStatus(ctx context.Context, issueID, siteID, status
 		issueID, siteID, status, now, untilStr,
 	)
 	if err == nil {
-		s.markCachedResolved(ctx, issueID, siteID, status == "resolved")
+		s.markCachedStatus(ctx, issueID, siteID, status)
 	}
 	return err
 }

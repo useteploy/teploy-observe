@@ -131,3 +131,9 @@ func SummarizeStack(frames []StackFrame) string {
 	}
 	return b.String()
 }
+
+// summarizeStack is the seam ResolveIssueEvent renders sample stacks
+// through. A variable (not a direct call) so the laziness test can count
+// renders (SF5): the render must happen only when a notification is
+// actually emitted, never on every ingest event.
+var summarizeStack = SummarizeStack

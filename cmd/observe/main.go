@@ -1667,6 +1667,11 @@ func main() {
 		// unaffected by design, alerts are being lost by design, and the
 		// operator should see that.
 		health["issue_alerts"] = issueAlerts.Stats()
+		// EV1 (SF3): the issue spike detector - tracked issues, the map
+		// bound, and idle evictions. Evictions are healthy churn; a
+		// tracked count pinned at max_tracked with zero evictions would
+		// mean the map is full of ACTIVE issues and new ones cannot fire.
+		health["issue_spike_detector"] = issueSvc.SpikeDetectorStats()
 		// O08: flag-evaluation condition counters — how many evaluations
 		// could not read their config (unavailable) and how many flags
 		// were quarantined from evaluation by invalid stored config.

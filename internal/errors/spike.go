@@ -305,7 +305,21 @@ const (
 	issueSpikeBuckets       = 12 // 12 x 5min = the 1-hour trail
 	issueSpikeMaxTracked    = 50000
 	issueSpikeRefireEvery   = time.Hour
+	// issueSpikeIdleEvict is how long an issue may go unseen before a
+	// full tracked map may drop it (SF3, review round 2): an hour is the
+	// refire gate, so an entry idle that long carries no live gating
+	// state worth keeping. Without eviction the map filled at 50,000
+	// issues and spikes silently stopped firing for every new issue.
+	issueSpikeIdleEvict = time.Hour
 )
+
+// IssueSpikeStats is the /healthz shape for the detector: what it
+// is tracking now and how many idle issues it has had to drop.
+type IssueSpikeStats struct {
+	Tracked  int   `json:"tracked"`
+	Evicted  int64 `json:"evicted"`
+	MaxTrack int   `json:"max_tracked"`
+}
 
 // issueSpikeDetector is the in-memory burst detector. All methods are
 // nil-safe (a nil detector never fires), so IssueService values built
@@ -316,6 +330,12 @@ type issueSpikeDetector struct {
 	factor  float64
 	now     func() time.Time
 	tracked map[string]*issueSpikeState
+	// maxTracked bounds the tracked map; a field (not the const) so the
+	// eviction tests can exercise the full path without 50,000 entries.
+	maxTracked int
+
+	// evictions counts entries dropped by the idle-eviction sweep.
+	evictions atomic.Int64
 }
 
 type issueSpikeState struct {
@@ -325,6 +345,9 @@ type issueSpikeState struct {
 	buckets  []int64
 	current  int64
 	lastFire time.Time
+	// lastTouch is the last observe() for this issue - the idle signal
+	// the eviction sweep works from.
+	lastTouch time.Time
 }
 
 func newIssueSpikeDetectorFromEnv() *issueSpikeDetector {
@@ -338,10 +361,11 @@ func newIssueSpikeDetector(min int64, factor float64) *issueSpikeDetector {
 		factor = DefaultIssueSpikeFactor
 	}
 	return &issueSpikeDetector{
-		min:     min,
-		factor:  factor,
-		now:     time.Now,
-		tracked: map[string]*issueSpikeState{},
+		min:        min,
+		factor:     factor,
+		now:        time.Now,
+		tracked:    map[string]*issueSpikeState{},
+		maxTracked: issueSpikeMaxTracked,
 	}
 }
 
@@ -371,15 +395,24 @@ func (d *issueSpikeDetector) observe(siteID, issueID string) (fire bool, window 
 	key := siteID + "\x00" + issueID
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	now := d.now()
 	st, ok := d.tracked[key]
 	if !ok {
-		if len(d.tracked) >= issueSpikeMaxTracked {
-			return false, 0 // untracked issues never fire; protection still caps them
+		if len(d.tracked) >= d.maxTracked {
+			// Full: reclaim idle entries before refusing new ones. An
+			// entry idle past issueSpikeIdleEvict holds no live refire
+			// gate (the gate itself is an hour), so dropping it changes
+			// no behaviour a fresh entry would not reproduce.
+			if n := d.evictIdleLocked(now); n == 0 {
+				// Everything is active: the map really is at capacity.
+				// Untracked issues never fire; protection still caps them.
+				return false, 0
+			}
 		}
 		st = &issueSpikeState{}
 		d.tracked[key] = st
 	}
-	now := d.now()
+	st.lastTouch = now
 	st.rollLocked(now)
 	st.current++
 	window = st.current
@@ -407,11 +440,48 @@ func (d *issueSpikeDetector) observe(siteID, issueID string) (fire bool, window 
 	return false, window
 }
 
+// evictIdleLocked drops entries not seen for more than issueSpikeIdleEvict
+// and returns how many went. Caller holds d.mu.
+func (d *issueSpikeDetector) evictIdleLocked(now time.Time) int {
+	if len(d.tracked) < d.maxTracked {
+		return 0
+	}
+	n := 0
+	for k, st := range d.tracked {
+		if st.lastTouch.IsZero() || now.Sub(st.lastTouch) > issueSpikeIdleEvict {
+			delete(d.tracked, k)
+			n++
+		}
+	}
+	if n > 0 {
+		d.evictions.Add(int64(n))
+	}
+	return n
+}
+
+// stats snapshots the detector counters for /healthz (nil-safe: a service
+// without a detector reports zeros, not a panic).
+func (d *issueSpikeDetector) stats() IssueSpikeStats {
+	if d == nil {
+		return IssueSpikeStats{}
+	}
+	d.mu.Lock()
+	tracked := len(d.tracked)
+	maxTracked := d.maxTracked
+	d.mu.Unlock()
+	return IssueSpikeStats{
+		Tracked:  tracked,
+		Evicted:  d.evictions.Load(),
+		MaxTrack: maxTracked,
+	}
+}
+
 // spikeDetected feeds the detector and emits the IssueEventSpike
 // notification when it fires. Called inline on the ingest path: the
 // detector is pure in-memory arithmetic, and notify itself is
-// enqueue-only.
-func (s *IssueService) spikeDetected(ctx context.Context, siteID, issueID, groupHash, title, culprit, level, release, environment, stack string, eventCount int64) bool {
+// enqueue-only. The stack is a LAZY callback (SF5): a spike that does not
+// fire never pays for rendering one.
+func (s *IssueService) spikeDetected(ctx context.Context, siteID, issueID, groupHash, title, culprit, level, release, environment string, stack func() string, eventCount int64) bool {
 	if s.spikeAlerts == nil {
 		return false
 	}
@@ -423,7 +493,15 @@ func (s *IssueService) spikeDetected(ctx context.Context, siteID, issueID, group
 		Kind: IssueEventSpike, SiteID: siteID, IssueID: issueID,
 		Title: title, Culprit: culprit, Level: level, Release: release,
 		EventCount: eventCount, GroupHash: groupHash, Environment: environment,
-		SampleStack: stack, WindowCount: window,
+		SampleStack: stack(), WindowCount: window,
 	})
 	return true
+}
+
+// SpikeDetectorStats snapshots the burst detector's counters for /healthz
+// (tracked issues, idle evictions, the map bound). An eviction count that
+// only grows means the site farm exceeds the tracker bound - spikes stay
+// enabled, but the operator can see the churn.
+func (s *IssueService) SpikeDetectorStats() IssueSpikeStats {
+	return s.spikeAlerts.stats()
 }
