@@ -27,7 +27,9 @@ func TestCronTransitionsRetryLookupAndPartialTargetAdmission(t *testing.T) {
 			ctx := context.Background()
 			calls := 0
 			if failAt == 0 {
-				e.alerts.listHooksHook = func(context.Context, string, string) ([]Webhook, error) { return nil, errors.New("lookup failed") }
+				e.alerts.listHooksHook = func(context.Context, string, string, string) ([]Webhook, error) {
+					return nil, errors.New("lookup failed")
+				}
 			} else {
 				e.notify.enqueueHook = func(NotificationIntent) error {
 					calls++
@@ -59,7 +61,9 @@ func TestCronTransitionsRetryLookupAndPartialTargetAdmission(t *testing.T) {
 			// back, so the new process discovers the obligation through active state.
 			calls = 0
 			if failAt == 0 {
-				e.alerts.listHooksHook = func(context.Context, string, string) ([]Webhook, error) { return nil, errors.New("lookup failed") }
+				e.alerts.listHooksHook = func(context.Context, string, string, string) ([]Webhook, error) {
+					return nil, errors.New("lookup failed")
+				}
 			} else {
 				e.notify.enqueueHook = func(NotificationIntent) error {
 					calls++
@@ -113,7 +117,9 @@ func TestAlertRecoveryCarriesEveryIncidentAndAtomicAdmission(t *testing.T) {
 		}
 		ids = append(ids, inc.IncidentID)
 	}
-	e.alerts.listHooksHook = func(context.Context, string, string) ([]Webhook, error) { return nil, errors.New("lookup failed") }
+	e.alerts.listHooksHook = func(context.Context, string, string, string) ([]Webhook, error) {
+		return nil, errors.New("lookup failed")
+	}
 	if err := e.alerts.evaluateHealthy(ctx, rule, ruleState{State: StateFiring}, 0, 10, clk.now()); err == nil {
 		t.Fatal("lost lookup error")
 	}

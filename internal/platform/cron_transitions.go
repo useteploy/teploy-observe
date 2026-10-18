@@ -16,7 +16,7 @@ import (
 func (s *AlertService) EnsureCronMissed(ctx context.Context, cron CronMonitorRef, graceSecs int) (incidents.Incident, bool, error) {
 	s.evalMu.Lock()
 	defer s.evalMu.Unlock()
-	hooks, err := s.listHooks(ctx, cron.SiteID, "warning")
+	hooks, err := s.listHooks(ctx, cron.SiteID, "warning", NotifyCronMissed)
 	if err != nil {
 		return incidents.Incident{}, false, err
 	}
@@ -57,7 +57,7 @@ func (s *AlertService) EnsureCronMissed(ctx context.Context, cron CronMonitorRef
 func (s *AlertService) RecoverCron(ctx context.Context, cron CronMonitorRef, graceSecs int) (int, error) {
 	s.evalMu.Lock()
 	defer s.evalMu.Unlock()
-	hooks, err := s.listHooks(ctx, cron.SiteID, "warning")
+	hooks, err := s.listHooks(ctx, cron.SiteID, "warning", NotifyCronRecovered)
 	if err != nil {
 		return 0, err
 	}

@@ -174,7 +174,7 @@ func (s *AlertService) evaluateFiring(ctx context.Context, rule AlertRule, prev 
 	}
 
 	if len(active) == 0 {
-		hooks, err := s.listHooks(ctx, rule.SiteID, rule.severityOrDefault())
+		hooks, err := s.listHooks(ctx, rule.SiteID, rule.severityOrDefault(), NotifyIncidentOpened)
 		if err != nil {
 			return err
 		}
@@ -205,7 +205,7 @@ func (s *AlertService) evaluateFiring(ctx context.Context, rule AlertRule, prev 
 			})
 		}
 		if now.UnixMilli()-last >= int64(rule.Cooldown)*60*1000 {
-			hooks, err := s.listHooks(ctx, rule.SiteID, rule.severityOrDefault())
+			hooks, err := s.listHooks(ctx, rule.SiteID, rule.severityOrDefault(), NotifyIncidentRepeat)
 			if err != nil {
 				return err
 			}
@@ -237,7 +237,7 @@ func (s *AlertService) evaluateHealthy(ctx context.Context, rule AlertRule, prev
 		})
 	}
 
-	hooks, err := s.listHooks(ctx, rule.SiteID, rule.severityOrDefault())
+	hooks, err := s.listHooks(ctx, rule.SiteID, rule.severityOrDefault(), NotifyIncidentRecovered)
 	if err != nil {
 		return err
 	}
@@ -375,11 +375,18 @@ func (s *AlertService) commitEdge(ctx context.Context, in edgeInput) error {
 }
 
 // listHooks returns the site's enabled webhook targets that ROUTE the
-// given severity, frozen per notification. Errors stop transitions so
-// recovery/opening obligations cannot disappear as an empty target list.
-func (s *AlertService) listHooks(ctx context.Context, siteID, severity string) ([]Webhook, error) {
+// given severity AND the given notification kind, frozen per
+// notification. Errors stop transitions so recovery/opening obligations
+// cannot disappear as an empty target list.
+//
+// The kind filter is the documented MatchesKind contract (webhooks.go):
+// an empty kinds filter receives the pre-066 kinds, a non-empty filter is
+// exact and governs EVERY kind. Until review round 2 the cron and
+// incident paths ignored it - a webhook that had opted into exactly
+// issue_new,issue_regression was still receiving cron_missed.
+func (s *AlertService) listHooks(ctx context.Context, siteID, severity, kind string) ([]Webhook, error) {
 	if s.listHooksHook != nil {
-		return s.listHooksHook(ctx, siteID, severity)
+		return s.listHooksHook(ctx, siteID, severity, kind)
 	}
 	if s.webhookSvc == nil {
 		return nil, nil
@@ -390,7 +397,7 @@ func (s *AlertService) listHooks(ctx context.Context, siteID, severity string) (
 	}
 	out := hooks[:0]
 	for _, h := range hooks {
-		if MatchesSeverity(h.Severities, severity) {
+		if MatchesSeverity(h.Severities, severity) && MatchesKind(h.Kinds, kind) {
 			out = append(out, h)
 		}
 	}
