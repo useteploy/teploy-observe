@@ -11,14 +11,17 @@ package platform
 // an alert is a derived convenience, ingest is the product; a dropped
 // alert is honest, a stalled ingest path is not.
 //
-// The drain goroutine does the slow half: after a short settle delay (the
-// triggering event's own error_events row lands right after the notify
-// call, so counts read a moment later are real), it re-reads the issue
-// through the injected reader, rebuilds the payload with live numbers, and
-// enqueues one durable intent per webhook target whose `kinds` filter
-// opted into the kind. Retries, the HMAC signature, the delivery-id
-// dedupe marker, maintenance-window suppression and dead letters all come
-// from the existing outbox drain.
+// The drain goroutine does the slow half: it routes first (an event with
+// no opted-in webhook costs nothing), then waits until the event's OWN
+// settle deadline - the triggering event's error_events row lands right
+// after the notify call, so counts read a moment later are real, and a
+// backlog of already-settled events drains at full speed rather than one
+// settle-sleep at a time. It then re-reads the issue through the injected
+// reader, rebuilds the payload with live numbers, and enqueues one durable
+// intent per webhook target whose `kinds` filter opted into the kind.
+// Retries, the HMAC signature, the delivery-id dedupe marker,
+// maintenance-window suppression and dead letters all come from the
+// existing outbox drain.
 //
 // Crash posture: anything still on the channel at shutdown is lost - the
 // same declared budget as the in-memory integrations dispatcher. New and
@@ -105,6 +108,11 @@ type IssueAlertEmitter struct {
 	queue  chan IssueAlertEvent
 	settle time.Duration
 
+	// enqueueIntent is the outbox admission seam; production is
+	// Notifier.Enqueue. A field (not a call) so the drain tests can count
+	// admissions without a store.
+	enqueueIntent func(ctx context.Context, in NotificationIntent) (string, error)
+
 	// dropped counts a full-queue drop; emitted counts events that reached
 	// the drain (before per-hook routing).
 	dropped atomic.Int64
@@ -140,14 +148,15 @@ func NewIssueAlertEmitter(notifier *Notifier, hooks func(ctx context.Context, si
 		settle = time.Duration(v) * time.Millisecond
 	}
 	return &IssueAlertEmitter{
-		notifier: notifier,
-		hooks:    hooks,
-		read:     read,
-		baseURL:  strings.TrimRight(baseURL, "/"),
-		logger:   logger,
-		queue:    make(chan IssueAlertEvent, queue),
-		settle:   settle,
-		seq:      map[string]int64{},
+		notifier:      notifier,
+		hooks:         hooks,
+		read:          read,
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		logger:        logger,
+		queue:         make(chan IssueAlertEvent, queue),
+		settle:        settle,
+		enqueueIntent: notifier.Enqueue,
+		seq:           map[string]int64{},
 	}
 }
 
@@ -261,25 +270,27 @@ func (e *IssueAlertEmitter) Stats() IssueAlertStats {
 // deliver settles, re-reads the issue, routes and enqueues. Errors are
 // logged and swallowed: the emitter runs on its own goroutine and a
 // failing read must not kill the drain.
+//
+// Settle discipline (SF1, review round 2): routing happens BEFORE any
+// waiting - an event with no opted-in webhook costs the drain nothing -
+// and the wait is until the event's OWN deadline (ev.At + settle), not a
+// fixed sleep per event. A backlog whose events are already past their
+// deadline therefore drains at full speed: one site's 1024-deep burst
+// delays every other site by at most one settle window, not 1024 of them.
 func (e *IssueAlertEmitter) deliver(ctx context.Context, ev IssueAlertEvent) {
-	if e.settle > 0 {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(e.settle):
-		}
+	e.emitted.Add(1)
+
+	hooks := e.routeHooks(ctx, ev)
+	if len(hooks) == 0 {
+		return
 	}
+	e.waitSettled(ctx, ev)
+
 	// Bound the whole delivery so a stuck hook listing or issue read
 	// cannot wedge the single drain goroutine.
 	dctx, cancel := context.WithTimeout(ctx, issueAlertDeliveryDeadline)
 	defer cancel()
 
-	e.emitted.Add(1)
-
-	hooks := e.routeHooks(dctx, ev)
-	if len(hooks) == 0 {
-		return
-	}
 	snap := e.snapshot(dctx, ev)
 	payload := e.buildPayload(ev, snap)
 
@@ -294,9 +305,33 @@ func (e *IssueAlertEmitter) deliver(ctx context.Context, ev IssueAlertEvent) {
 			Secret:     hook.Secret,
 			Payload:    payload,
 		}
-		if _, err := e.notifier.Enqueue(dctx, intent); err != nil {
+		if _, err := e.enqueueIntent(dctx, intent); err != nil {
 			e.logger.Error("issue alert enqueue failed",
 				"kind", ev.Kind, "issue", ev.IssueID, "webhook", hook.WebhookID, "err", err)
+		}
+	}
+}
+
+// waitSettled sleeps until the event's settle deadline (its own At plus
+// the settle delay - the triggering event's error_events row lands right
+// after the notify call, so counts read a moment later are real). A zero
+// At falls back to settling from now. Already-late events do not wait at
+// all, which is what lets a backlog drain at full speed.
+func (e *IssueAlertEmitter) waitSettled(ctx context.Context, ev IssueAlertEvent) {
+	if e.settle <= 0 {
+		return
+	}
+	deadline := ev.At
+	if deadline.IsZero() {
+		deadline = time.Now().UTC()
+	}
+	deadline = deadline.Add(e.settle)
+	if wait := time.Until(deadline); wait > 0 {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+		case <-timer.C:
 		}
 	}
 }

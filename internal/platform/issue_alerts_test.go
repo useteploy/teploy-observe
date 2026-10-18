@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -316,5 +317,86 @@ func TestIssueAlertEmitter_FullQueueDropsAndCountsNeverBlocks(t *testing.T) {
 	e.Notify(IssueAlertEvent{Kind: NotifyIncidentOpened, IssueID: "x"})
 	if got := e.Stats().Dropped; got != 200 {
 		t.Fatalf("non-issue kind changed the drop count: %d", got)
+	}
+}
+
+// --- Drain settle discipline (SF1, review round 2) ---
+
+// drainTestEmitter builds an emitter whose enqueue path counts intents
+// in memory (no store), with one always-routing hook.
+func drainTestEmitter(t *testing.T, settleMs int, hooks func(context.Context, string) ([]Webhook, error)) (*IssueAlertEmitter, *int) {
+	t.Helper()
+	t.Setenv("OBSERVE_ISSUE_ALERT_QUEUE", "1024")
+	t.Setenv("OBSERVE_ISSUE_ALERT_SETTLE_MS", strconv.Itoa(settleMs))
+	e := NewIssueAlertEmitter(&Notifier{}, hooks, nil, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	enqueued := 0
+	e.enqueueIntent = func(context.Context, NotificationIntent) (string, error) {
+		enqueued++
+		return "nfy-test", nil
+	}
+	return e, &enqueued
+}
+
+func oneHook(context.Context, string) ([]Webhook, error) {
+	return []Webhook{{WebhookID: "w1", WebhookType: "http", URL: "https://sink.example", Kinds: "issue_new"}}, nil
+}
+
+// The review's headline number: 100 queued events whose settle window has
+// already elapsed must drain in ~zero time, not 100 x settle (the old
+// drain slept the FULL settle delay per event serially - a 1024-deep
+// burst delayed every site behind it by ~34 minutes at 2s settle).
+func TestIssueAlertEmitter_BacklogDrainsWithoutPerEventSettle(t *testing.T) {
+	const settleMs = 2000
+	e, enqueued := drainTestEmitter(t, settleMs, oneHook)
+	past := time.Now().UTC().Add(-time.Minute) // settle long elapsed
+	start := time.Now()
+	const n = 100
+	for i := 0; i < n; i++ {
+		ev := sampleIssueAlertEvent(NotifyIssueNew)
+		ev.At = past
+		e.deliver(context.Background(), ev)
+	}
+	elapsed := time.Since(start)
+	if *enqueued != n {
+		t.Fatalf("enqueued %d intents, want %d", *enqueued, n)
+	}
+	// 100 x settle would be 200s; anything under 3 x settle (6s, generous
+	// CI headroom over the microseconds this actually takes) proves the
+	// per-event sleep is gone.
+	if elapsed > time.Duration(3*settleMs)*time.Millisecond {
+		t.Fatalf("draining %d settled events took %v - the drain is still sleeping per event (budget %v)", n, elapsed, 3*settleMs*time.Millisecond)
+	}
+}
+
+// An event with NO opted-in webhook must not consume a settle wait at
+// all: most events on most sites route nowhere, and parking the single
+// drain goroutine on them was pure added latency for every other site.
+func TestIssueAlertEmitter_UnroutedEventSkipsTheSettleWait(t *testing.T) {
+	e, enqueued := drainTestEmitter(t, 3000, func(context.Context, string) ([]Webhook, error) {
+		return nil, nil
+	})
+	ev := sampleIssueAlertEvent(NotifyIssueNew) // At = now: not yet settled
+	start := time.Now()
+	e.deliver(context.Background(), ev)
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("unrouted event waited %v - routing must happen BEFORE the settle wait", elapsed)
+	}
+	if *enqueued != 0 {
+		t.Fatalf("unrouted event enqueued %d intents", *enqueued)
+	}
+}
+
+// The settle still happens for a routed, not-yet-settled event: the
+// re-read of the issue needs the triggering event's row to have landed.
+func TestIssueAlertEmitter_RoutedEventWaitsForItsOwnDeadline(t *testing.T) {
+	e, enqueued := drainTestEmitter(t, 250, oneHook)
+	ev := sampleIssueAlertEvent(NotifyIssueNew) // At = now: deadline = now+250ms
+	start := time.Now()
+	e.deliver(context.Background(), ev)
+	if elapsed := time.Since(start); elapsed < 200*time.Millisecond {
+		t.Fatalf("routed event returned after %v - the settle wait was skipped", elapsed)
+	}
+	if *enqueued != 1 {
+		t.Fatalf("enqueued %d intents, want 1", *enqueued)
 	}
 }
