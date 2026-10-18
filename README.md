@@ -334,12 +334,19 @@ Declared limits, fixture-tested scale points, and where to read them live:
   and maintenance-window suppression. Strictly opt-in per webhook via the
   `kinds` filter (`POST /api/v1/platform/webhooks`, e.g.
   `kinds: "issue_new,issue_regression,issue_spike"`): a webhook without
-  issue kinds receives none. Payloads carry the grouping fingerprint,
-  release, environment, event/user counts, first/last seen and a scrubbed
-  sample stack clipped to 2 KB — Slack-type targets get a chat summary and
-  never a stack. The emitter never slows ingest: bounded queue, drop and
-  count when full (`/healthz` → `issue_alerts`). A burst alert fires at
-  most once per issue per hour.
+  issue kinds receives none — and a non-empty `kinds` filter governs EVERY
+  kind, including `cron_*` and `incident_*`. Payloads carry the grouping
+  fingerprint, release, environment, event/user counts, first/last seen
+  and a scrubbed sample stack clipped to 2 KB — Slack-type targets get a
+  chat summary (every field length-capped and neutralised for Slack's
+  `<...>` control syntax, e.g. `<!channel>` or disguised links) and never
+  a stack. The emitter never slows ingest: bounded queue, drop and count
+  when full (`/healthz` → `issue_alerts`), and the drain routes before
+  its settle wait, so a backlog of already-settled events drains at full
+  speed instead of one settle delay per event. A burst alert fires at
+  most once per issue per hour, never for issues marked ignored, and the
+  detector retires issues idle over an hour so it cannot fill up and go
+  silent (`/healthz` → `issue_spike_detector`).
 - Recovery read for issue alerts: `GET /api/v1/errors/issues/{id}/since?ts=&release=`
   returns an issue's status and event counts since a timestamp (total and in
   a given release), so a fix pipeline can confirm a fingerprint stopped in

@@ -12,6 +12,7 @@ import (
 
 	"github.com/neutron-build/neutron/go/nucleus"
 
+	"github.com/useteploy/teploy-observe/internal/dbutil"
 	"github.com/useteploy/teploy-observe/internal/query"
 )
 
@@ -734,13 +735,16 @@ func (s *IssueService) IssueSince(ctx context.Context, siteID, issueID string, s
 	}
 	stats.Status = rows[0].Status
 
-	since := strconv.FormatInt(sinceMs, 10)
+	// sinceMs binds through dbutil.IntParam + CAST (the CLAUDE.md wire
+	// quirk rule for numeric parameters): error_events.timestamp is
+	// BIGINT and a bare text bind compares as text.
+	since := dbutil.IntParam(sinceMs)
 	// Each statement binds its own leading parameters, so the IN-clause
 	// placeholders start at a different index per query.
 	inSince, argsSince := issueIDClause(3, ids)
 	countRows, err := nucleus.Query[issueCountRow](ctx, s.db.SQL(),
 		`SELECT COUNT(*) AS n FROM error_events
-		 WHERE site_id = $1 AND timestamp >= $2 AND `+inSince,
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND `+inSince,
 		append([]any{siteID, since}, argsSince...)...,
 	)
 	if err != nil {
@@ -753,7 +757,7 @@ func (s *IssueService) IssueSince(ctx context.Context, siteID, issueID string, s
 	inRel, argsRel := issueIDClause(4, ids)
 	relRows, err := nucleus.Query[issueCountRow](ctx, s.db.SQL(),
 		`SELECT COUNT(*) AS n FROM error_events
-		 WHERE site_id = $1 AND timestamp >= $2 AND release_tag = $3 AND `+inRel,
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND release_tag = $3 AND `+inRel,
 		append([]any{siteID, since, release}, argsRel...)...,
 	)
 	if err != nil {

@@ -95,7 +95,14 @@ skew refused at admission with a 400).
   path still rides the in-memory queue (its senders are create-only);
   alert recovery cannot resolve PagerDuty/Jira/GitHub tickets; the
   issue_url in payloads points at the /errors page (a per-issue UI
-  route still does not exist).
+  route still does not exist). Review round 2 (2026-10-17) closed:
+  Slack issue text now runs the shared escape-and-cap (integrations.
+  SlackEscape), `kinds` governs the cron/incident paths too, the
+  spike detector evicts idle entries (healthz issue_spike_detector),
+  ignored issues never spike, and the stack summary renders lazily.
+  Operator follow-ups live in the PR body: rotate webhook secrets
+  after deploy (the pre-fix List JSON leaked them) and drop
+  webhooks_pre066 after verifying the 066 copy.
 - Notification buckets, spike windows, persons-properties limiter and
   survey limiters stay per-process (reset on restart, per replica) -
   the standing single-process posture (AUD-018).
