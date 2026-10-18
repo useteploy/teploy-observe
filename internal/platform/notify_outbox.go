@@ -45,6 +45,7 @@ import (
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 	"github.com/useteploy/teploy-observe/internal/incidents"
+	"github.com/useteploy/teploy-observe/internal/integrations"
 	"github.com/useteploy/teploy-observe/internal/netsafe"
 )
 
@@ -483,8 +484,27 @@ func (n *Notifier) postSlackIssue(ctx context.Context, row *notifyRow) error {
 	return postSignedJSON(ctx, n.client, row.ID, row.TargetURL, "", body)
 }
 
+// Slack field caps for issue notifications, mirroring fireSlack's budget
+// in internal/integrations: the title gets the room a headline needs,
+// short context fields get a line each. Slack rejects chat messages past
+// ~4 KB of blocks/text, which would dead-letter the intent, and an
+// attacker-controlled title (the public ingest key lets anyone mint one)
+// must never be the reason a delivery dies.
+const (
+	slackIssueTitleMax = 300
+	slackIssueFieldMax = 100
+)
+
 // slackIssueText renders the chat line for an issue notification from its
 // frozen payload. Deliberately excludes sample_stack.
+//
+// Every interpolated field runs through integrations.SlackEscape - the
+// same neutraliser the integrations path uses (Slack's <...> control
+// syntax covers <!channel> pings and disguised <https://evil|text> links,
+// and the title/culprit/release/environment are attacker-influenced via
+// the public browser ingest key) - and every field is capped so a 10 KB
+// title cannot push the message past Slack's size limit into a
+// dead letter.
 func slackIssueText(payload string) (string, error) {
 	var p IssueNotification
 	if err := json.Unmarshal([]byte(payload), &p); err != nil {
@@ -498,17 +518,21 @@ func slackIssueText(payload string) (string, error) {
 	if label == "" {
 		label = p.Kind
 	}
+	esc := integrations.SlackEscape
 	var b strings.Builder
-	fmt.Fprintf(&b, "*[%s] %s: %s*", strings.ToUpper(p.Level), label, p.Title)
+	fmt.Fprintf(&b, "*[%s] %s: %s*",
+		esc(strings.ToUpper(p.Level), slackIssueFieldMax),
+		esc(label, slackIssueFieldMax),
+		esc(p.Title, slackIssueTitleMax))
 	if p.Culprit != "" {
-		fmt.Fprintf(&b, "\nCulprit: %s", p.Culprit)
+		fmt.Fprintf(&b, "\nCulprit: %s", esc(p.Culprit, slackIssueTitleMax))
 	}
-	fmt.Fprintf(&b, "\nSite: %s (issue %s)", p.SiteID, p.IssueID)
+	fmt.Fprintf(&b, "\nSite: %s (issue %s)", esc(p.SiteID, slackIssueFieldMax), esc(p.IssueID, slackIssueFieldMax))
 	if p.Release != "" {
-		fmt.Fprintf(&b, "\nRelease: %s", p.Release)
+		fmt.Fprintf(&b, "\nRelease: %s", esc(p.Release, slackIssueFieldMax))
 	}
 	if p.Environment != "" {
-		fmt.Fprintf(&b, "\nEnvironment: %s", p.Environment)
+		fmt.Fprintf(&b, "\nEnvironment: %s", esc(p.Environment, slackIssueFieldMax))
 	}
 	fmt.Fprintf(&b, "\nEvents: %d | Users: %d", p.EventCount, p.UserCount)
 	if p.WindowCount > 0 {

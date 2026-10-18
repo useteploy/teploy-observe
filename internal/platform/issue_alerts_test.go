@@ -107,6 +107,72 @@ func mustJSON(t *testing.T, v any) string {
 	return string(raw)
 }
 
+// BLOCKER regression (security review B1): Title, Culprit, Release and
+// Environment are attacker-influenced through the public browser ingest
+// key. Raw into Slack text they carried live control syntax - a title of
+// "<!channel>" pings the whole channel, "<https://evil.example|x>" renders
+// as a disguised link, and both must arrive HTML-escaped instead. The
+// escape used is the SAME one the integrations path uses (exported
+// SlackEscape), not a second implementation.
+func TestSlackIssueText_EscapesSlackControlSequences(t *testing.T) {
+	p := IssueNotification{
+		Kind: NotifyIssueNew, IssueID: "iss-1", SiteID: "site-1",
+		Title:   `Boom <!channel> <https://evil.example|click me> <@U123>`,
+		Culprit: `app.ts:42 <https://evil.example|culprit>`,
+		Level:   "error", Release: "rel-<https://evil.example|rel>", Environment: "prod<!here>",
+		EventCount: 1, UserCount: 1,
+	}
+	text, err := slackIssueText(mustJSON(t, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{
+		"<!channel>", "<https://evil.example", "<!here>", "<@U123>",
+	} {
+		if strings.Contains(text, raw) {
+			t.Fatalf("slack text carries live control syntax %q: %s", raw, text)
+		}
+	}
+	for _, want := range []string{
+		"&lt;!channel&gt;",
+		"&lt;https://evil.example|click me&gt;",
+		"&lt;https://evil.example|culprit&gt;",
+		"&lt;https://evil.example|rel&gt;",
+		"prod&lt;!here&gt;",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("slack text missing escaped form %q: %s", want, text)
+		}
+	}
+}
+
+// The other half of B1: a very long title must not reach Slack. Slack
+// rejects oversized messages, the outbox would burn its retry budget and
+// dead-letter the alert - so every field is capped (title at 300 runes,
+// the same budget fireSlack gives a headline).
+func TestSlackIssueText_CapsAttackerSizedFields(t *testing.T) {
+	p := IssueNotification{
+		Kind: NotifyIssueSpike, IssueID: "iss-1", SiteID: "site-1",
+		Title:   strings.Repeat("A", 10*1024), // a 10 KB title
+		Culprit: strings.Repeat("c", 10*1024),
+		Level:   "error", Release: strings.Repeat("r", 10*1024), Environment: strings.Repeat("e", 10*1024),
+		EventCount: 1, UserCount: 1, WindowCount: 3,
+	}
+	text, err := slackIssueText(mustJSON(t, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len([]rune(text)); got > 2000 {
+		t.Fatalf("slack text is %d runes - a 10 KB title pushed it past Slack's message budget", got)
+	}
+	if !strings.Contains(text, "AAA") || !strings.HasSuffix(strings.SplitN(text, "\n", 2)[0], "...*") {
+		t.Fatalf("title not capped with the ellipsis marker: %.80q...", text)
+	}
+	if strings.Contains(text, strings.Repeat("c", 400)) || strings.Contains(text, strings.Repeat("r", 200)) {
+		t.Fatal("culprit/release not capped")
+	}
+}
+
 // ClipStack: byte cap honored, partial line dropped, valid UTF-8.
 func TestClipStack(t *testing.T) {
 	short := "a.ts:1 f\nb.ts:2 g"
