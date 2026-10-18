@@ -21,11 +21,11 @@ func TestO10SeverityRouting(t *testing.T) {
 	e := newO10Engine(t, db, recv, clk)
 
 	// Two sinks: one pages only on critical, one receives everything.
-	criticalOnly, err := e.hooks.Create(context.Background(), e.site, "crit-sink", "http", e.server.URL, "critical")
+	criticalOnly, err := e.hooks.Create(context.Background(), e.site, "crit-sink", "http", e.server.URL, "critical", "")
 	if err != nil {
 		t.Fatalf("create crit webhook: %v", err)
 	}
-	allSink, err := e.hooks.Create(context.Background(), e.site, "all-sink", "http", e.server.URL, "")
+	allSink, err := e.hooks.Create(context.Background(), e.site, "all-sink", "http", e.server.URL, "", "")
 	if err != nil {
 		t.Fatalf("create all webhook: %v", err)
 	}
@@ -186,6 +186,81 @@ func (e *o10Engine) dbIntentsByWebhook(t *testing.T, ruleID string) map[string]i
 		out[r.WebhookID]++
 	}
 	return out
+}
+
+// TestO10KindsFilterGovernsCronPaths (SF2, review round 2): the documented
+// MatchesKind contract says a NON-EMPTY kinds filter is exact and governs
+// every kind. The cron paths ignored it: a webhook that opted into exactly
+// issue_new,issue_regression was still receiving cron_missed. The
+// transition must route only webhooks whose filter lists cron_missed (an
+// empty filter keeps the pre-066 kinds, including cron_missed).
+func TestO10KindsFilterGovernsCronPaths(t *testing.T) {
+	db := o10Fixture(t)
+	clk := newO10Clock()
+	e := newO10Engine(t, db, &o10Receiver{}, clk)
+
+	issueOnly, err := e.hooks.Create(context.Background(), e.site, "issue-only-sink", "http", e.server.URL, "", "issue_new,issue_regression")
+	if err != nil {
+		t.Fatalf("create issue-only webhook: %v", err)
+	}
+	cronSink, err := e.hooks.Create(context.Background(), e.site, "cron-sink", "http", e.server.URL, "", "cron_missed,cron_recovered")
+	if err != nil {
+		t.Fatalf("create cron webhook: %v", err)
+	}
+
+	cronRef := CronMonitorRef{CronID: "cron-kinds", SiteID: e.site, Name: "nightly backup", Slug: "nightly-backup"}
+	if _, _, err := e.alerts.EnsureCronMissed(context.Background(), cronRef, 300); err != nil {
+		t.Fatalf("cron transition: %v", err)
+	}
+	intents := e.dbIntentsByWebhook(t, "cron:"+cronRef.CronID)
+	if intents[issueOnly.WebhookID] != 0 {
+		t.Fatalf("webhook with kinds=issue_new,issue_regression received %d cron_missed intents, want 0 (a non-empty filter is exact)", intents[issueOnly.WebhookID])
+	}
+	if intents[cronSink.WebhookID] != 1 {
+		t.Fatalf("webhook with kinds=cron_missed,cron_recovered received %d cron_missed intents, want 1", intents[cronSink.WebhookID])
+	}
+
+	// Recovery routes through the same filter.
+	if _, err := e.alerts.RecoverCron(context.Background(), cronRef, 300); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	intents = e.dbIntentsByWebhook(t, "cron:"+cronRef.CronID)
+	if intents[issueOnly.WebhookID] != 0 {
+		t.Fatalf("webhook with kinds=issue_new,issue_regression received %d cron intents after recovery, want 0", intents[issueOnly.WebhookID])
+	}
+	if intents[cronSink.WebhookID] != 2 {
+		t.Fatalf("cron-listing webhook received %d cron intents after recovery, want 2 (missed + recovered)", intents[cronSink.WebhookID])
+	}
+}
+
+// TestO10KindsFilterGovernsIncidentPaths: the same contract on the alert
+// engine's incident_opened / incident_recovered edges.
+func TestO10KindsFilterGovernsIncidentPaths(t *testing.T) {
+	db := o10Fixture(t)
+	clk := newO10Clock()
+	e := newO10Engine(t, db, &o10Receiver{}, clk)
+
+	issueOnly, err := e.hooks.Create(context.Background(), e.site, "issue-only-sink", "http", e.server.URL, "", "issue_new")
+	if err != nil {
+		t.Fatalf("create issue-only webhook: %v", err)
+	}
+	incidentSink, err := e.hooks.Create(context.Background(), e.site, "incident-sink", "http", e.server.URL, "", "incident_opened,incident_recovered")
+	if err != nil {
+		t.Fatalf("create incident webhook: %v", err)
+	}
+
+	rule := e.rule(t, "error_count", "gt", 0, 5, 0, 1)
+	e.seedEvents(t, 10, time.Minute)
+	e.seedErrors(t, 3, time.Minute)
+	e.check(t)
+
+	intents := e.dbIntentsByWebhook(t, rule.RuleID)
+	if intents[issueOnly.WebhookID] != 0 {
+		t.Fatalf("webhook with kinds=issue_new received %d incident_opened intents, want 0", intents[issueOnly.WebhookID])
+	}
+	if intents[incidentSink.WebhookID] != 1 {
+		t.Fatalf("webhook listing incident_opened received %d intents, want 1", intents[incidentSink.WebhookID])
+	}
 }
 
 // rebindNotifyOnly swaps just the notifier (the restart between enqueue and

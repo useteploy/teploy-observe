@@ -298,7 +298,8 @@ func (s *Service) insertErrorEvent(ctx context.Context, sqlc *nucleus.SQLModel, 
 	}
 
 	// Resolve or create issue
-	issueID, err = s.issueSvc.ResolveIssue(ctx, input.SiteID, groupHash, title, culprit, input.Level, input.ReleaseTag, ts)
+	issueID, err = s.issueSvc.ResolveIssueEvent(ctx, input.SiteID, groupHash, title, culprit, input.Level, input.ReleaseTag, ts,
+		EventOrigin{Environment: input.Environment, Frames: input.StackTrace})
 	if err != nil {
 		return "", "", fmt.Errorf("resolve issue: %w", err)
 	}

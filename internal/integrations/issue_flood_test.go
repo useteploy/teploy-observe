@@ -119,7 +119,7 @@ func TestDispatcher_RateLimitEnvAndUnlimited(t *testing.T) {
 
 func TestSlackEscapeNeutralisesControlSequences(t *testing.T) {
 	in := "<!channel> <!here> <@U123> <https://evil.example|click> `code` & more"
-	out := slackEscape(in, 1000)
+	out := SlackEscape(in, 1000)
 	for _, bad := range []string{"<!channel>", "<!here>", "<@U123>", "<https", "`"} {
 		if strings.Contains(out, bad) {
 			t.Fatalf("%q survived in %q", bad, out)
@@ -128,7 +128,7 @@ func TestSlackEscapeNeutralisesControlSequences(t *testing.T) {
 	if !strings.Contains(out, "&lt;!channel&gt;") || !strings.Contains(out, "&amp; more") {
 		t.Fatalf("unexpected escape: %q", out)
 	}
-	if got := slackEscape(strings.Repeat("a", 5000), 100); len([]rune(got)) > 103 {
+	if got := SlackEscape(strings.Repeat("a", 5000), 100); len([]rune(got)) > 103 {
 		t.Fatalf("not truncated: %d", len(got))
 	}
 }

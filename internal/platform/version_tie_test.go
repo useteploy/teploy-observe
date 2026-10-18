@@ -9,7 +9,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/nucleustest"
 )
 
-// alert_rules and webhooks as 004_platform + 049 declare them.
+// alert_rules and webhooks as 004_platform + 049 (+ 066's kinds) declare them.
 const alertRuleColumns = `(
 	rule_id        TEXT NOT NULL,
 	tenant_id      TEXT NOT NULL DEFAULT 'default',
@@ -38,6 +38,7 @@ const webhookColumns = `(
 	url            TEXT NOT NULL DEFAULT '',
 	secret         TEXT NOT NULL DEFAULT '',
 	severities     TEXT NOT NULL DEFAULT '',
+	kinds          TEXT NOT NULL DEFAULT '',
 	enabled        TEXT NOT NULL DEFAULT 'true',
 	created_at     TEXT NOT NULL,
 	version        BIGINT NOT NULL DEFAULT 0
@@ -85,7 +86,7 @@ func TestSameMillisecondCreateDeleteTombstoneWins(t *testing.T) {
 			}
 		}
 
-		hook, err := hooks.Create(ctx, site, "tie", "http", "https://example.com/hook", "")
+		hook, err := hooks.Create(ctx, site, "tie", "http", "https://example.com/hook", "", "")
 		if err != nil {
 			t.Fatalf("iter %d create webhook: %v", i, err)
 		}

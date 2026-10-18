@@ -36,7 +36,7 @@ type AlertService struct {
 	// FIRE-only integrations dispatcher (SetIntegrationsHook).
 	scalarHook func(ctx context.Context, q string, args ...any) (float64, error)
 	// listHooksHook injects target-lookup failures in transition regressions.
-	listHooksHook    func(context.Context, string, string) ([]Webhook, error)
+	listHooksHook    func(context.Context, string, string, string) ([]Webhook, error)
 	integrationsHook func(ctx context.Context, ev AlertFireEvent)
 }
 

@@ -38,12 +38,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/neutron-build/neutron/go/neutron"
 	"github.com/neutron-build/neutron/go/nucleus"
 
 	"github.com/useteploy/teploy-observe/internal/dbutil"
 	"github.com/useteploy/teploy-observe/internal/incidents"
+	"github.com/useteploy/teploy-observe/internal/integrations"
 	"github.com/useteploy/teploy-observe/internal/netsafe"
 )
 
@@ -58,6 +60,16 @@ const (
 	// delivered).
 	NotifyCronMissed    = "cron_missed"
 	NotifyCronRecovered = "cron_recovered"
+
+	// EV1 (066): issue-level alert kinds. Fired by the issue alert emitter
+	// (issue_alerts.go) from internal/errors lifecycle events; delivered
+	// with the same HMAC scheme, delivery-id dedupe, retries and dead
+	// letters as every other outbox kind. OPT-IN per webhook via the
+	// `kinds` filter (webhooks.go): a webhook that does not list them
+	// receives none.
+	NotifyIssueNew        = "issue_new"
+	NotifyIssueRegression = "issue_regression"
+	NotifyIssueSpike      = "issue_spike"
 )
 
 // Notifier defaults (mirroring the derived-outbox worker).
@@ -446,6 +458,9 @@ func (n *Notifier) deliver(ctx context.Context, row *notifyRow) error {
 }
 
 func (n *Notifier) postSlack(ctx context.Context, row *notifyRow) error {
+	if IsIssueKind(row.Kind) {
+		return n.postSlackIssue(ctx, row)
+	}
 	var p NotificationPayload
 	if err := json.Unmarshal([]byte(row.Payload), &p); err != nil {
 		return fmt.Errorf("slack notification: decode payload: %w", err)
@@ -454,6 +469,76 @@ func (n *Notifier) postSlack(ctx context.Context, row *notifyRow) error {
 		p.Severity, p.RuleName, p.Message, p.SiteID, p.IncidentID)
 	body, _ := json.Marshal(map[string]string{"text": text})
 	return postSignedJSON(ctx, n.client, row.ID, row.TargetURL, "", body)
+}
+
+// postSlackIssue renders an issue_* intent for a Slack target. Slack renders
+// chat text, not structured payloads, and chat scrolls: the sample stack is
+// NEVER included - not truncated, not linked, omitted. The full signed
+// payload is only ever POSTed to http-type targets.
+func (n *Notifier) postSlackIssue(ctx context.Context, row *notifyRow) error {
+	text, err := slackIssueText(row.Payload)
+	if err != nil {
+		return fmt.Errorf("slack issue notification: %w", err)
+	}
+	body, _ := json.Marshal(map[string]string{"text": text})
+	return postSignedJSON(ctx, n.client, row.ID, row.TargetURL, "", body)
+}
+
+// Slack field caps for issue notifications, mirroring fireSlack's budget
+// in internal/integrations: the title gets the room a headline needs,
+// short context fields get a line each. Slack rejects chat messages past
+// ~4 KB of blocks/text, which would dead-letter the intent, and an
+// attacker-controlled title (the public ingest key lets anyone mint one)
+// must never be the reason a delivery dies.
+const (
+	slackIssueTitleMax = 300
+	slackIssueFieldMax = 100
+)
+
+// slackIssueText renders the chat line for an issue notification from its
+// frozen payload. Deliberately excludes sample_stack.
+//
+// Every interpolated field runs through integrations.SlackEscape - the
+// same neutraliser the integrations path uses (Slack's <...> control
+// syntax covers <!channel> pings and disguised <https://evil|text> links,
+// and the title/culprit/release/environment are attacker-influenced via
+// the public browser ingest key) - and every field is capped so a 10 KB
+// title cannot push the message past Slack's size limit into a
+// dead letter.
+func slackIssueText(payload string) (string, error) {
+	var p IssueNotification
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		return "", fmt.Errorf("decode payload: %w", err)
+	}
+	label := map[string]string{
+		NotifyIssueNew:        "New issue",
+		NotifyIssueRegression: "Regression",
+		NotifyIssueSpike:      "Spike",
+	}[p.Kind]
+	if label == "" {
+		label = p.Kind
+	}
+	esc := integrations.SlackEscape
+	var b strings.Builder
+	fmt.Fprintf(&b, "*[%s] %s: %s*",
+		esc(strings.ToUpper(p.Level), slackIssueFieldMax),
+		esc(label, slackIssueFieldMax),
+		esc(p.Title, slackIssueTitleMax))
+	if p.Culprit != "" {
+		fmt.Fprintf(&b, "\nCulprit: %s", esc(p.Culprit, slackIssueTitleMax))
+	}
+	fmt.Fprintf(&b, "\nSite: %s (issue %s)", esc(p.SiteID, slackIssueFieldMax), esc(p.IssueID, slackIssueFieldMax))
+	if p.Release != "" {
+		fmt.Fprintf(&b, "\nRelease: %s", esc(p.Release, slackIssueFieldMax))
+	}
+	if p.Environment != "" {
+		fmt.Fprintf(&b, "\nEnvironment: %s", esc(p.Environment, slackIssueFieldMax))
+	}
+	fmt.Fprintf(&b, "\nEvents: %d | Users: %d", p.EventCount, p.UserCount)
+	if p.WindowCount > 0 {
+		fmt.Fprintf(&b, " | Window events: %d", p.WindowCount)
+	}
+	return b.String(), nil
 }
 
 // recordDispositionTx persists the timeline through the same SQL transaction as
@@ -756,6 +841,75 @@ func BuildNotificationPayload(kind string, rule AlertRule, value float64, sample
 	}
 	raw, _ := json.Marshal(p)
 	return string(raw)
+}
+
+// IssueNotification is the frozen JSON body of an issue_* notification
+// intent (EV1, 066). Self-describing for a machine receiver: the grouping
+// identity (fingerprint), where it happened (site/service/release/
+// environment), how bad (counts, first/last seen), and a scrubbed sample
+// stack clipped to issueStackMaxBytes so a receiver can show cause without
+// a second read. Slack-type targets never receive the stack (postSlackIssue).
+type IssueNotification struct {
+	Kind        string `json:"kind"`
+	DeliverySeq int64  `json:"delivery_seq"`
+	IssueID     string `json:"issue_id"`
+	SiteID      string `json:"site_id"`
+	// Service names the failing component. There is no service tag on the
+	// error wire yet, so v1 mirrors site_id; the field exists so a later
+	// event tag can fill it without a payload breaking change.
+	Service            string `json:"service"`
+	Fingerprint        string `json:"fingerprint"`
+	FingerprintVersion int    `json:"fingerprint_version"`
+	Title              string `json:"title"`
+	Culprit            string `json:"culprit"`
+	Level              string `json:"level"`
+	// Release is the TRIGGERING event's release; FirstRelease is the
+	// issue's first-seen release (issues.release_tag) - the pair tells a
+	// receiver whether the error followed a deploy.
+	FirstRelease string `json:"first_release"`
+	Release      string `json:"release"`
+	Environment  string `json:"environment"`
+	// EventCount/UserCount are re-read from the issue at emit time (real
+	// numbers, not the cache's racey counter). WindowCount is the spike
+	// window's event count (issue_spike only; 0 otherwise).
+	EventCount  int64 `json:"event_count"`
+	UserCount   int64 `json:"user_count"`
+	WindowCount int64 `json:"window_count"`
+	// RegressionCount is the issue's lifetime resolved-then-reopened count.
+	RegressionCount int64  `json:"regression_count"`
+	FirstSeen       string `json:"first_seen"`
+	LastSeen        string `json:"last_seen"`
+	// SampleStack is built from the POST-SCRUB frames of the triggering
+	// event (scrubbing runs at admission, scrub.go): file:line function
+	// lines only - no local variables, no breadcrumbs, no request data -
+	// and clipped to IssueStackMaxBytes.
+	SampleStack string `json:"sample_stack,omitempty"`
+	IssueURL    string `json:"issue_url,omitempty"`
+	OccurredAt  string `json:"occurred_at"`
+}
+
+// IssueStackMaxBytes caps sample_stack. 2 KB per the EV1 spec; 2000 rather
+// than 2048 so it also fits under teploy-ship's DETAIL_STACK_MAX unchanged.
+const IssueStackMaxBytes = 2000
+
+// ClipStack bounds a sample stack to at most IssueStackMaxBytes
+// (marker included), cutting on a rune boundary and dropping a
+// partially-cut trailing line rather than shipping half a frame.
+func ClipStack(s string) string {
+	if len(s) <= IssueStackMaxBytes {
+		return s
+	}
+	const marker = "\n[clipped]"
+	cut := s[:IssueStackMaxBytes-len(marker)]
+	// Drop a partial last line: keep everything before its final newline.
+	if idx := strings.LastIndex(cut, "\n"); idx > 0 {
+		cut = cut[:idx]
+	}
+	// Rune-boundary trim (a cut inside a multi-byte rune is invalid UTF-8).
+	for len(cut) > 0 && !utf8.ValidString(cut[len(cut)-1:]) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut + marker
 }
 
 // postSignedJSON POSTs body to url with the stable delivery-id header and,

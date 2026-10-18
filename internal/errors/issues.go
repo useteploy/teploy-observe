@@ -12,6 +12,7 @@ import (
 
 	"github.com/neutron-build/neutron/go/nucleus"
 
+	"github.com/useteploy/teploy-observe/internal/dbutil"
 	"github.com/useteploy/teploy-observe/internal/query"
 )
 
@@ -57,10 +58,13 @@ type IssueService struct {
 	store lifecycleStore
 	// counts caches merged-scope event counts (merge_read.go).
 	counts scopeCountCache
+	// spikeAlerts is the in-memory burst DETECTOR (spike.go, EV1); nil or
+	// min<=0 means issue_spike never fires.
+	spikeAlerts *issueSpikeDetector
 }
 
 func NewIssueService(db *nucleus.Client) *IssueService {
-	s := &IssueService{db: db}
+	s := &IssueService{db: db, spikeAlerts: newIssueSpikeDetectorFromEnv()}
 	s.merge = newMergeState(sqlMergeStore{db})
 	return s
 }
@@ -194,6 +198,12 @@ type cachedIssue struct {
 	// can recognise the next event as a regression without a SQL read. The
 	// cache-miss path reads the real status and does not depend on it.
 	Resolved bool `json:"rs,omitempty"`
+	// Ignored marks an issue UpdateStatus ignored (SF4): the cache-hit
+	// path suppresses issue_spike for it without a SQL read. Entries
+	// cached before the field existed decode as not-ignored; the miss
+	// path re-reads the real status, so the staleness is bounded by one
+	// cache entry lifetime.
+	Ignored bool `json:"ig,omitempty"`
 }
 
 // lifecycleStore is the storage the ingest-time issue lifecycle needs. The
@@ -272,6 +282,14 @@ func (l sqlLifecycle) scopeCount(ctx context.Context, siteID string, ids []strin
 	return l.s.eventCount(ctx, siteID, ids)
 }
 
+// EventOrigin carries the parts of the TRIGGERING event that live only on
+// error_events (environment) or on its stack, so the lifecycle
+// notifications can carry them without a second read (EV1).
+type EventOrigin struct {
+	Environment string
+	Frames      []StackFrame
+}
+
 // ResolveIssue looks up or creates an issue for the given grouphash.
 // Uses KV cache for O(1) hot-path lookups. Returns the issue_id.
 //
@@ -280,7 +298,35 @@ func (l sqlLifecycle) scopeCount(ctx context.Context, siteID string, ids []strin
 // lifecycle (reopen, regression notification) is judged against the target
 // row, and no notification is ever sent for a hidden source id.
 func (s *IssueService) ResolveIssue(ctx context.Context, siteID, groupHash, title, culprit, level, release string, ts int64) (string, error) {
+	return s.ResolveIssueEvent(ctx, siteID, groupHash, title, culprit, level, release, ts, EventOrigin{})
+}
+
+// ResolveIssueEvent is ResolveIssue with the triggering event's origin
+// (environment, stack frames) attached to the lifecycle notifications it
+// emits. The HTTP ingest path calls this; ResolveIssue keeps the plain
+// signature for the seed, tooling and tests.
+func (s *IssueService) ResolveIssueEvent(ctx context.Context, siteID, groupHash, title, culprit, level, release string, ts int64, origin EventOrigin) (string, error) {
 	lc := s.lifecycle()
+	// The sample stack is rendered LAZILY (SF5, review round 2): most
+	// events produce no notification at all (an open issue below the
+	// spike threshold), and SummarizeStack - scrubbing up to ten frames -
+	// ran on every single ingest event. The memo means a notification
+	// pays for the render at most once per event.
+	var memoStack string
+	memoDone := false
+	summarize := func() string {
+		if !memoDone {
+			memoStack = summarizeStack(origin.Frames)
+			memoDone = true
+		}
+		return memoStack
+	}
+	// Identifier-like fields, token-scrubbed defensively: the buffer path
+	// already scrubbed them at admission, but direct IngestErrorEvent
+	// callers (seed, tooling) bypass it, and a notification is a new
+	// egress surface (idempotent on already-scrubbed text).
+	environment := sampleStackScrub.scrubTokens(origin.Environment)
+	release = sampleStackScrub.scrubTokens(release)
 
 	// 1. Check KV cache
 	if ci, ok := lc.cacheGet(ctx, siteID, groupHash); ok {
@@ -296,9 +342,15 @@ func (s *IssueService) ResolveIssue(ctx context.Context, siteID, groupHash, titl
 			// bumpIssue reopened it (resolved -> open).
 			ci.Resolved = false
 			s.notify(ctx, IssueEvent{Kind: IssueEventRegression, SiteID: siteID, IssueID: ci.IssueID,
-				Title: title, Culprit: culprit, Level: level, Release: release, EventCount: newCount})
+				Title: title, Culprit: culprit, Level: level, Release: release, EventCount: newCount,
+				GroupHash: groupHash, Environment: environment, SampleStack: summarize()})
 		}
 		lc.cacheSet(ctx, siteID, groupHash, ci)
+		// An issue the operator IGNORED gets no spike alerts (SF4): the
+		// ignore is the operator saying "stop telling me about this".
+		if !ci.Ignored {
+			s.spikeDetected(ctx, siteID, ci.IssueID, groupHash, title, culprit, level, release, environment, summarize, newCount)
+		}
 		return ci.IssueID, nil
 	}
 
@@ -313,10 +365,23 @@ func (s *IssueService) ResolveIssue(ctx context.Context, siteID, groupHash, titl
 		if err := lc.bump(ctx, existing.IssueID, siteID, ts, newCount); err != nil {
 			return "", fmt.Errorf("bump issue: %w", err)
 		}
-		lc.cacheSet(ctx, siteID, groupHash, cachedIssue{IssueID: existing.IssueID, EventCount: newCount})
+		// The rebuilt cache entry carries the ignored flag (ignored
+		// survives a bump - bumpIssue leaves it ignored), so the hot
+		// path's spike suppression (SF4) keeps holding. Resolved is
+		// deliberately NOT set: the bump just reopened a resolved issue.
+		lc.cacheSet(ctx, siteID, groupHash, cachedIssue{
+			IssueID: existing.IssueID, EventCount: newCount,
+			Ignored: existing.Status == "ignored",
+		})
 		if existing.Status == "resolved" {
 			s.notify(ctx, IssueEvent{Kind: IssueEventRegression, SiteID: siteID, IssueID: existing.IssueID,
-				Title: existing.Title, Culprit: existing.Culprit, Level: existing.Level, Release: release, EventCount: newCount})
+				Title: existing.Title, Culprit: existing.Culprit, Level: existing.Level, Release: release, EventCount: newCount,
+				GroupHash: groupHash, Environment: environment, SampleStack: summarize()})
+		}
+		// Ignored issues do not spike (SF4) - same rule as the cache-hit
+		// path, judged on the row's real status here.
+		if existing.Status != "ignored" {
+			s.spikeDetected(ctx, siteID, existing.IssueID, groupHash, existing.Title, existing.Culprit, existing.Level, release, environment, summarize, newCount)
 		}
 		return existing.IssueID, nil
 	}
@@ -333,15 +398,18 @@ func (s *IssueService) ResolveIssue(ctx context.Context, siteID, groupHash, titl
 	lc.cacheSet(ctx, siteID, groupHash, cachedIssue{IssueID: issueID, EventCount: 1})
 
 	s.notify(ctx, IssueEvent{Kind: IssueEventNew, SiteID: siteID, IssueID: issueID,
-		Title: title, Culprit: culprit, Level: level, Release: release, EventCount: 1})
+		Title: title, Culprit: culprit, Level: level, Release: release, EventCount: 1,
+		GroupHash: groupHash, Environment: environment, SampleStack: summarize()})
 	return issueID, nil
 }
 
-// markCachedResolved records on the grouphash cache entry (when one exists)
-// whether the issue is now resolved. Best-effort: a miss only costs the
-// cache-hit path a regression notification until the entry is rebuilt from
-// the database, which reads the real status.
-func (s *IssueService) markCachedResolved(ctx context.Context, issueID, siteID string, resolved bool) {
+// markCachedStatus records on the grouphash cache entry (when one exists)
+// the issue's operator-set status, so the cache-hit path can judge both
+// regression (resolved) and spike suppression (ignored) without a SQL
+// read. Best-effort: a miss only costs the cache-hit path a regression
+// notification until the entry is rebuilt from the database, which reads
+// the real status.
+func (s *IssueService) markCachedStatus(ctx context.Context, issueID, siteID, status string) {
 	rows, err := nucleus.Query[issueScan](ctx, s.db.SQL(),
 		`SELECT `+issueSelectCols+`
 		 FROM `+issuesLatest("issue_id = $1 AND site_id = $2"),
@@ -357,10 +425,11 @@ func (s *IssueService) markCachedResolved(ctx context.Context, issueID, siteID s
 		return
 	}
 	var ci cachedIssue
-	if json.Unmarshal(data, &ci) != nil || ci.IssueID != issueID || ci.Resolved == resolved {
+	resolved, ignored := status == "resolved", status == "ignored"
+	if json.Unmarshal(data, &ci) != nil || ci.IssueID != issueID || (ci.Resolved == resolved && ci.Ignored == ignored) {
 		return
 	}
-	ci.Resolved = resolved
+	ci.Resolved, ci.Ignored = resolved, ignored
 	if raw, err := json.Marshal(ci); err == nil {
 		_ = kv.Set(ctx, key, raw)
 	}
@@ -452,7 +521,7 @@ func (s *IssueService) UpdateStatus(ctx context.Context, issueID, siteID, status
 		issueID, siteID, status, now, untilStr,
 	)
 	if err == nil {
-		s.markCachedResolved(ctx, issueID, siteID, status == "resolved")
+		s.markCachedStatus(ctx, issueID, siteID, status)
 	}
 	return err
 }
@@ -625,6 +694,101 @@ func (s *IssueService) issueReleases(ctx context.Context, siteID string, ids []s
 		return nil
 	}
 	return rows
+}
+
+// IssueSinceStats is the recovery-read shape for one issue (EV1 step 6):
+// enough for a caller such as teploy-ship to decide "the fix release has
+// been seen and shows zero events of this fingerprint since" without any
+// payload-bearing read.
+type IssueSinceStats struct {
+	Status               string    `json:"status"`
+	EventsSince          int64     `json:"events_since"`
+	EventsSinceInRelease int64     `json:"events_since_in_release"`
+	LastSeen             time.Time `json:"last_seen"`
+	LatestRelease        string    `json:"latest_release"`
+}
+
+// IssueSince answers the recovery question for one issue: how many events
+// landed since a point in time (sinceMs, unix milliseconds), how many of
+// those carried exactly the given release tag, and the issue's current
+// status. Read-only, site-scoped, merged-source aware (a merged source's
+// events count towards its target).
+func (s *IssueService) IssueSince(ctx context.Context, siteID, issueID string, sinceMs int64, release string) (*IssueSinceStats, error) {
+	target := s.ResolveMerged(ctx, siteID, issueID)
+	ids := s.issueScope(ctx, siteID, target)
+	if len(ids) == 0 {
+		ids = []string{target}
+	}
+
+	stats := &IssueSinceStats{}
+	rows, err := nucleus.Query[struct {
+		Status string `db:"status"`
+	}](ctx, s.db.SQL(),
+		`SELECT status FROM `+issuesLatest("issue_id = $1 AND site_id = $2"),
+		target, siteID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil // not found (or a foreign site's id): the handler 404s
+	}
+	stats.Status = rows[0].Status
+
+	// sinceMs binds through dbutil.IntParam + CAST (the CLAUDE.md wire
+	// quirk rule for numeric parameters): error_events.timestamp is
+	// BIGINT and a bare text bind compares as text.
+	since := dbutil.IntParam(sinceMs)
+	// Each statement binds its own leading parameters, so the IN-clause
+	// placeholders start at a different index per query.
+	inSince, argsSince := issueIDClause(3, ids)
+	countRows, err := nucleus.Query[issueCountRow](ctx, s.db.SQL(),
+		`SELECT COUNT(*) AS n FROM error_events
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND `+inSince,
+		append([]any{siteID, since}, argsSince...)...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(countRows) > 0 {
+		stats.EventsSince = countRows[0].N
+	}
+
+	inRel, argsRel := issueIDClause(4, ids)
+	relRows, err := nucleus.Query[issueCountRow](ctx, s.db.SQL(),
+		`SELECT COUNT(*) AS n FROM error_events
+		 WHERE site_id = $1 AND timestamp >= CAST($2 AS BIGINT) AND release_tag = $3 AND `+inRel,
+		append([]any{siteID, since, release}, argsRel...)...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(relRows) > 0 {
+		stats.EventsSinceInRelease = relRows[0].N
+	}
+
+	// Last event: total order under the LIMIT (CLAUDE.md's ordering rule).
+	inLast, argsLast := issueIDClause(2, ids)
+	lastRows, err := nucleus.Query[struct {
+		Timestamp  string `db:"timestamp"`
+		ReleaseTag string `db:"release_tag"`
+	}](ctx, s.db.SQL(),
+		`SELECT CAST(timestamp AS TEXT) AS timestamp, release_tag FROM error_events
+		 WHERE site_id = $1 AND `+inLast+`
+		 ORDER BY timestamp DESC, error_id ASC
+		 LIMIT 1`,
+		append([]any{siteID}, argsLast...)...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(lastRows) > 0 {
+		if ms, perr := strconv.ParseInt(lastRows[0].Timestamp, 10, 64); perr == nil {
+			stats.LastSeen = time.UnixMilli(ms).UTC()
+		}
+		stats.LatestRelease = lastRows[0].ReleaseTag
+	}
+	return stats, nil
 }
 
 // ErrorEvent represents a stored error event.

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -178,5 +179,51 @@ func TestFireHTTPReturnsErrorOnFailureStatus(t *testing.T) {
 
 	if err := testWebhookService(t).fireHTTP("test-delivery-id", srv.URL, "s", samplePayload()); err == nil {
 		t.Error("fireHTTP returned nil for a 500 response")
+	}
+}
+
+// The EV1 List fix, pinned from the leaking side: before webhookScan,
+// reads scanned into the Webhook DTO, whose SecretReveal field (json tag
+// "secret", no db tag) hijacked the secret COLUMN's mapping - so the
+// List JSON carried every webhook's signing secret to any logged-in
+// viewer, AND the intents went unsigned. The conversion row must keep
+// the secret for SIGNING (Secret) while the wire shape carries no
+// "secret" key at all.
+func TestWebhookListJSON_HasNoSecretKey(t *testing.T) {
+	const secret = "whsec-super-secret-signing-key"
+	row := webhookScan{
+		WebhookID: "wh_1", TenantID: "default", SiteID: "site_1",
+		Name: "ops sink", WebhookType: "http", URL: "https://ops.example/hook",
+		Secret: secret, Severities: "critical", Kinds: "issue_new,issue_regression",
+		Enabled: "true", CreatedAt: "1760000000000", Version: "3",
+	}
+	hooks := []Webhook{row.toWebhook()}
+
+	if hooks[0].Secret != secret {
+		t.Fatalf("scan conversion lost the signing secret (deliveries would go unsigned): %+v", hooks[0])
+	}
+	raw, err := json.Marshal(hooks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), secret) {
+		t.Fatalf("the signing secret leaked into the List JSON: %s", raw)
+	}
+	var asMap []map[string]any
+	if err := json.Unmarshal(raw, &asMap); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range asMap {
+		if _, ok := m["secret"]; ok {
+			t.Fatalf("List JSON contains a %q-typed secret key: %v", "secret", m)
+		}
+	}
+	// And the JSON round-trip of the whole slice never mints the key.
+	var again []Webhook
+	if err := json.Unmarshal(raw, &again); err != nil {
+		t.Fatal(err)
+	}
+	if again[0].SecretReveal != "" {
+		t.Fatalf("SecretReveal populated by a List-shaped read: %+v", again[0])
 	}
 }
