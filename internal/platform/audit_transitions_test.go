@@ -20,7 +20,7 @@ func TestCronTransitionsRetryLookupAndPartialTargetAdmission(t *testing.T) {
 			db := o10Fixture(t)
 			clk := newO10Clock()
 			e := newO10Engine(t, db, &o10Receiver{}, clk)
-			if _, err := e.hooks.Create(context.Background(), e.site, "second", "http", e.server.URL, ""); err != nil {
+			if _, err := e.hooks.Create(context.Background(), e.site, "second", "http", e.server.URL, "", ""); err != nil {
 				t.Fatal(err)
 			}
 			cron := CronMonitorRef{CronID: e.site, SiteID: e.site, Name: "cron"}

@@ -328,6 +328,23 @@ Declared limits, fixture-tested scale points, and where to read them live:
   and per-site hourly budget. Events are held in memory (lost if the process
   stops) and every attempt is recorded in the delivery history. Email now
   refuses non-public SMTP hosts.
+- Issue alert notifications (`issue_new`, `issue_regression`, `issue_spike`)
+  ride the same durable signed outbox as alerting: HMAC-signed POSTs with a
+  stable `X-Observe-Delivery` dedupe id, retries with backoff, dead letters
+  and maintenance-window suppression. Strictly opt-in per webhook via the
+  `kinds` filter (`POST /api/v1/platform/webhooks`, e.g.
+  `kinds: "issue_new,issue_regression,issue_spike"`): a webhook without
+  issue kinds receives none. Payloads carry the grouping fingerprint,
+  release, environment, event/user counts, first/last seen and a scrubbed
+  sample stack clipped to 2 KB — Slack-type targets get a chat summary and
+  never a stack. The emitter never slows ingest: bounded queue, drop and
+  count when full (`/healthz` → `issue_alerts`). A burst alert fires at
+  most once per issue per hour.
+- Recovery read for issue alerts: `GET /api/v1/errors/issues/{id}/since?ts=&release=`
+  returns an issue's status and event counts since a timestamp (total and in
+  a given release), so a fix pipeline can confirm a fingerprint stopped in
+  the fix release. Accepts a share token (GET-only, pinned to its own site)
+  or a session.
 - Sentry-protocol ingest: stock Sentry SDKs can use an Observe DSN
   (`https://<obs_key>@host/<site_id>`) for **error events**; transactions,
   sessions, replays, profiles and attachments are acknowledged and dropped
@@ -431,6 +448,10 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 | `OBSERVE_UPTIME_RETENTION_DAYS` | `90` | Uptime check result (`uptime_results`) retention. Must be at least 1. Fixed windows on the same daily cleanup: `performance_issues` 90 days (by last detection), `service_dependencies` 30 days. |
 | `OBSERVE_ALERTS_TO_INTEGRATIONS` | (unset) | Set to `true` to also send alert FIRE events to the site's integrations (PagerDuty, Jira, GitHub, email, Slack). Recovery and repeat events are not sent. |
 | `OBSERVE_ISSUE_NOTIFY_PER_HOUR` | `10` | Max new-issue/regression notifications per integration and per site per hour (`0` = unlimited); excess is suppressed with one summary notification. |
+| `OBSERVE_ISSUE_SPIKE_MIN` | `30` | Floor for the issue_spike burst alert: events of one issue in a 5-minute window before it can fire (`0` = spike alerts off). The effective threshold is `max(this, 4 x the issue's trailing 1-hour per-5-minute mean)`, at most one spike per issue per hour. |
+| `OBSERVE_ISSUE_SPIKE_FACTOR` | `4` | The multiple of an issue's trailing 1-hour per-5-minute mean that raises the spike threshold above the floor. |
+| `OBSERVE_ISSUE_ALERT_QUEUE` | `1024` | Bounded queue of the issue alert emitter; when full, events are dropped and counted at `/healthz` (`issue_alerts.dropped`) rather than stalling ingest. |
+| `OBSERVE_ISSUE_ALERT_SETTLE_MS` | `2000` | Delay before an issue alert payload is frozen, so the re-read counts include the triggering event. |
 | `OBSERVE_SCRUB_KEYS` | | Extra comma-separated key fragments scrubbed from error events (defaults already cover password, token, secret, authorization, cookie, card, and similar). |
 | `OBSERVE_SCRUB_DISABLE` | (unset) | `true` turns server-side error scrubbing off. Default is on. |
 | `OBSERVE_ERROR_SPIKE_ISSUE_PER_MIN` | `1000` | Per-issue events per minute before sampling (`0` = off). |
@@ -564,6 +585,7 @@ so the direct role claim is available here and takes precedence over groups.
 | POST | `/api/v1/incidents` | editor+ | Declare manual incident. |
 | POST | `/api/v1/incidents/{id}/close` | editor+ | Close. |
 | GET/POST/DELETE | `/api/v1/exports/scheduled` | admin | Scheduled SQL exports to S3. |
+| GET | `/api/v1/errors/issues/{id}/since?ts=&release=` | any / share token | Recovery read: issue status and event counts since a timestamp, by release. |
 | POST | `/api/v1/sites` | admin | Create site. |
 | DELETE | `/api/v1/sites/{id}` | admin | Delete site. |
 | PUT | `/api/v1/sites/{id}/ratelimit` | admin | Set per-site events/sec cap. |

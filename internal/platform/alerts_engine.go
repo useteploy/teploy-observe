@@ -353,6 +353,12 @@ func (s *AlertService) commitEdge(ctx context.Context, in edgeInput) error {
 			}
 			payload := BuildNotificationPayload(in.notifyKind, in.rule, in.value, in.samples, in.from, in.to, in.incidentID, in.now)
 			for _, hook := range in.hooks {
+				// 066: a non-empty kinds filter governs every kind, the
+				// pre-066 ones included; the EMPTY filter keeps receiving
+				// them, so no existing webhook changes behavior.
+				if !MatchesKind(hook.Kinds, in.notifyKind) {
+					continue
+				}
 				if _, err := s.notifier.enqueueTx(ctx, sqlc, NotificationIntent{
 					Kind: in.notifyKind, RuleID: in.rule.RuleID, IncidentID: in.incidentID,
 					SiteID: in.rule.SiteID, WebhookID: hook.WebhookID,

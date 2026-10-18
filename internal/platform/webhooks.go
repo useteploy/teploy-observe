@@ -74,16 +74,63 @@ type Webhook struct {
 	WebhookType string `json:"webhook_type" db:"webhook_type"`
 	URL         string `json:"url"`
 	Secret      string `json:"-" db:"secret"`
-	// Severities (O10): comma-delivered subset of the severity domain this
+	// Severities (O10): comma-delimited subset of the severity domain this
 	// webhook wants (info, warning, critical, error). Empty = all - the
 	// pre-056 behavior every existing webhook keeps.
 	Severities string `json:"severities" db:"severities"`
+	// Kinds (066, EV1): comma-delimited subset of the notification kind
+	// domain this webhook wants. Empty = every kind that existed before
+	// 066 (incident_*/cron_*); the issue_* kinds are OPT-IN, so an
+	// existing webhook receives none of them until an operator lists
+	// them. See MatchesKind.
+	Kinds string `json:"kinds" db:"kinds"`
 	// SecretReveal carries the signing secret back to the caller exactly once,
 	// at creation. It has no db tag, so List/Get never populate it.
+	//
+	// SCAN NOTE: the SDK's scanner falls back to a field's json tag when
+	// the db tag is absent, so this field maps to column "secret" and -
+	// being the LATER field - silently overwrites Secret's mapping. Webhook
+	// reads therefore scan into webhookScan (which has no reveal field) and
+	// convert; never scan into Webhook directly. Before that fix, every
+	// webhook POST left unsigned: the intent's Secret was empty, so the
+	// HMAC headers were skipped (X-Observe-Signature, X-Observe-Timestamp)
+	// while X-Observe-Delivery still identified the delivery.
 	SecretReveal string    `json:"secret,omitempty"`
 	Enabled      bool      `json:"enabled"`
 	CreatedAt    time.Time `json:"created_at" db:"created_at"`
 	Version      string    `json:"-" db:"version"`
+}
+
+// webhookScan is the typed scan row for webhooks: the domain columns ONLY,
+// no DTO-only field whose json tag could hijack a column mapping (see the
+// SecretReveal note on Webhook).
+type webhookScan struct {
+	WebhookID   string `db:"webhook_id"`
+	TenantID    string `db:"tenant_id"`
+	SiteID      string `db:"site_id"`
+	Name        string `db:"name"`
+	WebhookType string `db:"webhook_type"`
+	URL         string `db:"url"`
+	Secret      string `db:"secret"`
+	Severities  string `db:"severities"`
+	Kinds       string `db:"kinds"`
+	Enabled     string `db:"enabled"`
+	CreatedAt   string `db:"created_at"`
+	Version     string `db:"version"`
+}
+
+func (r webhookScan) toWebhook() Webhook {
+	enabled := r.Enabled == "true"
+	var createdAt time.Time
+	if ms, err := strconv.ParseInt(r.CreatedAt, 10, 64); err == nil {
+		createdAt = time.UnixMilli(ms).UTC()
+	}
+	return Webhook{
+		WebhookID: r.WebhookID, TenantID: r.TenantID, SiteID: r.SiteID,
+		Name: r.Name, WebhookType: r.WebhookType, URL: r.URL,
+		Secret: r.Secret, Severities: r.Severities, Kinds: r.Kinds,
+		Enabled: enabled, CreatedAt: createdAt, Version: r.Version,
+	}
 }
 
 // SeverityDomain is the closed set a webhook's severities filter may name.
@@ -92,6 +139,27 @@ var SeverityDomain = map[string]bool{
 	"warning":  true,
 	"critical": true,
 	"error":    true,
+}
+
+// KindDomain is the closed set a webhook's kinds filter may name: the
+// notification kinds the outbox has ever delivered. Adding a kind here is a
+// wire-contract change receivers can observe, so it is deliberate and rare.
+var KindDomain = map[string]bool{
+	NotifyIncidentOpened:    true,
+	NotifyIncidentRecovered: true,
+	NotifyIncidentRepeat:    true,
+	NotifyCronMissed:        true,
+	NotifyCronRecovered:     true,
+	NotifyIssueNew:          true,
+	NotifyIssueRegression:   true,
+	NotifyIssueSpike:        true,
+}
+
+// IsIssueKind reports whether kind is one of the issue_* notification kinds
+// (066). Those are opt-in per webhook: an unconfigured (empty) kinds filter
+// never receives them.
+func IsIssueKind(kind string) bool {
+	return kind == NotifyIssueNew || kind == NotifyIssueRegression || kind == NotifyIssueSpike
 }
 
 // NormalizeSeverities validates and canonicalizes a comma-delimited
@@ -133,7 +201,52 @@ func MatchesSeverity(severities, severity string) bool {
 	return false
 }
 
-func (s *WebhookService) Create(ctx context.Context, siteID, name, webhookType, url, severities string) (*Webhook, error) {
+// NormalizeKinds validates and canonicalizes a comma-delimited kind filter:
+// entries must be in KindDomain, output is lowercase, deduped, comma-joined.
+// Empty input is valid and means "the pre-066 kinds" (see MatchesKind).
+func NormalizeKinds(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return "", nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		k := strings.ToLower(strings.TrimSpace(part))
+		if k == "" {
+			continue
+		}
+		if !KindDomain[k] {
+			return "", fmt.Errorf("unknown kind %q (domain: incident_opened, incident_recovered, incident_repeat, cron_missed, cron_recovered, issue_new, issue_regression, issue_spike)", k)
+		}
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	return strings.Join(out, ","), nil
+}
+
+// MatchesKind reports whether a webhook receives the given notification kind.
+//
+// An EMPTY filter receives only the kinds that existed before 066 - the
+// pre-066 behavior every existing webhook keeps. The issue_* kinds are
+// opt-in: a webhook that does not list them receives none of them, so issue
+// traffic never arrives unannounced (and a Slack channel never suddenly
+// receives a stack). A non-empty filter is exact: it governs every kind,
+// including the pre-066 ones.
+func MatchesKind(kinds, kind string) bool {
+	if kinds == "" {
+		return !IsIssueKind(kind)
+	}
+	for _, part := range strings.Split(kinds, ",") {
+		if strings.TrimSpace(part) == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *WebhookService) Create(ctx context.Context, siteID, name, webhookType, url, severities, kinds string) (*Webhook, error) {
 	if webhookType != "slack" && webhookType != "http" {
 		webhookType = "http"
 	}
@@ -144,14 +257,18 @@ func (s *WebhookService) Create(ctx context.Context, siteID, name, webhookType, 
 	if err != nil {
 		return nil, fmt.Errorf("webhook severities: %w", err)
 	}
+	normalizedKinds, err := NormalizeKinds(kinds)
+	if err != nil {
+		return nil, fmt.Errorf("webhook kinds: %w", err)
+	}
 	id := genID()
 	secret := genID() + genID() // 32 random bytes, hex-encoded
 	now := strconv.FormatInt(time.Now().UTC().UnixMilli(), 10)
 
 	_, err = s.db.SQL().Exec(ctx,
-		`INSERT INTO webhooks (webhook_id, tenant_id, site_id, name, webhook_type, url, secret, severities, enabled, created_at, version)
-		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, 'true', $8, $9)`,
-		id, siteID, name, webhookType, url, secret, severities, now, now,
+		`INSERT INTO webhooks (webhook_id, tenant_id, site_id, name, webhook_type, url, secret, severities, kinds, enabled, created_at, version)
+		 VALUES ($1, 'default', $2, $3, $4, $5, $6, $7, $8, 'true', $9, $10)`,
+		id, siteID, name, webhookType, url, secret, severities, normalizedKinds, now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create webhook: %w", err)
@@ -160,18 +277,29 @@ func (s *WebhookService) Create(ctx context.Context, siteID, name, webhookType, 
 	nowMs, _ := strconv.ParseInt(now, 10, 64)
 	return &Webhook{
 		WebhookID: id, SiteID: siteID, Name: name,
-		WebhookType: webhookType, URL: url, Enabled: true, Severities: severities,
+		WebhookType: webhookType, URL: url, Enabled: true, Severities: severities, Kinds: normalizedKinds,
 		Secret: secret, SecretReveal: secret,
 		CreatedAt: time.UnixMilli(nowMs).UTC(),
 	}, nil
 }
 
 func (s *WebhookService) List(ctx context.Context, siteID string) ([]Webhook, error) {
-	return nucleus.Query[Webhook](ctx, s.db.SQL(),
-		`SELECT webhook_id, tenant_id, site_id, name, webhook_type, url, secret, severities, enabled, created_at, version
+	// Scans through webhookScan (not Webhook): Webhook.SecretReveal's json
+	// tag resolves to column "secret" in the SDK's scanner and would
+	// hijack Secret's mapping, leaving every intent unsigned.
+	rows, err := nucleus.Query[webhookScan](ctx, s.db.SQL(),
+		`SELECT webhook_id, tenant_id, site_id, name, webhook_type, url, secret, severities, kinds, enabled, created_at, version
 		 FROM `+webhooksLatest("site_id = $1")+`
 		 WHERE enabled = 'true'
 		 ORDER BY created_at DESC`, siteID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Webhook, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.toWebhook())
+	}
+	return out, nil
 }
 
 func (s *WebhookService) Delete(ctx context.Context, webhookID string) error {
@@ -180,8 +308,8 @@ func (s *WebhookService) Delete(ctx context.Context, webhookID string) error {
 	// same-millisecond create+delete must not tie, or the tombstone loses
 	// the collapse and the deleted webhook keeps receiving payloads.
 	_, err := s.db.SQL().Exec(ctx,
-		`INSERT INTO webhooks (webhook_id, tenant_id, site_id, name, webhook_type, url, secret, severities, enabled, created_at, version)
-		 SELECT webhook_id, tenant_id, site_id, name, webhook_type, url, secret, severities, 'false', created_at,
+		`INSERT INTO webhooks (webhook_id, tenant_id, site_id, name, webhook_type, url, secret, severities, kinds, enabled, created_at, version)
+		 SELECT webhook_id, tenant_id, site_id, name, webhook_type, url, secret, severities, kinds, 'false', created_at,
 		        GREATEST(CAST($2 AS BIGINT), version + 1)
 		 FROM `+webhooksLatest("webhook_id = $1"),
 		webhookID, now,

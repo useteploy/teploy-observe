@@ -440,9 +440,15 @@ func main() {
 	reportSvc := reports.NewReportService(db, logger)
 	integrations.SetSMTPPrivateHosts(os.Getenv("OBSERVE_SMTP_PRIVATE_HOSTS"))
 	integrationSvc := integrations.NewIntegrationService(db, logger)
+	// EV1 (066): issue lifecycle events also ride the durable signed
+	// outbox as issue_new / issue_regression / issue_spike, one intent per
+	// webhook whose `kinds` filter opted in. The emitter never blocks
+	// ingest: bounded channel, drop-and-count when full (healthz
+	// issue_alerts).
+	issueAlerts := platform.NewIssueAlertEmitter(notifier, webhookSvc.List, issueSnapshotReader(issueSvc), cfg.PublicURL, logger)
 	// New-issue and regression events fire the site's integrations. Wired
 	// after the demo seed above so seeded issues do not page anyone.
-	issueNotifier := wireIssueNotifications(issueSvc, integrationSvc, cfg.PublicURL)
+	issueNotifier := wireIssueNotifications(issueSvc, integrationSvc, cfg.PublicURL, issueAlerts)
 	wireAlertsToIntegrations(alertSvc, integrationSvc, logger)
 	feedbackSvc := feedback.NewFeedbackService(db)
 	viewSvc := views.NewViewService(db)
@@ -634,6 +640,14 @@ func main() {
 				return shutdownIssueNotifications(issueNotifier)
 			},
 		}),
+		// EV1: the issue alert emitter's drain. Registered after
+		// issue-notifications and before error-buffer, so on shutdown it
+		// stops AFTER the error buffer's final flush (which can raise
+		// new-issue/regression events) and its in-flight enqueue lands
+		// before the notification outbox's own stop has already committed
+		// anything pending (the outbox resumes undelivered intents on the
+		// next start).
+		neutron.WithLifecycle(issueAlerts.LifecycleHook()),
 		neutron.WithLifecycle(neutron.LifecycleHook{
 			Name: "error-buffer",
 			OnStart: func(ctx context.Context) error {
@@ -943,6 +957,18 @@ func main() {
 	neutron.Get(issueGroup, "/daily", dailyErrorCountsHandler(issueSvc),
 		neutron.WithTags("issues"),
 		neutron.WithSummary("Daily error counts (zero-filled) for a time window"),
+	)
+
+	// --- Issue recovery read (EV1): share token or JWT ---
+	// Same narrow posture as the trace RED-metrics read above: this is the
+	// one errors read a machine consumer gets - counts and status only,
+	// never event payloads (no stacks, no URLs, no user-supplied values),
+	// GET-only under jwtOrShareMW so a share token is pinned to its own
+	// site. teploy-ship's recovery sweep (EV7) polls exactly this.
+	errorsShared := r.Group("/api/v1/errors", jwtOrShareMW(jwtMW, shareSvc))
+	neutron.Get(errorsShared, "/issues/{issue_id}/since", issueSinceHandler(issueSvc),
+		neutron.WithTags("issues"),
+		neutron.WithSummary("Issue event counts since a timestamp, by release (recovery read)"),
 	)
 
 	// --- Trace query API (JWT auth) ---
@@ -1635,6 +1661,12 @@ func main() {
 		// delivered / failed / timed-out, and the overflow and cooldown
 		// suppression counters.
 		health["issue_notifications"] = issueNotifier.Stats()
+		// EV1: the issue alert emitter - queued / emitted / dropped. A
+		// growing dropped count means the outbox enqueue path (or the
+		// settle delay) cannot keep up with issue events; ingest is
+		// unaffected by design, alerts are being lost by design, and the
+		// operator should see that.
+		health["issue_alerts"] = issueAlerts.Stats()
 		// O08: flag-evaluation condition counters — how many evaluations
 		// could not read their config (unavailable) and how many flags
 		// were quarantined from evaluation by invalid stored config.
@@ -2909,6 +2941,46 @@ func issueEventsHandler(svc *obserrors.IssueService, srcmap *sourcemaps.SourceMa
 type issueSessionInput struct {
 	IssueID string `path:"issue_id"`
 	SiteID  string `query:"site_id"`
+}
+
+type issueSinceInput struct {
+	IssueID string `path:"issue_id"`
+	SiteID  string `query:"site_id"`
+	// Ts is the recovery epoch: unix milliseconds. Everything is counted
+	// at and after this instant.
+	Ts int64 `query:"ts"`
+	// Release is the fix release to test against: events_since_in_release
+	// counts only events carrying exactly this release tag.
+	Release string `query:"release"`
+}
+
+// issueSinceHandler is the EV1 recovery read: how many events of an issue
+// landed since a point in time, how many of those in a given release, plus
+// the issue's status and last event. Read-only and site-scoped; registered
+// on the share-token surface (jwtOrShareMW) so a machine consumer such as
+// teploy-ship can poll a fix's effect with a revocable, site-pinned token
+// instead of a person's 24h JWT. Fails closed: missing site_id, ts or
+// release is a 400, an unknown issue is a 404.
+func issueSinceHandler(svc *obserrors.IssueService) neutron.HandlerFunc[issueSinceInput, obserrors.IssueSinceStats] {
+	return func(ctx context.Context, input issueSinceInput) (obserrors.IssueSinceStats, error) {
+		if input.SiteID == "" || input.IssueID == "" {
+			return obserrors.IssueSinceStats{}, neutron.ErrBadRequest("site_id and issue_id required")
+		}
+		if input.Ts <= 0 {
+			return obserrors.IssueSinceStats{}, neutron.ErrBadRequest("ts (unix milliseconds) required")
+		}
+		if input.Release == "" {
+			return obserrors.IssueSinceStats{}, neutron.ErrBadRequest("release required")
+		}
+		stats, err := svc.IssueSince(ctx, input.SiteID, input.IssueID, input.Ts, input.Release)
+		if err != nil {
+			return obserrors.IssueSinceStats{}, err
+		}
+		if stats == nil {
+			return obserrors.IssueSinceStats{}, neutron.ErrNotFound("issue not found")
+		}
+		return *stats, nil
+	}
 }
 
 type issueSessionResponse struct {
@@ -5734,9 +5806,13 @@ type createWebhookInput struct {
 	Name        string `json:"name"`
 	WebhookType string `json:"webhook_type"`
 	URL         string `json:"url"`
-	// Severities (O10): optional comma-delivered routing filter
+	// Severities (O10): optional comma-delimited routing filter
 	// (info,warning,critical,error); empty receives everything.
 	Severities string `json:"severities"`
+	// Kinds (066, EV1): optional comma-delivered notification-kind filter.
+	// Empty receives the pre-066 kinds only - issue_new, issue_regression
+	// and issue_spike are strictly opt-in.
+	Kinds string `json:"kinds"`
 }
 
 func createWebhookHandler(svc *platform.WebhookService) neutron.HandlerFunc[createWebhookInput, platform.Webhook] {
@@ -5744,7 +5820,7 @@ func createWebhookHandler(svc *platform.WebhookService) neutron.HandlerFunc[crea
 		if input.SiteID == "" || input.URL == "" {
 			return platform.Webhook{}, neutron.ErrBadRequest("site_id and url required")
 		}
-		w, err := svc.Create(ctx, input.SiteID, input.Name, input.WebhookType, input.URL, input.Severities)
+		w, err := svc.Create(ctx, input.SiteID, input.Name, input.WebhookType, input.URL, input.Severities, input.Kinds)
 		if err != nil {
 			return platform.Webhook{}, err
 		}

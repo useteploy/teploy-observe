@@ -89,10 +89,13 @@ skew refused at admission with a 400).
   `_internal/UPSTREAM_BUGS.md`, 2026-10-04). Single-process dedupe
   stays via the submit lock; `once` stays client-side; authoring UI has
   no targeting editor.
-- Integrations: issue-fire delivery rides the in-memory queue (the
-  alert path has the durable outbox); alert recovery cannot resolve
-  PagerDuty/Jira/GitHub tickets (senders are create-only); no issue
-  deep link in payloads.
+- Integrations: the OUTBOX half closed by EV1 (066) - issue_new /
+  issue_regression / issue_spike now ride the durable signed outbox,
+  opt-in per webhook via `kinds`; the Jira/Slack-style integrations
+  path still rides the in-memory queue (its senders are create-only);
+  alert recovery cannot resolve PagerDuty/Jira/GitHub tickets; the
+  issue_url in payloads points at the /errors page (a per-issue UI
+  route still does not exist).
 - Notification buckets, spike windows, persons-properties limiter and
   survey limiters stay per-process (reset on restart, per replica) -
   the standing single-process posture (AUD-018).

@@ -21,11 +21,11 @@ func TestO10SeverityRouting(t *testing.T) {
 	e := newO10Engine(t, db, recv, clk)
 
 	// Two sinks: one pages only on critical, one receives everything.
-	criticalOnly, err := e.hooks.Create(context.Background(), e.site, "crit-sink", "http", e.server.URL, "critical")
+	criticalOnly, err := e.hooks.Create(context.Background(), e.site, "crit-sink", "http", e.server.URL, "critical", "")
 	if err != nil {
 		t.Fatalf("create crit webhook: %v", err)
 	}
-	allSink, err := e.hooks.Create(context.Background(), e.site, "all-sink", "http", e.server.URL, "")
+	allSink, err := e.hooks.Create(context.Background(), e.site, "all-sink", "http", e.server.URL, "", "")
 	if err != nil {
 		t.Fatalf("create all webhook: %v", err)
 	}
