@@ -50,7 +50,7 @@ export default function Layout({ children }: { children: preact.ComponentChildre
           <DemoBanner />
           <Sidebar />
           <div class="obs-main-content">
-            <div style="max-width:1280px;margin:0 auto;padding:24px 24px 48px;">
+            <div class="obs-main-inner">
               {children}
             </div>
           </div>

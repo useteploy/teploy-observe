@@ -336,10 +336,93 @@ button:focus-visible { outline: 2px solid var(--obs-accent); outline-offset: 2px
   to { opacity: 1; transform: translateY(0); }
 }
 
+/* ─── Page container ─── */
+.obs-main-inner {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 24px 24px 48px;
+}
+
+/* ─── Layout grids ───
+   Column counts are set per use through the custom property, so desktop keeps
+   its layout and every grid collapses the same way on narrow screens.
+   minmax(0, 1fr) lets a cell shrink below its longest unbreakable value. */
+.obs-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(var(--obs-kpi-cols, 4), minmax(0, 1fr));
+  gap: 12px;
+}
+.obs-kpi-grid > * { min-width: 0; overflow-wrap: anywhere; }
+.obs-form-cols {
+  display: grid;
+  grid-template-columns: repeat(var(--obs-form-cols, 2), minmax(0, 1fr));
+  gap: 12px;
+}
+.obs-label-grid {
+  display: grid;
+  grid-template-columns: var(--obs-label-col, 120px) minmax(0, 1fr);
+  gap: 10px 12px;
+  align-items: center;
+}
+.obs-split {
+  display: grid;
+  grid-template-columns: var(--obs-split-col, 260px) minmax(0, 1fr);
+  gap: 16px;
+}
+.obs-grid-2 > * { min-width: 0; }
+
 /* Responsive helpers */
 @media (max-width: 768px) {
-  .obs-grid-2 { grid-template-columns: 1fr !important; }
+  .obs-main-inner {
+    padding: 16px max(16px, env(safe-area-inset-right)) calc(32px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  }
+  .obs-grid-2 { grid-template-columns: minmax(0, 1fr) !important; }
+  .obs-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .obs-kpi-grid--stack { grid-template-columns: minmax(0, 1fr); }
+  .obs-form-cols,
+  .obs-label-grid,
+  .obs-split { grid-template-columns: minmax(0, 1fr); }
+  .obs-label-grid { gap: 6px; }
+  .obs-label-grid > label:not(:first-child) { margin-top: 6px; }
+
   .obs-page-header { flex-direction: column; align-items: flex-start; gap: 8px; }
-  .obs-tabs-bar { flex-wrap: wrap; }
-  .obs-modal { width: 95vw; max-width: 95vw; margin: 16px; }
+  .obs-page-header > * { max-width: 100%; }
+  .obs-page-title { overflow-wrap: anywhere; }
+  .obs-page-actions { flex-wrap: wrap; }
+  .obs-tabs-bar { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  .obs-tabs-bar::-webkit-scrollbar { display: none; }
+  .obs-tab { flex: none; white-space: nowrap; }
+
+  .obs-modal-overlay {
+    align-items: flex-end;
+    padding: max(16px, env(safe-area-inset-top)) 0 0;
+  }
+  .obs-modal {
+    width: 100%;
+    max-width: 100%;
+    max-height: calc(100dvh - 32px);
+    border-radius: var(--obs-radius-lg) var(--obs-radius-lg) 0 0;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .obs-modal-body { padding: 16px; }
+
+  .obs-toast-container {
+    left: 16px;
+    right: 16px;
+    bottom: calc(16px + env(safe-area-inset-bottom));
+    max-width: none;
+  }
+
+  /* Touch targets and iOS focus zoom: anything below 16px zooms the page
+     when focused, and controls get a 44px hit area. */
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  select,
+  textarea { font-size: 16px; }
+  .obs-input, .obs-select, .obs-search-input { min-height: 44px; }
+  .obs-btn, .obs-tab, .obs-dropdown-item, .obs-modal-close {
+    min-height: 44px;
+  }
+  .obs-btn { display: inline-flex; align-items: center; justify-content: center; }
+  .obs-modal-close { min-width: 44px; justify-content: center; align-items: center; }
+  .obs-code-copy { min-height: 32px; min-width: 44px; }
 }
