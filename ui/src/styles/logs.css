@@ -375,6 +375,7 @@
   align-items: center;
   gap: 6px;
   padding: 6px 12px;
+  font-family: var(--obs-font);
   background: var(--obs-surface);
   border: 1px solid var(--obs-border);
   border-radius: 6px;
