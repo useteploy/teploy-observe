@@ -2,6 +2,7 @@ import QueryFailure from "../components/shared/QueryFailure.js";
 import { useRequestGuard } from "../hooks/useRequestGuard.js";
 import { useState, useEffect, useCallback } from "preact/hooks";
 import ExportButton from "../components/shared/ExportButton.js";
+import Modal from "../components/shared/Modal.js";
 import { useFilters } from "../hooks/useFilters.js";
 
 export const config = { mode: "app" };
@@ -175,27 +176,24 @@ export default function IncidentsPage() {
       )}
 
       {showCreate && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999, padding: "16px" }}>
-          <div style={{ background: "var(--obs-bg)", border: "1px solid var(--obs-border)", borderRadius: "8px", padding: "20px", minWidth: "min(420px, 100%)", maxWidth: "100%", maxHeight: "100%", overflowY: "auto" }}>
-            <h2 style={{ marginTop: 0 }}>Declare incident</h2>
+        <Modal open onClose={() => setShowCreate(false)} title="Declare incident">
             <div class="obs-label-grid" style={{ "--obs-label-col": "100px", gap: "10px" }}>
-              <label>Title</label>
+              <label class="obs-label" style={{ margin: 0 }}>Title</label>
               <input class="obs-input" value={form.title} onInput={(e) => setForm({ ...form, title: (e.target as HTMLInputElement).value })} />
-              <label>Severity</label>
+              <label class="obs-label" style={{ margin: 0 }}>Severity</label>
               <select class="obs-input" value={form.severity} onChange={(e) => setForm({ ...form, severity: (e.target as HTMLSelectElement).value })}>
                 <option value="info">Info</option>
                 <option value="warning">Warning</option>
                 <option value="critical">Critical</option>
               </select>
-              <label>Description</label>
+              <label class="obs-label" style={{ margin: 0 }}>Description</label>
               <textarea class="obs-input" rows={3} value={form.description} onInput={(e) => setForm({ ...form, description: (e.target as HTMLTextAreaElement).value })} />
             </div>
             <div style={{ marginTop: "16px", display: "flex", gap: "10px", justifyContent: "flex-end" }}>
               <button class="obs-btn" onClick={() => setShowCreate(false)}>Cancel</button>
               <button class="obs-btn obs-btn--primary" onClick={create} disabled={!form.title}>Declare</button>
             </div>
-          </div>
-        </div>
+        </Modal>
       )}
     </div>
   );

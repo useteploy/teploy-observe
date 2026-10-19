@@ -413,7 +413,7 @@ function OperationsTable({ siteId, service, from, to, onSelectTrace }: {
           {topSlow.map((op, i) => (
             <div key={op.operation_name} class="traces-top-slow-row" onClick={() => handleOpClick(op.operation_name)}>
               <span class="traces-top-slow-rank">{i + 1}</span>
-              <span class="traces-top-slow-name">{op.operation_name}</span>
+              <span class="traces-top-slow-name" title={op.operation_name}>{op.operation_name}</span>
               <span class="traces-top-slow-metric"><span>p95</span>{formatDuration(op.p95_ms)}</span>
               <span class="traces-top-slow-metric"><span>p99</span>{formatDuration(op.p99_ms)}</span>
               <span class="traces-top-slow-metric"><span>req</span>{op.request_count.toLocaleString()}</span>

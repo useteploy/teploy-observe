@@ -43,8 +43,8 @@ export default function Audit() {
   }, []);
 
   return (
-    <div style={{ padding: "24px", maxWidth: "1100px", margin: "0 auto" }}>
-      <h1 style={{ fontSize: "20px", marginBottom: "4px" }}>Audit log</h1>
+    <div>
+      <h1 class="obs-page-title" style={{ marginBottom: "4px" }}>Audit log</h1>
       <p style={{ color: "var(--muted, #8b93a1)", marginTop: 0, fontSize: "13px" }}>
         Immutable record of who did what, when, and from where. Admin-only.
       </p>
@@ -56,14 +56,14 @@ export default function Audit() {
         }}
         style={{ display: "flex", gap: "8px", flexWrap: "wrap", margin: "16px 0" }}
       >
-        <input placeholder="actor" value={actor} onInput={(e) => setActor((e.target as HTMLInputElement).value)} />
-        <input placeholder="action (e.g. auth.login)" value={action} onInput={(e) => setAction((e.target as HTMLInputElement).value)} />
-        <select value={result} onChange={(e) => setResult((e.target as HTMLSelectElement).value)}>
+        <input class="obs-input" style={{ flex: "1 1 160px", width: "auto" }} placeholder="actor" value={actor} onInput={(e) => setActor((e.target as HTMLInputElement).value)} />
+        <input class="obs-input" style={{ flex: "1 1 200px", width: "auto" }} placeholder="action (e.g. auth.login)" value={action} onInput={(e) => setAction((e.target as HTMLInputElement).value)} />
+        <select class="obs-select" style={{ flex: "0 1 160px", width: "auto" }} value={result} onChange={(e) => setResult((e.target as HTMLSelectElement).value)}>
           {RESULTS.map((r) => (
             <option value={r}>{r || "any result"}</option>
           ))}
         </select>
-        <button type="submit">Filter</button>
+        <button class="obs-btn obs-btn--primary" type="submit">Filter</button>
       </form>
 
       {err && <div style={{ color: "#f85149", marginBottom: "12px" }}>{err}</div>}

@@ -632,3 +632,16 @@
   border-radius: 2px;
   display: inline-block;
 }
+
+/* Top-slow rows on narrow screens: the operation name takes its own line
+   (wrapping rather than truncating) and the metrics sit beneath it. */
+@media (max-width: 768px) {
+  .traces-top-slow-row { flex-wrap: wrap; row-gap: 4px; min-height: 44px; }
+  .traces-top-slow-name {
+    flex: 1 1 calc(100% - 32px);
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .traces-top-slow-metric { min-width: 0; margin-left: 32px; }
+  .traces-top-slow-metric + .traces-top-slow-metric { margin-left: 0; }
+}
