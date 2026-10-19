@@ -317,6 +317,8 @@
   .logs-service-input {
     width: 100%;
   }
+
+  .logs-level-btn { min-height: 44px; padding-left: 14px; padding-right: 14px; }
 }
 
 /* ─── Volume histogram ─── */
@@ -411,4 +413,12 @@
   0%   { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6); }
   70%  { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
   100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
+
+/* After the base histogram and live-button rules so the overrides win. */
+@media (max-width: 768px) {
+  /* A full day of buckets cannot keep 2px bars and 2px gaps on a phone. */
+  .logs-histogram-bars { gap: 1px; overflow: hidden; }
+  .logs-histogram-bar-wrap { min-width: 0; }
+  .logs-live-btn { min-height: 44px; font-size: 13px; justify-content: center; }
 }

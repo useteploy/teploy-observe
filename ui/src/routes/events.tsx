@@ -169,7 +169,7 @@ function EventDetailView({ eventType, siteId, from, to, onBack }: {
           <h2 style={{ fontSize: "14px", fontWeight: 600, color: "var(--obs-text)", marginBottom: "12px" }}>
             Property Breakdown
           </h2>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: "12px" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(320px, 100%), 1fr))", gap: "12px" }}>
             {Array.from(grouped.entries()).map(([key, values]) => {
               const keyTotal = values.reduce((s, v) => s + v.count, 0);
               return (

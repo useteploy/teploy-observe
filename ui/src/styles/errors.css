@@ -627,8 +627,21 @@
 
 /* ─── Responsive ─── */
 @media (max-width: 768px) {
-  .errors-issue-meta {
+  /* Keep the event count and last-seen time; the 14-day strip goes. */
+  .errors-issue-activity {
     display: none;
+  }
+
+  .errors-issue-meta {
+    min-width: 0;
+  }
+
+  .errors-issue-title {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
   }
 
   .errors-detail-header {
@@ -639,4 +652,9 @@
     flex-direction: column;
     gap: 8px;
   }
+
+  .errors-status-btn { min-height: 44px; padding-left: 14px; padding-right: 14px; }
+
+  /* Long minified paths wrap inside the frame instead of being clipped. */
+  .errors-stack-frame { overflow-wrap: anywhere; }
 }

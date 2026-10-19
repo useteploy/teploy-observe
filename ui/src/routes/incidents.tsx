@@ -175,10 +175,10 @@ export default function IncidentsPage() {
       )}
 
       {showCreate && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999 }}>
-          <div style={{ background: "var(--obs-bg)", border: "1px solid var(--obs-border)", borderRadius: "8px", padding: "20px", minWidth: "420px" }}>
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999, padding: "16px" }}>
+          <div style={{ background: "var(--obs-bg)", border: "1px solid var(--obs-border)", borderRadius: "8px", padding: "20px", minWidth: "min(420px, 100%)", maxWidth: "100%", maxHeight: "100%", overflowY: "auto" }}>
             <h2 style={{ marginTop: 0 }}>Declare incident</h2>
-            <div style={{ display: "grid", gridTemplateColumns: "100px 1fr", gap: "10px", alignItems: "center" }}>
+            <div class="obs-label-grid" style={{ "--obs-label-col": "100px", gap: "10px" }}>
               <label>Title</label>
               <input class="obs-input" value={form.title} onInput={(e) => setForm({ ...form, title: (e.target as HTMLInputElement).value })} />
               <label>Severity</label>
