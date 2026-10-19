@@ -204,13 +204,13 @@ export default function PersonsPage() {
         <h1 class="obs-page-title">Persons</h1>
       </div>
 
-      <div style={{ display: "flex", gap: "12px", marginBottom: "16px", alignItems: "center" }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "12px", marginBottom: "16px", alignItems: "center" }}>
         <input
           class="obs-input"
           placeholder="Search distinct_id…"
           value={search}
           onInput={(e) => setSearch((e.target as HTMLInputElement).value)}
-          style={{ flex: 1, maxWidth: "400px" }}
+          style={{ flex: "1 1 220px", maxWidth: "400px" }}
           data-testid="persons-search"
         />
         <label style={{ fontSize: "12px", color: "var(--obs-text-muted)",

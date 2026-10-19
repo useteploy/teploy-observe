@@ -232,7 +232,7 @@ export default function MetricsRoute() {
         </div>
       )}
 
-      <div style={{ display: "grid", gridTemplateColumns: "260px 1fr", gap: "16px", flex: 1, minHeight: 0 }}>
+      <div class="obs-split" style={{ flex: 1, minHeight: 0 }}>
         <aside style={{ border: "1px solid var(--obs-border)", borderRadius: "8px", overflow: "hidden", display: "flex", flexDirection: "column" }}>
           <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--obs-border)", fontSize: "12px", textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--obs-text-secondary)" }}>
             Metrics ({list.length})

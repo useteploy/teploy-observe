@@ -599,7 +599,7 @@ export default function ErrorsPage() {
                 <div key={issue.issue_id} class="errors-issue-row" onClick={() => setSelectedIssue(issue)}>
                   <StatusBadge status={issue.status} size="sm" />
                   <div class="errors-issue-info">
-                    <div class="errors-issue-title">{issue.title}</div>
+                    <div class="errors-issue-title" title={issue.title}>{issue.title}</div>
                     <div class="errors-issue-culprit">
                       {issue.culprit}
                       {Number(issue.regression_count) > 0 && (

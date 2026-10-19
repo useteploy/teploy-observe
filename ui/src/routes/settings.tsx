@@ -1064,7 +1064,7 @@ function AISection() {
         Provide an OpenAI-compatible endpoint and API key. Observe sends only the
         schema and your question — no stored data leaves the instance.
       </p>
-      <div style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "12px 16px", maxWidth: "640px", alignItems: "center" }}>
+      <div class="obs-label-grid" style={{ gap: "12px 16px", maxWidth: "640px" }}>
         <label>Provider</label>
         <input class="obs-input" disabled={saving || !cfg} value={cfg?.provider || ""} onInput={(e) => setCfg({ ...cfg!, provider: (e.target as HTMLInputElement).value })} placeholder="openai / anthropic / ollama" />
         <label>Endpoint</label>
@@ -1219,7 +1219,7 @@ function ExportsSection() {
 
       {showCreate && (
         <Modal open onClose={() => setShowCreate(false)} title="New scheduled export">
-          <div style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "10px 12px", alignItems: "center" }}>
+          <div class="obs-label-grid">
             <label>Name</label>
             <input class="obs-input" value={form.name} onInput={(e) => setForm({ ...form, name: (e.target as HTMLInputElement).value })} />
             <label>Cron</label>

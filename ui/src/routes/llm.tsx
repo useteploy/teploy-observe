@@ -134,7 +134,7 @@ export default function LLMPage() {
           </div>
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "12px", marginBottom: "20px" }}>
+        <div class="obs-kpi-grid" style={{ marginBottom: "20px" }}>
           {[
             { label: "Provider", value: selected.provider || "unknown" },
             { label: "Operation", value: selected.operation },
@@ -198,7 +198,7 @@ export default function LLMPage() {
           {stats && (<>
           <ExportButton filename={`llm-costs-${siteId}.csv`} rows={[stats]} columns={[{ key: "total_calls", label: "total_calls" }, ...partitionColumns]} />
           {/* Summary cards */}
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: "12px", marginBottom: "20px" }}>
+          <div class="obs-kpi-grid obs-kpi-grid--stack" style={{ "--obs-kpi-cols": 5, marginBottom: "20px" }}>
             {[
               { label: "Total Calls", value: formatNumber(stats.total_calls), color: "var(--obs-accent)" },
               { label: "Total Tokens", value: tokenSplit(stats), color: "var(--obs-text)" },

@@ -220,3 +220,11 @@
   background: rgba(239, 68, 68, 0.12);
   color: #dc2626;
 }
+
+@media (max-width: 768px) {
+  /* Row actions wrap under the name instead of being clipped by the list. */
+  .settings-row { flex-wrap: wrap; }
+  .settings-row-name { flex-basis: 100%; min-width: 0; overflow-wrap: anywhere; }
+  .settings-row-value { min-width: 0; overflow-wrap: anywhere; }
+  .settings-key-display { flex-wrap: wrap; }
+}

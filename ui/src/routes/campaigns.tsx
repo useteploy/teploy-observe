@@ -300,7 +300,7 @@ export default function CampaignsPage() {
         ) : (
           <>
             {/* Summary */}
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "12px", marginBottom: "20px" }}>
+            <div class="obs-kpi-grid" style={{ "--obs-kpi-cols": 3, marginBottom: "20px" }}>
               {[
                 { label: "Unique Sources", value: utmErrors.source ? "Unavailable" : sources.length, color: "var(--obs-accent)" },
                 { label: "Unique Mediums", value: utmErrors.medium ? "Unavailable" : mediums.length, color: "#22c55e" },

@@ -72,7 +72,7 @@ function CapturePanels({ captured, elapsedMs }: { captured: ReturnType<typeof ex
   const reqs = upTo(captured.network, elapsedMs);
   const rowStyle = { display: "flex", gap: "10px", fontSize: "12px", padding: "3px 0", fontFamily: "var(--obs-font-mono, monospace)" };
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: "16px", marginBottom: "16px" }}>
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(320px, 100%), 1fr))", gap: "16px", marginBottom: "16px" }}>
       <div>
         <h2 style={{ fontSize: "13px", fontWeight: 600, marginBottom: "8px" }}>Console ({logs.length}/{captured.console.length})</h2>
         <div style={{ maxHeight: "240px", overflow: "auto" }}>

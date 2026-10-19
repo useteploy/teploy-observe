@@ -898,6 +898,31 @@ p { line-height: 1.6; }
   }
 }
 
+@media (max-width: 768px) {
+  .obs-header > div { flex-wrap: wrap; max-width: 100%; }
+  /* The range menu anchors to the whole control row rather than its button,
+     so it opens leftward-aligned instead of off the left edge. */
+  .obs-header > div > div { position: relative; }
+  .obs-header .obs-dropdown { position: static; }
+  .obs-header .obs-dropdown-menu { left: 0; right: auto; max-width: calc(100vw - 32px); }
+  .obs-nav-arrow { width: 44px; height: 44px; }
+
+  .obs-card, .obs-card-static { padding: 16px; }
+  .obs-tabs { overflow-x: auto; scrollbar-width: none; }
+  .obs-tabs::-webkit-scrollbar { display: none; }
+  .obs-tab { flex: none; white-space: nowrap; }
+  .obs-table-row { min-height: 44px; }
+  .obs-table-row-label { flex: 1; min-width: 0; max-width: none; }
+
+  .obs-chart-legend { flex-wrap: wrap; gap: 6px 14px; }
+  .obs-interval-btns { flex: none; }
+  .obs-interval-btns .obs-btn { min-height: 36px; padding: 4px 12px; }
+
+  .obs-pill { max-width: 100%; min-height: 36px; }
+  .obs-pill-remove { width: 28px; height: 28px; margin-right: -8px; }
+  .obs-filter-clear { min-height: 36px; }
+}
+
 /* ─── Unique-coverage note ───
    Shown above the tiles when the visitor figures cover a shorter window than
    the selected range: pageviews come from the rollups, uniques from raw events

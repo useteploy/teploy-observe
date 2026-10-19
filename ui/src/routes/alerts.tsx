@@ -201,7 +201,7 @@ function RulesTab({ siteId }: { siteId: string }) {
           <input class="obs-input" placeholder="High Error Rate" value={formName}
             onInput={(e) => setFormName((e.target as HTMLInputElement).value)} />
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px" }}>
+        <div class="obs-form-cols" style={{ "--obs-form-cols": 3 }}>
           <div class="obs-form-group">
             <label class="obs-label">Metric</label>
             <select class="obs-select" value={formMetric}
@@ -222,7 +222,7 @@ function RulesTab({ siteId }: { siteId: string }) {
               onInput={(e) => setFormThreshold((e.target as HTMLInputElement).value)} />
           </div>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
+        <div class="obs-form-cols">
           <div class="obs-form-group">
             <label class="obs-label">Window (minutes)</label>
             <input class="obs-input" type="number" value={formWindow}

@@ -265,7 +265,7 @@ function UptimeTab() {
           <input class="obs-input" placeholder="https://api.example.com/health" value={formUrl}
             onInput={(e) => setFormUrl((e.target as HTMLInputElement).value)} />
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px" }}>
+        <div class="obs-form-cols" style={{ "--obs-form-cols": 3 }}>
           <div class="obs-form-group">
             <label class="obs-label">Method</label>
             <select class="obs-select" value={formMethod}
@@ -377,7 +377,7 @@ function CronTab() {
           <input class="obs-input" placeholder="nightly-backup" value={formSlug}
             onInput={(e) => setFormSlug((e.target as HTMLInputElement).value)} />
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
+        <div class="obs-form-cols">
           <div class="obs-form-group">
             <label class="obs-label">Schedule (cron)</label>
             <input class="obs-input" placeholder="0 2 * * *" value={formSchedule}

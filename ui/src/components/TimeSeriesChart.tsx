@@ -203,20 +203,26 @@ function TimeSeriesChart() {
     // X-axis labels
     ctx.fillStyle = "#52525b";
     ctx.textAlign = "center";
-    const labelCount = Math.min(data.length, 8);
-    const step = Math.max(1, Math.floor(data.length / labelCount));
+    const xLabel = (bucket: number) => {
+      const date = new Date(bucket);
+      if (interval === "hour") {
+        return `${date.getMonth() + 1}/${date.getDate()} ${String(date.getHours()).padStart(2, "0")}:00`;
+      } else if (interval === "month") {
+        return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+      }
+      return `${date.getMonth() + 1}/${date.getDate()}`;
+    };
+    // At most 8 labels, and no more than fit side by side: on a phone-width
+    // plot eight hourly labels overprint into an unreadable band.
+    const labelW = ctx.measureText(xLabel(data[0].bucket)).width + 16;
+    const maxLabels = Math.min(data.length, 8);
+    const labelCount = Math.max(1, Math.min(maxLabels, Math.floor(plotW / labelW)));
+    const step = labelCount === maxLabels
+      ? Math.max(1, Math.floor(data.length / labelCount))
+      : Math.ceil(data.length / labelCount);
     for (let i = 0; i < data.length; i += step) {
       const x = pad.left + ((data[i].bucket - minT) / rangeT) * plotW;
-      const date = new Date(data[i].bucket);
-      let label: string;
-      if (interval === "hour") {
-        label = `${date.getMonth() + 1}/${date.getDate()} ${String(date.getHours()).padStart(2, "0")}:00`;
-      } else if (interval === "month") {
-        label = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
-      } else {
-        label = `${date.getMonth() + 1}/${date.getDate()}`;
-      }
-      ctx.fillText(label, x, h - pad.bottom + 20);
+      ctx.fillText(xLabel(data[i].bucket), x, h - pad.bottom + 20);
     }
 
     // Compute bezier control points for smooth curves
@@ -412,7 +418,7 @@ function TimeSeriesChart() {
 
   return (
     <div>
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:12px;">
         <div class="obs-chart-legend">
           <div class="obs-chart-legend-item">
             <span class="obs-chart-legend-dot" style={`background:${PAGEVIEW_COLOR}`} />

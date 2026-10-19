@@ -87,7 +87,7 @@ function StatsCards() {
 
   return (
     <div class="obs-grid-stats">
-      {error && <div role="alert">Unable to load overview: {error}</div>}
+      {error && <div role="alert" style="grid-column:1 / -1;">Unable to load overview: {error}</div>}
       {cards.map((c, i) => (
         <div key={c.label} class="obs-card" style={{ animationDelay: `${i * 40}ms` }}>
           {c.target !== null ? (

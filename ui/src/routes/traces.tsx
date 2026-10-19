@@ -1200,7 +1200,7 @@ function SiteTracesPage() {
 
       {/* RED summary cards */}
       {services.length > 0 && view === "services" && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "12px", marginBottom: "16px" }}>
+        <div class="obs-kpi-grid" style={{ marginBottom: "16px" }}>
           {(() => {
             const totalReqs = services.reduce((s, svc) => s + svc.request_count, 0);
             const totalErrs = services.reduce((s, svc) => s + svc.error_count, 0);
