@@ -58,9 +58,15 @@ publish:
 port: 3000
 
 # Teploy readiness must probe SQL/WAL health rather than the SPA fallback.
+# 90s, not the 30s default: /healthz runs a real SELECT 1 and the recovery-era
+# store idles above 6 GB resident, so a cold boot (pool + migration ladder)
+# against a busy or freshly-restarted engine routinely outlives 30s - two
+# deploys on 2026-10-19 rolled back on exactly that while the engine sat in
+# its memory-pressure eviction loop.
 health:
   mode: http
   path: /healthz
+  timeout_seconds: 90
 
 platform: linux/amd64
 
