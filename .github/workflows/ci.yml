@@ -610,7 +610,13 @@ jobs:
         run: |
           npm ci
           npx playwright install --with-deps chromium
-          npx playwright test tests/smoke.spec.ts tests/core.spec.ts tests/dashboard-replay-journey.spec.ts
+          # The pair runs the chart DEFAULTS - the last published release
+          # image, not this branch's build - so only the pair-appropriate
+          # acceptance runs here. dashboard-replay-journey asserts
+          # post-release UI (the rrweb player root) and can never pass
+          # against the historic image; e2e-smoke covers it against the
+          # current build.
+          npx playwright test tests/smoke.spec.ts tests/core.spec.ts
         env:
           OBSERVE_URL: http://127.0.0.1:3000
       - uses: actions/upload-artifact@v4
