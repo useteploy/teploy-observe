@@ -38,21 +38,6 @@ var retentionKeys = map[string][]string{
 	"notification_outbox":      {"tenant_id", "id"},
 }
 
-type retentionKeyRow struct {
-	K0 string `db:"k0"`
-	K1 string `db:"k1"`
-	K2 string `db:"k2"`
-	K3 string `db:"k3"`
-	K4 string `db:"k4"`
-	K5 string `db:"k5"`
-	K6 string `db:"k6"`
-	K7 string `db:"k7"`
-}
-
-func (r retentionKeyRow) values() []string {
-	return []string{r.K0, r.K1, r.K2, r.K3, r.K4, r.K5, r.K6, r.K7}
-}
-
 // cleanupWhere runs each select/count/delete on the same transaction snapshot.
 // No DELETE LIMIT is used: the pinned engine does not implement that clause.
 func (r *RetentionService) cleanupWhere(ctx context.Context, table, where string, args []any, keys []string) (int64, error) {
@@ -94,51 +79,61 @@ func (r *RetentionService) cleanupWhere(ctx context.Context, table, where string
 	}
 }
 
-func deleteRetentionChunk(ctx context.Context, sql *nucleus.SQLModel, table, where string, args []any, keys []string) (int64, error) {
-	cols := make([]string, len(keys))
-	orders := make([]string, len(keys))
+// retentionIdentityExpr builds the injective text identity of a row: each
+// key CAST-ed to TEXT with the separator escaped inside it, joined by the
+// separator. Escaping makes the mapping injective - two distinct key
+// tuples can never collide into the same concatenated string.
+func retentionIdentityExpr(keys []string) string {
+	parts := make([]string, len(keys))
 	for i, k := range keys {
-		cols[i] = fmt.Sprintf("CAST(%s AS TEXT) AS k%d", k, i)
-		orders[i] = fmt.Sprintf("k%d", i)
+		parts[i] = fmt.Sprintf("REPLACE(CAST(%s AS TEXT), '|', '||')", k)
 	}
-	rows, err := nucleus.Query[retentionKeyRow](ctx, sql, fmt.Sprintf("SELECT DISTINCT %s FROM %s WHERE %s ORDER BY %s LIMIT 500", strings.Join(cols, ","), table, where, strings.Join(orders, ",")), args...)
+	return strings.Join(parts, " || '|' || ")
+}
+
+type retentionIdentRow struct {
+	Ident string `db:"ident"`
+}
+
+// deleteRetentionChunk deletes at most retentionChunkSize rows matching
+// where, in two statements on the caller's snapshot: a bounded scan reads
+// each candidate's identity (engine-computed, LIMIT-retentionChunkSize),
+// then one DELETE matches those identities through a flat IN-parameter
+// list.
+//
+// Why this shape: the engine has no bounded physical DELETE (no
+// DELETE ... LIMIT), and its parser rejects expression nesting past 256 -
+// the OR-group-per-identity predicate this used to build was unparseable
+// at candidate counts it itself allowed (500), and the IN-subquery variant
+// (`IN (SELECT ... LIMIT n)`) nested-loops into quadratic time on ties
+// (measured: 303ms at 1k rows, 2.7s at 4k). A flat parameter IN-list has
+// constant nesting depth and the engine matches it in one pass (measured:
+// 479ms for a 5000-of-6001 tie delete). The affected-row check keeps the
+// physical-delete budget: an engine reporting more physical versions than
+// the selected visible set is refused, never silently truncated.
+func deleteRetentionChunk(ctx context.Context, sql *nucleus.SQLModel, table, where string, args []any, keys []string) (int64, error) {
+	if len(keys) == 0 {
+		return 0, fmt.Errorf("retention: %s has no identity keys", table)
+	}
+	ident := retentionIdentityExpr(keys)
+	rows, err := nucleus.Query[retentionIdentRow](ctx, sql,
+		fmt.Sprintf("SELECT %s AS ident FROM %s WHERE %s LIMIT %d", ident, table, where, retentionChunkSize), args...)
 	if err != nil || len(rows) == 0 {
 		return 0, err
 	}
-	for {
-		predicate, bindings := retentionIdentityPredicate(keys, rows, args)
-		predicate = "(" + where + ") AND (" + predicate + ")"
-		// Count visible matches with a limit, rather than COUNT over a giant tie.
-		// DELETE may expose more physical versions than SELECT on some engines.
-		matches, err := nucleus.Query[boundaryRow](ctx, sql, fmt.Sprintf("SELECT 1 AS c FROM %s WHERE %s LIMIT %d", table, predicate, retentionChunkSize+1), bindings...)
-		if err != nil {
-			return 0, err
-		}
-		if len(matches) <= retentionChunkSize {
-			n, err := sql.Exec(ctx, "DELETE FROM "+table+" WHERE "+predicate, bindings...)
-			if err == nil && n > retentionChunkSize {
-				return 0, fmt.Errorf("retention: %s DELETE exposed %d physical rows beyond visible-row budget; rolling back (bounded physical DELETE required)", table, n)
-			}
-			return n, err
-		}
-		if len(rows) == 1 {
-			return 0, fmt.Errorf("retention: %s identity has more than %d physical copies; refusing unbounded delete (engine bounded physical DELETE required)", table, retentionChunkSize)
-		}
-		rows = rows[:len(rows)/2]
+	placeholders := make([]string, len(rows))
+	vals := make([]any, len(rows))
+	for i, r := range rows {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		vals[i] = r.Ident
 	}
-}
-
-func retentionIdentityPredicate(keys []string, rows []retentionKeyRow, initial []any) (string, []any) {
-	args := append([]any(nil), initial...)
-	groups := make([]string, len(rows))
-	for i, row := range rows {
-		terms := make([]string, len(keys))
-		values := row.values()
-		for j, key := range keys {
-			args = append(args, values[j])
-			terms[j] = fmt.Sprintf("CAST(%s AS TEXT) = $%d", key, len(args))
-		}
-		groups[i] = "(" + strings.Join(terms, " AND ") + ")"
+	n, err := sql.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE %s IN (%s)",
+		table, ident, strings.Join(placeholders, ",")), vals...)
+	if err != nil {
+		return 0, err
 	}
-	return strings.Join(groups, " OR "), args
+	if n > int64(len(rows)) {
+		return 0, fmt.Errorf("retention: %s DELETE exposed %d physical rows beyond the %d selected identities; rolling back (bounded physical DELETE required)", table, n, len(rows))
+	}
+	return n, nil
 }
