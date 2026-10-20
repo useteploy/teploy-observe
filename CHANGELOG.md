@@ -4,6 +4,8 @@ All notable changes to Observe are recorded here.
 
 ## [Unreleased]
 
+## v0.2.0 — 2026-10-20
+
 Competitive-gap and hardening sweep (2026-10). Everything below is merged on
 one branch; SQL and storage paths are unit-tested but were **not verified
 against a live Nucleus** (integration tests were skipped in the build
