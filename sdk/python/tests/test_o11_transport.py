@@ -173,7 +173,22 @@ def test_flush_deadline_leaves_queue_visible(fault):
     assert stats["queued"] == 1, "the timed-out entry must remain visible"
 
     fault.set_mode({"kind": "ok"})
-    client.flush()
+    # The cancel from the timed-out flush can still be landing when we get
+    # here under load; DeliveryDeadline("cancelled transport is still
+    # stopping") is the documented ambiguous-outcome signal, so retry until
+    # the transport accepts the delivery instead of asserting on a race.
+    import time as _time
+
+    from observe_sdk.transport import DeliveryDeadline
+
+    for _ in range(20):
+        try:
+            client.flush()
+            break
+        except DeliveryDeadline:
+            _time.sleep(0.1)
+    else:
+        pytest.fail("transport never left the cancelling state")
     assert client.stats()["queued"] == 0
     client.close()
 

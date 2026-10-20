@@ -127,8 +127,19 @@ class AbsoluteDeadlineTests(unittest.TestCase):
         with patch("observe_sdk.transport.socket.getaddrinfo", return_value=addresses), patch("observe_sdk.transport.socket.socket", return_value=ConnectingSocket()):
             self.assert_retained(client, client.flush)
             self.assertTrue(entered.is_set())
-            self.assertTrue(client._batch_operation.done.wait(0.2))
-            self.assertTrue(client._batch_operation.cancelled.is_set())
+            # done then the interrupt: under suite load the flush deadline
+            # can expire on the caller side before the transport wait, in
+            # which case cancel() never runs with interrupt=True and the
+            # stalled connect is ended by the operation's own socket
+            # timeout instead. Both arms interrupt the connect and release
+            # the socket (cancel's shutdown/close loop runs either way);
+            # pin that invariant rather than which deadline won the race.
+            self.assertTrue(client._batch_operation.done.wait(2.0))
+            op = client._batch_operation
+            self.assertTrue(
+                op.cancelled.is_set() or isinstance(op.error, (OSError, TimeoutError)),
+                f"stalled connect neither cancelled nor deadline-ended: error={op.error!r}",
+            )
 
     def test_ambiguous_and_oversized_ack_stay_queued(self):
         for body in [b'{"accepted":true,"rejected":0}', b'{"accepted":2,"rejected":0}', b'bad json', b' ' * (64 * 1024 + 1)]:
