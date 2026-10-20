@@ -148,7 +148,9 @@ func TestVerifySnapshotSerializesCheckpointWriter(t *testing.T) {
 func TestVerifyAndListNonpositiveRowsAtEngine(t *testing.T) {
 	db := checkpointFixture(t)
 	ctx := context.Background()
-	s := NewService(db, []byte(integrationAuditKey))
+	// The loop below constructs a fresh Service per combination; the only
+	// value of s that is read is the one assigned there.
+	var s *Service
 	for _, seq := range []int64{0, -1} {
 		for _, empty := range []bool{true, false} {
 			for _, checkpoint := range []bool{false, true} {

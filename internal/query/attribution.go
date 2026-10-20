@@ -256,47 +256,9 @@ func computeAttribution(ctx context.Context, events []attributionEvent, model st
 	return out, check("attribution-complete")
 }
 
-// creditsForSession returns map[source] = credit for one session under
-// the given model. Sessions with no utm_source on any event get full
-// credit attributed to "(direct)".
-//
-// Caller must pass events already sorted by timestamp ascending.
-func creditsForSession(evts []attributionEvent, model string) map[string]float64 {
-	credits := make(map[string]float64)
-	if len(evts) == 0 {
-		return credits
-	}
-
-	// Collect non-empty utm_source values in chronological order, plus
-	// the unique set for linear attribution.
-	var ordered []string
-	uniq := make(map[string]struct{})
-	for _, e := range evts {
-		if e.UTMSource == "" {
-			continue
-		}
-		ordered = append(ordered, e.UTMSource)
-		uniq[e.UTMSource] = struct{}{}
-	}
-
-	if len(ordered) == 0 {
-		credits[directBucket] = 1.0
-		return credits
-	}
-
-	switch model {
-	case AttributionFirstTouch:
-		credits[ordered[0]] = 1.0
-	case AttributionLastTouch:
-		credits[ordered[len(ordered)-1]] = 1.0
-	case AttributionLinear:
-		share := 1.0 / float64(len(uniq))
-		for src := range uniq {
-			credits[src] = share
-		}
-	}
-	return credits
-}
+// creditsForSession was the pre-bounded-kernel attribution kernel; the
+// cancellable per-work rewrite (audit r5) replaced it and nothing calls it.
+// (Removed rather than kept dead.)
 
 // TimeRangeMs is a small helper that mirrors the rest of the query
 // package's window-defaulting behavior (last 24h on zero values). Used

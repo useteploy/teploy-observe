@@ -16,14 +16,17 @@ import (
 )
 
 func TestOBS79PushPolicyFailureAndInvalidIdentityNeverEnterWAL(t *testing.T) {
+	// SA1029: an empty struct key can collide with any other empty struct
+	// key in the context chain — a dedicated type is the pinned fix.
+	type r3RequestValue struct{}
 	for _, mode := range []string{"cold-error", "missing", "empty-salt", "canceled", "nul", "invalid-utf8", "overlong"} {
 		t.Run(mode, func(t *testing.T) {
 			q := r3Queue(t, t.TempDir())
 			defer q.Close()
-			ctx := context.WithValue(context.Background(), struct{}{}, "request-value")
+			ctx := context.WithValue(context.Background(), r3RequestValue{}, "request-value")
 			id := "synthetic-private-person"
 			svc := NewService(nil, nil, nil, nil).WithPrivacyChecked(func(got context.Context, site string) (string, bool, bool, error) {
-				if site != "site" || got.Value(struct{}{}) != "request-value" {
+				if site != "site" || got.Value(r3RequestValue{}) != "request-value" {
 					t.Fatal("lost admitting site/context")
 				}
 				if mode == "cold-error" {
