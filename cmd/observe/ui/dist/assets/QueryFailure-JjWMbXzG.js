@@ -1,0 +1,1 @@
+import{u as r}from"./jsxRuntime-CqlJ79eJ.js";function n({message:o,retry:t}){return r("div",{class:"obs-form-error",role:"alert",children:[r("span",{children:o})," ",r("button",{type:"button",class:"obs-btn obs-btn--sm",onClick:t,children:"Retry"})]})}export{n as Q};

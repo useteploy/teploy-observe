@@ -5,7 +5,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>Observe</title>
-    <script type="module" crossorigin src="/assets/index-CX39qQME.js"></script>
+    <script>
+      // Apply the stored theme before first paint: the CSS is dark-first, so
+      // without this a light-mode reload flashes dark, and the bare-layout
+      // pages (/login, /onboard, /setup) never mount the sidebar that used to
+      // apply it. Mirrors the read in src/lib/theme.ts — only the exact
+      // string "light" switches; try/catch for blocked storage.
+      try {
+        if (localStorage.getItem("obs_theme") === "light") {
+          document.documentElement.setAttribute("data-theme", "light");
+        }
+      } catch (e) { /* keep dark */ }
+    </script>
+    <script type="module" crossorigin src="/assets/index-DEhq1mqV.js"></script>
   </head>
   <body>
     <div id="app"></div>
