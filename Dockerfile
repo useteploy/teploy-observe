@@ -4,7 +4,7 @@
 # 1.25, not 1.24: go.opentelemetry.io/proto/otlp (the OTLP protobuf types
 # behind /v1/traces, /v1/metrics and /v1/logs) declares go 1.25.0, as do the
 # golang.org/x/* versions it pulls in. On 1.24 the vendored build fails.
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates
 WORKDIR /src

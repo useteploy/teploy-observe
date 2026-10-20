@@ -17,7 +17,7 @@ permissions:
 # docker-compose.yml defaults to it). One place to bump.
 env:
   NUCLEUS_VERSION: v1.3.0
-  STATICCHECK_VERSION: 2025.1.1
+  STATICCHECK_VERSION: 2026.2.2
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.26'
       - name: Build
         run: go build ./...
       - name: Vet
@@ -63,7 +63,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.26'
       - name: Race
         run: go test -race ./...
 
@@ -78,7 +78,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.26'
       - name: govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
@@ -91,7 +91,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.26'
       - name: staticcheck
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@${{ env.STATICCHECK_VERSION }}
@@ -197,7 +197,7 @@ jobs:
           node-version: '20'
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.26'
       - name: Resolve pinned Neutron revision
         id: pin
         run: echo "sha=$(git ls-tree HEAD Neutron | awk '{print $3}')" >> "$GITHUB_OUTPUT"
@@ -297,7 +297,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.26'
       - name: Start pinned Nucleus
         run: |
           docker run -d --name nucleus -p 127.0.0.1:55432:5432 \
@@ -345,7 +345,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.26'
       - name: Start pinned Nucleus
         run: |
           docker run -d --name nucleus -p 127.0.0.1:55432:5432 \
@@ -399,7 +399,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.26'
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -468,7 +468,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.26'
       - uses: dtolnay/rust-toolchain@stable
       - name: Resolve pinned Neutron revision
         id: pin
