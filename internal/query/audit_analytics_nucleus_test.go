@@ -16,7 +16,12 @@ func TestAuditEventSeriesScreenChannelAndSessionSegment(t *testing.T) {
 		session, kind, path, source, medium string
 		w, h                                int
 	}{{"paid", "pageview", "/paid", "google", "cpc", 1920, 1080}, {"paid", "pageview", "/paid", "bing", "cpc", 1920, 1080}, {"other", "pageview", "/other", "", "", 800, 600}, {"paid", "purchase", "/paid", "google", "cpc", 1920, 1080}} {
-		_, err := seed.db.SQL().Exec(ctx, `INSERT INTO events (event_id,tenant_id,site_id,session_id,visit_id,event_type,pathname,timestamp,utm_source,utm_medium,screen_width,screen_height,distinct_id) VALUES ($1,'default',$2,$3,'v',$4,$5,$6,$7,$8,$9,$10,$3)`, r.session+r.kind+string(rune('a'+i)), seed.site, r.session, r.kind, r.path, from.Add(time.Duration(i+1)*time.Hour).UnixMilli(), r.source, r.medium, r.w, r.h)
+		// properties are set on every row: the row-budget assertions below
+		// (MaxScanRows 2) need rows the property-keys and attribution reads
+		// actually scan, and the property-keys read filters
+		// `properties IS NOT NULL` — without this the guarded call scans
+		// nothing and the refusal it pins can never fire.
+		_, err := seed.db.SQL().Exec(ctx, `INSERT INTO events (event_id,tenant_id,site_id,session_id,visit_id,event_type,pathname,timestamp,utm_source,utm_medium,screen_width,screen_height,distinct_id,properties) VALUES ($1,'default',$2,$3,'v',$4,$5,$6,$7,$8,$9,$10,$3,'{"segment":"audit"}')`, r.session+r.kind+string(rune('a'+i)), seed.site, r.session, r.kind, r.path, from.Add(time.Duration(i+1)*time.Hour).UnixMilli(), r.source, r.medium, r.w, r.h)
 		if err != nil {
 			t.Fatal(err)
 		}

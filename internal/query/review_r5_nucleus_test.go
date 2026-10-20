@@ -81,11 +81,15 @@ func TestR5GoalNativeCountBoundary(t *testing.T) {
 
 // This test talks to the actual production routes of a parent-started Observe
 // server backed by the SAME native DSN. No substitute httptest handlers. Supply
-// an isolated fixture site and an editor JWT; required mode fails on omission.
+// an isolated fixture site and an editor JWT. Its fixtures are a separate
+// opt-in from the engine: OBSERVE_REQUIRE_NUCLEUS covers the DSN only, and CI
+// has no parent-started server, so requiring the HTTP fixture there made this
+// job structurally red. Set OBSERVE_REQUIRE_R5_HTTP=1 to make omission fatal
+// (the lane harness does).
 func TestR5GoalNativeHTTPCreateReadAggregate(t *testing.T) {
 	base, site, token := os.Getenv("OBSERVE_R5_HTTP_URL"), os.Getenv("OBSERVE_R5_HTTP_SITE"), os.Getenv("OBSERVE_R5_HTTP_TOKEN")
 	if base == "" || site == "" || token == "" {
-		if os.Getenv("OBSERVE_REQUIRE_NUCLEUS") == "1" {
+		if os.Getenv("OBSERVE_REQUIRE_R5_HTTP") == "1" {
 			t.Fatal("required actual Observe HTTP URL/site/editor token absent")
 		}
 		t.Skip("actual Observe HTTP fixture absent")
