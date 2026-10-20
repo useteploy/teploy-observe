@@ -15,6 +15,8 @@ import "../styles/settings.css";
 import "../styles/meta.css";
 import { useFilters } from "../hooks/useFilters.js";
 import { copyToClipboard } from "../lib/clipboard.js";
+import { storedTheme, setTheme } from "../lib/theme.js";
+import type { Theme } from "../lib/theme.js";
 
 export const config = { mode: "app" };
 
@@ -942,6 +944,66 @@ function MCPSection() {
   );
 }
 
+// ─── Appearance ───
+
+// The theme switch used to be a button at the bottom of the sidebar, where it
+// was unreachable below 480px (the sidebar collapses to zero width there) and
+// icon-only up to 768px. Settings is the one surface every screen size gets.
+const THEME_OPTIONS: Array<{ value: Theme; label: string; icon: string; hint: string }> = [
+  {
+    value: "dark",
+    label: "Dark",
+    icon: "M9.37 5.51A7.35 7.35 0 0 0 9.1 7.5c0 4.08 3.32 7.4 7.4 7.4.68 0 1.35-.09 1.99-.27A7.014 7.014 0 0 1 12 19c-3.86 0-7-3.14-7-7 0-2.93 1.81-5.45 4.37-6.49zM12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z",
+    hint: "Default",
+  },
+  {
+    value: "light",
+    label: "Light",
+    icon: "M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2c.55 0 1-.45 1-1s-.45-1-1-1H2c-.55 0-1 .45-1 1s.45 1 1 1zm18 0h2c.55 0 1-.45 1-1s-.45-1-1-1h-2c-.55 0-1 .45-1 1s.45 1 1 1zM11 2v2c0 .55.45 1 1 1s1-.45 1-1V2c0-.55-.45-1-1-1s-1 .45-1 1zm0 18v2c0 .55.45 1 1 1s1-.45 1-1v-2c0-.55-.45-1-1-1s-1 .45-1 1zM5.99 4.58c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.03 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0s.39-1.03 0-1.41L5.99 4.58zm12.37 12.37c-.39-.39-1.03-.39-1.41 0-.39.39-.39 1.03 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0 .39-.39.39-1.03 0-1.41l-1.06-1.06zm1.06-10.96c.39-.39.39-1.03 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.39.39-.39 1.03 0 1.41s1.03.39 1.41 0l1.06-1.06zM7.05 18.36c.39-.39.39-1.03 0-1.41-.39-.39-1.03-.39-1.41 0l-1.06 1.06c-.39.39-.39 1.03 0 1.41s1.03.39 1.41 0l1.06-1.06z",
+    hint: "",
+  },
+];
+
+function AppearanceSection() {
+  const [theme, setThemeState] = useState<Theme>(() => storedTheme());
+
+  const choose = (next: Theme) => {
+    // Persist and flip <html> data-theme immediately — the change is live,
+    // including this page, because everything reads the same CSS variables.
+    setTheme(next);
+    setThemeState(next);
+  };
+
+  return (
+    <div class="settings-section">
+      <div class="settings-section-header">
+        <h2 class="settings-section-title">Appearance</h2>
+      </div>
+      <div class="settings-key-note" style={{ marginBottom: "16px" }}>
+        Applies immediately and is remembered per browser — it carries across
+        reloads, tabs and the login page.
+      </div>
+      <div role="group" aria-label="Color theme" style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+        {THEME_OPTIONS.map((opt) => (
+          <button
+            key={opt.value}
+            class={`obs-btn ${theme === opt.value ? "obs-btn--primary" : ""}`}
+            aria-pressed={theme === opt.value}
+            onClick={() => choose(opt.value)}
+            style={{ display: "inline-flex", alignItems: "center", gap: "8px" }}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <path d={opt.icon} />
+            </svg>
+            {opt.label}
+            {opt.hint && <span style={{ fontSize: "11px", opacity: 0.7 }}>{opt.hint}</span>}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function PasswordSection() {
   const [currentPw, setCurrentPw] = useState("");
   const [newPw, setNewPw] = useState("");
@@ -1269,6 +1331,7 @@ export default function SettingsPage() {
     { key: "users", label: "Users" },
     { key: "keys", label: "API Keys" },
     { key: "mcp", label: "MCP" },
+    { key: "appearance", label: "Appearance" },
     { key: "password", label: "Password" },
     { key: "ai", label: "AI" },
     { key: "exports", label: "Exports" },
@@ -1298,6 +1361,7 @@ export default function SettingsPage() {
       {tab === "users" && <UsersSection />}
       {tab === "keys" && <APIKeysSection />}
       {tab === "mcp" && <MCPSection />}
+      {tab === "appearance" && <AppearanceSection />}
       {tab === "password" && <PasswordSection />}
       {tab === "ai" && <AISection />}
       {tab === "exports" && <ExportsSection />}

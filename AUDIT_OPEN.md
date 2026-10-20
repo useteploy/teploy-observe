@@ -2739,3 +2739,43 @@ post-freeze `scripts/ui-sync.sh` run plus final build/test re-verification;
 and the pre-existing open gates (browser matrix, CSV, image, release
 assurance). No commits, pushes, engine starts, vendor/pin changes, or other
 repos were touched.
+
+## 2026-10-16 — DEFERRED FUNCTIONALITY: deliverability monitoring pack (Tatami-class)
+
+Parked idea, recorded so it stops living in someone's head. Reference
+shape: tatamimonitor.com (Bento's product) — webhook-driven
+delivered/deferred/bounced analytics, 100+ blocklist checks, provider
+reputation signals, spike alerts, AI bounce explanations, for ESPs/MTAs
+and volume senders.
+
+Why it fits Observe: about two-thirds of it is already the core loop —
+webhook event ingestion (a deliverability event source is an event
+schema), per-tenant/provider/IP time-series dashboards, alert rules
+(plus incident-mode overlays Tatami lacks), scheduled exports, and the
+AI query assistant pattern. Strategically coherent too: the natural
+first event source is Teploy Send's own delivery webhooks (Bento built
+Tatami to watch Bento's mail for exactly this reason).
+
+The three genuinely new pieces, none of them platform work:
+
+1. DNSBL poller service — blocklists publish over DNS
+   (reverse-lookups like 24.100.51.198.zen.spamhaus.org); poll every
+   sending IP/domain × ~100 lists on a schedule, alert on new
+   listings. The code is trivial; the work is own recursive resolvers
+   (public resolvers are blocked by the big lists) and per-list
+   terms/delisting procedures.
+2. Provider-reputation acquisition — Google Postmaster / Microsoft
+   SNDS publish their opinion of a sender behind verified-ownership
+   portals with no public API. Getting the data continuously and
+   legitimately is the moat, not displaying it. Start indirect: the
+   event stream itself encodes provider verdicts (Outlook 451 4.7.650
+   deferral spikes, Gmail 550 5.7.1 abuse bounces) and needs no
+   permissions at all.
+3. Bounce-code knowledge base — a curated, versioned table of SMTP
+   code → cause → fix (S3150 = Outlook spam threshold; 5.7.607 =
+   banned IP, delist at sender.office.com), grounding the LLM
+   explanations. Domain content, maintained forever, hard to copy.
+
+DEFERRED: not scheduled. Revisit when Teploy Send volume reaches real
+deliverability exposure or a customer asks; the indirect (event-stream
+verdicts) slice is the cheap first step if it ever moves.
