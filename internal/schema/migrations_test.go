@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -317,6 +318,79 @@ var l9CreatedTables = []string{
 	"experiment_metric_events",
 }
 
+// renameAsideArtifacts lists every migration ABOVE the L9 rewind floor (048)
+// that renames its table aside instead of altering it in place, in migration
+// order. Each such migration deliberately fails closed on retry (the aside
+// name already exists) and its header forbids dropping the aside blindly, so
+// a ledger rewind must undo the rename first — drop the destination the
+// migration created, rename the aside back — exactly the recovery procedure
+// each migration's header prescribes for an unrecorded run. Policy: a new
+// rename-aside migration above 048 MUST be added here, or the re-apply in
+// TestMigrationsUpgradePopulatedStore aborts at it and every later package's
+// schema.Apply fails the same way (the 2026-10-17 cascade: 064's
+// metric_points_pre064 collision took down jobs/llm/query/surveys/tracing/
+// tracking fixtures, none of which had a defect).
+var renameAsideArtifacts = []struct {
+	version int
+	table   string
+	aside   string
+}{
+	{64, "metric_points", "metric_points_pre064"},
+	{65, "performance_issues", "performance_issues_pre065"},
+	{66, "webhooks", "webhooks_pre066"},
+}
+
+// restoreRenameAsides reverses the rename-aside migrations that the ledger
+// does NOT record as applied, in reverse migration order, per each
+// migration's documented recovery procedure. Ledger-aware on purpose: after
+// a passing re-apply the 064-066 asides are legitimate recovery artifacts
+// and restoring them would roll the table shapes back under a complete
+// ledger - silently downgrading every package that runs after this test
+// (observed as the O01 detector writes failing against a pre-065
+// performance_issues on CI). A migration absent from the ledger with its
+// aside present is a mid-flight run; that one gets restored.
+func restoreRenameAsides(ctx context.Context, db *nucleus.Client) error {
+	applied := map[int]bool{}
+	rows, err := db.Pool().Query(ctx, "SELECT CAST(version AS TEXT) FROM _neutron_migrations")
+	if err != nil {
+		return fmt.Errorf("read migration ledger: %w", err)
+	}
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan migration ledger: %w", err)
+		}
+		if n, err := strconv.Atoi(v); err == nil {
+			applied[n] = true
+		}
+	}
+	rows.Close()
+
+	for i := len(renameAsideArtifacts) - 1; i >= 0; i-- {
+		a := renameAsideArtifacts[i]
+		if applied[a.version] {
+			// Recorded as applied: whatever aside exists is the
+			// migration's own recovery artifact. Leave it alone.
+			continue
+		}
+		if !l9TableExists(ctx, db, a.aside) {
+			continue
+		}
+		if l9TableExists(ctx, db, a.table) {
+			// The destination the migration created; the aside holds the
+			// original rows and is renamed back over it.
+			if _, err := db.Pool().Exec(ctx, "DROP TABLE "+a.table); err != nil {
+				return fmt.Errorf("drop post-%d destination %s: %w", a.version, a.table, err)
+			}
+		}
+		if _, err := db.Pool().Exec(ctx, "ALTER TABLE "+a.aside+" RENAME TO "+a.table); err != nil {
+			return fmt.Errorf("restore %s from %s: %w", a.table, a.aside, err)
+		}
+	}
+	return nil
+}
+
 // l9Column is one introspected column of a table's current shape.
 type l9Column struct {
 	name     string
@@ -372,6 +446,12 @@ func TestMigrationsUpgradePopulatedStore(t *testing.T) {
 				}
 			}
 		}
+		// A failure after the rewind below may leave the rename-aside
+		// migrations mid-flight; restore them so this re-apply cannot
+		// trip their fail-closed retry and strand the shared store.
+		if err := restoreRenameAsides(cctx, db); err != nil {
+			t.Logf("cleanup could not restore rename-aside artifacts: %v", err)
+		}
 		if err := Apply(cctx, db); err != nil {
 			t.Logf("cleanup re-apply: %v", err)
 		}
@@ -400,6 +480,13 @@ func TestMigrationsUpgradePopulatedStore(t *testing.T) {
 	// A store last migrated at 047.
 	if _, err := db.Pool().Exec(ctx, "DELETE FROM _neutron_migrations WHERE version >= 48"); err != nil {
 		t.Fatalf("rewind ledger past 048: %v", err)
+	}
+	// Undo the rename-aside migrations above the rewind floor (064-066
+	// today) per their documented recovery procedure, so the re-apply can
+	// run them again instead of aborting on their fail-closed retry. The
+	// re-apply then exercises them on populated tables as well.
+	if err := restoreRenameAsides(ctx, db); err != nil {
+		t.Fatalf("restore rename-aside artifacts: %v", err)
 	}
 	for _, name := range l9CreatedTables {
 		if _, err := db.Pool().Exec(ctx, "DROP TABLE IF EXISTS "+name); err != nil {

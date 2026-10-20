@@ -31,6 +31,9 @@ func TestDeleteRemovesTheExportAndItsRunHistory(t *testing.T) {
 		t.Skipf("connect: %v", err)
 	}
 	defer db.Close()
+	// Create stores the destination secret via secretbox, which refuses to
+	// run without a key. Same fixture key as exports_runs_test.go.
+	t.Setenv("OBSERVE_SECRET_KEY", "0123456789abcdef0123456789abcdef")
 	if err := schema.Apply(ctx, db); err != nil {
 		t.Fatalf("apply schema: %v", err)
 	}

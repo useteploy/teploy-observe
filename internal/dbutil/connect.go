@@ -39,7 +39,7 @@ func Connect(ctx context.Context, dsn string) (*nucleus.Client, error) {
 	}
 	db, err := nucleus.Connect(ctx, "", nucleus.WithPoolConfig(cfg))
 	if err != nil {
-		return nil, errors.New("Nucleus connection failed; verify address, credentials and engine readiness")
+		return nil, errors.New("nucleus connection failed; verify address, credentials and engine readiness")
 	}
 	return db, nil
 }

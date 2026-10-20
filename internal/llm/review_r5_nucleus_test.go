@@ -97,11 +97,11 @@ func TestR5LLMNativeIndependentLegacyTotals(t *testing.T) {
 	now := time.Now().UTC()
 	t.Cleanup(func() { db.SQL().Exec(ctx, `DELETE FROM llm_traces WHERE site_id=$1`, site) })
 	for i, r := range []struct {
-		costSource, tokenSource any
+		costSource, tokenSource string
 		in, out, total, usd     string
 	}{
 		{"reported", "estimated", "10", "20", "30", "1"}, {"estimated", "reported", "40", "50", "90", "2"},
-		{"", "", "60", "70", "999", "3"}, {"future", "future", "80", "90", "170", "4"}, {nil, nil, "100", "110", "210", "5"},
+		{"", "", "60", "70", "999", "3"}, {"future", "future", "80", "90", "170", "4"}, {"", "", "100", "110", "210", "5"},
 	} {
 		_, err := db.SQL().Exec(ctx, `INSERT INTO llm_traces (trace_id,site_id,timestamp,model,provider,cost_usd,prompt_tokens,completion_tokens,total_tokens,latency_ms,cost_source,token_source) VALUES ($1,$2,$3,'mixed','fixture',$4,$5,$6,$7,'1',$8,$9)`, fmt.Sprintf("%s-%d", site, i), site, now.UnixMilli(), r.usd, r.in, r.out, r.total, r.costSource, r.tokenSource)
 		if err != nil {

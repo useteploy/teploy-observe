@@ -401,9 +401,9 @@ func legacySearchQuery(siteID, fromMs, toMs, level, service, search string, limi
 		idx++
 	}
 	if search != "" {
+		// Last use of idx; no increment needed after it.
 		where += fmt.Sprintf(" AND message ILIKE '%%' || $%d || '%%'", idx)
 		params = append(params, search)
-		idx++
 	}
 
 	query := fmt.Sprintf(

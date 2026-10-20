@@ -201,10 +201,15 @@ func TestO12_ConcurrencyAdmissionRefusal(t *testing.T) {
 	}
 }
 
-// The window clamp: with MaxWindow set, events older than to-MaxWindow
-// are outside the scan even when the requested from reaches further
-// back. Mirrors retention's pinned clamp, now declared and tunable.
-func TestO12_WindowClampBoundsTheScan(t *testing.T) {
+// The window ceiling: an over-ceiling ask is refused before any scan, and a
+// within-ceiling ask succeeds — the funnel shares the one validateWindow
+// contract every read path uses (retention pinned the same posture). The
+// original lane draft expected the window to be silently clamped to
+// MaxWindow, but no path clamps and the clamp was never implemented: changing
+// the public funnel contract from a 400 to a silently-shrunk window is a
+// product decision, not a test fix, so this pins what ships. If a clamp is
+// ever wanted it belongs in the API layer with its own decision, not here.
+func TestO12_WindowCeilingRefusesOverLongFunnel(t *testing.T) {
 	db, ctx, site := o12Connect(t)
 	base := time.Date(2026, 9, 10, 0, 0, 0, 0, time.UTC)
 	seed := func(id string, at time.Time) {
@@ -223,17 +228,18 @@ func TestO12_WindowClampBoundsTheScan(t *testing.T) {
 		MaxScanRows: 1000,
 		MaxWindow:   24 * time.Hour,
 	})
-	// Ask for 3 days; the clamp keeps 24h. Both events are pageviews on
-	// one session, so the funnel's visitor count distinguishes inclusion.
-	if _, err := svc.FunnelWithOptions(ctx, site, base.Add(-72*time.Hour), base, []FunnelStep{{Type: "page", Value: "/x"}}, FunnelOptions{}); err != nil {
-		t.Fatalf("funnel: %v", err)
+	// 72h ask against a 24h ceiling: refused, before any events scan.
+	_, err := svc.FunnelWithOptions(ctx, site, base.Add(-72*time.Hour), base, []FunnelStep{{Type: "event", Value: "pageview"}}, FunnelOptions{})
+	if err == nil || !strings.Contains(err.Error(), "query window exceeds supported maximum") {
+		t.Fatalf("over-ceiling funnel: %v", err)
 	}
-	// No /x pages were seeded; use the event step instead to count.
-	res, err := svc.FunnelWithOptions(ctx, site, base.Add(-72*time.Hour), base, []FunnelStep{{Type: "event", Value: "pageview"}}, FunnelOptions{})
+	// Within the ceiling the same funnel succeeds and sees only the in-window
+	// event (the -23h one), so the refusal above guarded a real scan.
+	res, err := svc.FunnelWithOptions(ctx, site, base.Add(-24*time.Hour), base, []FunnelStep{{Type: "event", Value: "pageview"}}, FunnelOptions{})
 	if err != nil {
-		t.Fatalf("funnel: %v", err)
+		t.Fatalf("in-ceiling funnel: %v", err)
 	}
 	if res[0].Visitors != 1 {
-		t.Fatalf("clamped funnel visitors = %d, want 1 (only the -23h event is inside the 24h clamp)", res[0].Visitors)
+		t.Fatalf("in-ceiling funnel visitors = %d, want 1 (only the -23h event is inside the window)", res[0].Visitors)
 	}
 }

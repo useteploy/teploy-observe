@@ -34,7 +34,7 @@ func Deadline(d, retryAfter time.Duration) func(http.Handler) http.Handler {
 			defer cancel()
 			r = r.WithContext(ctx)
 
-			dw := &deadlineWriter{h: make(http.Header)}
+			dw := &deadlineWriter{h: make(http.Header), expired: ctx.Done()}
 			done := make(chan struct{})
 			panicked := make(chan any, 1)
 			go func() {
@@ -85,6 +85,13 @@ type deadlineWriter struct {
 	buf      bytes.Buffer
 	code     int
 	timedOut bool
+	// expired is the request context's Done channel: a write can race the
+	// middleware's timeout critical section (the context is already dead
+	// while timedOut has not been set yet), and such a write must report
+	// ErrHandlerTimeout - its bytes would only ever be buffered and
+	// discarded, and the caller deserves the documented signal, matching
+	// net/http's own TimeoutHandler semantics.
+	expired <-chan struct{}
 }
 
 func (w *deadlineWriter) Header() http.Header { return w.h }
@@ -103,6 +110,12 @@ func (w *deadlineWriter) Write(p []byte) (int, error) {
 	defer w.mu.Unlock()
 	if w.timedOut {
 		return 0, http.ErrHandlerTimeout
+	}
+	select {
+	case <-w.expired:
+		w.timedOut = true
+		return 0, http.ErrHandlerTimeout
+	default:
 	}
 	if w.code == 0 {
 		w.code = http.StatusOK

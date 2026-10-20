@@ -62,13 +62,15 @@ func TestRetentionLargeTimestampTieStaysBounded(t *testing.T) {
 			end = 6001
 		}
 		values := make([]string, end-start)
-		args := make([]any, 0, 3*(end-start))
+		args := make([]any, 0, 5*(end-start))
 		for i := start; i < end; i++ {
 			n := len(args)
-			values[i-start] = fmt.Sprintf("($%d,$%d,$%d)", n+1, n+2, n+3)
-			args = append(args, fmt.Sprintf("%s-%05d", site, i), site, old)
+			values[i-start] = fmt.Sprintf("($%d,$%d,$%d,$%d,$%d)", n+1, n+2, n+3, n+4, n+5)
+			// session_id and visit_id are NOT NULL without defaults; the
+			// retention path under test keys on site_id + timestamp only.
+			args = append(args, fmt.Sprintf("%s-%05d", site, i), site, site+"-session", site+"-visit", old)
 		}
-		if _, err := db.SQL().Exec(ctx, "INSERT INTO events (event_id,site_id,timestamp) VALUES "+strings.Join(values, ","), args...); err != nil {
+		if _, err := db.SQL().Exec(ctx, "INSERT INTO events (event_id,site_id,session_id,visit_id,timestamp) VALUES "+strings.Join(values, ","), args...); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -159,7 +161,9 @@ func TestSessionSummarySurvivesRawRetention(t *testing.T) {
 			roll := NewRollupService(db, logger)
 			roll.now = func() time.Time { return time.UnixMilli(early).Add(5 * time.Minute) }
 			insert := func(id string, ts int64, path, release string) {
-				if _, err := db.SQL().Exec(ctx, "INSERT INTO events (event_id,site_id,session_id,timestamp,pathname,release_tag) VALUES ($1,$2,$3,$4,$5,$6)", id, site, sid, ts, path, release); err != nil {
+				// visit_id is NOT NULL with no default; the rollup reads
+				// session_id, not visit_id.
+				if _, err := db.SQL().Exec(ctx, "INSERT INTO events (event_id,site_id,session_id,visit_id,timestamp,pathname,release_tag) VALUES ($1,$2,$3,$3,$4,$5,$6)", id, site, sid, ts, path, release); err != nil {
 					t.Fatal(err)
 				}
 			}

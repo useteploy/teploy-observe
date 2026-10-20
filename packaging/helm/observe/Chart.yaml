@@ -2,8 +2,14 @@ apiVersion: v2
 name: observe
 description: Single-instance Teploy Observe (analytics, errors, logs, traces, replays) with a Nucleus database StatefulSet.
 type: application
-version: 0.1.0
-appVersion: "0.2.0"
+version: 0.1.1
+# The LAST PUBLISHED release, not the one in development: the release pair
+# gate verifies the chart's default images actually exist (amd64+arm64) at
+# every CI run, so pointing this at an unreleased tag makes main
+# permanently red - exactly what happened when the chart shipped
+# pre-bumped to 0.2.0. Bump this in the release follow-up commit, after
+# the tag's images are on GHCR.
+appVersion: "0.1.9"
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/useteploy/teploy-observe
 sources:

@@ -44,6 +44,11 @@ environment) - see `AUDIT_OPEN.md` S1 for the verification checklist.
 
 ### Changed
 
+- Building Observe now requires Go 1.26 (module, CI, Dockerfile): the
+  fixed golang.org/x/net (GO advisory, was v0.58.0) only builds on 1.26+,
+  and govulncheck on 1.25 had no clean path to the fix. CI pins go 1.26
+  (latest patch; 1.26.10 verified vuln-clean) and staticcheck 2026.2.2.
+
 - **Behavior changes to review before upgrading:**
   - Email integrations now refuse non-public SMTP hosts (no private relay
     allowlist yet).
@@ -65,6 +70,15 @@ environment) - see `AUDIT_OPEN.md` S1 for the verification checklist.
 
 ### Fixed
 
+- Retention's chunked DELETE was unparseable at real table sizes: the
+  identity predicate chained one OR group per distinct identity tuple (up
+  to 500), past the engine parser's 256-deep expression limit, so any
+  cleanup whose chunk held more than ~128 identities failed with
+  "statement too complex" and left the rows in place. The delete now reads
+  a bounded identity scan and matches it through a flat IN-parameter list
+  (constant parse depth, one engine pass; 479 ms measured on a 6,001-row
+  timestamp tie). The IN-subquery variant was measured quadratic and
+  rejected.
 - Data race in the query admission limiter refusal path.
 - OTLP attributes with value `false`, `0`, `0.0` or `""` were dropped.
 - Retention now covers `metric_points`, `host_metrics`, `uptime_results`,
