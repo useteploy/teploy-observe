@@ -1,0 +1,1 @@
+const n="obs_token",r="X-Observe-Token";function a(){try{return typeof localStorage<"u"?localStorage:null}catch{return null}}function u(o,e=a()){const t=o.headers.get(r);!t||!e||e.getItem(n)&&e.setItem(n,t)}export{u as a};

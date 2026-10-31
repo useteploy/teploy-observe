@@ -92,7 +92,16 @@ func NewAuthService(db *nucleus.Client, jwtSecret string, logger *slog.Logger) *
 	}
 }
 
-// GenerateToken creates a signed JWT with a 24-hour expiry. role is stored
+// SessionTTL is the lifetime of a browser session token. Sessions are
+// idle-sliding: JWTAuthMiddleware re-mints a token older than
+// SessionRenewAfter on use, so an active user is never logged out and an
+// idle one expires SessionTTL after their last renewal.
+const SessionTTL = 30 * 24 * time.Hour
+
+// SessionRenewAfter bounds renewal to roughly once a day per session.
+const SessionRenewAfter = 24 * time.Hour
+
+// GenerateToken creates a signed JWT with a SessionTTL expiry. role is stored
 // in the token so middleware can enforce RBAC without hitting the database
 // on every request. tokenVersion is embedded so JWTAuthMiddleware can detect
 // revocation: any credential or role change on the principal bumps its
@@ -106,7 +115,17 @@ func (s *AuthService) GenerateToken(userID, username, role string, tokenVersion 
 		"role":     normalizeRole(role),
 		"tv":       tokenVersion,
 	}
-	return neutronauth.GenerateToken(claims, s.jwtSecret, 24*time.Hour)
+	return neutronauth.GenerateToken(claims, s.jwtSecret, SessionTTL)
+}
+
+// RenewToken mints a fresh session token for a principal from its CURRENT
+// row (role and token_version), or "" when the principal no longer exists.
+func (s *AuthService) RenewToken(ctx context.Context, userID string) (string, error) {
+	p, err := s.store.ByID(ctx, userID)
+	if err != nil || p == nil {
+		return "", err
+	}
+	return s.GenerateToken(p.ID, p.Username, p.Role, p.TokenVersion)
 }
 
 // CurrentTokenVersion returns the live token_version for a principal. Used by
@@ -125,8 +144,8 @@ func (s *AuthService) ValidateToken(tokenStr string) (neutronauth.Claims, error)
 // StreamTicketTTL is how long a minted stream ticket lives. Tickets are
 // accepted at connection-open time only, so the TTL has to cover a user
 // clicking "export" or opening a log tail - not the duration of the stream
-// or download itself. Two minutes is deliberately far under the 24h general
-// token lifetime: a ticket leaking into a URL is compromised material for
+// or download itself. Two minutes is deliberately far under the general
+// session token lifetime: a ticket leaking into a URL is compromised material for
 // minutes, not a day (AUD-008).
 const StreamTicketTTL = 2 * time.Minute
 

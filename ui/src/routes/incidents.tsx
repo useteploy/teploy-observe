@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from "preact/hooks";
 import ExportButton from "../components/shared/ExportButton.js";
 import Modal from "../components/shared/Modal.js";
 import { useFilters } from "../hooks/useFilters.js";
+import { adoptRenewedToken } from "../lib/sessionToken.js";
 
 export const config = { mode: "app" };
 
@@ -33,6 +34,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
       ...(init?.headers || {}),
     },
   });
+  adoptRenewedToken(r);
   if (!r.ok) throw new Error(await r.text());
   if (r.status === 204) return undefined as T;
   return r.json();

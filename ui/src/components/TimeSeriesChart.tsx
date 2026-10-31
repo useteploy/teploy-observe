@@ -6,6 +6,7 @@ import { formatNumber } from "../utils/format.js";
 import LoadError from "./shared/LoadError.js";
 import { prepareMarkers, markerSummary } from "../utils/incidentMarkers.js";
 import type { IncidentMarker } from "../utils/incidentMarkers.js";
+import { adoptRenewedToken } from "../lib/sessionToken.js";
 
 const PAGEVIEW_COLOR = "#6366f1";
 const VISITOR_COLOR = "#22c55e";
@@ -101,7 +102,7 @@ function TimeSeriesChart() {
     fetch(`/api/v1/incidents?site_id=${encodeURIComponent(siteId)}&from=${fromMs}&to=${toMs}`, {
       headers: { Authorization: "Bearer " + (typeof localStorage !== "undefined" ? localStorage.getItem("obs_token") || "" : "") },
     })
-      .then((r) => r.ok ? r.json() : [])
+      .then((r) => { adoptRenewedToken(r); return r.ok ? r.json() : []; })
       .then((list) => { if (active) setMarkers(Array.isArray(list) ? list.map((inc: any) => ({
         id: String(inc.incident_id ?? ""),
         title: String(inc.title ?? ""),

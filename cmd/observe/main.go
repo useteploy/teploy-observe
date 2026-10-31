@@ -984,7 +984,7 @@ func main() {
 	//
 	// It is also what makes a machine consumer possible at all: a worker that
 	// wants to know whether a deploy moved a service's error rate cannot hold
-	// a 24-hour user JWT, and the ingest API keys are write-scoped. teploy-ship
+	// a 30-day sliding user JWT, and the ingest API keys are write-scoped. teploy-ship
 	// reads exactly this endpoint to put before/after telemetry on a pull
 	// request.
 	traceShared := r.Group("/api/v1/traces", jwtOrShareMW(jwtMW, shareSvc))
@@ -2964,7 +2964,7 @@ type issueSinceInput struct {
 // the issue's status and last event. Read-only and site-scoped; registered
 // on the share-token surface (jwtOrShareMW) so a machine consumer such as
 // teploy-ship can poll a fix's effect with a revocable, site-pinned token
-// instead of a person's 24h JWT. Fails closed: missing site_id, ts or
+// instead of a person's session JWT. Fails closed: missing site_id, ts or
 // release is a 400, an unknown issue is a 404.
 func issueSinceHandler(svc *obserrors.IssueService) neutron.HandlerFunc[issueSinceInput, obserrors.IssueSinceStats] {
 	return func(ctx context.Context, input issueSinceInput) (obserrors.IssueSinceStats, error) {

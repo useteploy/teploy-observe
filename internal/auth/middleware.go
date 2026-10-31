@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/neutron-build/neutron/go/neutron"
 	"github.com/neutron-build/neutron/go/neutronauth"
@@ -93,12 +94,17 @@ func queryTokenAllowed(r *http.Request) bool {
 	return false
 }
 
+// RenewedTokenHeader carries a re-minted session token on responses to
+// requests whose token is due for renewal. The dashboard is served
+// same-origin, so no CORS expose-header entry is needed.
+const RenewedTokenHeader = "X-Observe-Token"
+
 // JWTAuthMiddleware returns middleware that validates JWT tokens from the
 // Authorization: Bearer <token> header. If no admin users exist yet
 // (first-run grace period), requests are allowed through unauthenticated.
 //
 // AUD-008 (round 2): the query string accepts ONLY short-lived stream
-// tickets (?ticket=), never a normal access JWT - a 24h bearer credential
+// tickets (?ticket=), never a normal access JWT - a 30-day bearer credential
 // in a URL leaks through history, proxies, and logs. Symmetrically, a
 // stream ticket presented as an Authorization header is rejected: it is
 // not a general bearer token. Both checks run BEFORE the signature check
@@ -173,7 +179,7 @@ func JWTAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 			// match the principal's current token_version — this is what
 			// makes a password change, role change, or session revocation
 			// actually retire previously issued tokens instead of leaving
-			// them valid until their 24-hour expiry. Since migration 040
+			// them valid until their expiry. Since migration 040
 			// every principal has a row — local and issuer-namespaced OIDC
 			// alike — so the check is unconditional. A sub with no principal
 			// row (a pre-040 "oidc:<sub>" token, or a deleted principal)
@@ -199,6 +205,22 @@ func JWTAuthMiddleware(authSvc *AuthService) neutron.Middleware {
 				if tokenTV != currentTV {
 					neutron.WriteError(w, r, neutron.ErrUnauthorized("session revoked — please sign in again"))
 					return
+				}
+			}
+
+			// Sliding session: a user session token (never a stream ticket,
+			// never an API key - those don't reach this middleware) issued
+			// more than SessionRenewAfter ago is re-minted from the
+			// principal's current row and handed back in RenewedTokenHeader.
+			// Runs after the tv check, so a revoked token is never renewed.
+			// Renewal failure is not an auth failure: the presented token is
+			// still valid, so the request proceeds without a new one.
+			if !fromQuery && aud == "" && sub != "" {
+				if iat, err := claimAsInt64(claims["iat"]); err == nil &&
+					time.Since(time.Unix(iat, 0)) > SessionRenewAfter {
+					if fresh, err := authSvc.RenewToken(r.Context(), sub); err == nil && fresh != "" {
+						w.Header().Set(RenewedTokenHeader, fresh)
+					}
 				}
 			}
 

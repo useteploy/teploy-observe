@@ -1,4 +1,5 @@
 import { withProgress } from "../lib/progress.js";
+import { adoptRenewedToken } from "../lib/sessionToken.js";
 
 // Shared API helpers used by all feature modules.
 
@@ -95,6 +96,7 @@ export async function get<T>(path: string): Promise<T> {
     }
     throw new Error("Unauthorized");
   }
+  adoptRenewedToken(res);
   return readResponse<T>(res);
 }
 
@@ -110,6 +112,7 @@ export async function post<T>(path: string, body: unknown): Promise<T> {
     }
     throw new Error("Unauthorized");
   }
+  adoptRenewedToken(res);
   return readResponse<T>(res);
 }
 
@@ -125,6 +128,7 @@ export async function put<T>(path: string, body: unknown): Promise<T> {
     }
     throw new Error("Unauthorized");
   }
+  adoptRenewedToken(res);
   return readResponse<T>(res);
 }
 
@@ -140,6 +144,7 @@ export async function del<T = { ok: boolean }>(path: string): Promise<T | undefi
     }
     throw new Error("Unauthorized");
   }
+  adoptRenewedToken(res);
   return readResponse<T>(res);
 }
 

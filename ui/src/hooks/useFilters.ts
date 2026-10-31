@@ -4,6 +4,7 @@ import type { ComponentChildren } from "preact";
 import { h } from "preact";
 import { defaultRange, loadRange, saveRange } from "../utils/ranges.js";
 import type { PersistedRange } from "../utils/ranges.js";
+import { adoptRenewedToken } from "../lib/sessionToken.js";
 
 export interface DashboardState {
   siteId: string;
@@ -174,7 +175,7 @@ export function RouteFilterProvider({ children }: { children: ComponentChildren 
     const headers: Record<string, string> = {};
     if (token) headers["Authorization"] = `Bearer ${token}`;
     fetch("/api/v1/sites", { headers })
-      .then(r => r.ok ? r.json() : null)
+      .then(r => { adoptRenewedToken(r); return r.ok ? r.json() : null; })
       .then((sites: Array<{ site_id: string }> | null) => {
         if (cancelled || !sites?.length) return;
         // Prefer a configured site over the bootstrap fallback.
