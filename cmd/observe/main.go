@@ -2195,13 +2195,15 @@ func setupStatusHandler(authSvc *auth.AuthService) http.HandlerFunc {
 
 // teployNav returns the cross-product dashboard switcher entries: the current
 // app (marked, no link) plus any sibling Teploy dashboards whose URL is
-// configured via TEPLOY_NAV_{DASH,OBSERVE,SHIP}_URL. Same env convention across
-// Dash, Observe, and Ship so one set of vars drives the switcher everywhere.
+// configured via TEPLOY_NAV_{DASH,OBSERVE,SHIP,CLOUD}_URL. Same env convention
+// across Dash, Observe, and Ship so one set of vars drives the switcher
+// everywhere. Cloud is the hosted Teploy Cloud dashboard.
 func teployNav(current string) map[string]any {
 	products := []struct{ key, label, env string }{
 		{"dash", "Dash", "TEPLOY_NAV_DASH_URL"},
 		{"observe", "Observe", "TEPLOY_NAV_OBSERVE_URL"},
 		{"ship", "Ship", "TEPLOY_NAV_SHIP_URL"},
+		{"cloud", "Cloud", "TEPLOY_NAV_CLOUD_URL"},
 	}
 	apps := make([]map[string]string, 0, len(products))
 	for _, p := range products {

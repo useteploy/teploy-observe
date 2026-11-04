@@ -481,6 +481,7 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 | `OBSERVE_SMTP_FROM` | | From email address. |
 | `TEPLOY_NAV_DASH_URL` | | URL of your Teploy Dash dashboard. When set, it appears in the top-left cross-product switcher. |
 | `TEPLOY_NAV_SHIP_URL` | | URL of your Teploy Ship dashboard. When set, it appears in the top-left cross-product switcher. |
+| `TEPLOY_NAV_CLOUD_URL` | | URL of your Teploy Cloud dashboard (for example `https://cloud.teploy.com`). When set, it appears in the top-left cross-product switcher. |
 
 ### Single sign-on (OIDC)
 
