@@ -35,11 +35,12 @@ func TestClassifyReadOnlySQL(t *testing.T) {
 		"MERGE INTO x",
 		"CALL proc()",
 		"EXECUTE stmt",
-		"WITH t AS (SELECT 1) DELETE FROM events",         // buried in CTE
-		"/* comment */ UPDATE events SET x = 1",           // after comment
-		"EXPLAIN ANALYZE INSERT INTO events VALUES (1)",   // after EXPLAIN
-		"SELECT 1; DROP TABLE events",                     // stacked
-		"SELECT 1 /* /* */ 'x */ DELETE FROM events -- '", // nested comment
+		"WITH t AS (SELECT 1) DELETE FROM events",       // buried in CTE
+		"/* comment */ UPDATE events SET x = 1",         // after comment
+		"EXPLAIN ANALYZE INSERT INTO events VALUES (1)", // after EXPLAIN
+		"SELECT 1; DROP TABLE events",                   // stacked
+		"SELECT 1 /* /* */ 'x */ DELETE FROM events -- '",
+		"SELECT $$ ' $$; DELETE FROM events -- '", // nested comment
 		"", // empty
 	}
 	for _, q := range reject {

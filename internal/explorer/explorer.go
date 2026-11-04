@@ -304,6 +304,8 @@ func ClassifyReadOnlySQL(sql string) (stmtKind, error) {
 			if i < n {
 				i++
 			}
+		case c == '$':
+			return stmtUnknown, fmt.Errorf("dollar-quoted strings and parameters are not allowed")
 		case c == ';':
 			// Reject any `;` except as the very last non-whitespace char.
 			for j := i + 1; j < n; j++ {
