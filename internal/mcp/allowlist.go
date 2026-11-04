@@ -305,6 +305,9 @@ func lex(sql string) ([]token, error) {
 		case c == '/' && i+1 < n && sql[i+1] == '*':
 			i += 2
 			for i+1 < n && !(sql[i] == '*' && sql[i+1] == '/') {
+				if sql[i] == '/' && sql[i+1] == '*' {
+					return nil, fmt.Errorf("nested block comments are not supported over MCP")
+				}
 				i++
 			}
 			if i+1 >= n {
@@ -362,6 +365,8 @@ func lex(sql string) ([]token, error) {
 			}
 			word := sql[start:i]
 			out = append(out, token{kind: tokIdent, text: strings.ToLower(word), upper: strings.ToUpper(word)})
+		case c == '$':
+			return nil, fmt.Errorf("dollar-quoted strings and parameters are not supported over MCP")
 		default:
 			out = append(out, token{kind: tokPunct, text: string(c)})
 			i++

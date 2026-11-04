@@ -251,3 +251,27 @@ func TestCredentialAndFunctionBoundaries(t *testing.T) {
 		}
 	}
 }
+
+// The store's SQL dialect nests block comments and supports dollar-quoted
+// strings; a lexer that disagreed on either would see a literal where the
+// store sees SQL. Both shapes are refused outright.
+func TestCheckRefusesLexerDesyncShapes(t *testing.T) {
+	for name, sql := range map[string]string{
+		"nested block comment": "SELECT count(*) AS n FROM stats_daily /* /* */ ' */ UNION SELECT distinct_id FROM events -- '",
+		"dollar quote":         "SELECT count(*) AS n FROM stats_daily WHERE country = $$ ' $$ UNION SELECT distinct_id FROM events -- '",
+		"tagged dollar quote":  "SELECT count(*) AS n FROM stats_daily WHERE country = $country$ ' $country$ UNION SELECT distinct_id FROM events -- '",
+		"parameter":            "SELECT count(*) AS n FROM stats_daily WHERE country = $1",
+	} {
+		if err := Check(sql); err == nil {
+			t.Errorf("%s: not refused: %q", name, sql)
+		}
+	}
+	for _, sql := range []string{
+		"SELECT count(*) AS n FROM stats_daily WHERE country = '$$'",
+		"SELECT count(*) AS n FROM stats_daily /* a * / b */",
+	} {
+		if err := Check(sql); err != nil {
+			t.Errorf("legitimate query refused: %q -> %v", sql, err)
+		}
+	}
+}
