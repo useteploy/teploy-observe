@@ -271,6 +271,9 @@ func ClassifyReadOnlySQL(sql string) (stmtKind, error) {
 			// block comment until */
 			i += 2
 			for i+1 < n && !(sql[i] == '*' && sql[i+1] == '/') {
+				if sql[i] == '/' && sql[i+1] == '*' {
+					return stmtUnknown, fmt.Errorf("nested block comments are not allowed")
+				}
 				i++
 			}
 			if i+1 < n {
