@@ -33,7 +33,7 @@ type AuditEvent struct {
 	SiteID    string `json:"site_id" db:"site_id"`
 	Timestamp int64  `json:"timestamp" db:"timestamp"`
 	Actor     string `json:"actor" db:"actor"`           // username / api-key id / agent id ("" = system)
-	ActorType string `json:"actor_type" db:"actor_type"` // user | apikey | agent | system
+	ActorType string `json:"actor_type" db:"actor_type"` // user | apikey | agent | service | system
 	Action    string `json:"action" db:"action"`         // dotted verb, e.g. auth.login, user.create, sql.run
 	Target    string `json:"target" db:"target"`         // resource acted on (id/name), optional
 	Result    string `json:"result" db:"result"`         // success | failure | denied
@@ -64,10 +64,11 @@ const (
 
 // Actor-type constants.
 const (
-	ActorUser   = "user"
-	ActorAPIKey = "apikey"
-	ActorAgent  = "agent"
-	ActorSystem = "system"
+	ActorUser    = "user"
+	ActorAPIKey  = "apikey"
+	ActorAgent   = "agent"
+	ActorService = "service"
+	ActorSystem  = "system"
 )
 
 const (

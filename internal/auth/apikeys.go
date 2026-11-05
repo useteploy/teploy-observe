@@ -85,6 +85,9 @@ type APIKeyInfo struct {
 	CreatedAt string   `json:"created_at"`
 	Revoked   bool     `json:"revoked"`
 	Scopes    []string `json:"scopes"`
+	// CreatedBy is who minted the key: a username, or "service:<token id>" for
+	// a service token. Empty for keys that predate provenance (migration 067).
+	CreatedBy string `json:"created_by,omitempty"`
 }
 
 // ValidatedKey is the outcome of a successful key validation.
@@ -99,6 +102,13 @@ type ValidatedKey struct {
 // telemetry-only — a browser-exposed ingest key must never silently carry
 // artifact-publication power.
 func (s *AuthService) CreateAPIKey(ctx context.Context, siteID, label string, scopes []string) (plaintext string, info APIKeyInfo, err error) {
+	return s.CreateAPIKeyBy(ctx, siteID, label, "", scopes)
+}
+
+// CreateAPIKeyBy is CreateAPIKey with provenance. The provenance row is written
+// first: a failure there mints nothing, and a crash after it leaves a row that
+// names no live key rather than a live key that names no creator.
+func (s *AuthService) CreateAPIKeyBy(ctx context.Context, siteID, label, createdBy string, scopes []string) (plaintext string, info APIKeyInfo, err error) {
 	sql := s.db.SQL()
 
 	normalized, err := NormalizeScopes(scopes)
@@ -120,6 +130,15 @@ func (s *AuthService) CreateAPIKey(ctx context.Context, siteID, label string, sc
 	now := time.Now().UnixMilli()
 	nowStr := dbutil.IntParam(now)
 
+	if createdBy != "" {
+		if _, err := sql.Exec(ctx,
+			"INSERT INTO api_key_provenance (tenant_id, key_id, site_id, created_by, created_at) VALUES ('default', $1, $2, $3, $4)",
+			keyID, siteID, createdBy, nowStr,
+		); err != nil {
+			return "", APIKeyInfo{}, fmt.Errorf("auth: store key provenance: %w", err)
+		}
+	}
+
 	_, err = sql.Exec(ctx,
 		"INSERT INTO api_keys (key_id, tenant_id, site_id, key_hash, label, created_at, revoked, scopes) VALUES ($1, $2, $3, $4, $5, $6, 'false', $7)",
 		keyID, "default", siteID, keyHash, label, nowStr, scopesStr,
@@ -135,6 +154,7 @@ func (s *AuthService) CreateAPIKey(ctx context.Context, siteID, label string, sc
 		CreatedAt: nowStr,
 		Revoked:   false,
 		Scopes:    normalized,
+		CreatedBy: createdBy,
 	}
 	return plaintext, info, nil
 }
@@ -267,6 +287,17 @@ func (s *AuthService) ListAPIKeys(ctx context.Context, siteID string) ([]APIKeyI
 	if err != nil {
 		return nil, fmt.Errorf("auth: list api keys: %w", err)
 	}
+	provenance, err := nucleus.Query[struct {
+		KeyID     string `db:"key_id"`
+		CreatedBy string `db:"created_by"`
+	}](ctx, sql, "SELECT key_id, created_by FROM api_key_provenance WHERE site_id = $1", siteID)
+	if err != nil {
+		return nil, fmt.Errorf("auth: list key provenance: %w", err)
+	}
+	createdBy := make(map[string]string, len(provenance))
+	for _, p := range provenance {
+		createdBy[p.KeyID] = p.CreatedBy
+	}
 
 	result := make([]APIKeyInfo, len(rows))
 	for i, r := range rows {
@@ -277,6 +308,7 @@ func (s *AuthService) ListAPIKeys(ctx context.Context, siteID string) ([]APIKeyI
 			CreatedAt: r.CreatedAt,
 			Revoked:   r.Revoked == "true",
 			Scopes:    strings.Split(r.Scopes, ","),
+			CreatedBy: createdBy[r.KeyID],
 		}
 	}
 	return result, nil
