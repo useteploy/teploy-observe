@@ -111,6 +111,9 @@ func main() {
 		case "migrate":
 			runMigrate(cfg, logger)
 			return
+		case "reidentify":
+			runReidentify(logger, cfg, os.Args[2:])
+			return
 		case "version":
 			fmt.Println("observe " + version)
 			return
@@ -1864,6 +1867,7 @@ Usage:
   teploy-observe backup       Stream a tar archive of all tables to stdout.
   teploy-observe restore      Read a tar archive from stdin and insert into tables.
   teploy-observe migrate      Apply migrations without seeding (restore runbook step).
+  observe reidentify --yes    Give a restored copy a new instance_id; revokes all service tokens.
   observe upgrade             Verify and install a release through systemd.
   observe reindex             Rebuild the FTS index from error_events.
   observe version             Print the Observe version.

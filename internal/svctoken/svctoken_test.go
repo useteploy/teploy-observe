@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/neutron-build/neutron/go/nucleus"
@@ -100,6 +101,13 @@ func TestStoreLifecycleAgainstEngine(t *testing.T) {
 	if _, err := s.Verify(ctx, Prefix+"not-a-real-secret"); !errors.Is(err, ErrInvalid) {
 		t.Errorf("unknown token: err = %v", err)
 	}
+	wellFormed := Prefix + strings.Repeat("A", secretEncodedLen)
+	if !ValidFormat(wellFormed) || !ValidFormat(plaintext) {
+		t.Fatal("ValidFormat must accept the shape Create mints")
+	}
+	if _, err := s.Verify(ctx, wellFormed); !errors.Is(err, ErrInvalid) {
+		t.Errorf("well-formed unknown token: err = %v", err)
+	}
 	if _, err := s.Verify(ctx, "obs_0123"); !errors.Is(err, ErrInvalid) {
 		t.Errorf("telemetry key shape: err = %v", err)
 	}
@@ -142,5 +150,129 @@ func TestCreateRefusesMissingAdminAndBadInput(t *testing.T) {
 	}
 	if _, _, err := s.Create(ctx, "x", "", "root", []string{"users:write"}); err == nil {
 		t.Error("an unknown scope must be refused")
+	}
+}
+
+func rowCount(t *testing.T, s *Store, id string) int {
+	t.Helper()
+	rows, err := nucleus.Query[struct {
+		UpdatedAt int64 `db:"updated_at"`
+	}](context.Background(), s.db.SQL(), "SELECT updated_at FROM service_tokens WHERE token_id = $1", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(rows)
+}
+
+// Every last-used write is an append, so without pruning the table grows for as
+// long as the token lives. Writing on every verify is the worst case.
+func TestLastUsedWritesDoNotGrowTheTable(t *testing.T) {
+	ctx := context.Background()
+	s := engineStore(t)
+	s.usedInterval = 0
+	plaintext, tok, err := s.Create(ctx, "bounded", "", "root", []string{ScopeSitesCreate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var last int64
+	for i := 0; i < 25; i++ {
+		got, err := s.Verify(ctx, plaintext)
+		if err != nil {
+			t.Fatalf("verify %d: %v", i, err)
+		}
+		if got.ID != tok.ID || got.Name != "bounded" || got.CreatedBy != "root" || !got.Has(ScopeSitesCreate) {
+			t.Fatalf("verify %d lost the record: %+v", i, got)
+		}
+		last = got.LastUsedAt
+	}
+	if n := rowCount(t, s, tok.ID); n > 2 {
+		t.Fatalf("%d rows after 25 writes, want a small constant", n)
+	}
+	list, err := s.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range list {
+		if l.ID == tok.ID && l.LastUsedAt != last {
+			t.Fatalf("last_used_at = %d, want %d", l.LastUsedAt, last)
+		}
+	}
+
+	// The prune must never take a revocation with it, including when a verify that
+	// read before the revoke appends after it.
+	stale, err := s.Verify(ctx, plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Revoke(ctx, tok.ID); err != nil {
+		t.Fatal(err)
+	}
+	s.noteUsed(ctx, stale)
+	if _, err := s.Verify(ctx, plaintext); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("a stale last-used write undid a revocation: err = %v", err)
+	}
+}
+
+func TestLastUsedIsThrottledInProcess(t *testing.T) {
+	ctx := context.Background()
+	s := engineStore(t)
+	plaintext, tok, err := s.Create(ctx, "throttled", "", "root", []string{ScopeSitesCreate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.Verify(ctx, plaintext); err != nil {
+				t.Errorf("verify: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := rowCount(t, s, tok.ID); n > 2 {
+		t.Fatalf("%d rows after one interval's verifies", n)
+	}
+}
+
+func TestRevokeAll(t *testing.T) {
+	ctx := context.Background()
+	s := engineStore(t)
+	plaintext, _, err := s.Create(ctx, "revoke-all", "", "root", []string{ScopeSitesCreate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.RevokeAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < 1 {
+		t.Fatalf("revoked %d", n)
+	}
+	if _, err := s.Verify(ctx, plaintext); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("err = %v", err)
+	}
+	if n, err := s.RevokeAll(ctx); err != nil || n != 0 {
+		t.Fatalf("second run revoked %d, err %v", n, err)
+	}
+}
+
+func TestCreateSeparatesInputFromStoreFailure(t *testing.T) {
+	ctx := context.Background()
+	if _, _, err := NewStore(nil).Create(ctx, "", "", "root", []string{ScopeSitesCreate}); !errors.Is(err, ErrInvalidRequest) {
+		t.Errorf("blank name: err = %v", err)
+	}
+	s := engineStore(t)
+	dsn := nucleustest.DSN(t)
+	closed, err := nucleus.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed.Close()
+	_ = s
+	_, _, err = NewStore(closed).Create(ctx, "n", "", "root", []string{ScopeSitesCreate})
+	if err == nil || errors.Is(err, ErrInvalidRequest) || !errors.Is(err, ErrUnavailable) {
+		t.Errorf("closed store: err = %v, want ErrUnavailable", err)
 	}
 }

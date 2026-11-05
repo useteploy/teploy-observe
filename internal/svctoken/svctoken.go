@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -111,31 +112,63 @@ var ErrUnavailable = errors.New("service token store unavailable")
 // ErrNotFound means no token has the given id.
 var ErrNotFound = errors.New("service token not found")
 
-// lastUsedInterval throttles last-used writes. Every write here is an append.
-const lastUsedInterval = 5 * time.Minute
+// ErrInvalidRequest means a create was refused for what it asked for, as opposed
+// to the store failing. Its message is safe to show the caller.
+var ErrInvalidRequest = errors.New("invalid service token request")
+
+// lastUsedInterval throttles last-used writes. Every write is an append, and each
+// one prunes the rows it supersedes, so a token holds a small constant number of
+// rows however long it lives. See noteUsed.
+const lastUsedInterval = time.Hour
+
+// secretEncodedLen is the base64url length of the 32-byte secret.
+const secretEncodedLen = 43
 
 const maxLabelLen = 128
 
 // Store persists service tokens in Nucleus.
 type Store struct {
 	db *nucleus.Client
-	mu sync.Mutex
+	// mu guards stamped only. It is never held across a store call: verification
+	// is on every request's path and must not queue behind the database.
+	mu      sync.Mutex
+	stamped map[string]int64
+	// usedInterval is lastUsedInterval; tests shorten it.
+	usedInterval time.Duration
 }
 
 // NewStore wires the store to the shared Nucleus client.
-func NewStore(db *nucleus.Client) *Store { return &Store{db: db} }
+func NewStore(db *nucleus.Client) *Store {
+	return &Store{db: db, stamped: map[string]int64{}, usedInterval: lastUsedInterval}
+}
+
+// ValidFormat reports whether v has the shape of a token this package mints. It
+// says nothing about whether the token exists. Callers use it to tell a refused
+// credential worth recording from background noise.
+func ValidFormat(v string) bool {
+	secret, ok := strings.CutPrefix(v, Prefix)
+	if !ok || len(secret) != secretEncodedLen {
+		return false
+	}
+	_, err := base64.RawURLEncoding.DecodeString(secret)
+	return err == nil
+}
+
+func invalidRequest(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrInvalidRequest, fmt.Sprintf(format, args...))
+}
 
 // cleanLabel validates a human-chosen identifier.
 func cleanLabel(field, v string) (string, error) {
 	v = strings.TrimSpace(v)
 	if v == "" {
-		return "", fmt.Errorf("%s is required", field)
+		return "", invalidRequest("%s is required", field)
 	}
 	if len(v) > maxLabelLen {
-		return "", fmt.Errorf("%s is longer than %d bytes", field, maxLabelLen)
+		return "", invalidRequest("%s is longer than %d bytes", field, maxLabelLen)
 	}
 	if strings.IndexFunc(v, unicode.IsControl) >= 0 {
-		return "", fmt.Errorf("%s contains control characters", field)
+		return "", invalidRequest("%s contains control characters", field)
 	}
 	return v, nil
 }
@@ -157,11 +190,11 @@ func (s *Store) Create(ctx context.Context, name, managedBy, createdBy string, s
 		return "", Token{}, err
 	}
 	if strings.TrimSpace(createdBy) == "" {
-		return "", Token{}, errors.New("a service token must be created by an authenticated admin")
+		return "", Token{}, invalidRequest("a service token must be created by an authenticated admin")
 	}
 	normalized, err := NormalizeScopes(scopes)
 	if err != nil {
-		return "", Token{}, err
+		return "", Token{}, invalidRequest("%s", err)
 	}
 	secret := make([]byte, 32)
 	if _, err := rand.Read(secret); err != nil {
@@ -207,8 +240,6 @@ func (s *Store) List(ctx context.Context) ([]Token, error) {
 // acted. A success return means a read of the store sees the revocation; a
 // write that is not visible must not be reported as done.
 func (s *Store) Revoke(ctx context.Context, id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	rows, err := s.read(ctx, "token_id = $1", id)
 	if err != nil {
 		return fmt.Errorf("svctoken: revoke: %w", err)
@@ -235,16 +266,34 @@ func (s *Store) Revoke(ctx context.Context, id string) error {
 	return nil
 }
 
-// Verify resolves a presented plaintext to its live token. It returns
-// ErrInvalid for anything that is not one and ErrUnavailable when the store
-// cannot answer; neither lets a request through.
+// RevokeAll retires every live token and reports how many it revoked.
+func (s *Store) RevokeAll(ctx context.Context) (int, error) {
+	rows, err := s.read(ctx, "")
+	if err != nil {
+		return 0, fmt.Errorf("svctoken: revoke all: %w", err)
+	}
+	revoked := 0
+	for _, t := range rows {
+		if t.Revoked() {
+			continue
+		}
+		if err := s.Revoke(ctx, t.ID); err != nil {
+			return revoked, err
+		}
+		revoked++
+	}
+	return revoked, nil
+}
+
+// Verify resolves a presented plaintext to its live token. It returns ErrInvalid
+// for anything that is not one and ErrUnavailable when the store cannot answer;
+// neither lets a request through. A value of the wrong shape never reaches the
+// store, so anonymous traffic costs nothing here.
 func (s *Store) Verify(ctx context.Context, plaintext string) (Token, error) {
-	if !strings.HasPrefix(plaintext, Prefix) {
+	if !ValidFormat(plaintext) {
 		return Token{}, ErrInvalid
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.read(ctx, "")
+	rows, err := s.read(ctx, "hash = $1", hashToken(plaintext))
 	if err != nil {
 		return Token{}, fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
@@ -252,15 +301,46 @@ func (s *Store) Verify(ctx context.Context, plaintext string) (Token, error) {
 	if !ok {
 		return Token{}, ErrInvalid
 	}
+	return s.noteUsed(ctx, tok), nil
+}
+
+// noteUsed records last-used at most once per interval, per process, then removes
+// the rows that write superseded. Without the prune this table grows forever, since
+// every write is an append; with it a token holds one row plus any in-flight
+// writes, which is what makes the hash lookup in Verify bounded.
+//
+// A failure here never fails the request: last-used is informational. Revoked rows
+// are never pruned, because a revocation has to survive whatever a concurrent
+// verify appended from a read taken before it.
+func (s *Store) noteUsed(ctx context.Context, tok Token) Token {
 	now := time.Now().UTC().UnixMilli()
-	if now-tok.LastUsedAt >= lastUsedInterval.Milliseconds() {
-		used := tok
-		used.LastUsedAt = now
-		if err := s.write(ctx, used, tok.updatedAt, now); err == nil {
-			tok.LastUsedAt = now
-		}
+	interval := s.usedInterval.Milliseconds()
+	if now-tok.LastUsedAt < interval && interval > 0 {
+		return tok
 	}
-	return tok, nil
+	s.mu.Lock()
+	due := interval == 0 || now-s.stamped[tok.ID] >= interval
+	if due {
+		s.stamped[tok.ID] = now
+	}
+	s.mu.Unlock()
+	if !due {
+		return tok
+	}
+	used := tok
+	used.LastUsedAt = now
+	version := nextUpdatedAt(tok.updatedAt, now)
+	if err := s.write(ctx, used, tok.updatedAt, now); err != nil {
+		slog.Warn("service token last-used write failed", "token_id", tok.ID, "err", err)
+		return tok
+	}
+	if _, err := s.db.SQL().Exec(ctx,
+		"DELETE FROM service_tokens WHERE tenant_id = 'default' AND token_id = $1 AND revoked_at = 0 AND updated_at < $2",
+		tok.ID, dbutil.IntParam(version),
+	); err != nil {
+		slog.Warn("service token row prune failed", "token_id", tok.ID, "err", err)
+	}
+	return used
 }
 
 // match is the pure selection step of Verify: a constant-time comparison
@@ -301,7 +381,7 @@ func (s *Store) write(ctx context.Context, t Token, prior, now int64) error {
 		dbutil.IntParam(t.CreatedAt), dbutil.IntParam(t.LastUsedAt),
 		dbutil.IntParam(t.RevokedAt), dbutil.IntParam(nextUpdatedAt(prior, now)))
 	if err != nil {
-		return fmt.Errorf("svctoken: write: %w", err)
+		return fmt.Errorf("%w: write: %w", ErrUnavailable, err)
 	}
 	return nil
 }

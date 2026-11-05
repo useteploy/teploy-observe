@@ -24,7 +24,11 @@ GET /.well-known/teploy.json
 ```
 
 Unauthenticated, no secrets. `instance_id` is generated once and stored in the
-database, so it survives container replacement and a restore brings it back.
+database, so it survives container replacement and a restore brings it back. That
+also means a restored copy looks like the original: same id, same tokens. If the copy
+will run alongside the original, run `observe reidentify --yes` before starting it,
+which gives it a new id and revokes every service token. See
+`docs/operations/backup-restore.md`.
 
 - `dashboard_url` is `OBSERVE_DASHBOARD_URL`, which nothing else reads. With no
   separate ingest listener it falls back to `OBSERVE_PUBLIC_URL`. With a separate
