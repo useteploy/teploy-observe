@@ -1348,7 +1348,9 @@ func main() {
 	(&serviceAPI{
 		tokens: svcStore, sites: siteSvc, keys: authSvc, shares: shareSvc,
 		webhooks: webhookSvc, alerts: alertSvc, audit: auditSvc,
+		limit: ipRateLimitMW(ingest.NewRateLimiter(300, time.Minute, 600)),
 	}).register(r)
+	r.Handle("POST /api/v1/sites/{site_id}/adopt", jwtMW(requireAdmin(boundedRequestBody(64<<10)(adoptSiteHandler(siteSvc, auditSvc)))))
 
 	// --- Discovery (unauthenticated; carries no secrets) ---
 	r.HandleFunc("GET /.well-known/teploy.json", discoveryHandler(newDiscovery(cfg, instanceID)))
@@ -5873,7 +5875,13 @@ func createWebhookHandler(svc *platform.WebhookService) neutron.HandlerFunc[crea
 		if input.SiteID == "" || input.URL == "" {
 			return platform.Webhook{}, neutron.ErrBadRequest("site_id and url required")
 		}
+		if err := svc.ValidateDestination(input.URL); err != nil {
+			return platform.Webhook{}, neutron.ErrBadRequest(err.Error())
+		}
 		w, err := svc.Create(ctx, input.SiteID, input.Name, input.WebhookType, input.URL, input.Severities, input.Kinds)
+		if errors.Is(err, platform.ErrInvalidWebhook) {
+			return platform.Webhook{}, neutron.ErrBadRequest(err.Error())
+		}
 		if err != nil {
 			return platform.Webhook{}, err
 		}

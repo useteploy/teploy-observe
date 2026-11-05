@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"sync"
 	"testing"
 
@@ -169,5 +170,58 @@ func TestDeletedManagedSiteIsNotResurrected(t *testing.T) {
 	}
 	if !created || next.SiteID == first.SiteID {
 		t.Fatalf("expected a fresh site, got %+v created=%v", next, created)
+	}
+}
+
+func TestAdoptHandsAnOperatorSiteToAManager(t *testing.T) {
+	ctx := context.Background()
+	s := managedTestService(t)
+	plain, err := s.Create(ctx, "fylun.example.com", "Fylun")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, ref := "dash-"+uniqueRef(t), uniqueRef(t)
+
+	if owned, _ := s.IsManagedBy(ctx, plain.SiteID, manager); owned {
+		t.Fatal("not owned before adoption")
+	}
+	site, adopted, err := s.Adopt(ctx, plain.SiteID, manager, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !adopted || site.SiteID != plain.SiteID || site.ManagedBy != manager || site.ExternalRef != ref || site.Domain != "fylun.example.com" {
+		t.Fatalf("adopted = %v site = %+v", adopted, site)
+	}
+	if owned, err := s.IsManagedBy(ctx, plain.SiteID, manager); err != nil || !owned {
+		t.Fatalf("owned = %v, err = %v", owned, err)
+	}
+	// The idempotent create now finds this site instead of making another.
+	found, created, err := s.EnsureManaged(ctx, manager, ref, "", "Other")
+	if err != nil || created || found.SiteID != plain.SiteID {
+		t.Fatalf("ensure after adopt: %+v created=%v err=%v", found, created, err)
+	}
+
+	again, adopted, err := s.Adopt(ctx, plain.SiteID, manager, ref)
+	if err != nil || adopted || again.SiteID != plain.SiteID {
+		t.Fatalf("retry: %+v adopted=%v err=%v", again, adopted, err)
+	}
+
+	for name, tc := range map[string]struct{ manager, ref string }{
+		"another manager":      {"someone-else", ref},
+		"same manager new ref": {manager, uniqueRef(t)},
+	} {
+		if _, _, err := s.Adopt(ctx, plain.SiteID, tc.manager, tc.ref); !errors.Is(err, ErrManagementConflict) {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+	other, err := s.Create(ctx, "other.example.com", "Other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Adopt(ctx, other.SiteID, manager, ref); !errors.Is(err, ErrManagementConflict) {
+		t.Errorf("one ref, two sites: err = %v", err)
+	}
+	if _, _, err := s.Adopt(ctx, "no-such-site", manager, uniqueRef(t)); !errors.Is(err, ErrSiteNotFound) {
+		t.Errorf("missing site: err = %v", err)
 	}
 }

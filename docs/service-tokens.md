@@ -61,8 +61,8 @@ GET    /api/v1/service-tokens              -> 200 [record, ...]
 DELETE /api/v1/service-tokens/{token_id}   -> 200 {"ok": true}
 ```
 
-The token is shown once and stored as a SHA-256 hash. A signed-in admin is
-required even during the first-run grace period, when every other route is open.
+The token is shown once and stored as a SHA-256 hash. All three routes require a
+signed-in admin, even during the first-run grace period, when other routes are open.
 
 | Scope | Allows |
 |---|---|
@@ -86,8 +86,8 @@ its whole route table to hold this.
 to the token's name, so a replacement token with the same manager name keeps its
 sites after the old one is revoked. Every `{site_id}` route is limited to the
 manager's own sites, and answers a foreign site exactly like a missing one (404).
-Sites an operator created have no manager and cannot be reached; there is no
-adoption path yet. This covers `share:mint`, `webhooks:write` and `alerts:read`
+Sites an operator created have no manager and cannot be reached until an admin adopts
+them (below). This covers `share:mint`, `webhooks:write` and `alerts:read`
 too, because a share link on someone else's site would be a telemetry read, and a
 webhook there an outbound feed.
 
@@ -96,11 +96,44 @@ access to its own sites' dashboards at one remove. That is how machine reads sta
 on one credential instead of growing another. Grant it only to a client that should
 have that.
 
+**What a token mints outlives it.** Revoking a token does not touch the telemetry
+keys, share links or webhooks it made. To find them, filter the audit log by the token
+id as actor: the result row of `service.keys.mint` names the `key_id`, of
+`service.share.mint` the `share_link_id`, and of `service.webhooks.write` the
+`webhook_id` and `webhook_host`. Keys also report `created_by: service:<token id>`.
+Revoke each under Settings.
+
+**`webhooks:write` sends data out.** Alert titles can carry error text from your data,
+and a token can point a webhook at any public URL. Grant it only to a client you would
+trust with that text.
+
 **Audit.** Writes record `started` before they run and the result after; if the
-first write fails, the call returns 503 and changes nothing. Every refusal is
-recorded. Successful reads are not, since `alerts:read` is meant to be polled and
-`last_used_at` shows the token is alive. Actor type is `service`, actor is the token
-id, and no row holds a credential or request body.
+first write fails, the call returns 503 and changes nothing. Refusals of anything
+shaped like a token are recorded. Requests with nothing token-shaped are not, since
+anyone who can reach the port can send those; they get a 401 and never reach the
+store. Successful reads are not recorded, since `alerts:read` is meant to be polled and
+`last_used_at`, updated at most hourly, shows the token is alive. Requests are limited
+to 300 a minute per client IP. Actor type is `service`, actor is the token id, and no
+row holds a credential or request body.
+
+## Adopting an existing site
+
+Sites created before a manager existed need an admin to hand them over:
+
+```
+POST /api/v1/sites/{site_id}/adopt            (signed-in admin)
+{"managed_by": "teploy-dash", "external_ref": "app:fylun"}
+-> 201 {"adopted": true,  "site": {...}}
+-> 200 {"adopted": false, "site": {...}}      already exactly this; a retry is harmless
+-> 404                                        no such site
+-> 409                                        site has another manager or ref, or this
+                                              manager already uses that ref
+```
+
+After this, `POST /api/v1/service/sites` with that ref returns this site. Adoption
+exposes what the site already holds: a token with `share:mint` under that manager can
+read it. It never moves a site between managers. It is recorded as `sites.adopt` with
+the manager and ref, and a service token cannot call it.
 
 ## Service API
 
@@ -112,7 +145,8 @@ unknown field is a 400. Errors are `{"error": "..."}`.
 | 401 | missing, invalid or revoked token |
 | 403 | token lacks the scope |
 | 404 | site not found or not this manager's |
-| 503 + `Retry-After` | store or audit unavailable; nothing changed, retry. Not a verdict on the token |
+| 429 + `Retry-After` | over the per-IP request limit |
+| 503 + `Retry-After` | store or audit unavailable; retry. Not a verdict on the token |
 
 ### Create a site by external reference
 
@@ -164,8 +198,10 @@ GET /api/v1/service/sites/{site_id}/alerts/history?limit=  -> 200 [entry, ...]
 ```
 
 `ttl_days` defaults to 30 and accepts up to 3650. History `limit` defaults to 20 and
-caps at 200. Webhook destinations are checked the same way as admin-created ones,
-including the dial-time block on private addresses.
+caps at 200. Webhook destinations are checked the same way as admin-created ones: a
+literal private, loopback or metadata address, or a `localhost` name, is a 400 at create
+unless `OBSERVE_WEBHOOK_ALLOW_CIDRS` covers it. A hostname that resolves to a private
+address passes create and is blocked at delivery, with a warning in the server log.
 
 ## Environment contract for an app
 

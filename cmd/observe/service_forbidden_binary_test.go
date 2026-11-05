@@ -79,6 +79,7 @@ var mustRefuse = []string{
 	"GET /api/v1/sites",
 	"POST /api/v1/sites",
 	"POST /api/v1/sites/{site_id}/keys",
+	"POST /api/v1/sites/{site_id}/adopt",
 	"GET /api/v1/sites/{site_id}/keys",
 	"DELETE /api/v1/keys/{key_id}",
 	"POST /api/v1/sites/{site_id}/share",

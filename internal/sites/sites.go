@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -348,6 +349,75 @@ func (s *SiteService) EnsureManaged(ctx context.Context, managedBy, externalRef,
 		CreatedAt: now, SessionSalt: sessionSalt,
 		ExternalRef: externalRef, ManagedBy: managedBy,
 	}, true, nil
+}
+
+// ErrSiteNotFound means the site to adopt does not exist.
+var ErrSiteNotFound = errors.New("site not found")
+
+// ErrManagementConflict means adoption would give a site a second owner, or give a
+// manager two sites for one ref, which would break EnsureManaged's idempotence.
+var ErrManagementConflict = errors.New("site management conflict")
+
+// Adopt hands an existing operator site to a manager under an external ref, so a
+// service token can then reach it. It returns false when the site is already
+// exactly that, so a retry is harmless. It never moves a site between managers:
+// that would silently take it away from the first one, so the caller has to refuse
+// and an operator has to decide.
+func (s *SiteService) Adopt(ctx context.Context, siteID, managedBy, externalRef string) (Site, bool, error) {
+	if managedBy == "" || externalRef == "" {
+		return Site{}, false, fmt.Errorf("sites: adoption needs a manager and an external ref")
+	}
+	s.managedMu.Lock()
+	defer s.managedMu.Unlock()
+
+	exists, err := s.Exists(ctx, siteID)
+	if err != nil {
+		return Site{}, false, err
+	}
+	if !exists {
+		return Site{}, false, ErrSiteNotFound
+	}
+	sql := s.db.SQL()
+	current, err := nucleus.Query[managementRow](ctx, sql,
+		"SELECT site_id, managed_by, external_ref, created_at FROM site_management WHERE site_id = $1", siteID)
+	if err != nil {
+		return Site{}, false, fmt.Errorf("sites: read site manager: %w", err)
+	}
+	for _, m := range current {
+		if m.ManagedBy != managedBy || m.ExternalRef != externalRef {
+			return Site{}, false, fmt.Errorf("%w: site is already managed by %q as %q", ErrManagementConflict, m.ManagedBy, m.ExternalRef)
+		}
+	}
+	adopted := len(current) == 0
+	if adopted {
+		taken, err := nucleus.Query[managementRow](ctx, sql,
+			"SELECT site_id, managed_by, external_ref, created_at FROM site_management WHERE managed_by = $1 AND external_ref = $2",
+			managedBy, externalRef)
+		if err != nil {
+			return Site{}, false, fmt.Errorf("sites: read managed refs: %w", err)
+		}
+		for _, m := range taken {
+			live, err := s.Exists(ctx, m.SiteID)
+			if err != nil {
+				return Site{}, false, err
+			}
+			if live {
+				return Site{}, false, fmt.Errorf("%w: %q already names site %s for this manager", ErrManagementConflict, externalRef, m.SiteID)
+			}
+		}
+		if _, err := sql.Exec(ctx,
+			"INSERT INTO site_management (tenant_id, site_id, managed_by, external_ref, created_at) VALUES ('default', $1, $2, $3, $4)",
+			siteID, managedBy, externalRef, dbutil.IntParam(time.Now().UnixMilli()),
+		); err != nil {
+			return Site{}, false, fmt.Errorf("sites: record adoption: %w", err)
+		}
+	}
+	site, err := s.Get(ctx, siteID)
+	if err != nil {
+		return Site{}, false, err
+	}
+	site.ExternalRef, site.ManagedBy = externalRef, managedBy
+	return site, adopted, nil
 }
 
 // IsManagedBy reports whether a live site belongs to managedBy. An empty

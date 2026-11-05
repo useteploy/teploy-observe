@@ -42,13 +42,16 @@ import (
 
 const (
 	maxExternalRefLen  = 256
+	maxManagedByLen    = 128
 	maxSiteFieldLen    = 255
 	serviceBodyLimit   = 64 << 10
 	maxServiceHistory  = 200
+	maxAuditFieldLen   = 256
 	serviceKeyActorFmt = "service:%s"
 )
 
 type serviceWebhooks interface {
+	ValidateDestination(url string) error
 	Create(ctx context.Context, siteID, name, webhookType, url, severities, kinds string) (*platform.Webhook, error)
 	List(ctx context.Context, siteID string) ([]platform.Webhook, error)
 	Delete(ctx context.Context, webhookID string) error
@@ -67,10 +70,21 @@ type serviceAPI struct {
 	webhooks serviceWebhooks
 	alerts   serviceAlerts
 	audit    auditRecorder
+	// limit bounds requests per client IP before anything else runs, so nobody can
+	// turn refused credentials into unbounded audit rows. Optional for tests.
+	limit func(http.Handler) http.Handler
+}
+
+// serviceCall is one authorized call. A handler adds what it created to minted:
+// credentials and feeds outlive the token that made them, and the audit row is the
+// only record tying them back to it.
+type serviceCall struct {
+	tok    svctoken.Token
+	minted map[string]any
 }
 
 // serviceHandler runs after authentication, scope and ownership have passed.
-type serviceHandler func(w http.ResponseWriter, r *http.Request, tok svctoken.Token)
+type serviceHandler func(w http.ResponseWriter, r *http.Request, call *serviceCall)
 
 type routeHandler interface {
 	Handle(pattern string, h http.Handler)
@@ -78,7 +92,11 @@ type routeHandler interface {
 
 func (a *serviceAPI) register(r routeHandler) {
 	route := func(pattern, scope string, h serviceHandler) {
-		r.Handle(pattern, boundedRequestBody(serviceBodyLimit)(a.guard(pattern, scope, h)))
+		handler := boundedRequestBody(serviceBodyLimit)(a.guard(pattern, scope, h))
+		if a.limit != nil {
+			handler = a.limit(handler)
+		}
+		r.Handle(pattern, handler)
 	}
 	route("POST /api/v1/service/sites", svctoken.ScopeSitesCreate, a.createSite)
 	route("POST /api/v1/service/sites/{site_id}/keys", svctoken.ScopeKeysMint, a.mintKey)
@@ -92,9 +110,12 @@ func (a *serviceAPI) register(r routeHandler) {
 // guard is the whole authorization path, in order: credential, scope, site
 // ownership, then a durable record of intent for anything that writes.
 //
-// Writes and every refusal are audited. Successful reads are not: alerts:read
-// is meant to be polled, one row per poll would bury the trail, and the token's
-// last_used_at already says it is alive.
+// Writes are audited, and so is every refusal of a token-shaped credential.
+// Successful reads are not: alerts:read is meant to be polled, one row per poll
+// would bury the trail, and the token's last_used_at already says it is alive. A
+// request with nothing token-shaped is not audited either. Anyone who can reach the
+// port can send those, the row would say nothing about any credential, and they
+// never reach the store.
 func (a *serviceAPI) guard(pattern, scope string, next serviceHandler) http.Handler {
 	action := "service." + strings.ReplaceAll(scope, ":", ".")
 	write := !strings.HasPrefix(pattern, http.MethodGet+" ")
@@ -111,13 +132,15 @@ func (a *serviceAPI) guard(pattern, scope string, next serviceHandler) http.Hand
 				writeJSONError(w, http.StatusServiceUnavailable, "authentication temporarily unavailable")
 				return
 			}
-			_ = a.record(r, svctoken.Token{}, action, audit.ResultDenied, "invalid or revoked service token")
+			if svctoken.ValidFormat(presented) {
+				_ = a.record(r, svctoken.Token{}, action, audit.ResultDenied, "invalid or revoked service token", nil)
+			}
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeJSONError(w, http.StatusUnauthorized, "invalid or revoked service token")
 			return
 		}
 		if !tok.Has(scope) {
-			_ = a.record(r, tok, action, audit.ResultDenied, "missing scope "+scope)
+			_ = a.record(r, tok, action, audit.ResultDenied, "missing scope "+scope, nil)
 			writeJSONError(w, http.StatusForbidden, "token lacks the "+scope+" scope")
 			return
 		}
@@ -131,34 +154,38 @@ func (a *serviceAPI) guard(pattern, scope string, next serviceHandler) http.Hand
 			if !owned {
 				// The same answer as a site that does not exist, so a token
 				// cannot use this route to enumerate other sites.
-				_ = a.record(r, tok, action, audit.ResultDenied, "site is not managed by this token")
+				_ = a.record(r, tok, action, audit.ResultDenied, "site is not managed by this token", nil)
 				writeJSONError(w, http.StatusNotFound, "site not found")
 				return
 			}
 		}
 		w.Header().Set("Cache-Control", "no-store")
+		call := &serviceCall{tok: tok, minted: map[string]any{}}
 		if !write {
-			next(w, r, tok)
+			next(w, r, call)
 			return
 		}
 		// Intent is durable before work happens: a credential minted while the
 		// trail is down would be an unrecorded grant.
-		if err := a.record(r, tok, action, "started", ""); err != nil {
+		if err := a.record(r, tok, action, "started", "", nil); err != nil {
 			w.Header().Set("Retry-After", "5")
 			writeJSONError(w, http.StatusServiceUnavailable, "audit unavailable; nothing was changed")
 			return
 		}
 		rec := &auditStatusRecorder{ResponseWriter: w, status: http.StatusOK}
-		next(rec, r, tok)
-		_ = a.record(r, tok, action, auditResult(rec.status), "")
+		next(rec, r, call)
+		_ = a.record(r, tok, action, auditResult(rec.status), "", call.minted)
 	})
 }
 
 // record writes one audit row. It never carries a request body or a credential.
 // Callers on the refusal paths ignore the error because the request is already
 // refused; record has logged it.
-func (a *serviceAPI) record(r *http.Request, tok svctoken.Token, action, result, detail string) error {
+func (a *serviceAPI) record(r *http.Request, tok svctoken.Token, action, result, detail string, minted map[string]any) error {
 	meta := map[string]any{}
+	for k, v := range minted {
+		meta[k] = v
+	}
 	if tok.ID != "" {
 		meta["token_name"] = tok.Name
 		meta["managed_by"] = tok.ManagedBy
@@ -169,20 +196,39 @@ func (a *serviceAPI) record(r *http.Request, tok svctoken.Token, action, result,
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
 	defer cancel()
 	err := a.audit.Record(ctx, audit.AuditEvent{
-		SiteID:    r.PathValue("site_id"),
+		SiteID:    truncateAuditField(r.PathValue("site_id")),
 		Actor:     tok.ID,
 		ActorType: audit.ActorService,
 		Action:    action,
-		Target:    r.URL.Path,
+		Target:    truncateAuditField(r.URL.Path),
 		Result:    result,
 		SourceIP:  ingest.ClientIPFromContext(r.Context()),
-		UserAgent: r.UserAgent(),
+		UserAgent: truncateAuditField(r.UserAgent()),
 		Metadata:  audit.MarshalMetadata(meta),
 	})
 	if err != nil {
 		slog.Error("service token audit write failed", "action", action, "result", result, "err", err)
 	}
 	return err
+}
+
+// truncateAuditField bounds caller-controlled text before it reaches the trail. A
+// header or path can be as large as the server's limits allow, and these rows are
+// written for callers who failed to authenticate.
+func truncateAuditField(v string) string {
+	if len(v) <= maxAuditFieldLen {
+		return v
+	}
+	return strings.ToValidUTF8(v[:maxAuditFieldLen], "")
+}
+
+// writeServiceUnavailable is the answer to any store failure on this surface: 503
+// with Retry-After, never a detail from the store. A client must be able to tell
+// "try again" from "you asked for something wrong".
+func writeServiceUnavailable(w http.ResponseWriter, message string, err error) {
+	slog.Error("service API store failure", "message", message, "err", err)
+	w.Header().Set("Retry-After", "5")
+	writeJSONError(w, http.StatusServiceUnavailable, message)
 }
 
 // decodeServiceBody refuses unknown fields. A manager or a key capability
@@ -208,7 +254,7 @@ func validSiteField(v string, maxLen int) bool {
 	return len(v) <= maxLen && strings.IndexFunc(v, unicode.IsControl) < 0
 }
 
-func (a *serviceAPI) createSite(w http.ResponseWriter, r *http.Request, tok svctoken.Token) {
+func (a *serviceAPI) createSite(w http.ResponseWriter, r *http.Request, call *serviceCall) {
 	var in struct {
 		ExternalRef string `json:"external_ref"`
 		Name        string `json:"name"`
@@ -232,12 +278,14 @@ func (a *serviceAPI) createSite(w http.ResponseWriter, r *http.Request, tok svct
 	if in.Name == "" {
 		in.Name = in.ExternalRef
 	}
-	site, created, err := a.sites.EnsureManaged(r.Context(), tok.ManagedBy, in.ExternalRef, in.Domain, in.Name)
+	site, created, err := a.sites.EnsureManaged(r.Context(), call.tok.ManagedBy, in.ExternalRef, in.Domain, in.Name)
 	if err != nil {
-		slog.Error("service site create failed", "err", err)
-		writeJSONError(w, http.StatusInternalServerError, "creating the site failed")
+		writeServiceUnavailable(w, "creating the site failed; try again", err)
 		return
 	}
+	call.minted["site_id"] = site.SiteID
+	call.minted["external_ref"] = truncateAuditField(in.ExternalRef)
+	call.minted["created"] = created
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
@@ -248,7 +296,7 @@ func (a *serviceAPI) createSite(w http.ResponseWriter, r *http.Request, tok svct
 // mintKey issues a telemetry key. It has no scopes field to pass: the body is
 // decoded strictly, so asking for publish is a 400, and publish stays with an
 // admin.
-func (a *serviceAPI) mintKey(w http.ResponseWriter, r *http.Request, tok svctoken.Token) {
+func (a *serviceAPI) mintKey(w http.ResponseWriter, r *http.Request, call *serviceCall) {
 	var in struct {
 		Label string `json:"label"`
 	}
@@ -262,16 +310,17 @@ func (a *serviceAPI) mintKey(w http.ResponseWriter, r *http.Request, tok svctoke
 		return
 	}
 	key, info, err := a.keys.CreateAPIKeyBy(r.Context(), r.PathValue("site_id"), in.Label,
-		fmt.Sprintf(serviceKeyActorFmt, tok.ID), []string{auth.ScopeTelemetry})
+		fmt.Sprintf(serviceKeyActorFmt, call.tok.ID), []string{auth.ScopeTelemetry})
 	if err != nil {
-		slog.Error("service key mint failed", "err", err)
-		writeJSONError(w, http.StatusInternalServerError, "minting the key failed")
+		writeServiceUnavailable(w, "minting the key failed; try again", err)
 		return
 	}
+	call.minted["key_id"] = info.KeyID
+	call.minted["key_label"] = in.Label
 	writeServiceJSON(w, http.StatusCreated, createAPIKeyResponse{Key: key, Info: info})
 }
 
-func (a *serviceAPI) mintShare(w http.ResponseWriter, r *http.Request, _ svctoken.Token) {
+func (a *serviceAPI) mintShare(w http.ResponseWriter, r *http.Request, call *serviceCall) {
 	var in struct {
 		TTLDays int `json:"ttl_days"`
 	}
@@ -293,14 +342,16 @@ func (a *serviceAPI) mintShare(w http.ResponseWriter, r *http.Request, _ svctoke
 		link, err = a.shares.CreateWithTTL(r.Context(), r.PathValue("site_id"), time.Duration(in.TTLDays)*24*time.Hour)
 	}
 	if err != nil {
-		slog.Error("service share mint failed", "err", err)
-		writeJSONError(w, http.StatusInternalServerError, "minting the share link failed")
+		writeServiceUnavailable(w, "minting the share link failed; try again", err)
 		return
 	}
+	// The link's non-secret id, never the token. It is what revokes the link.
+	call.minted["share_link_id"] = link.ID
+	call.minted["share_expires_at"] = link.ExpiresAt
 	writeServiceJSON(w, http.StatusCreated, link)
 }
 
-func (a *serviceAPI) createWebhook(w http.ResponseWriter, r *http.Request, _ svctoken.Token) {
+func (a *serviceAPI) createWebhook(w http.ResponseWriter, r *http.Request, call *serviceCall) {
 	var in struct {
 		Name        string `json:"name"`
 		WebhookType string `json:"webhook_type"`
@@ -316,28 +367,31 @@ func (a *serviceAPI) createWebhook(w http.ResponseWriter, r *http.Request, _ svc
 		writeJSONError(w, http.StatusBadRequest, "url is required")
 		return
 	}
-	hook, err := a.webhooks.Create(r.Context(), r.PathValue("site_id"), in.Name, in.WebhookType, in.URL, in.Severities, in.Kinds)
-	if err != nil {
-		// Create wraps a store failure as "create webhook"; everything else is
-		// a validation verdict on the caller's input.
-		if strings.HasPrefix(err.Error(), "create webhook") {
-			slog.Error("service webhook create failed", "err", err)
-			writeJSONError(w, http.StatusInternalServerError, "creating the webhook failed")
-			return
-		}
+	if err := a.webhooks.ValidateDestination(in.URL); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	hook, err := a.webhooks.Create(r.Context(), r.PathValue("site_id"), in.Name, in.WebhookType, in.URL, in.Severities, in.Kinds)
+	if err != nil {
+		if errors.Is(err, platform.ErrInvalidWebhook) {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeServiceUnavailable(w, "creating the webhook failed; try again", err)
+		return
+	}
+	// The host only: a webhook URL's path can itself be the posting credential.
+	call.minted["webhook_id"] = hook.WebhookID
+	call.minted["webhook_host"] = endpointHost(in.URL)
 	writeServiceJSON(w, http.StatusCreated, hook)
 }
 
 // deleteWebhook confirms the webhook belongs to the site in the path, because
 // WebhookService.Delete takes a bare id and the ownership check covered the site.
-func (a *serviceAPI) deleteWebhook(w http.ResponseWriter, r *http.Request, _ svctoken.Token) {
+func (a *serviceAPI) deleteWebhook(w http.ResponseWriter, r *http.Request, call *serviceCall) {
 	hooks, err := a.webhooks.List(r.Context(), r.PathValue("site_id"))
 	if err != nil {
-		slog.Error("service webhook lookup failed", "err", err)
-		writeJSONError(w, http.StatusInternalServerError, "looking up the webhook failed")
+		writeServiceUnavailable(w, "looking up the webhook failed; try again", err)
 		return
 	}
 	id := r.PathValue("webhook_id")
@@ -346,21 +400,21 @@ func (a *serviceAPI) deleteWebhook(w http.ResponseWriter, r *http.Request, _ svc
 			continue
 		}
 		if err := a.webhooks.Delete(r.Context(), id); err != nil {
-			slog.Error("service webhook delete failed", "err", err)
-			writeJSONError(w, http.StatusInternalServerError, "deleting the webhook failed")
+			writeServiceUnavailable(w, "deleting the webhook failed; try again", err)
 			return
 		}
+		call.minted["webhook_id"] = id
+		call.minted["webhook_host"] = endpointHost(h.URL)
 		writeServiceJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
 	writeJSONError(w, http.StatusNotFound, "webhook not found")
 }
 
-func (a *serviceAPI) alertRules(w http.ResponseWriter, r *http.Request, _ svctoken.Token) {
+func (a *serviceAPI) alertRules(w http.ResponseWriter, r *http.Request, _ *serviceCall) {
 	rules, err := a.alerts.ListRules(r.Context(), r.PathValue("site_id"))
 	if err != nil {
-		slog.Error("service alert rules failed", "err", err)
-		writeJSONError(w, http.StatusInternalServerError, "reading alert rules failed")
+		writeServiceUnavailable(w, "reading alert rules failed; try again", err)
 		return
 	}
 	if rules == nil {
@@ -369,7 +423,7 @@ func (a *serviceAPI) alertRules(w http.ResponseWriter, r *http.Request, _ svctok
 	writeServiceJSON(w, http.StatusOK, rules)
 }
 
-func (a *serviceAPI) alertHistory(w http.ResponseWriter, r *http.Request, _ svctoken.Token) {
+func (a *serviceAPI) alertHistory(w http.ResponseWriter, r *http.Request, _ *serviceCall) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	if limit > maxServiceHistory {
@@ -377,8 +431,7 @@ func (a *serviceAPI) alertHistory(w http.ResponseWriter, r *http.Request, _ svct
 	}
 	history, err := a.alerts.ListHistory(r.Context(), r.PathValue("site_id"), limit, offset)
 	if err != nil {
-		slog.Error("service alert history failed", "err", err)
-		writeJSONError(w, http.StatusInternalServerError, "reading alert history failed")
+		writeServiceUnavailable(w, "reading alert history failed; try again", err)
 		return
 	}
 	if history == nil {
@@ -389,12 +442,30 @@ func (a *serviceAPI) alertHistory(w http.ResponseWriter, r *http.Request, _ svct
 
 // --- Token management API (admin only; the audit middleware records writes) ---
 
+// signedInAdmin is the gate every credential-management route here shares, on top
+// of the JWT and role middleware. Those wave every request through during the
+// first-run grace period, which is fine for onboarding but must not let an anonymous
+// caller see, plant or revoke a durable credential, or hand a site to a manager.
+func signedInAdmin(w http.ResponseWriter, r *http.Request) (string, bool) {
+	username := ""
+	if claims, err := neutronauth.ClaimsFromContext(r.Context()); err == nil {
+		username, _ = claims["username"].(string)
+	}
+	if username == "" || auth.RoleFromContext(r.Context()) != auth.RoleAdmin {
+		writeJSONError(w, http.StatusForbidden, "this requires a signed-in admin")
+		return "", false
+	}
+	return username, true
+}
+
 func serviceTokensListHandler(store *svctoken.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := signedInAdmin(w, r); !ok {
+			return
+		}
 		list, err := store.List(r.Context())
 		if err != nil {
-			slog.Error("listing service tokens failed", "err", err)
-			writeJSONError(w, http.StatusInternalServerError, "listing service tokens failed")
+			writeServiceUnavailable(w, "listing service tokens failed; try again", err)
 			return
 		}
 		if list == nil {
@@ -405,18 +476,10 @@ func serviceTokensListHandler(store *svctoken.Store) http.HandlerFunc {
 	}
 }
 
-// serviceTokensCreateHandler refuses to mint without a signed-in admin. The JWT
-// and role middleware wave every request through during the first-run grace
-// period, which is fine for onboarding but must not let an anonymous caller
-// plant a durable credential that outlives the admin's arrival.
 func serviceTokensCreateHandler(store *svctoken.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		createdBy := ""
-		if claims, err := neutronauth.ClaimsFromContext(r.Context()); err == nil {
-			createdBy, _ = claims["username"].(string)
-		}
-		if createdBy == "" || auth.RoleFromContext(r.Context()) != auth.RoleAdmin {
-			writeJSONError(w, http.StatusForbidden, "creating a service token requires a signed-in admin")
+		createdBy, ok := signedInAdmin(w, r)
+		if !ok {
 			return
 		}
 		var in struct {
@@ -430,7 +493,11 @@ func serviceTokensCreateHandler(store *svctoken.Store) http.HandlerFunc {
 		}
 		plaintext, tok, err := store.Create(r.Context(), in.Name, in.ManagedBy, createdBy, in.Scopes)
 		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+			if errors.Is(err, svctoken.ErrInvalidRequest) {
+				writeJSONError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeServiceUnavailable(w, "creating the service token failed; try again", err)
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
@@ -441,15 +508,96 @@ func serviceTokensCreateHandler(store *svctoken.Store) http.HandlerFunc {
 
 func serviceTokensRevokeHandler(store *svctoken.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := signedInAdmin(w, r); !ok {
+			return
+		}
 		err := store.Revoke(r.Context(), r.PathValue("token_id"))
 		switch {
 		case errors.Is(err, svctoken.ErrNotFound):
 			writeJSONError(w, http.StatusNotFound, "service token not found")
 		case err != nil:
-			slog.Error("revoking service token failed", "err", err)
-			writeJSONError(w, http.StatusInternalServerError, "revoking the service token failed")
+			writeServiceUnavailable(w, "revoking the service token failed; try again", err)
 		default:
 			writeServiceJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		}
+	}
+}
+
+// adoptSiteHandler hands an existing operator site to a manager, so Dash can manage
+// a site that predates it. This is the one route that moves a site into service
+// token reach, and it exposes what is already stored there: a token holding
+// share:mint can then read that site. So it is JWT and admin only, a service token
+// is not a JWT and cannot call it, and intent is durable before anything changes.
+//
+// The audit middleware records that the route was called; this adds what was asked.
+func adoptSiteHandler(siteSvc *sites.SiteService, rec auditRecorder) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		admin, ok := signedInAdmin(w, r)
+		if !ok {
+			return
+		}
+		var in struct {
+			ManagedBy   string `json:"managed_by"`
+			ExternalRef string `json:"external_ref"`
+		}
+		if err := decodeServiceBody(r, &in); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			return
+		}
+		in.ManagedBy = strings.TrimSpace(in.ManagedBy)
+		in.ExternalRef = strings.TrimSpace(in.ExternalRef)
+		if in.ManagedBy == "" || !validSiteField(in.ManagedBy, maxManagedByLen) {
+			writeJSONError(w, http.StatusBadRequest, "managed_by is required and must be at most 128 printable bytes")
+			return
+		}
+		if in.ExternalRef == "" || !validSiteField(in.ExternalRef, maxExternalRefLen) {
+			writeJSONError(w, http.StatusBadRequest, "external_ref is required and must be at most 256 printable bytes")
+			return
+		}
+		siteID := r.PathValue("site_id")
+		record := func(result string) error {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
+			defer cancel()
+			err := rec.Record(ctx, audit.AuditEvent{
+				SiteID:    truncateAuditField(siteID),
+				Actor:     admin,
+				ActorType: audit.ActorUser,
+				Action:    "sites.adopt",
+				Target:    truncateAuditField(r.URL.Path),
+				Result:    result,
+				SourceIP:  ingest.ClientIPFromContext(r.Context()),
+				UserAgent: truncateAuditField(r.UserAgent()),
+				Metadata:  audit.MarshalMetadata(map[string]any{"managed_by": in.ManagedBy, "external_ref": in.ExternalRef}),
+			})
+			if err != nil {
+				slog.Error("site adoption audit write failed", "result", result, "err", err)
+			}
+			return err
+		}
+		if err := record("started"); err != nil {
+			w.Header().Set("Retry-After", "5")
+			writeJSONError(w, http.StatusServiceUnavailable, "audit unavailable; nothing was changed")
+			return
+		}
+		site, adopted, err := siteSvc.Adopt(r.Context(), siteID, in.ManagedBy, in.ExternalRef)
+		switch {
+		case errors.Is(err, sites.ErrSiteNotFound):
+			_ = record(audit.ResultFailure)
+			writeJSONError(w, http.StatusNotFound, "site not found")
+		case errors.Is(err, sites.ErrManagementConflict):
+			_ = record(audit.ResultFailure)
+			writeJSONError(w, http.StatusConflict, err.Error())
+		case err != nil:
+			_ = record(audit.ResultFailure)
+			writeServiceUnavailable(w, "adopting the site failed; try again", err)
+		default:
+			_ = record(audit.ResultSuccess)
+			status := http.StatusOK
+			if adopted {
+				status = http.StatusCreated
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			writeServiceJSON(w, status, map[string]any{"site": site, "adopted": adopted})
 		}
 	}
 }

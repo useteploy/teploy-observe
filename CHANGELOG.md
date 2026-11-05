@@ -19,7 +19,24 @@ All notable changes to Observe are recorded here.
 - **Managed sites**: `external_ref` (idempotent per manager), optional domain,
   `managed_by`. API keys report `created_by`. Migration 067 only adds tables.
 - **Go and Python SDKs** read `OBSERVE_ENDPOINT`, `OBSERVE_API_KEY` and the
-  OpenTelemetry standard variables for options left unset.
+  OpenTelemetry standard variables for options left unset, and send a credential only
+  where it was issued for.
+- **`observe reidentify --yes`** gives a restored copy a new `instance_id` and revokes
+  every service token.
+- **`POST /api/v1/sites/{site_id}/adopt`**: an admin hands an existing site to a manager.
+
+### Changed
+
+- **All SDKs** with an API key and no site now send none, so the key's site applies.
+  They used to send `default`, which is refused for a key on any other site.
+- **Webhook create** refuses a literal private, loopback or metadata address or a
+  `localhost` name with a 400 unless `OBSERVE_WEBHOOK_ALLOW_CIDRS` covers it. These used
+  to return 201 and never deliver. Existing webhooks are not affected.
+- **Alert history** has a total order, so pages cannot repeat or skip a row.
+
+### Fixed
+
+- `GET /api/v1/audit/verify` no longer prints `%!(EXTRA ...)` in its detail text.
 
 ## v0.2.0 — 2026-10-20
 
