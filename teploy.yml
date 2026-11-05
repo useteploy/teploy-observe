@@ -26,8 +26,11 @@
 # OBSERVE_RESET_ADMIN_PASSWORD escape hatch the same way, then unset it.
 
 app: observe
-domain: observe.example.com
-server: observe.example.com
+# No `domain:` by default: this template is ingress: host, where an empty
+# domain is allowed and a placeholder would only be a label. Set one when
+# you actually route a hostname here. `server` names a target from
+# ~/.teploy/servers.yml — set it to yours before the first deploy.
+server: your-server
 
 # Ingress + binds. The dashboard/read API (`port`) is deliberately NOT on
 # 0.0.0.0: anything reaching it gets a login page, so it is pinned to the
