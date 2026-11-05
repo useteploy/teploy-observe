@@ -98,6 +98,22 @@ listener. A restore into a database the SERVER has ever started against
 is still refused — boot inserts the `default` site and the bootstrap
 admin, and both tables are restore tables.
 
+**A restored copy claims to be the original.** The archive carries the
+`instance_id` and the service tokens, so the copy answers
+`/.well-known/teploy.json` with the original's id and accepts the original's tokens.
+That is right when the copy replaces the original. If it will run alongside it (a
+drill, a staging clone), run this after `observe restore` and before starting the
+server:
+
+```bash
+observe reidentify --yes
+```
+
+It gives the database a new `instance_id` and revokes every service token, then logs
+both ids and the number revoked. It does not touch telemetry keys or share links,
+which also came across in the archive and still work against the copy. If it fails
+partway, run it again.
+
 ## Restore drill (do this before you need it)
 
 Run on a scratch host or a second Compose project, never the live database.
@@ -111,7 +127,8 @@ Run on a scratch host or a second Compose project, never the live database.
    restore` with the encryption key; confirm exit status 0 and the log
    line `restore complete`. (Do NOT start the server first — its seeding
    writes rows the emptiness check refuses.)
-4. Start `observe`. Check `/healthz` is `ok`.
+4. Run `observe reidentify --yes`, since this copy runs alongside production. Start
+   `observe`. Check `/healthz` is `ok`.
 5. Log in with a production account; compare site list, a known issue, a
    known dashboard and a recent day of stats against production.
 6. Open a source-mapped stack trace to confirm the KV source maps came back.

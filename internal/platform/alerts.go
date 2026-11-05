@@ -170,7 +170,7 @@ func (s *AlertService) ListHistory(ctx context.Context, siteID string, limit, of
 			CAST(triggered_at AS TEXT) AS triggered_at,
 			metric_value, threshold, status
 		 FROM alert_history WHERE site_id = $1
-		 ORDER BY triggered_at DESC LIMIT %d OFFSET %d`, limit, offset),
+		 ORDER BY triggered_at DESC, alert_id DESC LIMIT %d OFFSET %d`, limit, offset),
 		siteID,
 	)
 }

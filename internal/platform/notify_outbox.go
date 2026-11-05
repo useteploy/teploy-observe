@@ -30,6 +30,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -424,6 +425,7 @@ func (n *Notifier) processOne(ctx context.Context, row *notifyRow) error {
 		return ctx.Err()
 	}
 
+	n.noteBlocked(row, err)
 	attempts := row.Attempts + 1
 	n.bumpFailed(row.Kind)
 	dead := attempts >= int64(n.maxAttempts)
@@ -445,6 +447,15 @@ func (n *Notifier) processOne(ctx context.Context, row *notifyRow) error {
 			"attempts", attempts, "err", err)
 	}
 	return nil
+}
+
+// noteBlocked says out loud when the dial guard refused a target. A hostname that
+// resolves to a private address gets past create and is only caught here.
+func (n *Notifier) noteBlocked(row *notifyRow, err error) {
+	if errors.Is(err, netsafe.ErrBlocked) {
+		n.logger.Warn("notification blocked: destination resolves to a non-public address",
+			"delivery_id", row.ID, "kind", row.Kind, "site", row.SiteID, "err", err)
+	}
 }
 
 // deliver performs the POST. The delivery id header is the dedupe marker;

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -25,6 +27,11 @@ type Site struct {
 	// HMAC hashing of distinct_id values. Useful for operators that
 	// need server-side identity resolution (e.g. CRM joins by email).
 	RawDistinctID bool `json:"raw_distinct_id" db:"raw_distinct_id"`
+	// ExternalRef and ManagedBy identify a site provisioned by a service token
+	// (site_management table). Both empty means an operator created it. They
+	// are never selected from sites, so they stay zero on the ingest path.
+	ExternalRef string `json:"external_ref,omitempty" db:"-"`
+	ManagedBy   string `json:"managed_by,omitempty" db:"-"`
 }
 
 // SiteService provides CRUD operations for the sites table.
@@ -35,6 +42,9 @@ type SiteService struct {
 	// Cache size is naturally bounded by the number of sites.
 	mu    sync.RWMutex
 	cache map[string]Site
+	// managedMu serializes EnsureManaged's read-then-insert. The store has no
+	// unique constraint, and Observe runs one process per store.
+	managedMu sync.Mutex
 }
 
 // NewSiteService creates a new SiteService.
@@ -110,6 +120,21 @@ func (s *SiteService) List(ctx context.Context) ([]Site, error) {
 	}
 	if rows == nil {
 		rows = []Site{}
+	}
+	mgmt, err := nucleus.Query[managementRow](ctx, sql,
+		"SELECT site_id, managed_by, external_ref, created_at FROM site_management",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sites: list management: %w", err)
+	}
+	byID := make(map[string]managementRow, len(mgmt))
+	for _, m := range mgmt {
+		byID[m.SiteID] = m
+	}
+	for i := range rows {
+		if m, ok := byID[rows[i].SiteID]; ok {
+			rows[i].ExternalRef, rows[i].ManagedBy = m.ExternalRef, m.ManagedBy
+		}
 	}
 	return rows, nil
 }
@@ -248,6 +273,173 @@ func (s *SiteService) SetRawDistinctID(ctx context.Context, siteID string, optIn
 	return nil
 }
 
+// managementRow maps to the site_management table.
+type managementRow struct {
+	SiteID      string `db:"site_id"`
+	ManagedBy   string `db:"managed_by"`
+	ExternalRef string `db:"external_ref"`
+	CreatedAt   int64  `db:"created_at"`
+}
+
+// EnsureManaged is the idempotent create behind POST /api/v1/service/sites: the
+// same (managedBy, externalRef) always answers with the same site. The ref is
+// namespaced by manager, so one manager can neither collide with another's ref
+// nor learn that it exists.
+//
+// The mapping row is written before the site. A crash between the two leaves a
+// mapping to nothing, which every read ignores and a retry replaces; the other
+// order would leave an orphan site visible in the dashboard forever.
+func (s *SiteService) EnsureManaged(ctx context.Context, managedBy, externalRef, domain, name string) (Site, bool, error) {
+	if managedBy == "" || externalRef == "" {
+		return Site{}, false, fmt.Errorf("sites: managed site needs a manager and an external ref")
+	}
+	s.managedMu.Lock()
+	defer s.managedMu.Unlock()
+
+	sql := s.db.SQL()
+	rows, err := nucleus.Query[managementRow](ctx, sql,
+		"SELECT site_id, managed_by, external_ref, created_at FROM site_management WHERE managed_by = $1 AND external_ref = $2",
+		managedBy, externalRef,
+	)
+	if err != nil {
+		return Site{}, false, fmt.Errorf("sites: find managed site: %w", err)
+	}
+	// Oldest first, so that if a second process ever raced a duplicate in,
+	// every caller still converges on one site.
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].CreatedAt != rows[j].CreatedAt {
+			return rows[i].CreatedAt < rows[j].CreatedAt
+		}
+		return rows[i].SiteID < rows[j].SiteID
+	})
+	for _, m := range rows {
+		exists, err := s.Exists(ctx, m.SiteID)
+		if err != nil {
+			return Site{}, false, err
+		}
+		if !exists {
+			continue // the site was deleted; its ref is free again
+		}
+		site, err := s.Get(ctx, m.SiteID)
+		if err != nil {
+			return Site{}, false, err
+		}
+		site.ExternalRef, site.ManagedBy = externalRef, managedBy
+		return site, false, nil
+	}
+
+	siteID := generateID()
+	sessionSalt := generateID()
+	now := time.Now().UnixMilli()
+	nowStr := dbutil.IntParam(now)
+	if _, err := sql.Exec(ctx,
+		"INSERT INTO site_management (tenant_id, site_id, managed_by, external_ref, created_at) VALUES ('default', $1, $2, $3, $4)",
+		siteID, managedBy, externalRef, nowStr,
+	); err != nil {
+		return Site{}, false, fmt.Errorf("sites: record managed site: %w", err)
+	}
+	if _, err := sql.Exec(ctx,
+		"INSERT INTO sites (site_id, tenant_id, domain, name, created_at, session_salt) VALUES ($1, $2, $3, $4, $5, $6)",
+		siteID, "default", domain, name, nowStr, sessionSalt,
+	); err != nil {
+		return Site{}, false, fmt.Errorf("sites: create managed site: %w", err)
+	}
+	return Site{
+		SiteID: siteID, TenantID: "default", Domain: domain, Name: name,
+		CreatedAt: now, SessionSalt: sessionSalt,
+		ExternalRef: externalRef, ManagedBy: managedBy,
+	}, true, nil
+}
+
+// ErrSiteNotFound means the site to adopt does not exist.
+var ErrSiteNotFound = errors.New("site not found")
+
+// ErrManagementConflict means adoption would give a site a second owner, or give a
+// manager two sites for one ref, which would break EnsureManaged's idempotence.
+var ErrManagementConflict = errors.New("site management conflict")
+
+// Adopt hands an existing operator site to a manager under an external ref, so a
+// service token can then reach it. It returns false when the site is already
+// exactly that, so a retry is harmless. It never moves a site between managers:
+// that would silently take it away from the first one, so the caller has to refuse
+// and an operator has to decide.
+func (s *SiteService) Adopt(ctx context.Context, siteID, managedBy, externalRef string) (Site, bool, error) {
+	if managedBy == "" || externalRef == "" {
+		return Site{}, false, fmt.Errorf("sites: adoption needs a manager and an external ref")
+	}
+	s.managedMu.Lock()
+	defer s.managedMu.Unlock()
+
+	exists, err := s.Exists(ctx, siteID)
+	if err != nil {
+		return Site{}, false, err
+	}
+	if !exists {
+		return Site{}, false, ErrSiteNotFound
+	}
+	sql := s.db.SQL()
+	current, err := nucleus.Query[managementRow](ctx, sql,
+		"SELECT site_id, managed_by, external_ref, created_at FROM site_management WHERE site_id = $1", siteID)
+	if err != nil {
+		return Site{}, false, fmt.Errorf("sites: read site manager: %w", err)
+	}
+	for _, m := range current {
+		if m.ManagedBy != managedBy || m.ExternalRef != externalRef {
+			return Site{}, false, fmt.Errorf("%w: site is already managed by %q as %q", ErrManagementConflict, m.ManagedBy, m.ExternalRef)
+		}
+	}
+	adopted := len(current) == 0
+	if adopted {
+		taken, err := nucleus.Query[managementRow](ctx, sql,
+			"SELECT site_id, managed_by, external_ref, created_at FROM site_management WHERE managed_by = $1 AND external_ref = $2",
+			managedBy, externalRef)
+		if err != nil {
+			return Site{}, false, fmt.Errorf("sites: read managed refs: %w", err)
+		}
+		for _, m := range taken {
+			live, err := s.Exists(ctx, m.SiteID)
+			if err != nil {
+				return Site{}, false, err
+			}
+			if live {
+				return Site{}, false, fmt.Errorf("%w: %q already names site %s for this manager", ErrManagementConflict, externalRef, m.SiteID)
+			}
+		}
+		if _, err := sql.Exec(ctx,
+			"INSERT INTO site_management (tenant_id, site_id, managed_by, external_ref, created_at) VALUES ('default', $1, $2, $3, $4)",
+			siteID, managedBy, externalRef, dbutil.IntParam(time.Now().UnixMilli()),
+		); err != nil {
+			return Site{}, false, fmt.Errorf("sites: record adoption: %w", err)
+		}
+	}
+	site, err := s.Get(ctx, siteID)
+	if err != nil {
+		return Site{}, false, err
+	}
+	site.ExternalRef, site.ManagedBy = externalRef, managedBy
+	return site, adopted, nil
+}
+
+// IsManagedBy reports whether a live site belongs to managedBy. An empty
+// manager owns nothing, so an operator-created site can never match. A store
+// failure is an error, never a false "not yours" and never a true.
+func (s *SiteService) IsManagedBy(ctx context.Context, siteID, managedBy string) (bool, error) {
+	if siteID == "" || managedBy == "" {
+		return false, nil
+	}
+	rows, err := nucleus.Query[managementRow](ctx, s.db.SQL(),
+		"SELECT site_id, managed_by, external_ref, created_at FROM site_management WHERE site_id = $1 AND managed_by = $2",
+		siteID, managedBy,
+	)
+	if err != nil {
+		return false, fmt.Errorf("sites: check manager: %w", err)
+	}
+	if len(rows) == 0 {
+		return false, nil
+	}
+	return s.Exists(ctx, siteID)
+}
+
 // Delete removes a site by ID and drops its cached privacy config so a deleted
 // (or recreated) site can't keep serving a stale salt/opt-out.
 func (s *SiteService) Delete(ctx context.Context, siteID string) error {
@@ -260,6 +452,9 @@ func (s *SiteService) Delete(ctx context.Context, siteID string) error {
 		return fmt.Errorf("sites: delete: %w", err)
 	}
 	s.InvalidatePrivacyConfig(siteID)
+	// Best effort: every read of site_management confirms the site exists, so
+	// a leftover row is inert and must not fail a deletion that succeeded.
+	_, _ = sql.Exec(ctx, "DELETE FROM site_management WHERE site_id = $1", siteID)
 	return nil
 }
 

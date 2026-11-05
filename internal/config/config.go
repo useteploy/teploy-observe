@@ -20,7 +20,18 @@ type Config struct {
 	// ("https://observe.example.com"), used for SSO metadata and generated
 	// links. Empty falls back to the request's Host header, which a client
 	// can spoof — set this whenever the instance is reachable by a name.
-	PublicURL   string
+	PublicURL string
+	// DashboardURL is the base URL of the dashboard listener, published by
+	// /.well-known/teploy.json and read by nothing else. It exists because
+	// PublicURL names the ingest host on an instance with a separate ingest
+	// listener: PublicURL also generates links and SSO metadata, so it cannot be
+	// repointed to serve discovery.
+	DashboardURL string
+	// IngestURL is the externally reachable base URL of the ingest listener
+	// ("https://ingest.example.com"), published by /.well-known/teploy.json.
+	// Only an operator knows it: a separate listener's public name cannot be
+	// derived from its bind address, and discovery must not guess it.
+	IngestURL   string
 	NucleusURL  string
 	SiteID      string
 	SessionSalt string
@@ -80,6 +91,8 @@ func Load() Config {
 		Addr:           envOr("OBSERVE_ADDR", ":3000"),
 		IngestAddr:     envOr("OBSERVE_INGEST_ADDR", ""),
 		PublicURL:      strings.TrimRight(envOr("OBSERVE_PUBLIC_URL", ""), "/"),
+		DashboardURL:   strings.TrimRight(envOr("OBSERVE_DASHBOARD_URL", ""), "/"),
+		IngestURL:      strings.TrimRight(envOr("OBSERVE_INGEST_URL", ""), "/"),
 		NucleusURL:     envOr("OBSERVE_NUCLEUS_URL", "postgres://localhost:5432/observe"),
 		SiteID:         envOr("OBSERVE_SITE_ID", "default"),
 		SessionSalt:    envOr("OBSERVE_SESSION_SALT", ""),

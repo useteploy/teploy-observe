@@ -38,6 +38,9 @@ var auditSkipPrefixes = []string{
 	"/api/v1/infra/report",
 	"/api/v1/auth",
 	"/api/v1/audit",
+	// Service-token calls audit themselves with the token as actor; this
+	// middleware runs before the token is verified and could not name it.
+	"/api/v1/service/",
 }
 
 // auditSkipExact is the (method, path) telemetry write excluded from the

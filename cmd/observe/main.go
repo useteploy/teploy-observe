@@ -45,6 +45,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/incidents"
 	"github.com/useteploy/teploy-observe/internal/infra"
 	"github.com/useteploy/teploy-observe/internal/ingest"
+	"github.com/useteploy/teploy-observe/internal/instance"
 	"github.com/useteploy/teploy-observe/internal/integrations"
 	"github.com/useteploy/teploy-observe/internal/jobs"
 	"github.com/useteploy/teploy-observe/internal/live"
@@ -68,6 +69,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/sourcemaps"
 	"github.com/useteploy/teploy-observe/internal/sso"
 	"github.com/useteploy/teploy-observe/internal/surveys"
+	"github.com/useteploy/teploy-observe/internal/svctoken"
 	"github.com/useteploy/teploy-observe/internal/tracing"
 	"github.com/useteploy/teploy-observe/internal/tracking"
 	"github.com/useteploy/teploy-observe/internal/upgrade"
@@ -108,6 +110,9 @@ func main() {
 			return
 		case "migrate":
 			runMigrate(cfg, logger)
+			return
+		case "reidentify":
+			runReidentify(logger, cfg, os.Args[2:])
 			return
 		case "version":
 			fmt.Println("observe " + version)
@@ -162,6 +167,11 @@ func main() {
 	adoption, err := schema.ApplyWithAdoption(ctx, db)
 	if err != nil {
 		logger.Error("failed to run migrations", "err", err)
+		os.Exit(1)
+	}
+	instanceID, err := instance.EnsureID(ctx, db)
+	if err != nil {
+		logger.Error("failed to establish instance id", "err", err)
 		os.Exit(1)
 	}
 	if adoption != nil {
@@ -1327,6 +1337,24 @@ func main() {
 	r.Handle("POST /api/v1/mcp/tokens", jwtMW(requireAdmin(mcpTokensCreateHandler(mcpStore))))
 	r.Handle("DELETE /api/v1/mcp/tokens/{token_id}", jwtMW(requireAdmin(mcpTokensRevokeHandler(mcpStore))))
 
+	// --- Service tokens (machine provisioning; see docs/service-tokens.md) ---
+	// Minting and revoking is admin work. The token-authenticated surface has
+	// its own namespace rather than a new credential on existing routes, so a
+	// route added later can never accept a service token by omission.
+	svcStore := svctoken.NewStore(db)
+	r.Handle("GET /api/v1/service-tokens", jwtMW(requireAdmin(serviceTokensListHandler(svcStore))))
+	r.Handle("POST /api/v1/service-tokens", jwtMW(requireAdmin(boundedRequestBody(64<<10)(serviceTokensCreateHandler(svcStore)))))
+	r.Handle("DELETE /api/v1/service-tokens/{token_id}", jwtMW(requireAdmin(serviceTokensRevokeHandler(svcStore))))
+	(&serviceAPI{
+		tokens: svcStore, sites: siteSvc, keys: authSvc, shares: shareSvc,
+		webhooks: webhookSvc, alerts: alertSvc, audit: auditSvc,
+		limit: ipRateLimitMW(ingest.NewRateLimiter(300, time.Minute, 600)),
+	}).register(r)
+	r.Handle("POST /api/v1/sites/{site_id}/adopt", jwtMW(requireAdmin(boundedRequestBody(64<<10)(adoptSiteHandler(siteSvc, auditSvc)))))
+
+	// --- Discovery (unauthenticated; carries no secrets) ---
+	r.HandleFunc("GET /.well-known/teploy.json", discoveryHandler(newDiscovery(cfg, instanceID)))
+
 	// --- Scheduled SQL exports (admin only: writes data externally) ---
 	r.Handle("GET /api/v1/exports/scheduled", jwtMW(requireAdmin(exportsListHandler(scheduledExportSvc))))
 	r.Handle("POST /api/v1/exports/scheduled", jwtMW(requireAdmin(exportsCreateHandler(scheduledExportSvc))))
@@ -1375,7 +1403,7 @@ func main() {
 	// Public flag SDK endpoint: generous per-site/IP cap (60/min) for the
 	// browser evaluation path.
 	flagEvalLimiter := ingest.NewRateLimiter(60, time.Minute, 120)
-	r.HandleFunc("POST /api/v1/flags/evaluate", flagEvaluateHandler(flagSvc, flagEvalLimiter))
+	r.HandleFunc("POST /api/v1/flags/evaluate", flagEvaluateHandler(flagSvc, flagEvalLimiter, authSvc.ValidateAPIKey))
 	r.Handle("GET /api/v1/flags/config", flagConfigRoute(apiKeyMW, rateLimiter.Middleware, flagSvc))
 
 	// --- Experiments (JWT auth; editor+ writes) ---
@@ -1841,6 +1869,7 @@ Usage:
   teploy-observe backup       Stream a tar archive of all tables to stdout.
   teploy-observe restore      Read a tar archive from stdin and insert into tables.
   teploy-observe migrate      Apply migrations without seeding (restore runbook step).
+  observe reidentify --yes    Give a restored copy a new instance_id; revokes all service tokens.
   observe upgrade             Verify and install a release through systemd.
   observe reindex             Rebuild the FTS index from error_events.
   observe version             Print the Observe version.
@@ -2598,7 +2627,11 @@ func createAPIKeyHandler(authSvc *auth.AuthService) neutron.HandlerFunc[createAP
 		if input.Label == "" {
 			input.Label = "default"
 		}
-		key, info, err := authSvc.CreateAPIKey(ctx, input.SiteID, input.Label, input.Scopes)
+		createdBy := ""
+		if claims, err := neutronauth.ClaimsFromContext(ctx); err == nil {
+			createdBy, _ = claims["username"].(string)
+		}
+		key, info, err := authSvc.CreateAPIKeyBy(ctx, input.SiteID, input.Label, createdBy, input.Scopes)
 		if err != nil {
 			return createAPIKeyResponse{}, neutron.ErrBadRequest(err.Error())
 		}
@@ -3790,7 +3823,7 @@ func flagHistoryHandler(svc *flags.FlagService) neutron.HandlerFunc[flagHistoryI
 // flagEvaluateHandler is the public, browser-callable flag SDK endpoint. It is
 // IP-rate-limited to curb enumeration / write floods and validates input so a
 // malformed request returns 400 instead of a silent {enabled:false} oracle.
-func flagEvaluateHandler(svc *flags.FlagService, rl *ingest.RateLimiter) http.HandlerFunc {
+func flagEvaluateHandler(svc *flags.FlagService, rl *ingest.RateLimiter, validateKey func(context.Context, string) (auth.ValidatedKey, error)) http.HandlerFunc {
 	// Audit F23: an IP-only limiter admits the request BEFORE the body is
 	// parsed. The site-keyed limiter below runs after parsing, and its key
 	// includes a body-supplied site_id — without this first gate, one IP
@@ -3824,6 +3857,21 @@ func flagEvaluateHandler(svc *flags.FlagService, rl *ingest.RateLimiter) http.Ha
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 			return
+		}
+		// An SDK holding a key sends no site: the key is bound to one. Only that
+		// case consults the key, so the public browser path is unchanged.
+		if key := strings.TrimSpace(r.Header.Get("X-API-Key")); input.SiteID == "" && key != "" {
+			validated, err := validateKey(r.Context(), key)
+			if errors.Is(err, auth.ErrAuthUnavailable) {
+				w.Header().Set("Retry-After", "5")
+				http.Error(w, `{"error":"authentication temporarily unavailable"}`, http.StatusServiceUnavailable)
+				return
+			}
+			if err != nil {
+				http.Error(w, `{"error":"invalid API key"}`, http.StatusUnauthorized)
+				return
+			}
+			input.SiteID = validated.SiteID
 		}
 		if input.SiteID == "" || input.FlagKey == "" {
 			http.Error(w, `{"error":"site_id and flag_key required"}`, http.StatusBadRequest)
@@ -5827,7 +5875,13 @@ func createWebhookHandler(svc *platform.WebhookService) neutron.HandlerFunc[crea
 		if input.SiteID == "" || input.URL == "" {
 			return platform.Webhook{}, neutron.ErrBadRequest("site_id and url required")
 		}
+		if err := svc.ValidateDestination(input.URL); err != nil {
+			return platform.Webhook{}, neutron.ErrBadRequest(err.Error())
+		}
 		w, err := svc.Create(ctx, input.SiteID, input.Name, input.WebhookType, input.URL, input.Severities, input.Kinds)
+		if errors.Is(err, platform.ErrInvalidWebhook) {
+			return platform.Webhook{}, neutron.ErrBadRequest(err.Error())
+		}
 		if err != nil {
 			return platform.Webhook{}, err
 		}

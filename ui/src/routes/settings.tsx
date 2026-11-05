@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "preact/hooks";
 import { readAIConfig } from "../lib/aiConfig.js";
 import { settingsApi } from "../api/settings.js";
-import type { Site, Webhook, User, ShareLink, APIKeyInfo, MCPToken } from "../api/settings.js";
+import type { Site, Webhook, User, ShareLink, APIKeyInfo, MCPToken, ServiceToken } from "../api/settings.js";
 import { get } from "../api/helpers.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
@@ -289,6 +289,7 @@ function SitesSection() {
                 <span class="settings-row-value">
                   {s.domain ? `${s.domain} · ` : ""}
                   <code style={{ fontSize: "11px" }}>{s.site_id}</code>
+                  {s.managed_by ? ` · managed by ${s.managed_by}` : ""}
                 </span>
                 <button class="obs-btn obs-btn--sm" onClick={() => copyToClipboard(s.site_id)}>Copy ID</button>
                 <button class="obs-btn obs-btn--sm" onClick={() => handleGenerateKey(s.site_id)}>API Key</button>
@@ -775,7 +776,7 @@ function APIKeysSection() {
               <StatusBadge status={k.revoked ? "disabled" : "enabled"} size="sm" />
               <span class="settings-row-name">{k.label || "default"}</span>
               <span class="settings-row-value" style={{ fontFamily: "var(--obs-font-mono, 'SF Mono', monospace)", fontSize: "11px" }}>
-                {k.key_id.slice(0, 8)}...
+                {k.key_id.slice(0, 8)}...{k.created_by ? ` · by ${k.created_by}` : ""}
               </span>
               <span class="settings-row-date">{k.created_at}</span>
               {!k.revoked && (
@@ -937,6 +938,171 @@ function MCPSection() {
         onConfirm={handleRevoke}
         title="Revoke MCP Token"
         message="This token will immediately stop working. Any MCP client using it will lose access."
+        confirmLabel="Revoke"
+        loading={revokeLoading}
+      />
+    </div>
+  );
+}
+
+// ─── Service tokens ───
+
+const SERVICE_SCOPES: Array<{ value: string; hint: string }> = [
+  { value: "sites:create", hint: "Create sites by external reference" },
+  { value: "keys:mint", hint: "Mint telemetry keys for its own sites" },
+  { value: "share:mint", hint: "Mint share links for its own sites; a share link reads that site's dashboard" },
+  { value: "webhooks:write", hint: "Add and remove webhooks on its own sites. Warning: this sends alert titles, which can contain error text from your data, to any public URL the token names" },
+  { value: "alerts:read", hint: "Read alert rules and history for its own sites" },
+];
+
+function ServiceTokensSection() {
+  const [tokens, setTokens] = useState<ServiceToken[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showCreate, setShowCreate] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState("");
+  const [formName, setFormName] = useState("");
+  const [formManagedBy, setFormManagedBy] = useState("");
+  const [formScopes, setFormScopes] = useState<string[]>([]);
+  const [newToken, setNewToken] = useState<string | null>(null);
+  const [revokingId, setRevokingId] = useState<string | null>(null);
+  const [revokeLoading, setRevokeLoading] = useState(false);
+
+  const refresh = async () => {
+    const data = await settingsApi.serviceTokens();
+    setTokens(data || []);
+  };
+
+  useEffect(() => {
+    setLoading(true);
+    refresh().catch(() => setTokens([])).finally(() => setLoading(false));
+  }, []);
+
+  const toggleScope = (scope: string) => {
+    setFormScopes(prev => prev.includes(scope) ? prev.filter(s => s !== scope) : [...prev, scope]);
+  };
+
+  const handleCreate = async () => {
+    if (!formName.trim() || formScopes.length === 0) return;
+    setCreating(true);
+    setCreateError("");
+    try {
+      const result = await settingsApi.createServiceToken({
+        name: formName.trim(),
+        managed_by: formManagedBy.trim() || undefined,
+        scopes: formScopes,
+      });
+      setNewToken(result.token);
+      setShowCreate(false);
+      setFormName("");
+      setFormManagedBy("");
+      setFormScopes([]);
+      await refresh();
+    } catch (err) {
+      setCreateError(err instanceof Error ? err.message : "Creating the token failed");
+    } finally { setCreating(false); }
+  };
+
+  const handleRevoke = async () => {
+    if (!revokingId) return;
+    setRevokeLoading(true);
+    try {
+      await settingsApi.revokeServiceToken(revokingId);
+      setTokens(prev => prev.map(t => t.id === revokingId ? { ...t, revoked_at: Date.now() } : t));
+      setRevokingId(null);
+    } catch (err) { console.error("Failed to revoke service token:", err); }
+    finally { setRevokeLoading(false); }
+  };
+
+  return (
+    <div class="settings-section">
+      <div class="settings-section-header">
+        <h2 class="settings-section-title">Service Tokens</h2>
+        <button class="obs-btn obs-btn--primary obs-btn--sm" onClick={() => setShowCreate(true)}>Create Token</button>
+      </div>
+
+      <div class="settings-key-note" style={{ marginBottom: "12px" }}>
+        Lets another Teploy product provision this instance. A token acts only on sites created
+        under its own manager name, and can never reach users, SQL, stored telemetry or site
+        deletion. What it creates outlives it: revoking a token leaves its keys, share links and
+        webhooks working. Writes and refusals are recorded in the audit log. See docs/service-tokens.md.
+      </div>
+
+      {newToken && (
+        <>
+          <div class="settings-key-display">
+            <span class="settings-key-value">{newToken}</span>
+            <button class="obs-btn obs-btn--sm" onClick={() => copyToClipboard(newToken)}>Copy</button>
+          </div>
+          <div class="settings-key-note">Save this token now. It will not be shown again.</div>
+        </>
+      )}
+
+      {loading ? <SettingsSkeleton /> : tokens.length === 0 ? (
+        <div class="obs-empty-state">No service tokens</div>
+      ) : (
+        <div class="settings-list">
+          {tokens.map(t => (
+            <div key={t.id} class="settings-row">
+              <StatusBadge status={t.revoked_at ? "disabled" : "enabled"} size="sm" />
+              <span class="settings-row-name">{t.name}</span>
+              <span class="settings-row-value">
+                {t.scopes.join(", ")} · manages {t.managed_by} · <code style={{ fontSize: "11px" }}>{t.id}</code>
+              </span>
+              <span class="settings-row-date">
+                {t.last_used_at ? `last used ${formatDate(t.last_used_at)}` : "never used"}
+              </span>
+              <span class="settings-row-date">{formatDate(t.created_at)} by {t.created_by}</span>
+              {!t.revoked_at && (
+                <button class="obs-btn obs-btn--sm obs-btn--danger" onClick={() => setRevokingId(t.id)}>
+                  Revoke
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <Modal open={showCreate} onClose={() => setShowCreate(false)} title="Create Service Token">
+        <div class="obs-form-group">
+          <label class="obs-label">Name</label>
+          <input class="obs-input" placeholder="teploy-dash" value={formName}
+            onInput={(e) => setFormName((e.target as HTMLInputElement).value)} />
+        </div>
+        <div class="obs-form-group">
+          <label class="obs-label">Manager name (optional)</label>
+          <input class="obs-input" placeholder="Defaults to the token name" value={formManagedBy}
+            onInput={(e) => setFormManagedBy((e.target as HTMLInputElement).value)} />
+          <div class="settings-key-note" style={{ marginTop: "6px" }}>
+            Sites belong to this name, not to the token. A replacement token with the same manager
+            name keeps access to them after this one is revoked.
+          </div>
+        </div>
+        <div class="obs-form-group">
+          <label class="obs-label">Scopes</label>
+          {SERVICE_SCOPES.map(s => (
+            <label key={s.value} style={{ display: "flex", gap: "8px", alignItems: "baseline", marginBottom: "6px" }}>
+              <input type="checkbox" checked={formScopes.includes(s.value)} onChange={() => toggleScope(s.value)} />
+              <span><code style={{ fontSize: "11px" }}>{s.value}</code> {s.hint}</span>
+            </label>
+          ))}
+        </div>
+        {createError && <div class="settings-key-note">{createError}</div>}
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "8px" }}>
+          <button class="obs-btn" onClick={() => setShowCreate(false)}>Cancel</button>
+          <button class="obs-btn obs-btn--primary" onClick={handleCreate}
+            disabled={creating || !formName.trim() || formScopes.length === 0}>
+            {creating ? "Creating..." : "Create"}
+          </button>
+        </div>
+      </Modal>
+
+      <ConfirmDialog
+        open={!!revokingId}
+        onClose={() => setRevokingId(null)}
+        onConfirm={handleRevoke}
+        title="Revoke Service Token"
+        message="This token stops working immediately, but what it created does not. Telemetry keys, share links and webhooks it made keep working until you revoke each one. To find them, filter the Audit log by this token's id: each service.keys.mint, service.share.mint and service.webhooks.write row names the key, link or webhook. Revoke them under Settings: API Keys, a site's Share panel, and Webhooks."
         confirmLabel="Revoke"
         loading={revokeLoading}
       />
@@ -1331,6 +1497,7 @@ export default function SettingsPage() {
     { key: "users", label: "Users" },
     { key: "keys", label: "API Keys" },
     { key: "mcp", label: "MCP" },
+    { key: "service-tokens", label: "Service Tokens" },
     { key: "appearance", label: "Appearance" },
     { key: "password", label: "Password" },
     { key: "ai", label: "AI" },
@@ -1361,6 +1528,7 @@ export default function SettingsPage() {
       {tab === "users" && <UsersSection />}
       {tab === "keys" && <APIKeysSection />}
       {tab === "mcp" && <MCPSection />}
+      {tab === "service-tokens" && <ServiceTokensSection />}
       {tab === "appearance" && <AppearanceSection />}
       {tab === "password" && <PasswordSection />}
       {tab === "ai" && <AISection />}

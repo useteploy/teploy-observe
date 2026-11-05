@@ -6,7 +6,6 @@
 //	client, err := observe.New(observe.Options{
 //	    Endpoint: "https://observe.example.com",
 //	    APIKey:   os.Getenv("OBSERVE_API_KEY"),
-//	    SiteID:   "default",
 //	})
 //	if err != nil { panic(err) }
 //	defer client.Close()
@@ -35,21 +34,31 @@ import (
 // Options configures a Client.
 type Options struct {
 	// Endpoint is the Observe base URL, e.g. "https://observe.example.com".
+	// Empty falls back to OBSERVE_ENDPOINT, then OTEL_EXPORTER_OTLP_ENDPOINT.
 	Endpoint string
 
 	// APIKey identifies this application to Observe. Generate one in /settings.
+	// Empty falls back to OBSERVE_API_KEY, or the x-api-key in
+	// OTEL_EXPORTER_OTLP_HEADERS when the endpoint came from OTEL. See applyEnv
+	// for when each one applies.
 	APIKey string
 
-	// SiteID is the site identifier to scope events to. Defaults to "default".
+	// SiteID is the site identifier to scope events to. Leave it empty when
+	// using an APIKey: the key's site applies, and a different value is refused.
+	// With no key it defaults to "default".
 	SiteID string
 
-	// Release is an optional release tag applied to all events.
+	// Release is an optional release tag applied to all events. Empty falls
+	// back to service.version in OTEL_RESOURCE_ATTRIBUTES.
 	Release string
 
-	// Environment is an optional tag ("production", "staging", etc.).
+	// Environment is an optional tag ("production", "staging", etc.). Empty
+	// falls back to deployment.environment[.name] in OTEL_RESOURCE_ATTRIBUTES.
 	Environment string
 
-	// ServiceName is the default service_name for logs. Defaults to the binary name.
+	// ServiceName is the default service_name for logs. Empty falls back to
+	// OTEL_SERVICE_NAME, then service.name in OTEL_RESOURCE_ATTRIBUTES, then the
+	// binary name.
 	ServiceName string
 
 	// HTTPClient lets callers supply a custom client (timeouts, proxies). Optional.
@@ -343,10 +352,14 @@ func WithSpan(s *Span) ExceptionOption {
 // New constructs a Client and starts its background flush goroutine.
 // Caller must call Close() to flush pending logs and stop the goroutine.
 func New(opts Options) (*Client, error) {
+	applyEnv(&opts)
 	if opts.Endpoint == "" {
 		return nil, errors.New("observe: Endpoint is required")
 	}
-	if opts.SiteID == "" {
+	// A key is bound to one site on the server, and a site_id that disagrees
+	// with it is refused with a 403. So with a key, send none and let the key
+	// decide; "default" is only for keyless use.
+	if opts.SiteID == "" && opts.APIKey == "" {
 		opts.SiteID = "default"
 	}
 	base := opts.HTTPClient

@@ -33,7 +33,7 @@ type AuditEvent struct {
 	SiteID    string `json:"site_id" db:"site_id"`
 	Timestamp int64  `json:"timestamp" db:"timestamp"`
 	Actor     string `json:"actor" db:"actor"`           // username / api-key id / agent id ("" = system)
-	ActorType string `json:"actor_type" db:"actor_type"` // user | apikey | agent | system
+	ActorType string `json:"actor_type" db:"actor_type"` // user | apikey | agent | service | system
 	Action    string `json:"action" db:"action"`         // dotted verb, e.g. auth.login, user.create, sql.run
 	Target    string `json:"target" db:"target"`         // resource acted on (id/name), optional
 	Result    string `json:"result" db:"result"`         // success | failure | denied
@@ -64,10 +64,11 @@ const (
 
 // Actor-type constants.
 const (
-	ActorUser   = "user"
-	ActorAPIKey = "apikey"
-	ActorAgent  = "agent"
-	ActorSystem = "system"
+	ActorUser    = "user"
+	ActorAPIKey  = "apikey"
+	ActorAgent   = "agent"
+	ActorService = "service"
+	ActorSystem  = "system"
 )
 
 const (
@@ -286,6 +287,22 @@ type VerifyResult struct {
 	HasCheckpoint    bool        `json:"has_checkpoint"`
 }
 
+// chainBreakDetail says why a row failed verification. It is the finished text, so
+// nothing may format it again: the key id can hold anything, and it once went through
+// Sprintf a second time and printed "%!(EXTRA ...)".
+func (s *Service) chainBreakDetail(ev AuditEvent, expectSeq int64, prev string) string {
+	switch {
+	case ev.Seq != expectSeq:
+		return fmt.Sprintf("sequence gap: expected %d, got %d (record deleted or reordered)", expectSeq, ev.Seq)
+	case ev.PrevHash != prev:
+		return "prev_hash mismatch (record inserted or chain relinked)"
+	case !s.keyKnown(ev.KeyID):
+		return fmt.Sprintf("record signed by unknown key id %q (rotation key removed from the keyring?)", ev.KeyID)
+	default:
+		return "hash mismatch (record contents modified)"
+	}
+}
+
 // narrowIntactDetail is the O14 wording: what an in-database chain walk
 // actually proves, and what it cannot.
 const narrowIntactDetail = "chain internally consistent from seq 1 through %d; an append-only hash chain in one mutable database does not prove that its tail was not truncated - compare the latest checkpoint digest against an externally stored copy to extend the guarantee"
@@ -362,18 +379,8 @@ func (s *Service) Verify(ctx context.Context) (VerifyResult, error) {
 		for _, ev := range rows {
 			kind := s.rowMatchKind(ev)
 			if ev.Seq != expectSeq || ev.PrevHash != prev || !s.keyKnown(ev.KeyID) || kind == matchNone {
-				detail := "sequence gap: expected %d, got %d (record deleted or reordered)"
-				switch {
-				case ev.Seq != expectSeq:
-				case ev.PrevHash != prev:
-					detail = "prev_hash mismatch (record inserted or chain relinked)"
-				case !s.keyKnown(ev.KeyID):
-					detail = fmt.Sprintf("record signed by unknown key id %q (rotation key removed from the keyring?)", ev.KeyID)
-				default:
-					detail = "hash mismatch (record contents modified)"
-				}
 				return VerifyResult{Count: checked, BrokenAtSeq: ev.Seq, VerifiedThroughSeq: through,
-					Detail: fmt.Sprintf(detail, expectSeq, ev.Seq)}, nil
+					Detail: s.chainBreakDetail(ev, expectSeq, prev)}, nil
 			}
 			if kind == matchUnkeyed {
 				unkeyed++

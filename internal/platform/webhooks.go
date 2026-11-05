@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -22,6 +23,8 @@ import (
 )
 
 type WebhookService struct {
+	// allow is the operator allowlist the delivery client was built with.
+	allow  netsafe.Allow
 	db     *nucleus.Client
 	logger *slog.Logger
 	client *http.Client
@@ -54,6 +57,7 @@ const (
 )
 
 func NewWebhookService(db *nucleus.Client, logger *slog.Logger) *WebhookService {
+	allow := webhookAllow()
 	return &WebhookService{
 		db:     db,
 		logger: logger,
@@ -61,7 +65,8 @@ func NewWebhookService(db *nucleus.Client, logger *slog.Logger) *WebhookService 
 		// declared where their own services live. Empty by default, in which
 		// case this is exactly netsafe.Client. See netsafe.Allow for why the
 		// allowance is CIDRs and why link-local is never allowlistable.
-		client:     netsafe.ClientWithAllow(10*time.Second, webhookAllow()),
+		client:     netsafe.ClientWithAllow(10*time.Second, allow),
+		allow:      allow,
 		deliverSem: make(chan struct{}, deliveryWorkers),
 	}
 }
@@ -246,20 +251,34 @@ func MatchesKind(kinds, kind string) bool {
 	return false
 }
 
+// ErrInvalidWebhook means a webhook was refused for what it asked for, as opposed
+// to the store failing. Its message is safe to show the caller.
+var ErrInvalidWebhook = errors.New("invalid webhook")
+
+// ValidateDestination refuses a URL that could only ever be blocked at delivery.
+// The HTTP create routes call it. Create itself does not, so tests and fixtures
+// can aim at httptest's 127.0.0.1 with their own client.
+func (s *WebhookService) ValidateDestination(url string) error {
+	if err := netsafe.ValidateDestination(url, s.allow); err != nil {
+		return fmt.Errorf("%w: webhook url: %w", ErrInvalidWebhook, err)
+	}
+	return nil
+}
+
 func (s *WebhookService) Create(ctx context.Context, siteID, name, webhookType, url, severities, kinds string) (*Webhook, error) {
 	if webhookType != "slack" && webhookType != "http" {
 		webhookType = "http"
 	}
 	if err := netsafe.ValidateURL(url); err != nil {
-		return nil, fmt.Errorf("webhook url: %w", err)
+		return nil, fmt.Errorf("%w: webhook url: %w", ErrInvalidWebhook, err)
 	}
 	severities, err := NormalizeSeverities(severities)
 	if err != nil {
-		return nil, fmt.Errorf("webhook severities: %w", err)
+		return nil, fmt.Errorf("%w: webhook severities: %w", ErrInvalidWebhook, err)
 	}
 	normalizedKinds, err := NormalizeKinds(kinds)
 	if err != nil {
-		return nil, fmt.Errorf("webhook kinds: %w", err)
+		return nil, fmt.Errorf("%w: webhook kinds: %w", ErrInvalidWebhook, err)
 	}
 	id := genID()
 	secret := genID() + genID() // 32 random bytes, hex-encoded
@@ -410,6 +429,13 @@ func (s *WebhookService) attemptDelivery(job deliveryJob) {
 			return
 		}
 		lastErr = err
+		// A hostname that resolves to a private address gets past create and is
+		// only caught here. Retrying cannot help, and the operator needs to hear.
+		if errors.Is(err, netsafe.ErrBlocked) {
+			s.logger.Warn("webhook delivery blocked: destination resolves to a non-public address",
+				"webhook", job.hook.Name, "webhook_id", job.hook.WebhookID, "delivery_id", job.id, "err", err)
+			return
+		}
 		// Bounded backoff between attempts; a full sleep is acceptable on a
 		// worker goroutine, and shutdown does not wait on the backoff tail
 		// beyond the current attempt.

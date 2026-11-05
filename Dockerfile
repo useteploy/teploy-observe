@@ -21,6 +21,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
         ./cmd/observe
 
 FROM alpine:3.21
+# Teploy Dash finds candidate instances by this label, then confirms them with
+# GET /.well-known/teploy.json before doing anything.
+LABEL dev.teploy.product=observe
 # tini is PID 1 (see ENTRYPOINT): it reaps orphaned processes, which observe
 # itself never does.
 RUN apk add --no-cache ca-certificates tzdata tini

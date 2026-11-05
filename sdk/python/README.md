@@ -89,6 +89,31 @@ signal.signal(signal.SIGINT, _shutdown)
 - Queues are in-memory; `kill -9` loses the queue and its counters with
   the process. No durable local spool is claimed.
 
+## Configuration from the environment
+
+Options left unset fall back to the environment, so a platform can configure an
+app without code changes. An explicit keyword wins, then `OBSERVE_*`, then the
+OpenTelemetry names:
+
+| Option | Environment |
+|---|---|
+| `endpoint` | `OBSERVE_ENDPOINT`, then `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `api_key` | `OBSERVE_API_KEY`, or `x-api-key` in `OTEL_EXPORTER_OTLP_HEADERS` |
+| `service_name` | `OTEL_SERVICE_NAME`, then `service.name` in `OTEL_RESOURCE_ATTRIBUTES` |
+| `release` | `service.version` in `OTEL_RESOURCE_ATTRIBUTES` |
+| `environment` | `deployment.environment.name` or `deployment.environment` in `OTEL_RESOURCE_ATTRIBUTES` |
+
+A credential only goes where it was issued for. An explicit endpoint takes
+`OBSERVE_API_KEY` only if `OBSERVE_ENDPOINT` is unset or names the same place.
+`OTEL_EXPORTER_OTLP_ENDPOINT` is used only when `OTEL_EXPORTER_OTLP_HEADERS` carries
+`x-api-key` and no key was passed in code; otherwise it is treated as another vendor's
+collector, and with nothing else set the client refuses to start.
+`OTEL_EXPORTER_OTLP_PROTOCOL=grpc` disables the OTLP endpoint, since this client speaks
+HTTP.
+
+With a key, leave the site unset: the key is bound to one site on the server and a
+different site is refused with a 403. The site defaults to `default` only with no key.
+
 ## Breadcrumbs
 
 ```python

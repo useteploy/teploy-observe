@@ -7,6 +7,8 @@ const PLATFORM = "/api/v1/platform";
 
 export interface Site {
   site_id: string; name: string; domain: string; created_at: number;
+  // Set when a service token provisioned the site.
+  external_ref?: string; managed_by?: string;
 }
 
 export interface APIKey {
@@ -15,6 +17,7 @@ export interface APIKey {
 
 export interface APIKeyInfo {
   key_id: string; site_id: string; label: string; created_at: string; revoked: boolean;
+  created_by?: string;
 }
 
 export interface Webhook {
@@ -24,6 +27,13 @@ export interface Webhook {
 
 export interface User {
   user_id: string; username: string; email: string; role: string; created_at: string;
+}
+
+// A service token. The secret itself is returned exactly once, by
+// createServiceToken; nothing else ever carries it.
+export interface ServiceToken {
+  id: string; name: string; managed_by: string; scopes: string[];
+  created_by: string; created_at: number; last_used_at: number; revoked_at: number;
 }
 
 // An MCP access token. The secret itself is returned exactly once, by
@@ -77,6 +87,13 @@ export const settingsApi = {
     post<User>(`${PLATFORM}/users`, data),
   updateRole: (userId: string, role: string) =>
     post<{ ok: boolean }>(`${PLATFORM}/users/${userId}/role`, { role }),
+
+  // Service tokens
+  serviceTokens: () => get<ServiceToken[]>(`${BASE}/service-tokens`),
+  createServiceToken: (data: { name: string; managed_by?: string; scopes: string[] }) =>
+    post<{ token: string; record: ServiceToken }>(`${BASE}/service-tokens`, data),
+  revokeServiceToken: (tokenId: string) =>
+    del(`${BASE}/service-tokens/${tokenId}`),
 
   // MCP tokens
   mcpTokens: () => get<MCPToken[]>(`${BASE}/mcp/tokens`),

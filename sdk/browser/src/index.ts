@@ -535,7 +535,9 @@ export function init(options: InitOptions): void {
   const instance: Client = {
     opts: {
       endpoint: options.endpoint,
-      siteId: options.siteId ?? "default",
+      // A key is bound to one site and a different site_id is refused with a
+      // 403, so with a key send none and let the key decide.
+      siteId: options.siteId ?? (options.apiKey ? "" : "default"),
       apiKey: options.apiKey,
       disableAutoPageview: options.disableAutoPageview ?? false,
       batchSize: clamp(options.batchSize, 50, 1, MAX_EVENTS_PER_REQUEST),
