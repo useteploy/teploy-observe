@@ -89,6 +89,25 @@ signal.signal(signal.SIGINT, _shutdown)
 - Queues are in-memory; `kill -9` loses the queue and its counters with
   the process. No durable local spool is claimed.
 
+## Configuration from the environment
+
+Options left unset fall back to the environment, so a platform can configure an
+app without code changes. An explicit keyword wins, then `OBSERVE_*`, then the
+OpenTelemetry names:
+
+| Option | Environment |
+|---|---|
+| `endpoint` | `OBSERVE_ENDPOINT`, then `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `api_key` | `OBSERVE_API_KEY`, or `x-api-key` in `OTEL_EXPORTER_OTLP_HEADERS` |
+| `service_name` | `OTEL_SERVICE_NAME`, then `service.name` in `OTEL_RESOURCE_ATTRIBUTES` |
+| `release` | `service.version` in `OTEL_RESOURCE_ATTRIBUTES` |
+| `environment` | `deployment.environment.name` or `deployment.environment` in `OTEL_RESOURCE_ATTRIBUTES` |
+
+A credential only goes to the endpoint it came with: `OBSERVE_API_KEY` is not sent
+to an `OTEL_EXPORTER_OTLP_ENDPOINT`, and the OTLP `x-api-key` is not sent to any
+other endpoint. `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` disables the OTLP endpoint,
+since this client speaks HTTP.
+
 ## Breadcrumbs
 
 ```python

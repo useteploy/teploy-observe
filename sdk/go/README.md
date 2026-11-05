@@ -35,6 +35,26 @@ func main() {
 }
 ```
 
+## Configuration from the environment
+
+Options left empty fall back to the environment, so a platform can configure an
+app without code changes. An explicit option wins, then `OBSERVE_*`, then the
+OpenTelemetry names:
+
+| Option | Environment |
+|---|---|
+| `Endpoint` | `OBSERVE_ENDPOINT`, then `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `APIKey` | `OBSERVE_API_KEY`, or `x-api-key` in `OTEL_EXPORTER_OTLP_HEADERS` |
+| `ServiceName` | `OTEL_SERVICE_NAME`, then `service.name` in `OTEL_RESOURCE_ATTRIBUTES` |
+| `Release` | `service.version` in `OTEL_RESOURCE_ATTRIBUTES` |
+| `Environment` | `deployment.environment.name` or `deployment.environment` in `OTEL_RESOURCE_ATTRIBUTES` |
+
+A credential only goes to the endpoint it came with: `OBSERVE_API_KEY` is not sent
+to an `OTEL_EXPORTER_OTLP_ENDPOINT`, and the OTLP `x-api-key` is not sent to any
+other endpoint. `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` disables the OTLP endpoint,
+since this client speaks HTTP. The client sends OTLP as JSON whichever HTTP
+protocol is named; Observe accepts both.
+
 ## Guarantees
 
 - **Non-blocking logs.** `Info/Warn/Error` buffer in memory and flush on a timer or when the batch fills. `Close()`/`Shutdown(ctx)` drain the buffer.

@@ -25,6 +25,7 @@ from .breadcrumbs import (
     BreadcrumbHandler,
 )
 from . import flags as _flags
+from .env import apply_env
 from .transport import Operation, DeliveryDeadline
 
 # Wire protocol version this SDK speaks (F12/F19 idempotent delivery).
@@ -147,6 +148,7 @@ class Client:
     """
 
     def __init__(self, **kwargs: Any) -> None:
+        kwargs = apply_env(kwargs)
         if not kwargs.get("endpoint"):
             raise ValueError("observe_sdk: endpoint is required")
         self.opts = Options(**kwargs)
