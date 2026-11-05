@@ -951,7 +951,7 @@ const SERVICE_SCOPES: Array<{ value: string; hint: string }> = [
   { value: "sites:create", hint: "Create sites by external reference" },
   { value: "keys:mint", hint: "Mint telemetry keys for its own sites" },
   { value: "share:mint", hint: "Mint share links for its own sites; a share link reads that site's dashboard" },
-  { value: "webhooks:write", hint: "Add and remove webhooks on its own sites" },
+  { value: "webhooks:write", hint: "Add and remove webhooks on its own sites. Warning: this sends alert titles, which can contain error text from your data, to any public URL the token names" },
   { value: "alerts:read", hint: "Read alert rules and history for its own sites" },
 ];
 
@@ -1024,7 +1024,8 @@ function ServiceTokensSection() {
       <div class="settings-key-note" style={{ marginBottom: "12px" }}>
         Lets another Teploy product provision this instance. A token acts only on sites created
         under its own manager name, and can never reach users, SQL, stored telemetry or site
-        deletion. Writes and refusals are recorded in the audit log. See docs/service-tokens.md.
+        deletion. What it creates outlives it: revoking a token leaves its keys, share links and
+        webhooks working. Writes and refusals are recorded in the audit log. See docs/service-tokens.md.
       </div>
 
       {newToken && (
@@ -1101,7 +1102,7 @@ function ServiceTokensSection() {
         onClose={() => setRevokingId(null)}
         onConfirm={handleRevoke}
         title="Revoke Service Token"
-        message="This token will immediately stop working. Keys and sites it created keep working."
+        message="This token stops working immediately, but what it created does not. Telemetry keys, share links and webhooks it made keep working until you revoke each one. To find them, filter the Audit log by this token's id: each service.keys.mint, service.share.mint and service.webhooks.write row names the key, link or webhook. Revoke them under Settings: API Keys, a site's Share panel, and Webhooks."
         confirmLabel="Revoke"
         loading={revokeLoading}
       />
