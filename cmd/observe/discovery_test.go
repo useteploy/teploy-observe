@@ -11,7 +11,7 @@ import (
 )
 
 func TestDiscoveryDocumentShape(t *testing.T) {
-	cfg := config.Config{PublicURL: "https://observe.example.com", IngestAddr: ":3001", IngestURL: "https://ingest.example.com"}
+	cfg := config.Config{PublicURL: "https://ingest.example.com", DashboardURL: "https://observe.example.com", IngestAddr: ":3001", IngestURL: "https://ingest.example.com"}
 	rec := httptest.NewRecorder()
 	discoveryHandler(newDiscovery(cfg, "abc123"))(rec, httptest.NewRequest(http.MethodGet, "/.well-known/teploy.json", nil))
 	if rec.Code != http.StatusOK {
@@ -33,19 +33,30 @@ func TestDiscoveryDocumentShape(t *testing.T) {
 	}
 }
 
-func TestDiscoveryIngestURLNeverGuesses(t *testing.T) {
+func TestDiscoveryURLsNeverGuess(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		cfg  config.Config
-		want string
+		name                 string
+		cfg                  config.Config
+		wantDash, wantIngest string
 	}{
-		{"one listener is the public url", config.Config{PublicURL: "https://o.example.com"}, "https://o.example.com"},
-		{"operator named it", config.Config{PublicURL: "https://o.example.com", IngestAddr: ":3001", IngestURL: "https://i.example.com"}, "https://i.example.com"},
-		{"separate listener unnamed is unknown", config.Config{PublicURL: "https://o.example.com", IngestAddr: ":3001"}, ""},
-		{"nothing configured", config.Config{}, ""},
+		{"one listener: public url is both",
+			config.Config{PublicURL: "https://o.example.com"}, "https://o.example.com", "https://o.example.com"},
+		{"one listener: dashboard url named",
+			config.Config{DashboardURL: "https://d.example.com"}, "https://d.example.com", "https://d.example.com"},
+		// The live overlay: PublicURL is the ingest host and must not be published
+		// as the dashboard.
+		{"separate listener, only public url set",
+			config.Config{PublicURL: "https://observe.fylun.ai", IngestAddr: ":3001"}, "", ""},
+		{"separate listener, both named",
+			config.Config{PublicURL: "https://observe.fylun.ai", IngestAddr: ":3001", DashboardURL: "http://100.1.2.3:3000", IngestURL: "https://observe.fylun.ai"},
+			"http://100.1.2.3:3000", "https://observe.fylun.ai"},
+		{"nothing configured", config.Config{}, "", ""},
 	} {
-		if got := discoveryIngestURL(tc.cfg); got != tc.want {
-			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		if got := discoveryDashboardURL(tc.cfg); got != tc.wantDash {
+			t.Errorf("%s: dashboard %q, want %q", tc.name, got, tc.wantDash)
+		}
+		if got := discoveryIngestURL(tc.cfg); got != tc.wantIngest {
+			t.Errorf("%s: ingest %q, want %q", tc.name, got, tc.wantIngest)
 		}
 	}
 }

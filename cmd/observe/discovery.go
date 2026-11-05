@@ -34,22 +34,35 @@ func newDiscovery(cfg config.Config, instanceID string) discoveryDoc {
 		Product:      "observe",
 		Version:      version,
 		InstanceID:   instanceID,
-		DashboardURL: cfg.PublicURL,
+		DashboardURL: discoveryDashboardURL(cfg),
 		IngestURL:    discoveryIngestURL(cfg),
 		Capabilities: discoveryCapabilities(os.Getenv("OBSERVE_OTLP_GRPC_ADDR") != ""),
 	}
 }
 
-// discoveryIngestURL never guesses. With one listener, ingest is the public URL
-// because they are the same port. With a separate ingest listener only the
-// operator knows its public name, so an unset OBSERVE_INGEST_URL publishes ""
-// and the client has to ask rather than write a wrong endpoint into an app.
+// discoveryDashboardURL never guesses. With one listener the public URL is the
+// dashboard. With a separate ingest listener PublicURL may be the ingest host (the
+// live overlay does exactly that), so only OBSERVE_DASHBOARD_URL can answer.
+func discoveryDashboardURL(cfg config.Config) string {
+	if cfg.DashboardURL != "" {
+		return cfg.DashboardURL
+	}
+	if cfg.IngestAddr == "" {
+		return cfg.PublicURL
+	}
+	return ""
+}
+
+// discoveryIngestURL never guesses. With one listener, ingest is the same port as
+// the dashboard. With a separate ingest listener only the operator knows its public
+// name, so an unset OBSERVE_INGEST_URL publishes "" and the client has to ask rather
+// than write a wrong endpoint into an app.
 func discoveryIngestURL(cfg config.Config) string {
 	if cfg.IngestURL != "" {
 		return cfg.IngestURL
 	}
 	if cfg.IngestAddr == "" {
-		return cfg.PublicURL
+		return discoveryDashboardURL(cfg)
 	}
 	return ""
 }

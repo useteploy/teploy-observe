@@ -26,11 +26,15 @@ GET /.well-known/teploy.json
 Unauthenticated, no secrets. `instance_id` is generated once and stored in the
 database, so it survives container replacement and a restore brings it back.
 
-- `dashboard_url` is `OBSERVE_PUBLIC_URL`; empty when unset. It is never taken from
-  the request's Host header, which a client can spoof.
+- `dashboard_url` is `OBSERVE_DASHBOARD_URL`, which nothing else reads. With no
+  separate ingest listener it falls back to `OBSERVE_PUBLIC_URL`. With a separate
+  listener and no `OBSERVE_DASHBOARD_URL` it is empty, because `OBSERVE_PUBLIC_URL`
+  may be the ingest host. It is never taken from the request's Host header, which a
+  client can spoof.
 - `ingest_url` is `OBSERVE_INGEST_URL`. With no separate ingest listener it is the
-  public URL, because they are the same port. With a separate listener and no
-  `OBSERVE_INGEST_URL` it is empty: treat that as unknown and ask, never guess.
+  same as `dashboard_url`, because they are the same port. With a separate listener
+  and no `OBSERVE_INGEST_URL` it is empty.
+- Treat an empty URL as unknown and ask. Never guess.
 - `otlp_grpc` is listed only when `OBSERVE_OTLP_GRPC_ADDR` is set.
 
 **Served on the dashboard listener only.** The ingest listener keeps answering 404.
@@ -175,5 +179,12 @@ OTEL_SERVICE_NAME=<app>
 OTEL_RESOURCE_ATTRIBUTES=service.version=<version>,deployment.environment=production
 ```
 
-The OTLP header has to be `x-api-key`: `/v1/*` does not read `Authorization`. The
+The OTLP header has to be `x-api-key`: `/v1/*` does not read `Authorization`. Do not
+set a site: the key is bound to one, and the SDKs send none when they hold a key. The
 browser SDK and the Sentry shim have no environment to read and are unchanged.
+
+The SDKs send a credential only where it was issued for. An explicit endpoint takes
+`OBSERVE_API_KEY` only if `OBSERVE_ENDPOINT` is unset or equal, and
+`OTEL_EXPORTER_OTLP_ENDPOINT` is used only with its own `x-api-key` header and no key
+in code. An OTLP endpoint with no `x-api-key` is treated as another vendor's collector,
+and with nothing else set the SDK refuses to start.
