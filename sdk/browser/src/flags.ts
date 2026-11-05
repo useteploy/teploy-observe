@@ -112,7 +112,8 @@ function fallback(key: string, ctx: FlagContext | undefined, error: string): Fla
 }
 
 export function createFlagClient(options: FlagClientOptions): FlagClient {
-  const siteId = options.siteId ?? "default";
+  // With a key the server takes the site from it; see init().
+  const siteId = options.siteId ?? (options.apiKey ? "" : "default");
   const ttl = clamp(options.ttlMs, 30_000, 0, 3_600_000);
   const timeout = clamp(options.timeoutMs, 3_000, 100, 60_000);
   const maxEntries = clamp(options.maxEntries, 500, 1, 10_000);

@@ -1398,7 +1398,7 @@ func main() {
 	// Public flag SDK endpoint: generous per-site/IP cap (60/min) for the
 	// browser evaluation path.
 	flagEvalLimiter := ingest.NewRateLimiter(60, time.Minute, 120)
-	r.HandleFunc("POST /api/v1/flags/evaluate", flagEvaluateHandler(flagSvc, flagEvalLimiter))
+	r.HandleFunc("POST /api/v1/flags/evaluate", flagEvaluateHandler(flagSvc, flagEvalLimiter, authSvc.ValidateAPIKey))
 	r.Handle("GET /api/v1/flags/config", flagConfigRoute(apiKeyMW, rateLimiter.Middleware, flagSvc))
 
 	// --- Experiments (JWT auth; editor+ writes) ---
@@ -3817,7 +3817,7 @@ func flagHistoryHandler(svc *flags.FlagService) neutron.HandlerFunc[flagHistoryI
 // flagEvaluateHandler is the public, browser-callable flag SDK endpoint. It is
 // IP-rate-limited to curb enumeration / write floods and validates input so a
 // malformed request returns 400 instead of a silent {enabled:false} oracle.
-func flagEvaluateHandler(svc *flags.FlagService, rl *ingest.RateLimiter) http.HandlerFunc {
+func flagEvaluateHandler(svc *flags.FlagService, rl *ingest.RateLimiter, validateKey func(context.Context, string) (auth.ValidatedKey, error)) http.HandlerFunc {
 	// Audit F23: an IP-only limiter admits the request BEFORE the body is
 	// parsed. The site-keyed limiter below runs after parsing, and its key
 	// includes a body-supplied site_id — without this first gate, one IP
@@ -3851,6 +3851,21 @@ func flagEvaluateHandler(svc *flags.FlagService, rl *ingest.RateLimiter) http.Ha
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 			return
+		}
+		// An SDK holding a key sends no site: the key is bound to one. Only that
+		// case consults the key, so the public browser path is unchanged.
+		if key := strings.TrimSpace(r.Header.Get("X-API-Key")); input.SiteID == "" && key != "" {
+			validated, err := validateKey(r.Context(), key)
+			if errors.Is(err, auth.ErrAuthUnavailable) {
+				w.Header().Set("Retry-After", "5")
+				http.Error(w, `{"error":"authentication temporarily unavailable"}`, http.StatusServiceUnavailable)
+				return
+			}
+			if err != nil {
+				http.Error(w, `{"error":"invalid API key"}`, http.StatusUnauthorized)
+				return
+			}
+			input.SiteID = validated.SiteID
 		}
 		if input.SiteID == "" || input.FlagKey == "" {
 			http.Error(w, `{"error":"site_id and flag_key required"}`, http.StatusBadRequest)

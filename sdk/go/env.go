@@ -7,32 +7,40 @@ import (
 )
 
 // applyEnv fills options the caller left empty from the environment, so an app
-// a platform has configured needs no endpoint or key in code. An explicit
-// option always wins, then OBSERVE_*, then the OpenTelemetry standard names.
+// a platform has configured needs no endpoint or key in code. An explicit option
+// always wins, then OBSERVE_*, then the OpenTelemetry standard names.
 //
-// The credential follows the endpoint it was issued alongside: OBSERVE_API_KEY
-// is only sent to an explicit or OBSERVE_ENDPOINT endpoint, and the x-api-key
-// from OTEL_EXPORTER_OTLP_HEADERS only to OTEL_EXPORTER_OTLP_ENDPOINT. An app
-// whose OTEL_* point at some other vendor's collector must not have its Observe
-// key sent there, nor that vendor's key sent to Observe.
+// A credential only goes where it was issued for:
+//
+//   - An explicit Endpoint takes OBSERVE_API_KEY only if OBSERVE_ENDPOINT is unset
+//     or names the same place. Otherwise that key belongs to another instance.
+//   - OTEL_EXPORTER_OTLP_ENDPOINT is used only when OTEL_EXPORTER_OTLP_HEADERS
+//     carries x-api-key and no key was passed in code. Without that header the
+//     endpoint is some other vendor's collector, so New keeps returning "Endpoint
+//     is required" rather than sending telemetry there. With a key in code,
+//     using it would send that key there.
 //
 // OTEL_EXPORTER_OTLP_PROTOCOL=grpc disables the OTLP endpoint and headers: this
 // client speaks HTTP, and that endpoint would be a gRPC port. For http/protobuf
 // and http/json the endpoint is usable as is, because Observe accepts both
 // encodings on /v1/* and this client sends JSON.
 func applyEnv(opts *Options) {
-	explicitEndpoint := opts.Endpoint != ""
-	if opts.Endpoint == "" {
-		opts.Endpoint = os.Getenv("OBSERVE_ENDPOINT")
-	}
-	if opts.Endpoint != "" {
+	observeEndpoint := os.Getenv("OBSERVE_ENDPOINT")
+	switch {
+	case opts.Endpoint != "":
+		if opts.APIKey == "" && (observeEndpoint == "" || sameEndpoint(observeEndpoint, opts.Endpoint)) {
+			opts.APIKey = os.Getenv("OBSERVE_API_KEY")
+		}
+	case observeEndpoint != "":
+		opts.Endpoint = observeEndpoint
 		if opts.APIKey == "" {
 			opts.APIKey = os.Getenv("OBSERVE_API_KEY")
 		}
-	} else if !explicitEndpoint && otlpHTTPConfigured() {
-		opts.Endpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-		if opts.APIKey == "" {
-			opts.APIKey = parseOTELList(os.Getenv("OTEL_EXPORTER_OTLP_HEADERS"), true)["x-api-key"]
+	case opts.APIKey == "" && otlpHTTPConfigured():
+		key := parseOTELList(os.Getenv("OTEL_EXPORTER_OTLP_HEADERS"), true)["x-api-key"]
+		if key != "" {
+			opts.Endpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+			opts.APIKey = key
 		}
 	}
 
@@ -52,6 +60,10 @@ func applyEnv(opts *Options) {
 	if opts.Environment == "" {
 		opts.Environment = attrs["deployment.environment"]
 	}
+}
+
+func sameEndpoint(a, b string) bool {
+	return strings.TrimRight(a, "/") == strings.TrimRight(b, "/")
 }
 
 func otlpHTTPConfigured() bool {

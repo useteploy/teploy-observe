@@ -49,11 +49,16 @@ OpenTelemetry names:
 | `Release` | `service.version` in `OTEL_RESOURCE_ATTRIBUTES` |
 | `Environment` | `deployment.environment.name` or `deployment.environment` in `OTEL_RESOURCE_ATTRIBUTES` |
 
-A credential only goes to the endpoint it came with: `OBSERVE_API_KEY` is not sent
-to an `OTEL_EXPORTER_OTLP_ENDPOINT`, and the OTLP `x-api-key` is not sent to any
-other endpoint. `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` disables the OTLP endpoint,
-since this client speaks HTTP. The client sends OTLP as JSON whichever HTTP
-protocol is named; Observe accepts both.
+A credential only goes where it was issued for. An explicit endpoint takes
+`OBSERVE_API_KEY` only if `OBSERVE_ENDPOINT` is unset or names the same place.
+`OTEL_EXPORTER_OTLP_ENDPOINT` is used only when `OTEL_EXPORTER_OTLP_HEADERS` carries
+`x-api-key` and no key was passed in code; otherwise it is treated as another vendor's
+collector, and with nothing else set the client refuses to start.
+`OTEL_EXPORTER_OTLP_PROTOCOL=grpc` disables the OTLP endpoint, since this client speaks
+HTTP.
+
+With a key, leave the site unset: the key is bound to one site on the server and a
+different site is refused with a 403. The site defaults to `default` only with no key.
 
 ## Guarantees
 

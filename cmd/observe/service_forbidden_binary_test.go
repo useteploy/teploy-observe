@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -115,72 +117,8 @@ func TestServiceTokenIsRefusedEverywhereElseOnTheRealBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "observe")
-	build := exec.Command("go", "build", "-p", "2", "-o", bin, ".")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
-	addr := freeLoopbackAddr(t)
-	cmd := exec.Command(bin)
-	cmd.Env = append(os.Environ(),
-		"OBSERVE_ADDR="+addr,
-		"OBSERVE_NUCLEUS_URL="+dsn,
-		"OBSERVE_JWT_SECRET="+secret,
-		"OBSERVE_SESSION_SALT=sweep-salt-sweep-salt-sweep-salt",
-		"OBSERVE_DATA_DIR="+dir,
-		"OBSERVE_LOG_ROUTES=1",
-		"OBSERVE_PUBLIC_URL=http://"+addr,
-		"OBSERVE_INGEST_ADDR=",
-		"OBSERVE_OTLP_GRPC_ADDR=",
-	)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Signal(os.Interrupt)
-		done := make(chan struct{})
-		go func() { _ = cmd.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(15 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
-		}
-	})
-
-	routes := make(chan string, 2048)
-	go func() {
-		sc := bufio.NewScanner(stdout)
-		sc.Buffer(make([]byte, 64<<10), 1<<20)
-		for sc.Scan() {
-			routes <- sc.Text()
-		}
-		close(routes)
-	}()
-
-	base := "http://" + addr
+	base, routes := bootObserveBinary(t, dsn, secret)
 	client := &http.Client{Timeout: 15 * time.Second}
-	deadline := time.Now().Add(120 * time.Second)
-	for {
-		resp, err := client.Get(base + "/.well-known/teploy.json")
-		if err == nil {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK && strings.Contains(string(body), `"product":"observe"`) {
-				break
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("observe did not come up: %v", err)
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
 
 	seen := map[string]bool{}
 	drain := time.After(2 * time.Second)
@@ -271,6 +209,279 @@ collect:
 	}
 	if len(rows) != 2 {
 		t.Fatalf("audit rows = %+v, want started and success", rows)
+	}
+}
+
+var (
+	observeBinaryOnce sync.Once
+	observeBinaryPath string
+	observeBinaryErr  error
+)
+
+// bootObserveBinary builds once per test run, starts the real server against dsn on
+// a free port, and returns its base URL and its route-table output.
+func bootObserveBinary(t *testing.T, dsn, secret string) (string, <-chan string) {
+	t.Helper()
+	observeBinaryOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "observe-binary-test")
+		if err != nil {
+			observeBinaryErr = err
+			return
+		}
+		observeBinaryPath = filepath.Join(dir, "observe")
+		out, err := exec.Command("go", "build", "-p", "2", "-o", observeBinaryPath, ".").CombinedOutput()
+		if err != nil {
+			observeBinaryErr = fmt.Errorf("build: %w\n%s", err, out)
+		}
+	})
+	if observeBinaryErr != nil {
+		t.Fatal(observeBinaryErr)
+	}
+	addr := freeLoopbackAddr(t)
+	cmd := exec.Command(observeBinaryPath)
+	cmd.Env = append(os.Environ(),
+		"OBSERVE_ADDR="+addr,
+		"OBSERVE_NUCLEUS_URL="+dsn,
+		"OBSERVE_JWT_SECRET="+secret,
+		"OBSERVE_SESSION_SALT=sweep-salt-sweep-salt-sweep-salt",
+		"OBSERVE_DATA_DIR="+t.TempDir(),
+		"OBSERVE_LOG_ROUTES=1",
+		"OBSERVE_PUBLIC_URL=http://"+addr,
+		"OBSERVE_INGEST_ADDR=",
+		"OBSERVE_OTLP_GRPC_ADDR=",
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		done := make(chan struct{})
+		go func() { _ = cmd.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			_ = cmd.Process.Kill()
+			<-done
+		}
+	})
+	routes := make(chan string, 2048)
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		sc.Buffer(make([]byte, 64<<10), 1<<20)
+		for sc.Scan() {
+			select {
+			case routes <- sc.Text():
+			default:
+			}
+		}
+		close(routes)
+	}()
+	base := "http://" + addr
+	client := &http.Client{Timeout: 15 * time.Second}
+	deadline := time.Now().Add(120 * time.Second)
+	for {
+		resp, err := client.Get(base + "/.well-known/teploy.json")
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK && strings.Contains(string(body), `"product":"observe"`) {
+				return base, routes
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("observe did not come up: %v", err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// The documented path, whole: a token creates a site, mints a key, an SDK configured
+// from nothing but the environment contract writes, and the rows land under that
+// site. Each SDK's own default site used to turn every one of these writes into a 403.
+func TestMintedKeyReachesTheStoreThroughTheEnvContract(t *testing.T) {
+	ctx := context.Background()
+	dsn := nucleustest.DSN(t)
+	db, err := nucleus.Connect(ctx, dsn)
+	if err != nil {
+		t.Skipf("nucleus not reachable: %v", err)
+	}
+	defer db.Close()
+	if err := schema.Apply(ctx, db); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+	plaintext, _, err := svctoken.NewStore(db).Create(ctx, "e2e-"+randHex(t), "", "root",
+		[]string{svctoken.ScopeSitesCreate, svctoken.ScopeKeysMint})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, _ := bootObserveBinary(t, dsn, strings.Repeat("e", 48))
+
+	post := func(path, body string, out any) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, base+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+plaintext)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("POST %s: status %d", path, resp.StatusCode)
+		}
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var created struct {
+		Site struct {
+			SiteID string `json:"site_id"`
+		} `json:"site"`
+	}
+	post("/api/v1/service/sites", `{"external_ref":"app:e2e-`+randHex(t)+`"}`, &created)
+	site := created.Site.SiteID
+	var minted struct {
+		Key string `json:"key"`
+	}
+	post("/api/v1/service/sites/"+site+"/keys", `{"label":"e2e"}`, &minted)
+
+	// The server's and this test's own configuration must not reach the SDK.
+	sdkEnv := func(extra ...string) []string {
+		env := []string{}
+		for _, kv := range os.Environ() {
+			if !strings.HasPrefix(kv, "OBSERVE_") && !strings.HasPrefix(kv, "OTEL_") {
+				env = append(env, kv)
+			}
+		}
+		return append(env, extra...)
+	}
+	run := func(name string, cmd *exec.Cmd) {
+		t.Helper()
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%s: %v\n%s", name, err, out)
+		}
+	}
+	waitForRow := func(what, query, tag string) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			rows, err := nucleus.Query[struct {
+				SiteID string `db:"site_id"`
+			}](ctx, db.SQL(), query, tag)
+			if err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+			if len(rows) > 0 {
+				if rows[0].SiteID != site {
+					t.Fatalf("%s stored under site %q, want %q", what, rows[0].SiteID, site)
+				}
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s %q never reached the store", what, tag)
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
+	const errorQuery = "SELECT site_id FROM error_events WHERE error_value = $1"
+	const logQuery = "SELECT site_id FROM logs WHERE message = $1"
+
+	observeEnv := []string{"OBSERVE_ENDPOINT=" + base, "OBSERVE_API_KEY=" + minted.Key}
+	otelEnv := []string{
+		"OTEL_EXPORTER_OTLP_ENDPOINT=" + base,
+		"OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf",
+		"OTEL_EXPORTER_OTLP_HEADERS=x-api-key=" + minted.Key,
+		"OTEL_SERVICE_NAME=e2e",
+		"OTEL_RESOURCE_ATTRIBUTES=service.version=1.2.3",
+	}
+
+	goRun := func(tag string, env []string) {
+		t.Helper()
+		cmd := exec.Command("go", "run", "./examples/envcontract", tag)
+		cmd.Dir = filepath.Join("..", "..", "sdk", "go")
+		cmd.Env = sdkEnv(env...)
+		run("go sdk", cmd)
+		waitForRow("go error", errorQuery, tag)
+		waitForRow("go log", logQuery, tag)
+	}
+	goRun("envcontract-go-observe-"+randHex(t), observeEnv)
+	goRun("envcontract-go-otel-"+randHex(t), otelEnv)
+
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Log("python3 not found; the Python half of this test did not run")
+		return
+	}
+	const pythonProgram = `
+import sys
+import observe_sdk
+tag = sys.argv[1]
+client = observe_sdk.Client()
+client.capture_message(tag)
+client.info(tag)
+client.flush(timeout=10.0)
+client.close(timeout=10.0)
+lost = client.stats()["dropped"]
+if lost:
+    sys.exit("dropped: %s" % lost)
+`
+	pyRun := func(tag string, env []string) {
+		t.Helper()
+		cmd := exec.Command(python, "-c", pythonProgram, tag)
+		cmd.Env = sdkEnv(append(env, "PYTHONPATH="+filepath.Join("..", "..", "sdk", "python"))...)
+		run("python sdk", cmd)
+		waitForRow("python error", errorQuery, tag)
+		waitForRow("python log", logQuery, tag)
+	}
+	pyRun("envcontract-py-observe-"+randHex(t), observeEnv)
+	pyRun("envcontract-py-otel-"+randHex(t), otelEnv)
+
+	// The analytics path, which every SDK's non-browser user agent is filtered out
+	// of by IsBot, so this one is a plain request shaped like a browser's: a key and
+	// no site. The wrong site is refused rather than stored.
+	sendEvent := func(body string) int {
+		req, err := http.NewRequest(http.MethodPost, base+"/api/v1/events", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-API-Key", minted.Key)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0 Safari/537.36")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if got := sendEvent(`{"site_id":"default","event_type":"pageview","url":"https://x.example/","pathname":"/"}`); got != http.StatusForbidden {
+		t.Fatalf("event for another site: status %d, want 403", got)
+	}
+	if got := sendEvent(`{"event_type":"pageview","url":"https://x.example/","pathname":"/"}`); got/100 != 2 {
+		t.Fatalf("event with no site: status %d", got)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		rows, err := nucleus.Query[struct {
+			SiteID string `db:"site_id"`
+		}](ctx, db.SQL(), "SELECT site_id FROM events WHERE site_id = $1 LIMIT 1", site)
+		if err != nil {
+			t.Fatalf("events: %v", err)
+		}
+		if len(rows) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the event never reached the store under the key's site")
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
 }
 

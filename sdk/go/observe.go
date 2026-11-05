@@ -6,7 +6,6 @@
 //	client, err := observe.New(observe.Options{
 //	    Endpoint: "https://observe.example.com",
 //	    APIKey:   os.Getenv("OBSERVE_API_KEY"),
-//	    SiteID:   "default",
 //	})
 //	if err != nil { panic(err) }
 //	defer client.Close()
@@ -40,10 +39,13 @@ type Options struct {
 
 	// APIKey identifies this application to Observe. Generate one in /settings.
 	// Empty falls back to OBSERVE_API_KEY, or the x-api-key in
-	// OTEL_EXPORTER_OTLP_HEADERS when the endpoint came from OTEL (see applyEnv).
+	// OTEL_EXPORTER_OTLP_HEADERS when the endpoint came from OTEL. See applyEnv
+	// for when each one applies.
 	APIKey string
 
-	// SiteID is the site identifier to scope events to. Defaults to "default".
+	// SiteID is the site identifier to scope events to. Leave it empty when
+	// using an APIKey: the key's site applies, and a different value is refused.
+	// With no key it defaults to "default".
 	SiteID string
 
 	// Release is an optional release tag applied to all events. Empty falls
@@ -354,7 +356,10 @@ func New(opts Options) (*Client, error) {
 	if opts.Endpoint == "" {
 		return nil, errors.New("observe: Endpoint is required")
 	}
-	if opts.SiteID == "" {
+	// A key is bound to one site on the server, and a site_id that disagrees
+	// with it is refused with a 403. So with a key, send none and let the key
+	// decide; "default" is only for keyless use.
+	if opts.SiteID == "" && opts.APIKey == "" {
 		opts.SiteID = "default"
 	}
 	base := opts.HTTPClient

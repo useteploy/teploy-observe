@@ -65,33 +65,103 @@ func TestApplyEnvOTELGRPCIsNotUsable(t *testing.T) {
 	}
 }
 
-// A credential must not travel to an endpoint it was not issued alongside.
-func TestApplyEnvCredentialFollowsItsEndpoint(t *testing.T) {
-	clearObserveEnv(t)
-	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://other-vendor.example.com")
-	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-api-key=vendor_key")
-	t.Setenv("OBSERVE_ENDPOINT", "https://ingest.example.com")
-	var o Options
-	applyEnv(&o)
-	if o.Endpoint != "https://ingest.example.com" || o.APIKey != "" {
-		t.Fatalf("vendor key reached Observe: %+v", o)
+// An explicit endpoint takes the env key only when the env does not say that key
+// belongs somewhere else.
+func TestApplyEnvExplicitEndpointAndEnvKey(t *testing.T) {
+	for _, tc := range []struct {
+		name, observeEndpoint, wantKey string
+	}{
+		{"OBSERVE_ENDPOINT unset", "", "obs_key"},
+		{"OBSERVE_ENDPOINT equal", "https://code.example.com/", "obs_key"},
+		{"OBSERVE_ENDPOINT differs", "https://other.example.com", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearObserveEnv(t)
+			t.Setenv("OBSERVE_API_KEY", "obs_key")
+			t.Setenv("OBSERVE_ENDPOINT", tc.observeEndpoint)
+			o := Options{Endpoint: "https://code.example.com"}
+			applyEnv(&o)
+			if o.Endpoint != "https://code.example.com" || o.APIKey != tc.wantKey {
+				t.Fatalf("%+v", o)
+			}
+		})
 	}
+}
 
+// The OTEL endpoint needs its own x-api-key. Anything else is another vendor's
+// collector, and New must keep failing rather than send telemetry there.
+func TestOTELEndpointRequiresItsOwnKey(t *testing.T) {
+	const vendor = "https://other-vendor.example.com"
+	t.Run("empty options, no header", func(t *testing.T) {
+		clearObserveEnv(t)
+		t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", vendor)
+		if _, err := New(Options{}); err == nil {
+			t.Fatal("a vendor endpoint with no x-api-key must be an error")
+		}
+	})
+	t.Run("OBSERVE_API_KEY does not qualify", func(t *testing.T) {
+		clearObserveEnv(t)
+		t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", vendor)
+		t.Setenv("OBSERVE_API_KEY", "obs_key")
+		if _, err := New(Options{}); err == nil {
+			t.Fatal("the Observe key must not reach an OTEL endpoint")
+		}
+	})
+	t.Run("explicit key does not qualify", func(t *testing.T) {
+		clearObserveEnv(t)
+		t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", vendor)
+		t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-api-key=vendor_key")
+		if _, err := New(Options{APIKey: "obs_code"}); err == nil {
+			t.Fatal("a key in code must not reach an OTEL endpoint")
+		}
+	})
+	t.Run("OBSERVE_ENDPOINT wins and takes no vendor key", func(t *testing.T) {
+		clearObserveEnv(t)
+		t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", vendor)
+		t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-api-key=vendor_key")
+		t.Setenv("OBSERVE_ENDPOINT", "https://ingest.example.com")
+		var o Options
+		applyEnv(&o)
+		if o.Endpoint != "https://ingest.example.com" || o.APIKey != "" {
+			t.Fatalf("%+v", o)
+		}
+	})
+	t.Run("explicit endpoint takes no vendor key", func(t *testing.T) {
+		clearObserveEnv(t)
+		t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-api-key=vendor_key")
+		o := Options{Endpoint: "https://code.example.com"}
+		applyEnv(&o)
+		if o.APIKey != "" {
+			t.Fatalf("%+v", o)
+		}
+	})
+}
+
+func TestSiteIDDefaultsOnlyWithoutAKey(t *testing.T) {
 	clearObserveEnv(t)
-	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://other-vendor.example.com")
-	t.Setenv("OBSERVE_API_KEY", "obs_key")
-	o = Options{}
-	applyEnv(&o)
-	if o.Endpoint != "https://other-vendor.example.com" || o.APIKey != "" {
-		t.Fatalf("Observe key reached another vendor: %+v", o)
+	keyless, err := New(Options{Endpoint: "http://127.0.0.1:1"})
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	clearObserveEnv(t)
-	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-api-key=vendor_key")
-	o = Options{Endpoint: "https://code.example.com"}
-	applyEnv(&o)
-	if o.APIKey != "" {
-		t.Fatalf("vendor key reached an explicit endpoint: %+v", o)
+	defer keyless.Close()
+	if keyless.opts.SiteID != "default" {
+		t.Errorf("keyless SiteID = %q", keyless.opts.SiteID)
+	}
+	keyed, err := New(Options{Endpoint: "http://127.0.0.1:1", APIKey: "obs_key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer keyed.Close()
+	if keyed.opts.SiteID != "" {
+		t.Errorf("keyed SiteID = %q, want empty so the key's site applies", keyed.opts.SiteID)
+	}
+	explicit, err := New(Options{Endpoint: "http://127.0.0.1:1", APIKey: "obs_key", SiteID: "mine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer explicit.Close()
+	if explicit.opts.SiteID != "mine" {
+		t.Errorf("explicit SiteID = %q", explicit.opts.SiteID)
 	}
 }
 

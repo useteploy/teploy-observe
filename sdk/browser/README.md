@@ -68,7 +68,7 @@ try {
 | name | default | description |
 |------|---------|-------------|
 | `endpoint` | — | Required. Observe base URL. |
-| `siteId` | `"default"` | Site identifier. |
+| `siteId` | `"default"`, or none with `apiKey` | Site identifier. Leave unset with an `apiKey`: the key is bound to one site and a different one is refused. |
 | `apiKey` | — | API key for server-side ingest paths (errors, logs). |
 | `disableAutoPageview` | `false` | Skip auto pageview on init. |
 | `batchSize` | `50` | Buffer size before auto-flush. |

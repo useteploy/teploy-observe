@@ -40,7 +40,9 @@ def test_explicit_options_win(monkeypatch):
         "release": "1",
         "environment": "code",
     }
-    assert apply_env(explicit) == explicit
+    got = apply_env(explicit)
+    for option, value in explicit.items():
+        assert got[option] == value
 
 
 def test_otel_contract(monkeypatch):
@@ -65,11 +67,48 @@ def test_otel_grpc_is_not_usable(monkeypatch):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-api-key=obs_key")
     got = apply_env({})
-    assert not got["endpoint"]
+    assert not got["endpoint"] if "endpoint" in got else True
     assert not got.get("api_key")
 
 
-def test_vendor_key_never_reaches_observe(monkeypatch):
+@pytest.mark.parametrize(
+    "observe_endpoint,want_key",
+    [
+        (None, "obs_key"),
+        ("https://code.example.com/", "obs_key"),
+        ("https://other.example.com", None),
+    ],
+)
+def test_explicit_endpoint_and_env_key(monkeypatch, observe_endpoint, want_key):
+    monkeypatch.setenv("OBSERVE_API_KEY", "obs_key")
+    if observe_endpoint:
+        monkeypatch.setenv("OBSERVE_ENDPOINT", observe_endpoint)
+    got = apply_env({"endpoint": "https://code.example.com"})
+    assert got["endpoint"] == "https://code.example.com"
+    assert got.get("api_key") == want_key
+
+
+def test_vendor_otel_endpoint_with_no_header_is_an_error(monkeypatch):
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://other-vendor.example.com")
+    with pytest.raises(ValueError):
+        Client()
+
+
+def test_observe_key_does_not_qualify_an_otel_endpoint(monkeypatch):
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://other-vendor.example.com")
+    monkeypatch.setenv("OBSERVE_API_KEY", "obs_key")
+    with pytest.raises(ValueError):
+        Client()
+
+
+def test_explicit_key_does_not_qualify_an_otel_endpoint(monkeypatch):
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://other-vendor.example.com")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-api-key=vendor_key")
+    with pytest.raises(ValueError):
+        Client(api_key="obs_code")
+
+
+def test_observe_endpoint_wins_and_takes_no_vendor_key(monkeypatch):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://other-vendor.example.com")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-api-key=vendor_key")
     monkeypatch.setenv("OBSERVE_ENDPOINT", "https://ingest.example.com")
@@ -78,17 +117,15 @@ def test_vendor_key_never_reaches_observe(monkeypatch):
     assert not got.get("api_key")
 
 
-def test_observe_key_never_reaches_another_vendor(monkeypatch):
-    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://other-vendor.example.com")
-    monkeypatch.setenv("OBSERVE_API_KEY", "obs_key")
-    got = apply_env({})
-    assert got["endpoint"] == "https://other-vendor.example.com"
-    assert not got.get("api_key")
-
-
-def test_vendor_key_never_reaches_explicit_endpoint(monkeypatch):
+def test_explicit_endpoint_takes_no_vendor_key(monkeypatch):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-api-key=vendor_key")
     assert not apply_env({"endpoint": "https://code.example.com"}).get("api_key")
+
+
+def test_site_id_defaults_only_without_a_key():
+    assert apply_env({"endpoint": "http://x"})["site_id"] == "default"
+    assert apply_env({"endpoint": "http://x", "api_key": "k"})["site_id"] == ""
+    assert apply_env({"endpoint": "http://x", "api_key": "k", "site_id": "mine"})["site_id"] == "mine"
 
 
 def test_client_reads_env_and_still_requires_an_endpoint(monkeypatch):
