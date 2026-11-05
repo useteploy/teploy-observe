@@ -51,6 +51,7 @@ publish:
 #   env:
 #     OBSERVE_INGEST_ADDR: ":3001"
 #     OBSERVE_PUBLIC_URL: "https://observe.example.com"
+#     OBSERVE_INGEST_URL: "https://ingest.example.com"
 #
 # then route ingest.example.com -> 3001. That port serves telemetry writes
 # and 404s everything else, so the dashboard is not merely unrouted there —

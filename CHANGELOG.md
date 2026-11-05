@@ -4,6 +4,23 @@ All notable changes to Observe are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **Service tokens** (`obs_svc_...`): admin-created, hashed, audited, revocable
+  machine credentials with five closed scopes (`sites:create`, `keys:mint`,
+  `share:mint`, `webhooks:write`, `alerts:read`), limited to the sites their
+  manager owns. They authenticate only to `/api/v1/service/*`; users, SQL, stored
+  telemetry and site deletion stay out of reach. Managed in Settings > Service
+  Tokens. See `docs/service-tokens.md`.
+- **Discovery**: unauthenticated `GET /.well-known/teploy.json` on the dashboard
+  listener (never the ingest listener), a stable persisted `instance_id`, the image
+  label `dev.teploy.product=observe`, and `OBSERVE_INGEST_URL` to publish the ingest
+  hostname.
+- **Managed sites**: `external_ref` (idempotent per manager), optional domain,
+  `managed_by`. API keys report `created_by`. Migration 067 only adds tables.
+- **Go and Python SDKs** read `OBSERVE_ENDPOINT`, `OBSERVE_API_KEY` and the
+  OpenTelemetry standard variables for options left unset.
+
 ## v0.2.0 — 2026-10-20
 
 Competitive-gap and hardening sweep (2026-10). Everything below is merged on

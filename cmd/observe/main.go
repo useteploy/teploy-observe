@@ -45,6 +45,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/incidents"
 	"github.com/useteploy/teploy-observe/internal/infra"
 	"github.com/useteploy/teploy-observe/internal/ingest"
+	"github.com/useteploy/teploy-observe/internal/instance"
 	"github.com/useteploy/teploy-observe/internal/integrations"
 	"github.com/useteploy/teploy-observe/internal/jobs"
 	"github.com/useteploy/teploy-observe/internal/live"
@@ -68,6 +69,7 @@ import (
 	"github.com/useteploy/teploy-observe/internal/sourcemaps"
 	"github.com/useteploy/teploy-observe/internal/sso"
 	"github.com/useteploy/teploy-observe/internal/surveys"
+	"github.com/useteploy/teploy-observe/internal/svctoken"
 	"github.com/useteploy/teploy-observe/internal/tracing"
 	"github.com/useteploy/teploy-observe/internal/tracking"
 	"github.com/useteploy/teploy-observe/internal/upgrade"
@@ -162,6 +164,11 @@ func main() {
 	adoption, err := schema.ApplyWithAdoption(ctx, db)
 	if err != nil {
 		logger.Error("failed to run migrations", "err", err)
+		os.Exit(1)
+	}
+	instanceID, err := instance.EnsureID(ctx, db)
+	if err != nil {
+		logger.Error("failed to establish instance id", "err", err)
 		os.Exit(1)
 	}
 	if adoption != nil {
@@ -1326,6 +1333,22 @@ func main() {
 	r.Handle("GET /api/v1/mcp/tokens", jwtMW(requireAdmin(mcpTokensListHandler(mcpStore))))
 	r.Handle("POST /api/v1/mcp/tokens", jwtMW(requireAdmin(mcpTokensCreateHandler(mcpStore))))
 	r.Handle("DELETE /api/v1/mcp/tokens/{token_id}", jwtMW(requireAdmin(mcpTokensRevokeHandler(mcpStore))))
+
+	// --- Service tokens (machine provisioning; see docs/service-tokens.md) ---
+	// Minting and revoking is admin work. The token-authenticated surface has
+	// its own namespace rather than a new credential on existing routes, so a
+	// route added later can never accept a service token by omission.
+	svcStore := svctoken.NewStore(db)
+	r.Handle("GET /api/v1/service-tokens", jwtMW(requireAdmin(serviceTokensListHandler(svcStore))))
+	r.Handle("POST /api/v1/service-tokens", jwtMW(requireAdmin(boundedRequestBody(64<<10)(serviceTokensCreateHandler(svcStore)))))
+	r.Handle("DELETE /api/v1/service-tokens/{token_id}", jwtMW(requireAdmin(serviceTokensRevokeHandler(svcStore))))
+	(&serviceAPI{
+		tokens: svcStore, sites: siteSvc, keys: authSvc, shares: shareSvc,
+		webhooks: webhookSvc, alerts: alertSvc, audit: auditSvc,
+	}).register(r)
+
+	// --- Discovery (unauthenticated; carries no secrets) ---
+	r.HandleFunc("GET /.well-known/teploy.json", discoveryHandler(newDiscovery(cfg, instanceID)))
 
 	// --- Scheduled SQL exports (admin only: writes data externally) ---
 	r.Handle("GET /api/v1/exports/scheduled", jwtMW(requireAdmin(exportsListHandler(scheduledExportSvc))))
@@ -2598,7 +2621,11 @@ func createAPIKeyHandler(authSvc *auth.AuthService) neutron.HandlerFunc[createAP
 		if input.Label == "" {
 			input.Label = "default"
 		}
-		key, info, err := authSvc.CreateAPIKey(ctx, input.SiteID, input.Label, input.Scopes)
+		createdBy := ""
+		if claims, err := neutronauth.ClaimsFromContext(ctx); err == nil {
+			createdBy, _ = claims["username"].(string)
+		}
+		key, info, err := authSvc.CreateAPIKeyBy(ctx, input.SiteID, input.Label, createdBy, input.Scopes)
 		if err != nil {
 			return createAPIKeyResponse{}, neutron.ErrBadRequest(err.Error())
 		}

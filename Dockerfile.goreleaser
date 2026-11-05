@@ -3,6 +3,8 @@
 # sidesteps the vendor-in-build-context problem that deferred Docker in v0.1.0.
 # The from-source Dockerfile (used by docker-compose for dev) is kept separately.
 FROM alpine:3.21
+# Teploy Dash finds candidate instances by this label (see Dockerfile).
+LABEL dev.teploy.product=observe
 # tini is PID 1: it reaps orphaned healthcheck processes (see Dockerfile).
 RUN apk add --no-cache ca-certificates tzdata tini
 ARG TARGETPLATFORM
