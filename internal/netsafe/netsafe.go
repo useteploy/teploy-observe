@@ -7,6 +7,7 @@ package netsafe
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -31,6 +32,35 @@ func ValidateURL(raw string) error {
 	}
 	if u.Hostname() == "" {
 		return fmt.Errorf("url must have a host")
+	}
+	return nil
+}
+
+// ErrBlocked marks a connection the dial-time guard refused. Delivery paths check
+// for it: retrying cannot help, and an operator needs to hear about it.
+var ErrBlocked = errors.New("netsafe: blocked connection to non-public address")
+
+// ValidateDestination is ValidateURL plus a refusal of destinations that could
+// only ever be blocked at dial time: a literal non-public IP, or a localhost name.
+// Accepting those means a webhook that reports success and then never delivers.
+// allow is the same operator allowlist the dial-time guard uses. A hostname that
+// resolves to a private address can only be caught at dial time, so that guard
+// remains the real boundary and this is just the early, clear answer.
+func ValidateDestination(raw string, allow Allow) error {
+	if err := ValidateURL(raw); err != nil {
+		return err
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid url: %w", err)
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	ip := net.ParseIP(host)
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		ip = net.IPv4(127, 0, 0, 1)
+	}
+	if ip != nil && IsBlockedIPWith(ip, allow) {
+		return fmt.Errorf("url points at non-public address %s, which deliveries are never allowed to reach", u.Hostname())
 	}
 	return nil
 }
@@ -181,7 +211,7 @@ func ClientWithAllow(timeout time.Duration, allow Allow) *http.Client {
 			return err
 		}
 		if IsBlockedIPWith(net.ParseIP(host), allow) {
-			return fmt.Errorf("netsafe: blocked connection to non-public address %s", host)
+			return fmt.Errorf("%w %s", ErrBlocked, host)
 		}
 		return nil
 	}
@@ -205,7 +235,7 @@ func DialControl(_ context.Context, _, address string) error {
 		return err
 	}
 	if IsBlockedIP(net.ParseIP(host)) {
-		return fmt.Errorf("netsafe: blocked connection to non-public address %s", host)
+		return fmt.Errorf("%w %s", ErrBlocked, host)
 	}
 	return nil
 }

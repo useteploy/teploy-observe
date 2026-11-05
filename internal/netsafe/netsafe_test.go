@@ -219,3 +219,38 @@ func TestIsBlockedIPExtraRanges(t *testing.T) {
 		t.Error("NAT64-embedded metadata must stay blocked")
 	}
 }
+
+func TestValidateDestination(t *testing.T) {
+	for _, raw := range []string{
+		"http://127.0.0.1:9/x", "http://localhost/x", "http://LOCALHOST./x", "http://a.localhost/x",
+		"http://169.254.169.254/latest/meta-data/", "http://10.0.0.1/x", "http://[::1]/x",
+		"http://[::ffff:127.0.0.1]/x", "http://100.100.1.1/x",
+		"ftp://example.com/x", "https://user:pw@example.com/x",
+	} {
+		if err := ValidateDestination(raw, nil); err == nil {
+			t.Errorf("%s must be refused", raw)
+		}
+	}
+	for _, raw := range []string{"https://example.com/hook", "http://8.8.8.8/x"} {
+		if err := ValidateDestination(raw, nil); err != nil {
+			t.Errorf("%s: %v", raw, err)
+		}
+	}
+	allow, err := ParseAllow("100.64.0.0/10,127.0.0.0/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{"http://100.100.1.1/x", "http://localhost/x"} {
+		if err := ValidateDestination(raw, allow); err != nil {
+			t.Errorf("%s with allowlist: %v", raw, err)
+		}
+	}
+	// Link-local is cloud metadata and stays refused whatever the allowlist says.
+	metaAllow, err := ParseAllow("169.254.0.0/16")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateDestination("http://169.254.169.254/x", metaAllow); err == nil {
+		t.Error("metadata address must stay refused")
+	}
+}

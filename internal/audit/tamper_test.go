@@ -2,6 +2,7 @@ package audit
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/neutron-build/neutron/go/nucleus"
@@ -144,5 +145,27 @@ func TestChain_Integration(t *testing.T) {
 	}
 	if res.Count < 3 {
 		t.Errorf("expected at least our 3 records, got %d", res.Count)
+	}
+}
+
+func TestChainBreakDetailIsFinishedText(t *testing.T) {
+	s := NewService(nil, []byte("key1"))
+	for _, tc := range []struct {
+		name string
+		ev   AuditEvent
+		want string
+	}{
+		{"gap", AuditEvent{Seq: 9, PrevHash: "p"}, "expected 3, got 9"},
+		{"relink", AuditEvent{Seq: 3, PrevHash: "other"}, "prev_hash mismatch"},
+		{"unknown key", AuditEvent{Seq: 3, PrevHash: "p", KeyID: "2dbef2b6"}, `unknown key id "2dbef2b6"`},
+		{"format verbs in the key id", AuditEvent{Seq: 3, PrevHash: "p", KeyID: "%d%s"}, `unknown key id "%d%s"`},
+	} {
+		got := s.chainBreakDetail(tc.ev, 3, "p")
+		if !strings.Contains(got, tc.want) {
+			t.Errorf("%s: %q does not contain %q", tc.name, got, tc.want)
+		}
+		if strings.Contains(got, "%!") {
+			t.Errorf("%s: format debris in %q", tc.name, got)
+		}
 	}
 }
