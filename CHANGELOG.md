@@ -4,6 +4,14 @@ All notable changes to Observe are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Deployment template**: dropped the `observe.example.com` placeholder
+  domain from `teploy.yml` (the template is `ingress: host`, where an empty
+  domain is allowed and a placeholder only served as a misleading label), and
+  renamed the placeholder `server:` to `your-server` so it reads as a
+  servers.yml key to edit, not a hostname.
+
 ### Added
 
 - **Service tokens** (`obs_svc_...`): admin-created, hashed, audited, revocable
