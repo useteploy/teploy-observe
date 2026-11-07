@@ -4,10 +4,14 @@ All notable changes to Observe are recorded here.
 
 ## Unreleased
 
+## v0.2.2 — 2026-11-07
+
 ### Added
 
 - **Service token links**: `/settings?tab=service-tokens&name=...&scopes=...` opens the
   create form filled in, so another product can link to it. An admin still presses Create.
+- **Login return**: a logged-out visit to a dashboard page goes to `/login?next=...` and
+  returns to that page after sign-in (local paths only).
 
 ## v0.2.1 — 2026-11-05
 
