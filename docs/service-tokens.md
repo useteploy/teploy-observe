@@ -61,6 +61,10 @@ GET    /api/v1/service-tokens              -> 200 [record, ...]
 DELETE /api/v1/service-tokens/{token_id}   -> 200 {"ok": true}
 ```
 
+A product can link an admin to the filled-in form with
+`/settings?tab=service-tokens&name=teploy-dash&scopes=sites:create,keys:mint`. Unknown
+scopes are dropped, and the admin still presses Create.
+
 The token is shown once and stored as a SHA-256 hash. All three routes require a
 signed-in admin, even during the first-run grace period, when other routes are open.
 

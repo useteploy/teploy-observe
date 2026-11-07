@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "preact/hooks";
 import { readAIConfig } from "../lib/aiConfig.js";
 import { settingsApi } from "../api/settings.js";
 import type { Site, Webhook, User, ShareLink, APIKeyInfo, MCPToken, ServiceToken } from "../api/settings.js";
+import { parseServiceTokenLink, settingsTabFromLink } from "../lib/serviceTokenLink.js";
 import { get } from "../api/helpers.js";
 import StatusBadge from "../components/shared/StatusBadge.js";
 import Modal from "../components/shared/Modal.js";
@@ -976,6 +977,14 @@ function ServiceTokensSection() {
   useEffect(() => {
     setLoading(true);
     refresh().catch(() => setTokens([])).finally(() => setLoading(false));
+    // A link from another product fills the form in. An admin still reviews it
+    // and presses Create: nothing is created from a link.
+    const prefill = parseServiceTokenLink(window.location.search, SERVICE_SCOPES.map(s => s.value));
+    if (prefill) {
+      setFormName(prefill.name);
+      setFormScopes(prefill.scopes);
+      setShowCreate(true);
+    }
   }, []);
 
   const toggleScope = (scope: string) => {
@@ -1503,6 +1512,11 @@ export default function SettingsPage() {
     { key: "ai", label: "AI" },
     { key: "exports", label: "Exports" },
   ];
+
+  useEffect(() => {
+    const linked = settingsTabFromLink(window.location.search, tabs.map(t => t.key));
+    if (linked) setTab(linked);
+  }, []);
 
   return (
     <div>
