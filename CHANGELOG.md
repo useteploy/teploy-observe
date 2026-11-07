@@ -2,6 +2,13 @@
 
 All notable changes to Observe are recorded here.
 
+## Unreleased
+
+### Added
+
+- **Service token links**: `/settings?tab=service-tokens&name=...&scopes=...` opens the
+  create form filled in, so another product can link to it. An admin still presses Create.
+
 ## v0.2.1 — 2026-11-05
 
 ### Changed
