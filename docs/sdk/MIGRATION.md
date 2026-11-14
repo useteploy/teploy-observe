@@ -22,6 +22,14 @@ telemetry-only, and they can only append.
 
 ## 2. First event, per SDK
 
+<!-- not-yet-published: delete this block once the SDKs are on npm and PyPI -->
+> **Not yet published.** The npm packages and the Python package used below are
+> not on npm or PyPI yet. Install them from this repository as described in
+> [sdk/browser](../../sdk/browser/README.md#install),
+> [sdk/sentry-shim](../../sdk/sentry-shim/README.md#install) and
+> [sdk/python](../../sdk/python/README.md#install).
+<!-- /not-yet-published -->
+
 ### Browser / Node (`@teploy/observe-browser`)
 
 ```ts

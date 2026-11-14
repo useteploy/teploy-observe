@@ -8,6 +8,20 @@ Browser SDK for [Observe](https://github.com/useteploy/teploy-observe) — self-
 npm install @teploy/observe-browser
 ```
 
+<!-- not-yet-published: delete this block once @teploy/observe-browser is on npm -->
+> **Not yet published to npm.** Until it is, `npm install @teploy/observe-browser` fails
+> with a 404, and a package of that name that appears on npm before this note
+> is removed is not from this project. Build it from this repository instead:
+>
+> ```sh
+> git clone https://github.com/useteploy/teploy-observe
+> cd teploy-observe/sdk/browser
+> npm ci && npm run build && npm pack
+> # then, in your project:
+> npm install /path/to/teploy-observe/sdk/browser/teploy-observe-browser-0.1.0.tgz
+> ```
+<!-- /not-yet-published -->
+
 ## Usage
 
 ```ts

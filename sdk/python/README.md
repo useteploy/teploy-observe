@@ -8,6 +8,18 @@ Python SDK for [Observe](https://github.com/useteploy/teploy-observe) — self-h
 pip install teploy-observe
 ```
 
+<!-- not-yet-published: delete this block once teploy-observe is on PyPI -->
+> **Not yet published to PyPI.** Until it is, `pip install teploy-observe`
+> fails, and a package of that name that appears on PyPI before this note is
+> removed is not from this project. Install from this repository instead:
+>
+> ```sh
+> pip install "git+https://github.com/useteploy/teploy-observe#subdirectory=sdk/python"
+> # or, from a clone of this repository:
+> pip install ./sdk/python
+> ```
+<!-- /not-yet-published -->
+
 Zero dependencies; stdlib only.
 
 ## Usage
