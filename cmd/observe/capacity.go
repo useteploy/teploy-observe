@@ -14,12 +14,13 @@ import (
 
 // diskView reports the usage of one path in the /healthz shape. A path
 // that cannot be statfs'd reports ok=false with the error, never a
-// silent zero.
+// silent zero. The path itself is not echoed: /healthz is unauthenticated
+// on both listeners, including the public ingest one, and the operator
+// already knows which directory "disk" and "engine_disk" stand for.
 func diskView(path string) map[string]any {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(path, &st); err != nil {
 		return map[string]any{
-			"path":  path,
 			"ok":    false,
 			"error": err.Error(),
 		}
@@ -33,7 +34,6 @@ func diskView(path string) map[string]any {
 		usedPct = float64(total-free) / float64(total) * 100
 	}
 	return map[string]any{
-		"path":        path,
 		"ok":          true,
 		"free_bytes":  free,
 		"total_bytes": total,
