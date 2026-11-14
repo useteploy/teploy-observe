@@ -45,7 +45,7 @@ helm install observe packaging/helm/observe -n observe \
 ```
 
 The image tag defaults to the chart `appVersion` (release tags have no `v`
-prefix). Nucleus is pinned to `v1.1.1` (`nucleus.image.tag`); the schema rejects
+prefix). Nucleus is pinned to `v1.3.0` (`nucleus.image.tag`); the schema rejects
 `latest`.
 
 ## Secrets

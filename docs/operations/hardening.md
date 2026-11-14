@@ -27,8 +27,9 @@ database**.
 - systemd: `nucleus.service` starts with `--host 127.0.0.1`. `observe.service`
   uses `postgres://localhost:5432/observe`, so both stay on one host. Do not
   change the host to `0.0.0.0`.
-- Image version: compose defaults to `ghcr.io/neutron-build/nucleus:v1.1.1`
-  (override with `NUCLEUS_VERSION`); CI uses the same value.
+- Image version: compose defaults to `ghcr.io/neutron-build/nucleus:v1.3.0`
+  (override with `NUCLEUS_VERSION`); CI, `teploy.yml` and the Helm chart use
+  the same value.
 
 ## What an attacker with network access to Nucleus gets
 

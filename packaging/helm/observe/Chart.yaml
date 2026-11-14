@@ -2,12 +2,12 @@ apiVersion: v2
 name: observe
 description: Single-instance Teploy Observe (analytics, errors, logs, traces, replays) with a Nucleus database StatefulSet.
 type: application
-version: 0.2.0
-# Bumped post-release 2026-10-20: v0.2.0 images are on GHCR, so the pair
-# gate now verifies the current release. Bump this only AFTER the tag's
+version: 0.2.2
+# Bumped post-release 2026-11-14 to 0.2.2, whose images are on GHCR, so the
+# pair gate verifies the current release. Bump this only AFTER the tag's
 # images exist - see the 2026-10-19 entry for what pointing it at an
 # unreleased tag costs.
-appVersion: "0.2.0"
+appVersion: "0.2.2"
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/useteploy/teploy-observe
 sources:
