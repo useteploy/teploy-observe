@@ -79,10 +79,10 @@ wire `timestamp` honored (client time stored; more than 24h of future
 skew refused at admission with a 400).
 
 **Open items (owner decisions, upstream, or documented posture):**
-- L9 remains open, reframed by the runner contract - see the L9 entry:
-  applied migrations are checksum-frozen, so in-place conversion of
-  048-056/010 is refused on every store that already ran them. The live
-  `llm_traces` repair on infra-home is still the owner call.
+- L9 RESOLVED 2026-09-27 - see the L9 entry: the live `llm_traces`
+  store was repaired (rename-aside + recreate) and production moved to a
+  fixed engine. Applied migrations stay checksum-frozen, so 048-056/010
+  are not converted in place.
 - Surveys unique index on (site_id, survey_id, client_id): UPSTREAM-
   BLOCKED - Nucleus v1.1.1 parses `CREATE UNIQUE INDEX` but does not
   enforce it (duplicate keys accepted; logged in the umbrella
@@ -155,7 +155,7 @@ This fixes unbounded logical trace retention; it does not claim SQL DELETE
 shrinks files or establish this table as the cause of a past host incident.
 Deployment and sustained storage measurements remain separate acceptance gates.
 
-## L9 (2026-09-24) - P1 - Open: live llm_traces unreadable after migration 054; ALTER-ADD migrations
+## L9 (2026-09-24) - P1 - Resolved 2026-09-27: live llm_traces unreadable after migration 054; ALTER-ADD migrations
 
 Found deploying `d4bcbe6` (the zombie-reaping image fix) to infra-home, the
 first deploy of migrations 045-056 onto a populated store. Migration 054's
@@ -200,6 +200,15 @@ ordering (the guard test stays as belt-and-braces and for older engines);
 `nucleus/docs/HANDOVER_TEPLOY_OBSERVE_ADD_COLUMN.md`) that preserves the
 rows instead of losing regenerable traces - the rename-aside fallback that
 loses the 12,080 traces stays documented above as the last resort.
+
+**Resolved 2026-09-27 (register corrected 2026-11-14):** (a) was done
+before the update above was written. The live store was recovered on
+2026-09-27 by rename-aside + recreate (the regenerable LLM traces held at
+the time were not carried over), and the owner's 2026-10-04 close-out
+verified it: full-row reads of `llm_traces` green, both 054 columns
+present, migration ledger complete. Production moved to Nucleus v1.2.2 in
+that close-out; the repo now pins v1.3.0. Nothing on L9 is open. The
+ALTER-ADD guard test and `TestMigrationsUpgradePopulatedStore` stay.
 
 ## Round-4 register (2026-09-19 audit, 45 findings R01..R45)
 
