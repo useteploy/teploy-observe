@@ -22,9 +22,26 @@ export function parseServiceTokenLink(
 }
 
 // Where to go after signing in. Only a path on this instance, so a crafted
-// login link cannot send someone to another site.
-export function loginReturnPath(search: string): string {
+// login link cannot send someone to another site. origin is this app's
+// origin (window.location.origin); it is a parameter so tests can call this.
+//
+// String checks alone are not enough: URL parsers drop tab, CR and LF and
+// read "\" as "/", so "/\t/evil.example" resolves to https://evil.example.
+// The value is therefore resolved against the origin, the origin compared,
+// and only the parsed path, query and fragment are returned, never the raw
+// input. The parsed path is checked again because dot segments normalise
+// "/.//evil.example" to "//evil.example", which a browser reads as a host.
+export function loginReturnPath(search: string, origin: string): string {
   const next = new URLSearchParams(search).get("next") ?? "";
-  if (!next.startsWith("/") || next.startsWith("//") || next.includes("\\") || next.startsWith("/login")) return "/";
-  return next;
+  if (next === "" || next.startsWith("//") || /[\u0000-\u001f\u007f\\]/.test(next)) return "/";
+  let u: URL;
+  try {
+    u = new URL(next, origin);
+  } catch {
+    return "/";
+  }
+  if (u.origin !== origin) return "/";
+  const path = u.pathname + u.search + u.hash;
+  if (!u.pathname.startsWith("/") || u.pathname.startsWith("//") || u.pathname.startsWith("/login")) return "/";
+  return path;
 }
