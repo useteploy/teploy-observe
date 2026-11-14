@@ -70,3 +70,23 @@ test("percent-encoded tricks in next are decoded once and still refused", () => 
     assert.equal(new URL(got, origin).origin, origin, raw);
   }
 });
+
+test("same-origin look-alikes that are not a path on this instance are refused", () => {
+  const back = (v: string) => loginReturnPath(`?next=${encodeURIComponent(v)}`, origin);
+  // A blob: URL reports the origin of the URL inside it, so the origin check
+  // alone passes; its "path" is a whole URL and must not be followed.
+  assert.equal(new URL(`blob:${origin}/x`).origin, origin);
+  for (const bad of [
+    `blob:${origin}/x`, `blob:${origin}//evil.example`,
+    // Leading and trailing spaces are stripped by URL parsers.
+    " //evil.example", "  /\\evil.example", " https://evil.example ",
+    // Userinfo: the real host is the part after the @.
+    `https://observe.example.test@evil.example/`, `//observe.example.test@evil.example/`,
+  ]) {
+    assert.equal(back(bad), "/", JSON.stringify(bad));
+  }
+  // Harmless on this instance: an @ in a path, and // inside a query or fragment.
+  assert.equal(back("/@evil.example"), "/@evil.example");
+  assert.equal(back("/x?u=//evil.example#//evil.example"), "/x?u=//evil.example#//evil.example");
+  assert.equal(back(" /settings "), "/settings");
+});

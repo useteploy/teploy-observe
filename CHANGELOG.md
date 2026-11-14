@@ -4,6 +4,29 @@ All notable changes to Observe are recorded here.
 
 ## Unreleased
 
+### Security
+
+- **Login return**: `/login?next=...` could send a browser to another site after
+  a real sign-in (`next=/%09/evil.example`, `next=/.//evil.example`). The value
+  is now resolved against this instance's origin and only its path, query and
+  fragment are followed.
+- **`/healthz`** no longer includes the data directory's absolute path
+  (`capacity.disk.path`, `capacity.engine_disk.path` are gone). The endpoint
+  is unauthenticated on both listeners. The other capacity fields are
+  unchanged.
+
+### Changed
+
+- **Helm chart 0.2.2**: `appVersion` is 0.2.2 and `nucleus.image.tag` defaults
+  to `v1.3.0` (was 0.2.0 on `v1.1.1`), the engine CI, `docker-compose.yml` and
+  `teploy.yml` already use. **`helm upgrade` on an existing install that did
+  not set `nucleus.image.tag` replaces the database engine in place.**
+  Snapshot both PVCs and take an application backup first, or pass
+  `--set nucleus.image.tag=v1.1.1` to stay on the old engine. See
+  `docs/operations/kubernetes.md`, "Upgrading".
+- A legacy `./queue` directory chosen as the ingest WAL directory is now logged
+  at startup (behaviour unchanged).
+
 ## v0.2.2 — 2026-11-07
 
 ### Added
