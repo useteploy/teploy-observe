@@ -248,15 +248,7 @@ func main() {
 
 	// Ingestion buffer with WAL-backed durability. The queue directory
 	// survives process restarts; pending events are replayed on Attach.
-	queueDir := os.Getenv("OBSERVE_QUEUE_DIR")
-	if queueDir == "" {
-		queueDir = filepath.Join(effectiveDataDir(), "queue")
-		if os.Getenv("OBSERVE_DATA_DIR") == "" {
-			if _, err := os.Stat("queue"); err == nil {
-				queueDir = "queue"
-			}
-		}
-	}
+	queueDir := resolveQueueDir(logger)
 	buf := ingest.NewBuffer(db, cfg.BufferSize, cfg.FlushSize, cfg.FlushInterval, logger)
 	// F12: admission-time dedupe cache for v2 event batches. In-process and
 	// best-effort by design - the durable boundary is the flush-time
@@ -6124,6 +6116,28 @@ func effectiveDataDir() string {
 		return dataDir
 	}
 	return "./data"
+}
+
+// resolveQueueDir picks the ingest WAL directory: OBSERVE_QUEUE_DIR, else
+// <data dir>/queue. Legacy fallback: before the data dir defaulted to
+// ./data, an unset OBSERVE_DATA_DIR put the WAL at ./queue, so when neither
+// variable is set and ./queue exists in the working directory it is kept,
+// or events still waiting in it would never be replayed. That choice
+// depends on where the process was started, so it is logged.
+func resolveQueueDir(logger *slog.Logger) string {
+	if dir := os.Getenv("OBSERVE_QUEUE_DIR"); dir != "" {
+		return dir
+	}
+	dir := filepath.Join(effectiveDataDir(), "queue")
+	if os.Getenv("OBSERVE_DATA_DIR") == "" {
+		if _, err := os.Stat("queue"); err == nil {
+			cwd, _ := os.Getwd()
+			logger.Warn("using the legacy ingest WAL directory ./queue in the working directory instead of the data directory; set OBSERVE_QUEUE_DIR or OBSERVE_DATA_DIR to choose explicitly, or move it aside once it is drained",
+				"queue_dir", "queue", "working_dir", cwd, "default_queue_dir", dir)
+			return "queue"
+		}
+	}
+	return dir
 }
 
 // selfMonitorEndpoint converts a bind address (":3000", "0.0.0.0:3000")

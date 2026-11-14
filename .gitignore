@@ -74,3 +74,7 @@ docker-compose.override.yml
 
 # Runtime data dir (audit.key, queues) when the server runs from the repo
 data/
+# Legacy ingest WAL dir: before the data dir defaulted to ./data, running the
+# server from the repo wrote it to ./queue (still honored when present; see
+# resolveQueueDir in cmd/observe/main.go).
+/queue/
