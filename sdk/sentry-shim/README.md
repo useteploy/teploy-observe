@@ -11,6 +11,20 @@ them directly to Observe's ingest endpoints.
 npm install @teploy/observe-sentry-shim
 ```
 
+<!-- not-yet-published: delete this block once @teploy/observe-sentry-shim is on npm -->
+> **Not yet published to npm.** Until it is, `npm install @teploy/observe-sentry-shim` fails
+> with a 404, and a package of that name that appears on npm before this note
+> is removed is not from this project. Build it from this repository instead:
+>
+> ```sh
+> git clone https://github.com/useteploy/teploy-observe
+> cd teploy-observe/sdk/sentry-shim
+> npm ci && npm run build && npm pack
+> # then, in your project:
+> npm install /path/to/teploy-observe/sdk/sentry-shim/teploy-observe-sentry-shim-0.1.0.tgz
+> ```
+<!-- /not-yet-published -->
+
 ## Use
 
 Swap your import. Existing call sites keep working.
@@ -105,7 +119,7 @@ but do nothing:
 - `tracesSampleRate`, `profilesSampleRate` — Observe accepts every span;
   sampling lives at the OTLP exporter or ingest rate-limit layer.
 - `integrations: [...]` — Sentry's integration array is silently ignored.
-  Use Observe's official SDKs (`@teploy/observe-browser`, `observe-sdk` for Python,
+  Use Observe's official SDKs (`@teploy/observe-browser`, `teploy-observe` for Python,
   the Go SDK) for framework hooks.
 - `autoSessionTracking` / `startSession` / `endSession` — Observe derives
   release health from the `release` tag and event volume server-side.

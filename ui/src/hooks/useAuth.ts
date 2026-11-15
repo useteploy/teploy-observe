@@ -25,7 +25,7 @@ export function useAuth() {
     const res = await authApi.login(username, password);
     localStorage.setItem("obs_token", res.token);
     setAuthenticated(true);
-    window.location.href = loginReturnPath(window.location.search);
+    window.location.href = loginReturnPath(window.location.search, window.location.origin);
   };
 
   const logout = () => {

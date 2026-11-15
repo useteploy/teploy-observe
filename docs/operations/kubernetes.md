@@ -45,8 +45,29 @@ helm install observe packaging/helm/observe -n observe \
 ```
 
 The image tag defaults to the chart `appVersion` (release tags have no `v`
-prefix). Nucleus is pinned to `v1.1.1` (`nucleus.image.tag`); the schema rejects
+prefix). Nucleus is pinned to `v1.3.0` (`nucleus.image.tag`); the schema rejects
 `latest`.
+
+## Upgrading
+
+`helm upgrade` applies whatever the new chart defaults to, for both images.
+Chart 0.2.2 moved the default Nucleus engine from `v1.1.1` to `v1.3.0`. If your
+install did not set `nucleus.image.tag`, the upgrade restarts the Nucleus pod
+on the new engine against the existing data volume. An engine cannot be
+downgraded onto a data directory a newer engine has written.
+
+Before upgrading across an engine version:
+
+1. Snapshot both PVCs and take an application-level backup (see "Storage and
+   backup" below and `backup-restore.md`).
+2. Read `upgrade.md` and the CHANGELOG entries between your version and the
+   target.
+3. To upgrade Observe and keep the engine, pin it:
+   `helm upgrade ... --set nucleus.image.tag=v1.1.1`. Move the engine as its
+   own step afterwards.
+
+CI runs Observe against `v1.3.0` on a fresh database. An in-place move from
+`v1.1.1` on a chart install has not been rehearsed.
 
 ## Secrets
 

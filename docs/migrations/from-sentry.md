@@ -54,7 +54,8 @@ captureException(err, { release: "v1.4.2" });
 ### Drop-in shim
 
 To keep Sentry call sites, use the `@teploy/observe-sentry-shim` package
-(`sdk/sentry-shim`) instead of writing your own `window.Sentry` object. It
+(`sdk/sentry-shim`; not yet on npm, so build it from this repository as its
+[README](../../sdk/sentry-shim/README.md#install) shows) instead of writing your own `window.Sentry` object. It
 exports the Sentry-named functions and posts to Observe's API
 (`captureException` to `/api/v1/errors`, `captureMessage` to `/api/v1/logs`):
 

@@ -4,6 +4,29 @@ All notable changes to Observe are recorded here.
 
 ## Unreleased
 
+### Security
+
+- **Login return**: `/login?next=...` could send a browser to another site after
+  a real sign-in (`next=/%09/evil.example`, `next=/.//evil.example`). The value
+  is now resolved against this instance's origin and only its path, query and
+  fragment are followed.
+- **`/healthz`** no longer includes the data directory's absolute path
+  (`capacity.disk.path`, `capacity.engine_disk.path` are gone). The endpoint
+  is unauthenticated on both listeners. The other capacity fields are
+  unchanged.
+
+### Changed
+
+- **Helm chart 0.2.2**: `appVersion` is 0.2.2 and `nucleus.image.tag` defaults
+  to `v1.3.0` (was 0.2.0 on `v1.1.1`), the engine CI, `docker-compose.yml` and
+  `teploy.yml` already use. **`helm upgrade` on an existing install that did
+  not set `nucleus.image.tag` replaces the database engine in place.**
+  Snapshot both PVCs and take an application backup first, or pass
+  `--set nucleus.image.tag=v1.1.1` to stay on the old engine. See
+  `docs/operations/kubernetes.md`, "Upgrading".
+- A legacy `./queue` directory chosen as the ingest WAL directory is now logged
+  at startup (behaviour unchanged).
+
 ## v0.2.2 — 2026-11-07
 
 ### Added
@@ -191,14 +214,15 @@ environment) - see `AUDIT_OPEN.md` S1 for the verification checklist.
   profile sends HSTS and related headers.
 - New guard test refuses `ALTER TABLE ... ADD COLUMN` in migrations from 057 on.
 
+### Audit rounds and hardening (written up 2026-09-20)
 
-## v0.2.0 — 2026-09-20
-
-Four ChatGPT audit rounds plus a security hardening pass landed between
-v0.1.9 and here; the register (`AUDIT_OPEN.md`) carries per-finding records.
+This part of v0.2.0 was first recorded under a separate `v0.2.0 — 2026-09-20`
+heading before the release was tagged; it ships in the same v0.2.0 tag.
+Four ChatGPT audit rounds plus a security hardening pass landed after
+v0.1.9; the register (`AUDIT_OPEN.md`) carries per-finding records.
 Highlights and operator-visible changes:
 
-### Security
+#### Security
 
 - **Unified principal store** (migration 040): managed users can now sign in,
   role changes revoke live sessions/tokens, and OIDC identities are namespaced
@@ -217,7 +241,7 @@ Highlights and operator-visible changes:
 - Replay snapshots mask attributes; the asset proxy (`/api/v1/replay-assets`)
   gates replay-adjacent images behind a host allowlist.
 
-### Reliability
+#### Reliability
 
 - **Idempotent ingest (wire protocol v2)**: producers stamp stable event ids;
   duplicate batches dedupe; replay retries are exactly-once (deterministic
@@ -232,7 +256,7 @@ Highlights and operator-visible changes:
   source maps, which are now included in the archive and verified at restore.
 - Browser tracker: bounded automatic retry with backoff and drop-oldest.
 
-### Operations
+#### Operations
 
 - **CI keys**: telemetry/sourcemap-upload keys must be minted with
   `scopes:["publish"]` (plain telemetry keys no longer publish) — mint new

@@ -414,6 +414,18 @@ observeErrors.addBreadcrumb({ type: "user", category: "click", message: "Button"
 | Python | `teploy-observe` | `pip install teploy-observe` |
 | Go | `sdk/go` | `go get github.com/useteploy/teploy-observe/sdk/go` |
 
+<!-- not-yet-published: delete this block once the SDKs are on npm and PyPI -->
+> **Not yet published.** `teploy-observe` (PyPI), `@teploy/observe-browser` and
+> `@teploy/observe-sentry-shim` (npm) are not on the registries yet, so the
+> install commands for them fail, and a package of one of those names that
+> appears before this note is removed is not from this project. Install from
+> this repository instead:
+> `pip install "git+https://github.com/useteploy/teploy-observe#subdirectory=sdk/python"`
+> for Python; for the npm packages, build and pack them from a clone as shown in
+> [sdk/browser/README.md](sdk/browser/README.md) and
+> [sdk/sentry-shim/README.md](sdk/sentry-shim/README.md).
+<!-- /not-yet-published -->
+
 ## Environment variables
 
 | Variable | Default | Description |

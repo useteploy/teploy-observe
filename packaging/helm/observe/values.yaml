@@ -55,9 +55,10 @@ nucleus:
   externalUrl: ""
   image:
     repository: ghcr.io/neutron-build/nucleus
-    # Historical default. Availability and compatibility with the Observe
-    # appVersion must pass the release pair gate; no tested-pair claim is implied.
-    tag: v1.1.1
+    # The engine version CI tests against (NUCLEUS_VERSION in
+    # .github/workflows/ci.yml) and docker-compose.yml / teploy.yml pin; keep
+    # them in sync. The release pair gate checks it with the appVersion.
+    tag: v1.3.0
     pullPolicy: IfNotPresent
   port: 5432
   maxMemoryMB: 512
