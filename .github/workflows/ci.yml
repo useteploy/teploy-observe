@@ -393,7 +393,9 @@ jobs:
   # binary + real Nucleus. The fuller e2e suite is still local-only; this is
   # the honest browser-level check of the product's core surface.
   e2e-smoke:
-    runs-on: ubuntu-latest
+    # Pinned: Playwright 1.59 has no browser build for ubuntu-26.04,
+    # which ubuntu-latest now resolves to.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -553,7 +555,9 @@ jobs:
       - run: bash scripts/regenerate-replay.sh --check
 
   helm-pair-availability:
-    runs-on: ubuntu-latest
+    # Pinned: Playwright 1.59 has no browser build for ubuntu-26.04,
+    # which ubuntu-latest now resolves to.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
